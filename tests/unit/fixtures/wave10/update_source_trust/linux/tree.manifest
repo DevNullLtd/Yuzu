@@ -1,0 +1,25 @@
+# tree.manifest -- ONE composite injected root for lnx::apt_rows_at / lnx::rpm_rows_at.
+# Line grammar: <relative path>TAB<payload>; '#' lines and blank lines are skipped.
+#   F:<path>   copy the committed fixture at <path> (relative to this file's directory)
+#   T:<text>   literal text; escapes \n \t \\ (RECONSTRUCTION lines only)
+#   B:<base64> literal bytes
+#   L:<target> symlink to <target>
+# Every entry carries its own label. Byte sources are the wave-1 captures listed in
+# provenance.txt (single copy of each capture; nothing is duplicated here).
+#
+# REAL CAPTURE (debian:bookworm, 2026-09-21): deb822 sources with Signed-By + armored keyring.
+etc/apt/sources.list.d/debian.sources	F:debian-bookworm/etc/apt/sources.list.d/debian.sources
+etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc	F:debian-bookworm/etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc
+# REAL CAPTURE (ubuntu:22.04, 2026-09-21): one-line sources.list + binary keyring.
+etc/apt/sources.list	F:ubuntu-2204/etc/apt/sources.list
+etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg	F:ubuntu-2204/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg
+# REAL CAPTURE (rockylinux:9, 2026-09-21): the four shipped .repo files.
+etc/yum.repos.d/rocky.repo	F:rocky-9/etc/yum.repos.d/rocky.repo
+etc/yum.repos.d/rocky-addons.repo	F:rocky-9/etc/yum.repos.d/rocky-addons.repo
+etc/yum.repos.d/rocky-devel.repo	F:rocky-9/etc/yum.repos.d/rocky-devel.repo
+etc/yum.repos.d/rocky-extras.repo	F:rocky-9/etc/yum.repos.d/rocky-extras.repo
+# RECONSTRUCTION (hand-written, not a capture): a third-party one-line source that pins a
+# Signed-By keyring under /etc/apt/keyrings, and an insecure one (trusted=yes allow-insecure=yes).
+etc/apt/sources.list.d/thirdparty.list	T:deb [signed-by=/etc/apt/keyrings/thirdparty.gpg] https://repo.example.com/apt stable main\ndeb [trusted=yes allow-insecure=yes] http://insecure.example.com/apt ./\n
+# RECONSTRUCTION: the four leading bytes of a binary OpenPGP key packet (0x99 0x01 0x0d 0x04).
+etc/apt/keyrings/thirdparty.gpg	B:mQENBA==

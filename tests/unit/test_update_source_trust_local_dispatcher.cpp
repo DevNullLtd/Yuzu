@@ -1,0 +1,350 @@
+/**
+ * test_update_source_trust_local_dispatcher.cpp -- loads the ACTUAL built
+ * update_source_trust plugin (.dylib / .so / .dll) via PluginHandle::load and
+ * drives its one action, `sources`, through yuzu::agent::LocalDispatcher, so
+ * the real per-OS leg (run_linux / run_macos / run_windows) executes on the
+ * build host. Modelled on test_peripherals_local_dispatcher.cpp.
+ *
+ * UNGUARDED, deliberately, on all three platforms: a platform-guarded
+ * dispatcher TU is how a sibling plugin once shipped a Windows leg that was
+ * compiled out and stayed green. Everything platform-specific below is a
+ * runtime/`#if` choice INSIDE a test body; the TU and every case always exist.
+ *
+ * WHAT THIS DOES NOT ASSERT. It runs against the LIVE host (CI runners are
+ * shared, unknown hardware), so it never asserts that a real-host source
+ * exists. Where a row is asserted it is guarded on the host actually having
+ * the input (a readable regular file that the leg is documented to read) AND
+ * on the leg reporting `supported`; the populated-row assertions on injected
+ * fixture trees live in test_update_source_trust_{linux,macos}_parsers.cpp.
+ *
+ * What it DOES pin on every host: the first row is the status row, the status
+ * row agrees with the typed CC-07 result the plugin reported, the return code
+ * is 0 (a degraded read is not a failed command), and every data row has the
+ * exact field count of its kind under an escape-aware split.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/plugin.h>
+#include <yuzu/plugin.hpp>
+
+#include "local_dispatcher.hpp"
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+/// Escape-aware field split: safe_output_field writes a literal '|' as `\|`,
+/// so a naive split('|') overcounts on a row whose text contains a pipe.
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+std::vector<std::string> captured_rows(const std::string& captured) {
+    std::vector<std::string> out;
+    std::istringstream ss(captured);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!line.empty())
+            out.push_back(line);
+    }
+    return out;
+}
+
+/// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means
+/// the build is genuinely broken and must NOT report "All tests passed".
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+void require_plugin_or_skip() {
+    if (std::getenv("MESON_BUILD_ROOT") != nullptr) {
+        FAIL("update_source_trust plugin library not found under meson test -- the plugin did not "
+             "build, or link_depends is not forcing it to build before this test runs");
+    }
+    WARN("update_source_trust plugin library not found -- skipping the LocalDispatcher round-trip");
+}
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+#if defined(_WIN32)
+constexpr const char* kPluginExt = ".dll";
+#elif defined(__APPLE__)
+constexpr const char* kPluginExt = ".dylib";
+#else
+constexpr const char* kPluginExt = ".so";
+#endif
+
+fs::path find_plugin() {
+    const std::string lib_name = std::string{"update_source_trust"} + kPluginExt;
+    std::vector<fs::path> candidates;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    auto* build_root = std::getenv("MESON_BUILD_ROOT");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (build_root)
+        candidates.emplace_back(fs::path{build_root} / "agents" / "plugins" / "update_source_trust" /
+                                lib_name);
+    candidates.emplace_back(fs::path{"agents"} / "plugins" / "update_source_trust" / lib_name);
+    candidates.emplace_back(fs::path{".."} / "agents" / "plugins" / "update_source_trust" / lib_name);
+    for (const char* b : {"build-macos", "build-linux", "build-windows"})
+        candidates.emplace_back(fs::path{b} / "agents" / "plugins" / "update_source_trust" / lib_name);
+    for (const auto& c : candidates)
+        if (std::error_code ec; fs::exists(c, ec))
+            return c;
+    return {};
+}
+
+struct LoadedPlugin {
+    yuzu::agent::PluginHandle handle;
+    const YuzuPluginDescriptor* descriptor{nullptr};
+    explicit operator bool() const { return descriptor != nullptr; }
+};
+
+std::optional<LoadedPlugin> load_plugin() {
+    auto path = find_plugin();
+    if (path.empty())
+        return std::nullopt;
+    auto loaded = yuzu::agent::PluginHandle::load(path);
+    if (!loaded)
+        return std::nullopt;
+    const auto* d = loaded->descriptor();
+    if (!d)
+        return std::nullopt;
+    return LoadedPlugin{std::move(*loaded), d};
+}
+
+/// Documented field counts, kind token included:
+///   status|sources|<state>|<reason>                                       4
+///   apt_source|file|format|types|uris|suites|components|signed_by|
+///              trusted|allow_insecure|enabled                            11
+///   apt_keyring|path|scope|format|size_bytes                              5
+///   rpm_repo|file|id|name|enabled|gpgcheck|repo_gpgcheck|gpgkey|baseurl|
+///            mirror|sslverify                                            11
+///   macos_swu|scope|catalog_url|auto_check|auto_download|auto_install|
+///             config_data|critical|allow_prerelease                       9
+std::size_t expected_field_count(const std::string& kind) {
+    if (kind == "status")
+        return 4;
+    if (kind == "apt_source" || kind == "rpm_repo")
+        return 11;
+    if (kind == "apt_keyring")
+        return 5;
+    if (kind == "macos_swu")
+        return 9;
+    return 0; // unknown kind
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+/// A readable, non-symlink regular file (what the leg is documented to read).
+bool readable_regular_file(const fs::path& p) {
+    std::error_code ec;
+    if (fs::is_symlink(fs::symlink_status(p, ec)) || !fs::is_regular_file(p, ec))
+        return false;
+    std::ifstream f(p, std::ios::binary);
+    return static_cast<bool>(f);
+}
+#endif
+
+#if defined(__linux__)
+std::size_t count_kind(const std::vector<std::string>& rows, std::string_view kind) {
+    std::size_t n = 0;
+    for (const auto& r : rows)
+        if (split_fields_escape_aware(r)[0] == kind)
+            ++n;
+    return n;
+}
+
+/// True when some LINE of the file starts with `prefix`.
+bool file_has_line_starting(const fs::path& p, std::string_view prefix) {
+    std::ifstream f(p, std::ios::binary);
+    std::string text = "\n";
+    text.append(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return text.find("\n" + std::string{prefix}) != std::string::npos;
+}
+#endif
+
+} // namespace
+
+TEST_CASE("update_source_trust plugin: status row first, agrees with the typed result, rc 0",
+          "[update_source_trust][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "sources");
+    CHECK(result.rc == 0); // a degraded read is never a failed command
+    CHECK_FALSE(result.truncated);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+
+    const auto status = split_fields_escape_aware(rows[0]);
+    INFO("status row: " << rows[0]);
+    REQUIRE(status.size() == 4);
+    CHECK(status[0] == "status");
+    CHECK(status[1] == "sources");
+
+#if defined(_WIN32)
+    // The Windows leg is PLANNED: exactly one row, and an UNAVAILABLE result.
+    // MUTATION: implementing (or wiring) any Windows read changes this row.
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|sources|unsupported|windows:planned");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    CHECK(result.result_provenance == "windows:planned");
+#else
+    // Non-Windows: supported (clean read, full) or constrained (reason + partial).
+    // The row and the typed result are written together by report_sources, so
+    // they can never disagree.
+    if (status[2] == "supported") {
+        CHECK(status[3] == "-");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else {
+        REQUIRE(status[2] == "constrained");
+        CHECK(status[3] != "-");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK_FALSE(result.result_provenance.empty()); // the reason travels with the status
+    }
+#endif
+}
+
+TEST_CASE("update_source_trust plugin: every data row has its kind's exact field count",
+          "[update_source_trust][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
+    REQUIRE_FALSE(rows.empty());
+
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        INFO("row " << i << ": " << rows[i]);
+        const auto f = split_fields_escape_aware(rows[i]);
+        if (i == 0)
+            CHECK(f[0] == "status"); // the status row is FIRST and only first
+        else
+            CHECK(f[0] != "status");
+        const std::size_t want = expected_field_count(f[0]);
+        REQUIRE(want != 0); // an unknown row kind is a regression
+        CHECK(f.size() == want);
+#if defined(__APPLE__)
+        CHECK((f[0] == "status" || f[0] == "macos_swu"));
+#elif defined(__linux__)
+        CHECK((f[0] == "status" || f[0] == "apt_source" || f[0] == "apt_keyring" ||
+               f[0] == "rpm_repo"));
+#endif
+    }
+}
+
+#if defined(__APPLE__)
+TEST_CASE("update_source_trust plugin (macOS): a readable local plist yields a local macos_swu row",
+          "[update_source_trust][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    // Guarded on the host actually having a readable plist: presence on CI
+    // runners is not guaranteed.
+    const fs::path plist{"/Library/Preferences/com.apple.SoftwareUpdate.plist"};
+    if (!readable_regular_file(plist))
+        SKIP("no readable /Library/Preferences/com.apple.SoftwareUpdate.plist on this host");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto status = split_fields_escape_aware(rows[0]);
+    // A `constrained` leg (e.g. an unreadable MANAGED plist) still reports what it
+    // could read, so the local row is asserted either way. MUTATION: dropping the
+    // run_macos -> swu_rows_at wiring leaves only the status row and fails here.
+    std::size_t local = 0;
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        if (f[0] == "macos_swu" && f[1] == "local")
+            ++local;
+    }
+    INFO("status: " << rows[0]);
+    CHECK(local == 1);
+    CHECK((status[2] == "supported" || status[2] == "constrained"));
+}
+#endif
+
+#if defined(__linux__)
+TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this host produce their rows",
+          "[update_source_trust][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto status = split_fields_escape_aware(rows[0]);
+    if (status[2] != "supported")
+        SKIP("leg reported constrained on this host; populated-row assertions need a clean read");
+
+    // Each assertion is guarded on THIS host having the input the leg reads
+    // (a readable, non-symlink regular file with content); a host without it
+    // asserts nothing about that family. Populated rows on injected trees are
+    // pinned in test_update_source_trust_linux_parsers.cpp.
+    std::size_t asserted = 0;
+    if (readable_regular_file("/etc/apt/trusted.gpg")) {
+        ++asserted;
+        CHECK(count_kind(rows, "apt_keyring") >= 1);
+    }
+    if (readable_regular_file("/etc/apt/sources.list") &&
+        file_has_line_starting("/etc/apt/sources.list", "deb ")) {
+        ++asserted;
+        CHECK(count_kind(rows, "apt_source") >= 1);
+    }
+    for (const char* repo : {"/etc/yum.repos.d/redhat.repo", "/etc/yum.repos.d/rocky.repo",
+                             "/etc/yum.repos.d/CentOS-Base.repo", "/etc/yum.repos.d/fedora.repo"}) {
+        if (readable_regular_file(repo) && file_has_line_starting(repo, "[")) {
+            ++asserted;
+            CHECK(count_kind(rows, "rpm_repo") >= 1);
+            break;
+        }
+    }
+    if (asserted == 0)
+        WARN("no known apt/rpm trust input on this host; only row shape was asserted");
+}
+#endif
