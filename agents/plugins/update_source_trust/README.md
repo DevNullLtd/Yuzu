@@ -6,7 +6,7 @@
 | **What it does** | Package and update-source trust posture (facts only) |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.security.update_source_trust) |
-| **Platforms** | Windows 🟡 planned · macOS 🟡 constrained · Linux ✅ |
+| **Platforms** | Windows 🟡 planned · macOS 🟡 planned · Linux ✅ |
 | **Actions** | `sources` (definition `crossplatform.security.update_source_trust`) |
 | **Security** | securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator, security-admin · author: content-author |
@@ -33,12 +33,13 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `sources` | 🟡 planned · rung 1 · HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate{,\\AU} registry values | 🟡 constrained · rung 1 · CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist | ✅ supported · rung 1 · /etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*}, /etc/apt/keyrings/* and /etc/yum.repos.d/*.repo config file reads |
+| `sources` | 🟡 planned · rung 1 · HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate{,\\AU} registry values | 🟡 planned · rung 1 · CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist | ✅ supported · rung 1 · /etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/* config file reads |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`sources` / Windows** — follows as its own PR
-- **`sources` / macOS** — managed leg verified against fixtures only; no MDM-enrolled host in this run
+- **`sources` / macOS** — follows as its own PR
+- **`sources` / Linux** — rpm/dnf /etc/yum.repos.d/*.repo family follows as its own PR; a host with that directory reports constrained linux:rpm_repo:planned
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -68,17 +69,17 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `status` `apt_source` `apt_keyring` `rpm_repo` `macos_swu` | Windows, Linux, macOS | `apt_source` | Row shape discriminator (field 0). Values: status, apt_source, apt_keyring, rpm_repo, macos_swu. A planned wsus shape is documented for the Windows leg and is not emitted today. |
-| `field_1` | string | - | Windows, Linux, macOS | `/etc/apt/sources.list.d/debian.sources` | status: the literal "sources". apt_source, rpm_repo: the logical absolute path of the source file. apt_keyring: the keyring file path. macos_swu: scope, local or managed. |
-| `field_2` | string | - | Windows, Linux, macOS | `deb822` | status: supported, constrained or unsupported (Windows reports unsupported until its leg lands). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type. |
-| `field_3` | string | - | Windows, Linux, macOS | `deb` | status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows). apt_source: source types (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). rpm_repo: repository name. macos_swu: auto_check. |
-| `field_4` | string | - | Linux, macOS | `https://deb.debian.org/debian` | apt_source: URIs, userinfo (user:pass@) redacted. apt_keyring: size in bytes. rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled. |
-| `field_5` | string | - | Linux, macOS | `bookworm` | apt_source: suites. rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos. |
-| `field_6` | string | - | Linux, macOS | `main` | apt_source: components. rpm_repo: repo_gpgcheck. macos_swu: config_data_install. |
-| `field_7` | string | - | Linux, macOS | `/usr/share/keyrings/debian-archive-keyring.gpg` | apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), or "-" when absent (apt then uses its global trusted keyrings). rpm_repo: gpgkey URL(s). macos_swu: critical_update_install. |
-| `field_8` | string | - | Linux, macOS | `unset` | apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source). rpm_repo: baseurl. macos_swu: allow_prerelease. |
-| `field_9` | string | - | Linux | `unset` | apt_source: allow_insecure (yes, no, unset, unmodelled). rpm_repo: mirror (mirrorlist or metalink) URL. |
-| `field_10` | string | - | Linux | `yes` | apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled). rpm_repo: sslverify (yes, no, unset, unmodelled). |
+| `row_kind` | string | `status` `apt_source` `apt_keyring` | Windows, Linux, macOS | `apt_source` | Row shape discriminator (field 0). Values: status, apt_source, apt_keyring. The rpm_repo, macos_swu and wsus shapes are documented in the field descriptions below for the planned rpm/dnf, macOS and Windows legs and are not emitted today. |
+| `field_1` | string | - | Windows, Linux, macOS | `/etc/apt/sources.list.d/debian.sources` | status: the literal "sources". apt_source: the logical absolute path of the source file. apt_keyring: the keyring file path. Planned, not emitted today: rpm_repo: the logical absolute path of the .repo file. macos_swu: scope, local or managed. |
+| `field_2` | string | - | Windows, Linux, macOS | `deb822` | status: supported, constrained or unsupported (Windows and macOS report unsupported until their legs land). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type. |
+| `field_3` | string | - | Windows, Linux, macOS | `deb` | status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows, macos:planned on macOS, linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries). apt_source: source types (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check. |
+| `field_4` | string | - | Linux, macOS | `https://deb.debian.org/debian` | apt_source: URIs, userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled. |
+| `field_5` | string | - | Linux, macOS | `bookworm` | apt_source: suites. Planned, not emitted today: rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos. |
+| `field_6` | string | - | Linux, macOS | `main` | apt_source: components. Planned, not emitted today: rpm_repo: repo_gpgcheck. macos_swu: config_data_install. |
+| `field_7` | string | - | Linux, macOS | `/usr/share/keyrings/debian-archive-keyring.gpg` | apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), or "-" when absent (apt then uses its global trusted keyrings). Planned, not emitted today: rpm_repo: gpgkey URL(s). macos_swu: critical_update_install. |
+| `field_8` | string | - | Linux, macOS | `unset` | apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source). Planned, not emitted today: rpm_repo: baseurl. macos_swu: allow_prerelease. |
+| `field_9` | string | - | Linux | `unset` | apt_source: allow_insecure (yes, no, unset, unmodelled). Planned, not emitted today: rpm_repo: mirror (mirrorlist or metalink) URL. |
+| `field_10` | string | - | Linux | `yes` | apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled). Planned, not emitted today: rpm_repo: sslverify (yes, no, unset, unmodelled). |
 <!-- END GENERATED -->
 
 ### Result status
@@ -104,16 +105,15 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 20246992765e
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 4901149d2e67
 
 ```
 == action=sources
-status|sources|supported|-
-macos_swu|local|-|unset|yes|yes|yes|yes|unset
-[result_status] OK / FULL
+status|sources|unsupported|macos:planned
+[result_status] UNAVAILABLE / UNKNOWN / macos:planned
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 20246992765e
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 4901149d2e67
 
 ```
 == action=sources
@@ -144,9 +144,9 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/update_source_trust/src/update_source_trust_legs.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_macos.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_macos_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_plugin.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_win.cpp`
+- Plugin: `agents/plugins/update_source_trust/src/update_source_trust_legs.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_macos.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_plugin.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_win.cpp`
 - Definitions: `content/definitions/update_source_trust.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp`
-- Tests: `tests/unit/test_update_source_trust_ini.cpp` · `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_macos_parsers.cpp` · `tests/unit/test_update_source_trust_macos_plist.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
+- Tests: `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

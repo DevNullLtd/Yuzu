@@ -7,16 +7,16 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
-          "mechanism": "/etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*}, /etc/apt/keyrings/* and /etc/yum.repos.d/*.repo config file reads",
+          "fallback": "rpm/dnf /etc/yum.repos.d/*.repo family follows as its own PR; a host with that directory reports constrained linux:rpm_repo:planned",
+          "mechanism": "/etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/* config file reads",
           "rung": "1",
           "support": "supported"
         },
         "macos": {
-          "fallback": "managed leg verified against fixtures only; no MDM-enrolled host in this run",
+          "fallback": "follows as its own PR",
           "mechanism": "CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist",
           "rung": "1",
-          "support": "constrained"
+          "support": "planned"
         },
         "windows": {
           "fallback": "follows as its own PR",
@@ -30,9 +30,9 @@
   "caveats": [
     "**No documented customer driver.** Zero documented driver: `docs/capability-map.md` section 8.8 \"Patch Connectivity Testing\" tests reachability to update sources, never their trust or authenticity, and every \"supply chain\" mention in the SOC 2 doc (Workstream C) is about Yuzu's own build and release pipeline, never a customer endpoint's OS or package update-source configuration. Pure capability-gap reasoning.",
     "**Facts only.** The plugin is read-only and reports how sources are configured; an unsigned or rogue source is a row, not a verdict. It does not enforce, fetch, verify a signature or resolve a key, and enforcement posture belongs to the sibling posture plugins.",
-    "**macOS: managed leg verified against fixtures only; no MDM-enrolled host in this run.** The local Software Update policy is verified against a real capture of a Mac; the MDM-managed plist is verified against a reconstruction built from Apple's documented payload keys, so the macOS leg stays constrained.",
-    "**Windows leg planned.** The WSUS and Automatic Updates policy read under `HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate` follows as its own PR; until then Windows reports one `unsupported` status row. When it lands, a host with no WSUS policy will report `policy_configured=no` as a fact, distinct from `constrained`.",
-    "**Known limits.** Keys referenced by an apt `Signed-By` are reported by path, not resolved or fingerprinted, and `/usr/share/keyrings` is not inventoried. Only `.repo` files in `/etc/yum.repos.d` are read, not `dnf.conf`/`yum.conf` defaults or `/etc/zypp`, so `gpgcheck=unset` means the `.repo` file does not say, not that the effective value is off."
+    "**rpm/dnf family planned.** The yum/dnf `.repo` read (`gpgcheck`, `repo_gpgcheck`, `gpgkey`, `sslverify`) follows as its own PR. Until then a Linux host whose `/etc/yum.repos.d` has entries reports `CONSTRAINED` with `linux:rpm_repo:planned` and no `rpm_repo` rows, so it never reads as having no sources; a host without that directory (Debian, Ubuntu) is unaffected and stays `supported`.",
+    "**macOS and Windows legs planned.** The macOS Software Update policy read (the local and the MDM-managed `com.apple.SoftwareUpdate.plist`, including its Managed Preferences read) and the Windows WSUS and Automatic Updates policy read under `HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate` each follow as their own PR; until then each reports one `unsupported` status row. When the Windows leg lands, a host with no WSUS policy will report `policy_configured=no` as a fact, distinct from `constrained`.",
+    "**Known limits.** Keys referenced by an apt `Signed-By` are reported by path, not resolved or fingerprinted, and `/usr/share/keyrings` is not inventoried."
   ],
   "definitions": [
     {
@@ -40,7 +40,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Reports how the device's package and update sources are configured to trust their signing authorities, as facts only. On Linux, one row per apt source (one-line and deb822, with signed-by, trusted and allow-insecure), one row per apt keyring file, and one row per yum/dnf repository (with gpgcheck, repo_gpgcheck, gpgkey and sslverify). On macOS, one row for the local and one for the MDM-managed Software Update policy. The Windows WSUS leg is planned and follows as its own PR. A leading status row states whether the read was complete. The plugin never enforces, fetches or changes anything.",
+      "description": "Reports how the device's package and update sources are configured to trust their signing authorities, as facts only. On Linux, one row per apt source (one-line and deb822, with signed-by, trusted and allow-insecure) and one row per apt keyring file. The yum/dnf repository family is planned and follows as its own PR; a Linux host whose /etc/yum.repos.d has entries reports a constrained status with linux:rpm_repo:planned instead of rows. The macOS Software Update and Windows WSUS legs are planned and each follows as its own PR. A leading status row states whether the read was complete. The plugin never enforces, fetches or changes anything.",
       "display_name": "Update Source Trust",
       "execute_roles": [
         "endpoint-admin",
@@ -59,21 +59,21 @@
     }
   ],
   "description": "Package and update-source trust posture (facts only)",
-  "how_it_works": "`sources` reports facts about how the device's package and update sources are configured to trust their signing authorities. It reads local configuration and nothing else: no subprocess, no network fetch, no write. The first row is always a `status` row saying whether the read was complete; the data rows follow, one per source. It reports what is configured and leaves any judgement, and any enforcement, to the consumer and to the sibling posture plugins.\n\nOn Linux, apt sources are read from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, with the `signed-by`, `trusted` and `allow-insecure` settings surfaced. The apt keyring files under `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size (key material is never emitted). yum/dnf repositories are read from `/etc/yum.repos.d/*.repo` with `gpgcheck`, `repo_gpgcheck`, `gpgkey` and `sslverify`. On macOS, the Software Update policy is decoded with `CFPropertyListCreateWithData` from the local and from the MDM-managed `com.apple.SoftwareUpdate.plist`. The Windows leg is planned and answers with one `unsupported` status row until it lands. Files are opened without following symlinks and read with a 1 MiB cap.",
+  "how_it_works": "`sources` reports facts about how the device's package and update sources are configured to trust their signing authorities. It reads local configuration and nothing else: no subprocess, no network fetch, no write. The first row is always a `status` row saying whether the read was complete; the data rows follow, one per source. It reports what is configured and leaves any judgement, and any enforcement, to the consumer and to the sibling posture plugins.\n\nOn Linux, apt sources are read from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, with the `signed-by`, `trusted` and `allow-insecure` settings surfaced. The apt keyring files under `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size (key material is never emitted). The yum/dnf `.repo` family follows as its own PR: until then the leg only lists `/etc/yum.repos.d` (names, no `.repo` file is opened) and, when that directory has entries, reports `CONSTRAINED` with `linux:rpm_repo:planned`, so an rpm host never reads as having no sources. The macOS Software Update read and the Windows leg are planned and each answers with one `unsupported` status row until it lands. Files are opened without following symlinks and read with a 1 MiB cap.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "20246992765e",
+  "leg_hash": "4901149d2e67",
   "manifest_version": 1,
   "name": "update_source_trust",
   "outputs": [
     {
       "columns": [
         {
-          "description": "Row shape discriminator (field 0). Values: status, apt_source, apt_keyring, rpm_repo, macos_swu. A planned wsus shape is documented for the Windows leg and is not emitted today.",
+          "description": "Row shape discriminator (field 0). Values: status, apt_source, apt_keyring. The rpm_repo, macos_swu and wsus shapes are documented in the field descriptions below for the planned rpm/dnf, macOS and Windows legs and are not emitted today.",
           "example": "apt_source",
           "name": "row_kind",
           "platforms": [
@@ -85,13 +85,11 @@
           "values": [
             "status",
             "apt_source",
-            "apt_keyring",
-            "rpm_repo",
-            "macos_swu"
+            "apt_keyring"
           ]
         },
         {
-          "description": "status: the literal \"sources\". apt_source, rpm_repo: the logical absolute path of the source file. apt_keyring: the keyring file path. macos_swu: scope, local or managed.",
+          "description": "status: the literal \"sources\". apt_source: the logical absolute path of the source file. apt_keyring: the keyring file path. Planned, not emitted today: rpm_repo: the logical absolute path of the .repo file. macos_swu: scope, local or managed.",
           "example": "/etc/apt/sources.list.d/debian.sources",
           "name": "field_1",
           "platforms": [
@@ -103,7 +101,7 @@
           "values": null
         },
         {
-          "description": "status: supported, constrained or unsupported (Windows reports unsupported until its leg lands). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). rpm_repo: repo id. macos_swu: catalog URL, \"-\" when the plist sets none, or unmodelled for a value of the wrong type.",
+          "description": "status: supported, constrained or unsupported (Windows and macOS report unsupported until their legs land). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, \"-\" when the plist sets none, or unmodelled for a value of the wrong type.",
           "example": "deb822",
           "name": "field_2",
           "platforms": [
@@ -115,7 +113,7 @@
           "values": null
         },
         {
-          "description": "status: reason token(s) for a constrained or unsupported read, \"-\" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows). apt_source: source types (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). rpm_repo: repository name. macos_swu: auto_check.",
+          "description": "status: reason token(s) for a constrained or unsupported read, \"-\" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows, macos:planned on macOS, linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries). apt_source: source types (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.",
           "example": "deb",
           "name": "field_3",
           "platforms": [
@@ -127,7 +125,7 @@
           "values": null
         },
         {
-          "description": "apt_source: URIs, userinfo (user:pass@) redacted. apt_keyring: size in bytes. rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled.",
+          "description": "apt_source: URIs, userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled.",
           "example": "https://deb.debian.org/debian",
           "name": "field_4",
           "platforms": [
@@ -138,7 +136,7 @@
           "values": null
         },
         {
-          "description": "apt_source: suites. rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos.",
+          "description": "apt_source: suites. Planned, not emitted today: rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos.",
           "example": "bookworm",
           "name": "field_5",
           "platforms": [
@@ -149,7 +147,7 @@
           "values": null
         },
         {
-          "description": "apt_source: components. rpm_repo: repo_gpgcheck. macos_swu: config_data_install.",
+          "description": "apt_source: components. Planned, not emitted today: rpm_repo: repo_gpgcheck. macos_swu: config_data_install.",
           "example": "main",
           "name": "field_6",
           "platforms": [
@@ -160,7 +158,7 @@
           "values": null
         },
         {
-          "description": "apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), or \"-\" when absent (apt then uses its global trusted keyrings). rpm_repo: gpgkey URL(s). macos_swu: critical_update_install.",
+          "description": "apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), or \"-\" when absent (apt then uses its global trusted keyrings). Planned, not emitted today: rpm_repo: gpgkey URL(s). macos_swu: critical_update_install.",
           "example": "/usr/share/keyrings/debian-archive-keyring.gpg",
           "name": "field_7",
           "platforms": [
@@ -171,7 +169,7 @@
           "values": null
         },
         {
-          "description": "apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source). rpm_repo: baseurl. macos_swu: allow_prerelease.",
+          "description": "apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source). Planned, not emitted today: rpm_repo: baseurl. macos_swu: allow_prerelease.",
           "example": "unset",
           "name": "field_8",
           "platforms": [
@@ -182,7 +180,7 @@
           "values": null
         },
         {
-          "description": "apt_source: allow_insecure (yes, no, unset, unmodelled). rpm_repo: mirror (mirrorlist or metalink) URL.",
+          "description": "apt_source: allow_insecure (yes, no, unset, unmodelled). Planned, not emitted today: rpm_repo: mirror (mirrorlist or metalink) URL.",
           "example": "unset",
           "name": "field_9",
           "platforms": [
@@ -192,7 +190,7 @@
           "values": null
         },
         {
-          "description": "apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled). rpm_repo: sslverify (yes, no, unset, unmodelled).",
+          "description": "apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled). Planned, not emitted today: rpm_repo: sslverify (yes, no, unset, unmodelled).",
           "example": "yes",
           "name": "field_10",
           "platforms": [
@@ -205,10 +203,10 @@
       "definition_id": "crossplatform.security.update_source_trust"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|sources|<supported\\|constrained\\|unsupported>|<reason or ->`. The kinds are `apt_source`, `apt_keyring`, `rpm_repo` and `macos_swu` (a `wsus` kind is planned for the Windows leg and is not emitted today); every row of a kind has the same field count, and `-` is an absent value. Booleans use one four-value vocabulary: `yes`, `no`, `unset` (the key is absent) and `unmodelled` (the key is present with a value the plugin does not recognise). A host that has none of a source family reports zero rows for it and stays `supported`: an absent thing is not a failure. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design) and URL userinfo (`user:pass@`) is redacted. `update_source_trust` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`. The columns below are the widest shapes; narrower shapes use a prefix of them.",
+  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|sources|<supported\\|constrained\\|unsupported>|<reason or ->`. The kinds are `apt_source` and `apt_keyring` (the `rpm_repo`, `macos_swu` and `wsus` kinds are planned for the follow-up legs and are not emitted today); every row of a kind has the same field count, and `-` is an absent value. Booleans use one four-value vocabulary: `yes`, `no`, `unset` (the key is absent) and `unmodelled` (the key is present with a value the plugin does not recognise). A host that has no apt configuration reports zero rows and stays `supported`: an absent thing is not a failure (the deferred rpm/dnf family is the exception, see Result status). Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design) and URL userinfo (`user:pass@`) is redacted. `update_source_trust` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`. The columns below are the widest shapes; narrower shapes use a prefix of them.",
   "platforms": {
     "linux": "supported",
-    "macos": "constrained",
+    "macos": "planned",
     "windows": "planned"
   },
   "privileges": [
@@ -220,15 +218,15 @@
       "runs_as": "n/a — the leg is planned and reads nothing"
     },
     {
-      "grant": "None to read",
-      "if_refused": "`CONSTRAINED` / partial with a `macos:swu_local:<detail>` or `macos:swu_managed:<detail>` token; the affected scope's row is absent, never reported as empty policy",
-      "measured": "Not yet measured; the post-integration capture records it (`docs/samples/macos.txt`)",
+      "grant": "n/a",
+      "if_refused": "n/a — the placeholder reports `unsupported` with `macos:planned`",
+      "measured": "n/a",
       "os": "macOS",
-      "runs_as": "agent daemon — **root** by documented exception (`docs/agent-privilege-model.md`: launchd's LaunchDaemon has no `UserName` key)"
+      "runs_as": "n/a — the leg is planned and reads nothing"
     },
     {
       "grant": "None to read",
-      "if_refused": "`CONSTRAINED` / partial with a `linux:apt_sources:<detail>`, `linux:apt_keyring:<detail>` or `linux:rpm_repo:<detail>` token; the unreadable source is absent from the rows, never reported as unsigned or absent",
+      "if_refused": "`CONSTRAINED` / partial with a `linux:apt_sources:<detail>` or `linux:apt_keyring:<detail>` token (or `linux:rpm_repo:<detail>` when the `/etc/yum.repos.d` listing itself is refused); the unreadable source is absent from the rows, never reported as unsigned or absent",
       "measured": "Not yet measured; the post-integration capture records it (`docs/samples/linux.txt`)",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`)"
@@ -240,19 +238,31 @@
       "completeness": "full",
       "provenance": "(empty)",
       "status": "`OK`",
-      "when": "Linux and macOS: every read completed, populated or genuinely empty"
+      "when": "Linux: every read completed, populated or genuinely empty (no `/etc/yum.repos.d` entries)"
     },
     {
       "completeness": "partial",
-      "provenance": "`linux:apt_sources:<detail>` / `linux:apt_keyring:<detail>` / `linux:rpm_repo:<detail>` / `macos:swu_local:<detail>` / `macos:swu_managed:<detail>`, with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `not_regular`, `io_error`, `open_failed`, `read_failed`, `dir_open_failed`, `oversized`, `short_read`, `enumeration_error`, `entry_cap`, `unparsed_entry` (apt and rpm) or `unparseable` (macOS plist)",
+      "provenance": "`linux:apt_sources:<detail>` / `linux:apt_keyring:<detail>` / `linux:rpm_repo:<detail>`, with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `not_regular`, `io_error`, `open_failed`, `read_failed`, `dir_open_failed`, `oversized`, `short_read`, `enumeration_error`, `entry_cap` or `unparsed_entry` (apt only)",
       "status": "`CONSTRAINED`",
       "when": "a source exists but could not be read completely or decoded; the rows that were read are still emitted"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:rpm_repo:planned`",
+      "status": "`CONSTRAINED`",
+      "when": "`/etc/yum.repos.d` has entries and the rpm/dnf `.repo` family is planned, not yet read; the apt rows that were read are still emitted"
     },
     {
       "completeness": "unknown",
       "provenance": "`windows:planned`",
       "status": "`UNAVAILABLE`",
       "when": "Windows: the leg is planned; one `status|sources|unsupported|windows:planned` row"
+    },
+    {
+      "completeness": "unknown",
+      "provenance": "`macos:planned`",
+      "status": "`UNAVAILABLE`",
+      "when": "macOS: the leg is planned; one `status|sources|unsupported|macos:planned` row"
     },
     {
       "completeness": "unknown",
@@ -288,7 +298,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "container",
-        "leg_hash": "20246992765e",
+        "leg_hash": "4901149d2e67",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -302,14 +312,13 @@
           "params": "",
           "rc": 0,
           "result_status": {
-            "completeness": "FULL",
-            "provenance": "",
-            "status": "OK"
+            "completeness": "UNKNOWN",
+            "provenance": "macos:planned",
+            "status": "UNAVAILABLE"
           },
-          "row_count": 2,
+          "row_count": 1,
           "rows": [
-            "status|sources|supported|-",
-            "macos_swu|local|-|unset|yes|yes|yes|yes|unset"
+            "status|sources|unsupported|macos:planned"
           ],
           "truncated": false
         }
@@ -317,7 +326,7 @@
       "stamp": {
         "date": "2026-09-21",
         "host_class": "bare-metal",
-        "leg_hash": "20246992765e",
+        "leg_hash": "4901149d2e67",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -348,18 +357,14 @@
       "agents/plugins/update_source_trust/src/update_source_trust_linux.cpp",
       "agents/plugins/update_source_trust/src/update_source_trust_linux_parsers.hpp",
       "agents/plugins/update_source_trust/src/update_source_trust_macos.cpp",
-      "agents/plugins/update_source_trust/src/update_source_trust_macos_parsers.hpp",
       "agents/plugins/update_source_trust/src/update_source_trust_parsers.hpp",
       "agents/plugins/update_source_trust/src/update_source_trust_plugin.cpp",
       "agents/plugins/update_source_trust/src/update_source_trust_win.cpp"
     ],
     "privilege_row": true,
     "tests": [
-      "tests/unit/test_update_source_trust_ini.cpp",
       "tests/unit/test_update_source_trust_linux_parsers.cpp",
       "tests/unit/test_update_source_trust_local_dispatcher.cpp",
-      "tests/unit/test_update_source_trust_macos_parsers.cpp",
-      "tests/unit/test_update_source_trust_macos_plist.cpp",
       "tests/unit/test_update_source_trust_parsers.cpp"
     ]
   },
@@ -367,7 +372,7 @@
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `sources` is also a gathered definition (`crossplatform.security.update_source_trust`, 300s TTL).",
     "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
-    "**Sensitivity.** Rows name the repositories a device installs software from (URIs, repo ids, key paths), which discloses part of its software supply chain. URL userinfo is redacted; a secret carried in a URL query string cannot be recognised and is emitted as written. Key material is never emitted, only key file paths, formats and sizes. No row carries a username.",
+    "**Sensitivity.** Rows name the repositories a device installs software from (URIs, key paths), which discloses part of its software supply chain. URL userinfo is redacted; a secret carried in a URL query string cannot be recognised and is emitted as written. Key material is never emitted, only key file paths, formats and sizes. No row carries a username.",
     "**Siblings:** `windows_updates` (patch compliance and reachability of update sources, not their trust) and `installed_apps` (what is installed, not where it came from)."
   ]
 }

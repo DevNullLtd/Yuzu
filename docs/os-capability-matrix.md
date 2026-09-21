@@ -750,8 +750,8 @@ implementation is.
 | tar | purge_source | linux | supported | 1 | sqlite | - |
 | tar | purge_source | macos | supported | 1 | sqlite | - |
 | tar | purge_source | windows | supported | 1 | sqlite | - |
-| update_source_trust | sources | linux | supported | 1 | /etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*}, /etc/apt/keyrings/* and /etc/yum.repos.d/*.repo config file reads | - |
-| update_source_trust | sources | macos | constrained | 1 | CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist | managed leg verified against fixtures only; no MDM-enrolled host in this run |
+| update_source_trust | sources | linux | supported | 1 | /etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/* config file reads | rpm/dnf /etc/yum.repos.d/*.repo family follows as its own PR; a host with that directory reports constrained linux:rpm_repo:planned |
+| update_source_trust | sources | macos | planned | 1 | CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed Preferences com.apple.SoftwareUpdate.plist | follows as its own PR |
 | update_source_trust | sources | windows | planned | 1 | HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate{,\\AU} registry values | follows as its own PR |
 | users | logged_on | linux | supported | 1 | utmp (setutent/getutent) | - |
 | users | logged_on | macos | supported | 2 | runner argv 'who' | - |

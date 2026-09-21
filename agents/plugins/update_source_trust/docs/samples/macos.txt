@@ -1,6 +1,5 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 20246992765e
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 4901149d2e67
 == action=sources
-status|sources|supported|-
-macos_swu|local|-|unset|yes|yes|yes|yes|unset
-[result_status] OK / FULL / 
+status|sources|unsupported|macos:planned
+[result_status] UNAVAILABLE / UNKNOWN / macos:planned
 
