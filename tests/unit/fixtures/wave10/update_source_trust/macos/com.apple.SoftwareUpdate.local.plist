@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AutoInstallProductKeys</key>
+	<array>
+		<string>MSU_UPDATE_25G83_patch_26.6.2_minor</string>
+	</array>
+	<key>AutomaticDownload</key>
+	<true/>
+	<key>AutomaticallyInstallMacOSUpdates</key>
+	<true/>
+	<key>ConfigDataInstall</key>
+	<true/>
+	<key>CriticalUpdateInstall</key>
+	<true/>
+	<key>DDMPersistedErrorKey</key>
+	<dict/>
+	<key>FirstInstallTonightDateDictionary</key>
+	<dict>
+		<key>MSU_UPDATE_25G83_patch_26.6.2_minor</key>
+		<date>2026-08-28T18:21:44Z</date>
+	</dict>
+	<key>FirstOfferDateDictionary</key>
+	<dict>
+		<key>MSU_UPDATE_25G229_patch_26.7_minor</key>
+		<date>2026-09-14T17:23:47Z</date>
+		<key>MSU_UPDATE_25G83_patch_26.6.2_minor</key>
+		<date>2026-08-19T14:54:03Z</date>
+		<key>MSU_UPDATE_26A428_patch_27.0_major</key>
+		<date>2026-09-14T17:23:47Z</date>
+	</dict>
+	<key>InstallDateDictionary</key>
+	<dict>
+		<key>25G83</key>
+		<date>2026-09-06T20:15:54Z</date>
+	</dict>
+	<key>LastAttemptBuildVersion</key>
+	<string>26.6.2 (25G83)</string>
+	<key>LastAttemptSystemVersion</key>
+	<string>26.6.2 (25G83)</string>
+	<key>LastBackgroundSuccessfulDate</key>
+	<date>2026-09-21T08:39:40Z</date>
+	<key>LastCollectedLoginCredentialDate</key>
+	<date>2026-09-06T20:14:40Z</date>
+	<key>LastFullSuccessfulDate</key>
+	<date>2026-09-21T16:48:45Z</date>
+	<key>LastRecommendedMajorOSBundleIdentifier</key>
+	<string></string>
+	<key>LastResultCode</key>
+	<integer>0</integer>
+	<key>LastSessionSuccessful</key>
+	<true/>
+	<key>LastSuccessfulBackgroundMSUScanDate</key>
+	<date>2026-09-21T17:40:50Z</date>
+	<key>LastSuccessfulDate</key>
+	<date>2026-09-21T16:48:50Z</date>
+	<key>PostSuccessfulMinorUpdatePostLogOutNotification</key>
+	<false/>
+	<key>PrimaryLanguages</key>
+	<array>
+		<string>en-GB</string>
+	</array>
+	<key>RecommendedUpdates</key>
+	<array>
+		<dict>
+			<key>Display Name</key>
+			<string>macOS 27</string>
+			<key>Display Version</key>
+			<string>27</string>
+			<key>Identifier</key>
+			<string>MSU_UPDATE_26A428_patch_27.0_major</string>
+			<key>MobileSoftwareUpdate</key>
+			<true/>
+			<key>Product Key</key>
+			<string>MSU_UPDATE_26A428_patch_27.0_major</string>
+		</dict>
+		<dict>
+			<key>Display Name</key>
+			<string>macOS Tahoe 26.7</string>
+			<key>Display Version</key>
+			<string>26.7</string>
+			<key>Identifier</key>
+			<string>MSU_UPDATE_25G229_patch_26.7_minor</string>
+			<key>MobileSoftwareUpdate</key>
+			<true/>
+			<key>Product Key</key>
+			<string>MSU_UPDATE_25G229_patch_26.7_minor</string>
+		</dict>
+		<dict>
+			<key>Display Name</key>
+			<string>Command Line Tools for Xcode 27.0</string>
+			<key>Display Version</key>
+			<string>27.0</string>
+			<key>Identifier</key>
+			<string>Command Line Tools for Xcode 27.0</string>
+			<key>Product Key</key>
+			<string>082-83364</string>
+		</dict>
+		<dict>
+			<key>Display Name</key>
+			<string>Safari</string>
+			<key>Display Version</key>
+			<string>27.0</string>
+			<key>Identifier</key>
+			<string>Safari27.0TahoeAuto</string>
+			<key>Product Key</key>
+			<string>047-48781</string>
+		</dict>
+	</array>
+	<key>SplatEnabled</key>
+	<true/>
+</dict>
+</plist>

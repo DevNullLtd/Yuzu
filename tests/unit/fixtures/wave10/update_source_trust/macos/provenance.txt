@@ -1,0 +1,37 @@
+Directory: tests/unit/fixtures/wave10/update_source_trust/macos/
+Package: P1d-1 (update_source_trust, row PR10.1-d). One directory-level provenance file;
+every fixture below is labelled REAL CAPTURE / RECONSTRUCTION / SYNTHETIC.
+
+com.apple.SoftwareUpdate.local.plist
+  REAL CAPTURE (format-converted). Copy of /Library/Preferences/com.apple.SoftwareUpdate.plist
+  from the development Mac (macOS 26.6.2, build 25G83), captured 2026-09-21 with `cp`
+  (file(1): "Apple binary property list", 1534 bytes), then converted with
+  `plutil -convert xml1` so the fixture diffs as text -- values are unchanged, only the
+  serialization differs from the on-disk original. The test re-encodes it to binary
+  (CFPropertyListCreateData, kCFPropertyListBinaryFormat_v1_0) so the parser is still
+  exercised on the binary format real hosts use. Contains no user or
+  account names. Keys present: AutomaticallyInstallMacOSUpdates, AutomaticDownload,
+  ConfigDataInstall, CriticalUpdateInstall (all true) plus update-history keys the
+  plugin does not read; AutomaticCheckEnabled, CatalogURL and AllowPreReleaseInstallation
+  are ABSENT on this host, which is why the test pins them as `unset` / "-".
+
+com.apple.SoftwareUpdate.managed.plist
+  RECONSTRUCTION -- NOT a real capture. Hand-written XML plist carrying the Software
+  Update keys Apple documents for the com.apple.SoftwareUpdate configuration-profile
+  payload (CatalogURL, AllowPreReleaseInstallation, AutomaticCheckEnabled,
+  AutomaticDownload, AutomaticallyInstallMacOSUpdates, ConfigDataInstall,
+  CriticalUpdateInstall). Key names and types are taken from Apple's "Software
+  Update" payload definition, apple/device-management, mdm/profiles/
+  com.apple.SoftwareUpdate.yaml
+  (https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.SoftwareUpdate.yaml,
+  read 2026-09-21; macOS 10.7+, deprecated 26.0 in favour of the declarative
+  com.apple.configuration.softwareupdate.settings), rendered at
+  https://developer.apple.com/documentation/devicemanagement/softwareupdate.
+  Delivered on a managed host at
+  /Library/Managed Preferences/com.apple.SoftwareUpdate.plist. The CatalogURL is an
+  example.com placeholder. No MDM-enrolled host was available in this run, so the
+  managed leg has only ever run against this file (hence the descriptor's CONSTRAINED
+  note). Replace with a real capture when an MDM-managed Mac is available.
+
+Malformed and wrong-type inputs are built inline in test_update_source_trust_macos_plist.cpp
+and are labelled RECONSTRUCTION there.

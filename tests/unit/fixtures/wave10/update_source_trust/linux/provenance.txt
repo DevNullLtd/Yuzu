@@ -1,0 +1,29 @@
+Directory: tests/unit/fixtures/wave10/update_source_trust/linux/
+Package: P1d-1 (update_source_trust, row PR10.1-d). Each subdirectory is an injected root
+for lnx::apt_rows_at / lnx::rpm_rows_at: the paths below sit under it exactly as they do
+on a real host (etc/apt/..., etc/yum.repos.d/...). One provenance file for the directory.
+
+ALL files are REAL CAPTURES, byte-for-byte, captured 2026-09-21 from command-only Docker
+containers (`docker run --rm <image> tar -C / -cf - <paths>` piped to a local `tar -x`;
+no daemon or package manager was run in the container, so nothing was installed or
+modified). Only the files the plugin reads are kept; the keyring directories carry ONE
+representative key each because the plugin reads only the first 64 bytes and the file
+size (the other keys in those directories add bytes, not coverage).
+
+debian-bookworm/   image debian:bookworm (Debian GNU/Linux 12, bookworm)
+  etc/apt/sources.list.d/debian.sources                        (deb822, 443 bytes, two stanzas,
+                                                               Signed-By, `#` comment lines)
+  etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc     (armored key, 461 bytes)
+  Absent on the image and therefore absent here: /etc/apt/sources.list, /etc/apt/trusted.gpg,
+  the other 8 .asc keys of trusted.gpg.d, and /etc/yum.repos.d. /etc/apt/keyrings is empty.
+
+ubuntu-2204/       image ubuntu:22.04 (Ubuntu 22.04.5 LTS, arm64 image: ports.ubuntu.com mirror)
+  etc/apt/sources.list                                         (one-line, 2477 bytes, 10 active
+                                                               `deb` lines; sha256 f2f7236d...7093)
+  etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg        (binary key, 1733 bytes)
+  Omitted: ubuntu-keyring-2012-cdimage.gpg. /etc/apt/sources.list.d and /etc/apt/keyrings
+  are empty on the image.
+
+rocky-9/           image rockylinux:9 (Rocky Linux 9.3, Blue Onyx)
+  etc/yum.repos.d/rocky.repo, rocky-addons.repo, rocky-devel.repo, rocky-extras.repo
+  (6586 + 1161 + 2379 + 3405 bytes; 36 [section]s in total). No /etc/apt on this image.
