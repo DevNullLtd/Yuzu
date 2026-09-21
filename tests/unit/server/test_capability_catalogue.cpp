@@ -32,6 +32,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -140,6 +141,7 @@ struct LabeledSpan {
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
+        {"update_source_trust", capdecls::plugin_action_catalogue_update_source_trust(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -148,7 +150,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, fifteen sources exactly as a live composition site would use.
+    // literally, sixteen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -164,6 +166,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -270,6 +273,26 @@ TEST_CASE("capability catalogue: system_reserved is true only for core_dispatch_
             CHECK(row.system_reserved == source.is_core);
         }
     }
+}
+
+/// Exact-row pin for `update_source_trust.sources` (Wave 10 PR10.1-d). The
+/// action is a read-only supply-chain-POSTURE fact under `Security`:Read with
+/// no execute gate. Pinning it directly means a silent drift to a mutating
+/// class, a different securable, or a gate on a facts-only read fails here.
+TEST_CASE("capability catalogue: update_source_trust.sources pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_update_source_trust();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "update_source_trust");
+    CHECK(row.action == "sources");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
 }
 
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all eight "

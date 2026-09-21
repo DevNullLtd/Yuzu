@@ -519,6 +519,12 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
+    'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822/rpm/swu row parsers, portable
+    'unit/test_update_source_trust_ini.cpp',            # Wave 10 PR10.1-d: dedicated .repo INI grammar cases
+    'unit/test_update_source_trust_macos_plist.cpp',    # Wave 10 PR10.1-d: CFPropertyList decode (bodies __APPLE__-only) over REAL + RECONSTRUCTION plists
+    'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt/rpm walk over committed fixture trees (bodies POSIX-only)
+    'unit/test_update_source_trust_macos_parsers.cpp',  # Wave 10 PR10.1-d: injected-root Software Update walk (bodies POSIX-only)
+    'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -531,6 +537,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -681,6 +688,7 @@ agent_test_exe = executable(
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
+                update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak

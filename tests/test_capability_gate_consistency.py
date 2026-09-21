@@ -96,6 +96,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -116,10 +117,15 @@ FRAGMENT_FILES = [
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
 # Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
 # focused follow-up PR on top of this one.
+# Wave 10 PR10.1-d: +1 update_source_trust (sources).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
-# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) = 209.
-EXPECTED_TOTAL_ROWS = 209
+# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
+# 1 (update_source_trust) = 210.
+# NOTE for the integrator: every other Wave 10/Wave 8 PR adds its own rows to
+# this same total. This PR states base + 1 only; after merging fresh dev,
+# re-sum the fragments above and set the final value (do not trust this line).
+EXPECTED_TOTAL_ROWS = 210
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
