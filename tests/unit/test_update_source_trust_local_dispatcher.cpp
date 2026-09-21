@@ -15,12 +15,13 @@
  * exists. Where a row is asserted it is guarded on the host actually having
  * the input (a readable regular file that the leg is documented to read) AND
  * on the leg reporting `supported`; the populated-row assertions on injected
- * fixture trees live in test_update_source_trust_{linux,macos}_parsers.cpp.
+ * fixture trees live in test_update_source_trust_linux_parsers.cpp.
  *
  * What it DOES pin on every host: the first row is the status row, the status
  * row agrees with the typed CC-07 result the plugin reported, the return code
  * is 0 (a degraded read is not a failed command), and every data row has the
- * exact field count of its kind under an escape-aware split.
+ * exact field count of its kind under an escape-aware split. The Windows and
+ * macOS legs are PLANNED placeholders and are pinned to their exact single row.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -145,28 +146,24 @@ std::optional<LoadedPlugin> load_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-/// Documented field counts, kind token included:
+/// Documented field counts, kind token included (only the kinds this plugin
+/// EMITS; the planned rpm_repo / macos_swu / wsus shapes are deliberately absent,
+/// so an emission of one is a regression -- see the `want != 0` guard below):
 ///   status|sources|<state>|<reason>                                       4
 ///   apt_source|file|format|types|uris|suites|components|signed_by|
 ///              trusted|allow_insecure|enabled                            11
 ///   apt_keyring|path|scope|format|size_bytes                              5
-///   rpm_repo|file|id|name|enabled|gpgcheck|repo_gpgcheck|gpgkey|baseurl|
-///            mirror|sslverify                                            11
-///   macos_swu|scope|catalog_url|auto_check|auto_download|auto_install|
-///             config_data|critical|allow_prerelease                       9
 std::size_t expected_field_count(const std::string& kind) {
     if (kind == "status")
         return 4;
-    if (kind == "apt_source" || kind == "rpm_repo")
+    if (kind == "apt_source")
         return 11;
     if (kind == "apt_keyring")
         return 5;
-    if (kind == "macos_swu")
-        return 9;
-    return 0; // unknown kind
+    return 0; // unknown (or planned, never emitted) kind
 }
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__linux__)
 /// A readable, non-symlink regular file (what the leg is documented to read).
 bool readable_regular_file(const fs::path& p) {
     std::error_code ec;
@@ -175,9 +172,7 @@ bool readable_regular_file(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
     return static_cast<bool>(f);
 }
-#endif
 
-#if defined(__linux__)
 std::size_t count_kind(const std::vector<std::string>& rows, std::string_view kind) {
     std::size_t n = 0;
     for (const auto& r : rows)
@@ -226,10 +221,18 @@ TEST_CASE("update_source_trust plugin: status row first, agrees with the typed r
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     CHECK(result.result_provenance == "windows:planned");
+#elif defined(__APPLE__)
+    // The macOS leg is PLANNED: exactly one row, and an UNAVAILABLE result.
+    // MUTATION: implementing (or wiring) any macOS read changes this row.
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|sources|unsupported|macos:planned");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    CHECK(result.result_provenance == "macos:planned");
 #else
-    // Non-Windows: supported (clean read, full) or constrained (reason + partial).
-    // The row and the typed result are written together by report_sources, so
-    // they can never disagree.
+    // Linux: supported (clean read, full) or constrained (reason + partial; e.g. an
+    // rpm host reports `linux:rpm_repo:planned`). The row and the typed result are
+    // written together by report_sources, so they can never disagree.
     if (status[2] == "supported") {
         CHECK(status[3] == "-");
         CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
@@ -265,47 +268,11 @@ TEST_CASE("update_source_trust plugin: every data row has its kind's exact field
         const std::size_t want = expected_field_count(f[0]);
         REQUIRE(want != 0); // an unknown row kind is a regression
         CHECK(f.size() == want);
-#if defined(__APPLE__)
-        CHECK((f[0] == "status" || f[0] == "macos_swu"));
-#elif defined(__linux__)
-        CHECK((f[0] == "status" || f[0] == "apt_source" || f[0] == "apt_keyring" ||
-               f[0] == "rpm_repo"));
+#if defined(__linux__)
+        CHECK((f[0] == "status" || f[0] == "apt_source" || f[0] == "apt_keyring"));
 #endif
     }
 }
-
-#if defined(__APPLE__)
-TEST_CASE("update_source_trust plugin (macOS): a readable local plist yields a local macos_swu row",
-          "[update_source_trust][dispatcher]") {
-    auto plugin = load_plugin();
-    if (!plugin) {
-        require_plugin_or_skip();
-        return;
-    }
-    // Guarded on the host actually having a readable plist: presence on CI
-    // runners is not guaranteed.
-    const fs::path plist{"/Library/Preferences/com.apple.SoftwareUpdate.plist"};
-    if (!readable_regular_file(plist))
-        SKIP("no readable /Library/Preferences/com.apple.SoftwareUpdate.plist on this host");
-
-    yuzu::agent::LocalDispatcher dispatcher;
-    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
-    REQUIRE_FALSE(rows.empty());
-    const auto status = split_fields_escape_aware(rows[0]);
-    // A `constrained` leg (e.g. an unreadable MANAGED plist) still reports what it
-    // could read, so the local row is asserted either way. MUTATION: dropping the
-    // run_macos -> swu_rows_at wiring leaves only the status row and fails here.
-    std::size_t local = 0;
-    for (const auto& r : rows) {
-        const auto f = split_fields_escape_aware(r);
-        if (f[0] == "macos_swu" && f[1] == "local")
-            ++local;
-    }
-    INFO("status: " << rows[0]);
-    CHECK(local == 1);
-    CHECK((status[2] == "supported" || status[2] == "constrained"));
-}
-#endif
 
 #if defined(__linux__)
 TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this host produce their rows",
@@ -336,15 +303,7 @@ TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this hos
         ++asserted;
         CHECK(count_kind(rows, "apt_source") >= 1);
     }
-    for (const char* repo : {"/etc/yum.repos.d/redhat.repo", "/etc/yum.repos.d/rocky.repo",
-                             "/etc/yum.repos.d/CentOS-Base.repo", "/etc/yum.repos.d/fedora.repo"}) {
-        if (readable_regular_file(repo) && file_has_line_starting(repo, "[")) {
-            ++asserted;
-            CHECK(count_kind(rows, "rpm_repo") >= 1);
-            break;
-        }
-    }
     if (asserted == 0)
-        WARN("no known apt/rpm trust input on this host; only row shape was asserted");
+        WARN("no known apt trust input on this host; only row shape was asserted");
 }
 #endif

@@ -6,10 +6,12 @@
  *   "sources" -- facts about how the device's package/update sources are
  *                configured to trust signing authorities:
  *                  Linux   apt sources (one-line and deb822) with signed-by /
- *                          trusted / allow-insecure, apt keyrings, and rpm/dnf
- *                          .repo gpgcheck / repo_gpgcheck / gpgkey settings;
- *                  macOS   Software Update policy from the local and the
- *                          MDM-managed com.apple.SoftwareUpdate plists;
+ *                          trusted / allow-insecure, and apt keyrings. The
+ *                          rpm/dnf .repo family is PLANNED -- follows as its
+ *                          own PR; a host whose /etc/yum.repos.d has entries
+ *                          reports constrained `linux:rpm_repo:planned`;
+ *                  macOS   PLANNED -- follows as its own PR (the Software
+ *                          Update policy in com.apple.SoftwareUpdate.plist);
  *                  Windows PLANNED -- follows as its own PR.
  *
  * WHY (verified 2026-09-19, roadmap row PR10.1-d): there is no documented
@@ -49,14 +51,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "sources",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
-         "/etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*}, "
-         "/etc/apt/keyrings/* and /etc/yum.repos.d/*.repo config file reads",
-         nullptr},
+         "/etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and "
+         "/etc/apt/keyrings/* config file reads",
+         "rpm/dnf /etc/yum.repos.d/*.repo family follows as its own PR; a host with that "
+         "directory reports constrained linux:rpm_repo:planned"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1,
+        {YUZU_SUPPORT_PLANNED, 1,
          "CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed "
          "Preferences com.apple.SoftwareUpdate.plist",
-         "managed leg verified against fixtures only; no MDM-enrolled host in this run"},
+         "follows as its own PR"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
          "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate{,\\AU} registry values",

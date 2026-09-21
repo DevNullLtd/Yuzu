@@ -1,16 +1,11 @@
 # update_source_trust -- package/update-source trust posture (read-only facts).
 # Multi-TU shape follows agents/plugins/peripherals/meson.build: one portable
 # plugin TU plus three per-OS leg TUs, each #ifdef-gated internally for its own
-# target so all four are listed unconditionally. The leg TUs read config files
-# and property lists in-process: no subprocess, so no argv-runner dependency.
+# target so all four are listed unconditionally. The Linux leg reads config
+# files in-process (no subprocess, so no argv-runner dependency); the macOS and
+# Windows legs are PLANNED placeholders that read nothing, so no platform
+# framework is linked.
 update_source_trust_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
-
-if host_machine.system() == 'darwin'
-  # CoreFoundation for CFPropertyListCreateWithData over the SoftwareUpdate
-  # plists (update_source_trust_macos_parsers.hpp).
-  update_source_trust_deps += dependency('appleframeworks', modules: ['CoreFoundation'],
-                                         include_type: 'system')
-endif
 
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this
 # build output, matching peripherals_plugin_lib.

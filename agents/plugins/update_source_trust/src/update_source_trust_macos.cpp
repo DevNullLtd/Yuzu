@@ -1,36 +1,24 @@
 /**
- * update_source_trust_macos.cpp -- macOS leg entry point.
+ * update_source_trust_macos.cpp -- macOS leg: PLANNED placeholder.
  *
- * `run_macos` is a one-line wrapper over `run_macos_at`, which takes the
- * filesystem root as a parameter -- production calls it with "/", the unit
- * suite exercises swu_rows_at directly (update_source_trust_macos_parsers.hpp).
- * The plist decode is in-process CoreFoundation (CFPropertyListCreateWithData,
- * rung 1); there is no subprocess.
+ * The macOS Software Update policy read (the local and the MDM-managed
+ * com.apple.SoftwareUpdate.plist, decoded in-process with CoreFoundation)
+ * follows as its own PR; the descriptor in update_source_trust_plugin.cpp
+ * declares the leg PLANNED. Until then `sources` on macOS answers with exactly
+ * one status row (`status|sources|unsupported|macos:planned`) -- never an empty
+ * success. No decision logic lives here, and none is a candidate for a
+ * macOS-only code path: the row is formatted by the portable, unit-tested
+ * report_planned in update_source_trust_legs.hpp.
  */
 #include "update_source_trust_legs.hpp"
-#include "update_source_trust_macos_parsers.hpp"
 
 #if defined(__APPLE__)
 
-#include <filesystem>
-#include <string>
-#include <vector>
-
 namespace yuzu::update_source_trust {
 
-namespace {
-
-int run_macos_at(yuzu::CommandContext& ctx, const std::filesystem::path& root) {
-    yuzu::shared::ConstraintAccumulator acc;
-    const std::vector<std::string> rows = mac::swu_rows_at(root, acc);
-    report_sources(ctx, rows, acc);
-    return 0;
-}
-
-} // namespace
-
 int run_macos(yuzu::CommandContext& ctx) {
-    return run_macos_at(ctx, "/");
+    report_planned(ctx, kMacosPlannedToken);
+    return 0;
 }
 
 } // namespace yuzu::update_source_trust

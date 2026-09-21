@@ -519,11 +519,8 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
-    'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822/rpm/swu row parsers, portable
-    'unit/test_update_source_trust_ini.cpp',            # Wave 10 PR10.1-d: dedicated .repo INI grammar cases
-    'unit/test_update_source_trust_macos_plist.cpp',    # Wave 10 PR10.1-d: CFPropertyList decode (bodies __APPLE__-only) over REAL + RECONSTRUCTION plists
-    'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt/rpm walk over committed fixture trees (bodies POSIX-only)
-    'unit/test_update_source_trust_macos_parsers.cpp',  # Wave 10 PR10.1-d: injected-root Software Update walk (bodies POSIX-only)
+    'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822 row parsers, portable
+    'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt walk + rpm-planned tripwire over committed fixture trees (bodies POSIX-only)
     'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
   ),
   include_directories: [

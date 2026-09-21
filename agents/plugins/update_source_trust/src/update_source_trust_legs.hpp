@@ -22,6 +22,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::update_source_trust {
@@ -54,15 +55,16 @@ inline void report_sources(yuzu::CommandContext& ctx, const std::vector<std::str
     ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
 }
 
-/// The Windows leg is PLANNED: a single, exact status row and an UNAVAILABLE
-/// result. Kept here (not in the win TU) so the row is unit-testable on every
-/// host.
+/// The Windows and macOS legs are PLANNED: a single, exact status row and an
+/// UNAVAILABLE result -- never an empty success. Kept here (not in the per-OS
+/// TUs) so the row is unit-testable on every host.
 inline constexpr const char* kWindowsPlannedToken = "windows:planned";
+inline constexpr const char* kMacosPlannedToken = "macos:planned";
 
-inline void report_windows_planned(yuzu::CommandContext& ctx) {
-    ctx.write_output(format_status_row(StatusState::unsupported, kWindowsPlannedToken));
+inline void report_planned(yuzu::CommandContext& ctx, std::string_view os_token) {
+    ctx.write_output(format_status_row(StatusState::unsupported, os_token));
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                          kWindowsPlannedToken);
+                          os_token);
 }
 
 } // namespace yuzu::update_source_trust

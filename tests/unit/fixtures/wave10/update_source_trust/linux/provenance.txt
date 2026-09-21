@@ -1,7 +1,8 @@
 Directory: tests/unit/fixtures/wave10/update_source_trust/linux/
 Package: P1d-1 (update_source_trust, row PR10.1-d). Each subdirectory is an injected root
-for lnx::apt_rows_at / lnx::rpm_rows_at: the paths below sit under it exactly as they do
-on a real host (etc/apt/..., etc/yum.repos.d/...). One provenance file for the directory.
+for lnx::apt_rows_at / lnx::linux_rows_at: the paths below sit under it exactly as they do
+on a real host (etc/apt/...). One provenance file for the directory. The rpm/dnf family
+(etc/yum.repos.d) is deferred to its own PR, so no rpm capture is kept here.
 
 ALL files are REAL CAPTURES, byte-for-byte, captured 2026-09-21 from command-only Docker
 containers (`docker run --rm <image> tar -C / -cf - <paths>` piped to a local `tar -x`;
@@ -23,7 +24,3 @@ ubuntu-2204/       image ubuntu:22.04 (Ubuntu 22.04.5 LTS, arm64 image: ports.ub
   etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg        (binary key, 1733 bytes)
   Omitted: ubuntu-keyring-2012-cdimage.gpg. /etc/apt/sources.list.d and /etc/apt/keyrings
   are empty on the image.
-
-rocky-9/           image rockylinux:9 (Rocky Linux 9.3, Blue Onyx)
-  etc/yum.repos.d/rocky.repo, rocky-addons.repo, rocky-devel.repo, rocky-extras.repo
-  (6586 + 1161 + 2379 + 3405 bytes; 36 [section]s in total). No /etc/apt on this image.

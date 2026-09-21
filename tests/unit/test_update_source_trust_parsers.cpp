@@ -8,18 +8,18 @@
  * over `yuzu_test_ust_*` temp roots for the filesystem fault cases (FIFO,
  * symlink leaf, oversized file, directory cap, EACCES).
  *
- * Inputs are labelled. The apt/rpm texts in the parser cases are
- * RECONSTRUCTIONS written from sources.list(5) / apt's deb822 documentation and
- * yum.conf(5); the walk section reads the REAL CAPTURES (debian:bookworm,
- * ubuntu:22.04, rockylinux:9 containers -- see linux/provenance.txt). P1d-2's
- * tree suite layers manifest-described trees on top. Every behaviour asserted here is
+ * Inputs are labelled. The apt texts in the parser cases are RECONSTRUCTIONS
+ * written from sources.list(5) / apt's deb822 documentation; the walk section
+ * reads the REAL CAPTURES (debian:bookworm, ubuntu:22.04 containers -- see
+ * linux/provenance.txt). P1d-2's tree suite layers manifest-described trees on
+ * top. Every behaviour asserted here is
  * a value flowing from input text to an emitted wire row, so removing the
  * wiring (the parse, the tri mapping, the redaction, the escape) fails a test:
  * see the "MUTATION" notes on the individual cases.
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include "update_source_trust_legs.hpp" // kWindowsPlannedToken
+#include "update_source_trust_legs.hpp" // kWindowsPlannedToken, kMacosPlannedToken
 #include "update_source_trust_parsers.hpp"
 
 #include <cerrno>
@@ -317,96 +317,20 @@ TEST_CASE("apt_keyring row is exact", "[update_source_trust][parsers][apt]") {
           "apt_keyring|/etc/apt/trusted.gpg.d/ubuntu-keyring.gpg|trusted_gpg_d|binary|2794");
 }
 
-// ── rpm repos ────────────────────────────────────────────────────────────
-
-TEST_CASE("rpm_rows_from_text emits the exact rpm_repo wire rows", "[update_source_trust][parsers][rpm]") {
-    std::vector<std::string> rows;
-    const auto malformed = ust::rpm_rows_from_text(
-        "/etc/yum.repos.d/rocky.repo", // RECONSTRUCTION shaped like rockylinux:9's rocky.repo
-        "[baseos]\n"
-        "name=Rocky Linux $releasever - BaseOS\n"
-        "mirrorlist=https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=BaseOS-$releasever\n"
-        "#baseurl=http://dl.rockylinux.org/$contentdir/$releasever/BaseOS/$basearch/os/\n"
-        "gpgcheck=1\n"
-        "enabled=1\n"
-        "countme=1\n"
-        "gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9\n"
-        "\n"
-        "[private]\n"
-        "name=Private\n"
-        "baseurl=https://svc:tok3n@artifacts.example/rpm\n"
-        "    https://mirror2.example/rpm\n"
-        "metalink=https://m.example/ml\n"
-        "mirrorlist=https://ignored.example/\n"
-        "gpgcheck=0\n"
-        "repo_gpgcheck=maybe\n"
-        "sslverify=0\n",
-        rows);
-    CHECK(malformed == 0);
-    REQUIRE(rows.size() == 2);
-    // MUTATION: the tri mapping, the mirrorlist/metalink choice, the
-    // continuation join and the URL redaction each change one of these strings.
-    CHECK(rows[0] == "rpm_repo|/etc/yum.repos.d/rocky.repo|baseos|Rocky Linux $releasever - BaseOS|"
-                     "yes|yes|unset|file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9|-|"
-                     "https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&repo=BaseOS-$releasever|"
-                     "unset");
-    // `enabled` is absent in [private] -> unset (the .repo file does not say).
-    CHECK(rows[1] == "rpm_repo|/etc/yum.repos.d/rocky.repo|private|Private|unset|no|unmodelled|-|"
-                     "https://REDACTED@artifacts.example/rpm https://mirror2.example/rpm|"
-                     "https://m.example/ml|no");
-}
-
-TEST_CASE("rpm_repo row keeps its field count on a trailing-backslash value",
-          "[update_source_trust][parsers][wire]") {
-    ust::RpmRepoFacts f;
-    f.repo_id = "r";
-    f.name = "trailing\\";  // a name ending in a backslash
-    f.gpgkey = "file:///k";
-    const auto fields = split_wire(ust::format_rpm_repo_row("/etc/yum.repos.d/x.repo", f));
-    REQUIRE(fields.size() == 11);
-    CHECK(fields[3] == "trailing/");
-    CHECK(fields[4] == "unset");
-}
-
-TEST_CASE("rpm_rows_from_text reports malformed INI lines to the caller",
-          "[update_source_trust][parsers][rpm]") {
-    std::vector<std::string> rows;
-    CHECK(ust::rpm_rows_from_text("/etc/yum.repos.d/bad.repo", "stray=1\n[a]\nname=A\n", rows) == 1);
-    REQUIRE(rows.size() == 1);
-}
-
-// ── macOS row ────────────────────────────────────────────────────────────
-
-TEST_CASE("macos_swu row: defaults, full facts and redaction are exact",
-          "[update_source_trust][parsers][macos]") {
-    CHECK(ust::format_swu_row(ust::SwuScope::local, ust::SwuFacts{}) ==
-          "macos_swu|local|-|unset|unset|unset|unset|unset|unset");
-
-    ust::SwuFacts f;
-    f.catalog_url = "https://svc:pw@swscan.example.com/index.sucatalog";
-    f.auto_check = ust::Tri::no;
-    f.auto_download = ust::Tri::yes;
-    f.auto_install_macos = ust::Tri::yes;
-    f.config_data_install = ust::Tri::no;
-    f.critical_update_install = ust::Tri::yes;
-    f.allow_prerelease = ust::Tri::unmodelled;
-    const std::string row = ust::format_swu_row(ust::SwuScope::managed, f);
-    CHECK(row == "macos_swu|managed|https://REDACTED@swscan.example.com/index.sucatalog|no|yes|yes|"
-                 "no|yes|unmodelled");
-    CHECK(split_wire(row).size() == 9);
-}
-
 // ── status rows / tokens ─────────────────────────────────────────────────
 
-TEST_CASE("status rows: supported, constrained (reason), and the Windows planned row",
+TEST_CASE("status rows: supported, constrained (reason), and the Windows and macOS planned rows",
           "[update_source_trust][parsers]") {
     CHECK(ust::format_status_row(ust::StatusState::supported, {}) == "status|sources|supported|-");
-    CHECK(ust::format_status_row(ust::StatusState::constrained,
-                                 "linux:apt_sources:permission_denied,linux:rpm_repo:oversized") ==
-          "status|sources|constrained|linux:apt_sources:permission_denied,linux:rpm_repo:oversized");
-    // The exact row the Windows placeholder leg emits.
+    CHECK(ust::format_status_row(
+              ust::StatusState::constrained,
+              "linux:apt_sources:permission_denied,linux:apt_keyring:oversized") ==
+          "status|sources|constrained|linux:apt_sources:permission_denied,linux:apt_keyring:oversized");
+    // The exact rows the Windows and macOS placeholder legs emit.
     CHECK(ust::format_status_row(ust::StatusState::unsupported, ust::kWindowsPlannedToken) ==
           "status|sources|unsupported|windows:planned");
+    CHECK(ust::format_status_row(ust::StatusState::unsupported, ust::kMacosPlannedToken) ==
+          "status|sources|unsupported|macos:planned");
 }
 
 TEST_CASE("errno_detail maps real failures to stable tokens and never invents 'absent'",
@@ -492,6 +416,14 @@ TEST_CASE("apt_rows_at over the real debian:bookworm tree: deb822 rows + armored
                      "/usr/share/keyrings/debian-archive-keyring.gpg|unset|unset|yes");
     CHECK(rows[2] == "apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc|"
                      "trusted_gpg_d|armored|461");
+
+    // The WHOLE leg (apt + the rpm-family tripwire) is clean on this real capture:
+    // /etc/yum.repos.d is absent on the image, so nothing was skipped and the leg
+    // reports supported. MUTATION: an unconditional `planned` token fails here.
+    yuzu::shared::ConstraintAccumulator leg_acc;
+    CHECK(lnx::linux_rows_at(linux_fixture_root("debian-bookworm"), leg_acc) == rows);
+    CHECK_FALSE(leg_acc.any_failure());
+    CHECK_FALSE(leg_acc.incomplete());
 }
 
 TEST_CASE("apt_rows_at over the real ubuntu:22.04 tree: one-line rows + binary keyring",
@@ -509,34 +441,18 @@ TEST_CASE("apt_rows_at over the real ubuntu:22.04 tree: one-line rows + binary k
                      "main restricted universe multiverse|-|unset|unset|yes");
     CHECK(rows.back() == "apt_keyring|/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg|"
                          "trusted_gpg_d|binary|1733");
+
+    // No /etc/yum.repos.d on this image either: the whole leg stays supported.
+    yuzu::shared::ConstraintAccumulator leg_acc;
+    CHECK(lnx::linux_rows_at(linux_fixture_root("ubuntu-2204"), leg_acc) == rows);
+    CHECK_FALSE(leg_acc.any_failure());
 }
 
-TEST_CASE("rpm_rows_at over the real rockylinux:9 tree; apt on the same root is absent",
-          "[update_source_trust][walk][rpm]") {
-    const auto root = linux_fixture_root("rocky-9");
-    yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::rpm_rows_at(root, acc);
-    CHECK_FALSE(acc.any_failure());
-    CHECK_FALSE(acc.incomplete());
-    REQUIRE(rows.size() == 36); // 18 + 3 + 6 + 9 sections, files in sorted order
-    CHECK(rows[0].starts_with("rpm_repo|/etc/yum.repos.d/rocky-addons.repo|"));
-    CHECK(rows[35].starts_with("rpm_repo|/etc/yum.repos.d/rocky.repo|"));
-    CHECK(rows[27] == "rpm_repo|/etc/yum.repos.d/rocky.repo|baseos|Rocky Linux $releasever - BaseOS|"
-                      "yes|yes|unset|file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9|-|"
-                      "https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&"
-                      "repo=BaseOS-$releasever$rltype|unset");
-
-    yuzu::shared::ConstraintAccumulator apt_acc;
-    CHECK(lnx::apt_rows_at(root, apt_acc).empty());
-    CHECK_FALSE(apt_acc.any_failure()); // absent family: zero rows, supported
-}
-
-TEST_CASE("an empty root is absent for both families: zero rows, no failure token",
+TEST_CASE("an empty root is absent for every family: zero rows, no failure token",
           "[update_source_trust][walk]") {
     const TempRoot root;
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(root.path, acc).empty());
-    CHECK(lnx::rpm_rows_at(root.path, acc).empty());
+    CHECK(lnx::linux_rows_at(root.path, acc).empty());
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
 }

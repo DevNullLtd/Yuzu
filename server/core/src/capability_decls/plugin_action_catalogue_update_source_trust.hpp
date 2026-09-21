@@ -13,11 +13,12 @@
 /// `securable`/`operation` reuse an EXISTING `RbacStore` `types[]`/`ops[]`
 /// entry; none is minted here.
 ///
-/// `sources` is ReadOnly/None. Every leg is a plain, bounded read of local
-/// configuration: apt sources/keyrings and yum/dnf `.repo` files on Linux,
-/// the two com.apple.SoftwareUpdate property lists on macOS (the Windows leg
-/// is a PLANNED placeholder that reads nothing). No leg fetches anything over
-/// the network, spawns a subprocess, or changes host state, and the action
+/// `sources` is ReadOnly/None. The one implemented leg is a plain, bounded
+/// read of local configuration: apt sources and keyrings on Linux (plus a
+/// name-only listing of /etc/yum.repos.d; the yum/dnf `.repo` family is
+/// PLANNED). The macOS and Windows legs are PLANNED placeholders that read
+/// nothing. No leg fetches anything over the network, spawns a subprocess, or
+/// changes host state, and the action
 /// reports how a source is configured to trust its signing authority as a
 /// FACT -- it never enforces or judges.
 ///

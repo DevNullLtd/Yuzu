@@ -1,20 +1,23 @@
 /**
  * test_update_source_trust_linux_parsers.cpp -- manifest-materialised tree
  * suite for the update_source_trust Linux leg (lnx::apt_rows_at /
- * lnx::rpm_rows_at in update_source_trust_linux_parsers.hpp).
+ * lnx::rpm_family_planned_at / lnx::linux_rows_at in
+ * update_source_trust_linux_parsers.hpp).
  *
  * WHAT THIS ADDS. test_update_source_trust_parsers.cpp drives the same walk
- * over the three per-distro wave-1 capture trees one family at a time. This TU
- * layers ONE composite root on top: tests/unit/fixtures/wave10/
- * update_source_trust/linux/tree.manifest merges a real debian:bookworm deb822
- * source, a real ubuntu:22.04 one-line sources.list, and the real
- * rockylinux:9 .repo files (plus two labelled RECONSTRUCTION entries) into a
- * single host-shaped tree, so apt and rpm rows come from the SAME root, which
- * is what a real host looks like. Row bytes are asserted exactly, and the
- * failure paths (absent, EACCES, partial EACCES) are checked on that tree.
+ * over the per-distro wave-1 capture trees. This TU layers ONE composite root
+ * on top: tests/unit/fixtures/wave10/update_source_trust/linux/tree.manifest
+ * merges a real debian:bookworm deb822 source and a real ubuntu:22.04 one-line
+ * sources.list with three labelled RECONSTRUCTION entries (a third-party apt
+ * source pair, a keyring, and a placeholder /etc/yum.repos.d/placeholder.repo
+ * standing for the deferred rpm/dnf family) into a single host-shaped tree, so
+ * the apt rows and the rpm family's planned constraint come from the SAME root:
+ * one mixed host, walked once. Row bytes are asserted exactly, and the
+ * tripwire's three cases (directory with entries -> constrained `planned`;
+ * empty or absent -> supported; unreadable -> a real failure token) plus the
+ * failure paths (absent, EACCES) are checked on that tree.
  *
- * MANIFEST GRAMMAR (defined and unit-tested HERE; the macOS TU carries a
- * verbatim copy of materialize_tree). One line per file:
+ * MANIFEST GRAMMAR (defined and unit-tested HERE). One line per file:
  *     <relative path> TAB <payload>
  * with payload  T:<text; escapes \n \t \\>  |  B:<base64>  |  F:<committed
  * fixture path relative to the manifest's directory>  |  L:<symlink target>.
@@ -54,6 +57,7 @@ namespace {
 
 namespace fs = std::filesystem;
 namespace lnx = yuzu::update_source_trust::lnx;
+namespace ust = yuzu::update_source_trust;
 
 fs::path fixture_dir() {
 #ifdef YUZU_TEST_FIXTURE_DIR
@@ -286,7 +290,7 @@ TEST_CASE("tree.manifest grammar: T/B/F/L payloads, comments and CRLF materialis
         "\r\n"
         "a/t.txt\tT:one\\ntwo\\tx\\\\y\r\n"
         "a/b/bin.dat\tB:mQENBA==\n"
-        "c/copy.repo\tF:rocky-9/etc/yum.repos.d/rocky-devel.repo\n"
+        "c/copy.sources\tF:debian-bookworm/etc/apt/sources.list.d/debian.sources\n"
         "d/link\tL:/nonexistent-target\n";
     std::string error;
     REQUIRE(materialize_tree(manifest, fixture_dir(), dir.path, error));
@@ -295,9 +299,9 @@ TEST_CASE("tree.manifest grammar: T/B/F/L payloads, comments and CRLF materialis
     // committed fixture each change one of these.
     CHECK(slurp(dir.path / "a/t.txt") == "one\ntwo\tx\\y");
     CHECK(slurp(dir.path / "a/b/bin.dat") == std::string("\x99\x01\x0d\x04", 4));
-    CHECK(slurp(dir.path / "c/copy.repo") ==
-          slurp(fixture_dir() / "rocky-9/etc/yum.repos.d/rocky-devel.repo"));
-    CHECK_FALSE(slurp(dir.path / "c/copy.repo").empty());
+    CHECK(slurp(dir.path / "c/copy.sources") ==
+          slurp(fixture_dir() / "debian-bookworm/etc/apt/sources.list.d/debian.sources"));
+    CHECK_FALSE(slurp(dir.path / "c/copy.sources").empty());
     CHECK(fs::is_symlink(dir.path / "d/link"));
     CHECK(fs::read_symlink(dir.path / "d/link") == fs::path("/nonexistent-target"));
 }
@@ -375,46 +379,60 @@ TEST_CASE("apt_rows_at over the composite tree: deb822 + one-line sources with s
         }
     }
     CHECK(signed_by == 3); // both debian stanzas + the thirdparty signed-by line
+
+    // The deferred rpm family: the placeholder .repo in this host-shaped tree must
+    // surface as a family-level planned constraint -- a token, never a row and never
+    // silence -- so the leg reports constrained/partial rather than a clean "no rpm
+    // sources". linux_rows_at is the exact composition run_linux_at reports.
+    // MUTATION: dropping rpm_family_planned_at from linux_rows_at (or the directory
+    // check inside it) leaves the leg `supported` and fails the token/status asserts.
+    yuzu::shared::ConstraintAccumulator leg_acc;
+    const auto leg_rows = lnx::linux_rows_at(t.dir.path, leg_acc);
+    CHECK(leg_rows == rows);
+    CHECK(leg_acc.any_failure());
+    CHECK(leg_acc.incomplete());
+    CHECK(leg_acc.reason() == "linux:rpm_repo:planned");
+    CHECK(ust::format_status_row(ust::StatusState::constrained, leg_acc.reason()) ==
+          "status|sources|constrained|linux:rpm_repo:planned");
 }
 
-TEST_CASE("rpm_rows_at over the composite tree: every rocky section, exact gpgcheck row",
+// ── rpm-family tripwire: empty or absent is silent ───────────────────────
+
+TEST_CASE("an empty or absent /etc/yum.repos.d is not a skipped family: supported, no token",
           "[update_source_trust][walk][rpm]") {
     const Tree t;
-    yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::rpm_rows_at(t.dir.path, acc);
-    CHECK_FALSE(acc.any_failure());
-    CHECK_FALSE(acc.incomplete());
-    REQUIRE(rows.size() == 36); // 18 + 3 + 6 + 9 sections, files in sorted order
+    const fs::path repo_dir = t.dir.path / "etc" / "yum.repos.d";
+    std::error_code ec;
 
-    // MUTATION: reading only some .repo files, or losing the gpgcheck/gpgkey wiring,
-    // changes the count or this exact string.
-    CHECK(rows[0].starts_with("rpm_repo|/etc/yum.repos.d/rocky-addons.repo|"));
-    CHECK(rows[27] == "rpm_repo|/etc/yum.repos.d/rocky.repo|baseos|Rocky Linux $releasever - BaseOS|"
-                      "yes|yes|unset|file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9|-|"
-                      "https://mirrors.rockylinux.org/mirrorlist?arch=$basearch&"
-                      "repo=BaseOS-$releasever$rltype|unset");
-    std::size_t gpgcheck_yes = 0;
-    for (const auto& r : rows) {
-        const auto f = split_wire(r);
-        REQUIRE(f.size() == 11);
-        CHECK(f[0] == "rpm_repo");
-        if (f[5] == "yes")
-            ++gpgcheck_yes; // fields: 0 kind, 1 file, 2 id, 3 name, 4 enabled, 5 gpgcheck
-    }
-    CHECK(gpgcheck_yes >= 1);
+    // Directory present but empty: there was nothing to skip.
+    REQUIRE(fs::remove(repo_dir / "placeholder.repo", ec));
+    REQUIRE_FALSE(ec);
+    yuzu::shared::ConstraintAccumulator empty_acc;
+    CHECK(lnx::linux_rows_at(t.dir.path, empty_acc).size() == 17);
+    CHECK_FALSE(empty_acc.any_failure());
+    CHECK_FALSE(empty_acc.incomplete());
+
+    // Directory absent altogether (a Debian/Ubuntu host).
+    REQUIRE(fs::remove(repo_dir, ec));
+    REQUIRE_FALSE(ec);
+    yuzu::shared::ConstraintAccumulator absent_acc;
+    CHECK(lnx::linux_rows_at(t.dir.path, absent_acc).size() == 17);
+    // MUTATION: dropping the `!names.empty()` guard makes the empty directory
+    // constrained; mapping ENOENT to `planned` makes the absent one constrained.
+    CHECK_FALSE(absent_acc.any_failure());
+    CHECK_FALSE(absent_acc.incomplete());
 }
 
 // ── absent / EACCES ───────────────────────────────────────────────────────
 
-TEST_CASE("a root that does not exist is absent for both families: zero rows, supported",
+TEST_CASE("a root that does not exist is absent for every family: zero rows, supported",
           "[update_source_trust][walk][absent]") {
     yuzu::test::TempDir dir{"yuzu_test_update_source_trust_noroot_"};
     const fs::path missing = dir.path / "no-such-root";
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(missing, acc).empty());
-    CHECK(lnx::rpm_rows_at(missing, acc).empty());
-    // MUTATION: mapping ENOENT to a failure token would make an rpm-only or
-    // apt-only host read `constrained` forever.
+    CHECK(lnx::linux_rows_at(missing, acc).empty());
+    // MUTATION: mapping ENOENT to a failure token would make a host with no apt
+    // configuration (or no rpm directory) read `constrained` forever.
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
 }
@@ -428,33 +446,15 @@ TEST_CASE("an unreadable root is constrained with a token per source, never abse
     REQUIRE(::chmod(t.dir.path.c_str(), 0000) == 0);
 
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::apt_rows_at(t.dir.path, acc).empty());
-    CHECK(lnx::rpm_rows_at(t.dir.path, acc).empty());
-    // MUTATION: mapping EACCES to `absent` (zero rows, supported) drops these tokens.
+    CHECK(lnx::linux_rows_at(t.dir.path, acc).empty());
+    // MUTATION: mapping EACCES to `absent` (zero rows, supported) drops these tokens --
+    // including the rpm one, which proves the tripwire's own directory read reports an
+    // unreadable directory as a real failure rather than as absent or as `planned`.
     CHECK(reason_has(acc, "linux:apt_sources:permission_denied"));
     CHECK(reason_has(acc, "linux:apt_keyring:permission_denied"));
     CHECK(reason_has(acc, "linux:rpm_repo:permission_denied"));
+    CHECK_FALSE(reason_has(acc, "linux:rpm_repo:planned")); // unreadable is not "has entries"
     CHECK(acc.incomplete());
-}
-
-TEST_CASE("an unreadable rpm directory constrains rpm only; the apt rows are still fully reported",
-          "[update_source_trust][walk][eacces]") {
-    const Tree t;
-    if (::geteuid() == 0)
-        SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
-    const fs::path repo_dir = t.dir.path / "etc" / "yum.repos.d";
-    const PermRestore restore{repo_dir};
-    REQUIRE(::chmod(repo_dir.c_str(), 0000) == 0);
-
-    yuzu::shared::ConstraintAccumulator rpm_acc;
-    CHECK(lnx::rpm_rows_at(t.dir.path, rpm_acc).empty());
-    CHECK(reason_has(rpm_acc, "linux:rpm_repo:permission_denied"));
-    CHECK(rpm_acc.incomplete());
-
-    // A failure in one family must not eat, or be reported by, the other.
-    yuzu::shared::ConstraintAccumulator apt_acc;
-    CHECK(lnx::apt_rows_at(t.dir.path, apt_acc).size() == 17);
-    CHECK_FALSE(apt_acc.any_failure());
 }
 
 #endif // !defined(_WIN32)

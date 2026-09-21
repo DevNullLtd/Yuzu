@@ -16,15 +16,15 @@
 
 `sources` reports facts about how the device's package and update sources are configured to trust their signing authorities. It reads local configuration and nothing else: no subprocess, no network fetch, no write. The first row is always a `status` row saying whether the read was complete; the data rows follow, one per source. It reports what is configured and leaves any judgement, and any enforcement, to the consumer and to the sibling posture plugins.
 
-On Linux, apt sources are read from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, with the `signed-by`, `trusted` and `allow-insecure` settings surfaced. The apt keyring files under `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size (key material is never emitted). yum/dnf repositories are read from `/etc/yum.repos.d/*.repo` with `gpgcheck`, `repo_gpgcheck`, `gpgkey` and `sslverify`. On macOS, the Software Update policy is decoded with `CFPropertyListCreateWithData` from the local and from the MDM-managed `com.apple.SoftwareUpdate.plist`. The Windows leg is planned and answers with one `unsupported` status row until it lands. Files are opened without following symlinks and read with a 1 MiB cap.
+On Linux, apt sources are read from `/etc/apt/sources.list` and `/etc/apt/sources.list.d/` in both the one-line and the deb822 format, with the `signed-by`, `trusted` and `allow-insecure` settings surfaced. The apt keyring files under `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/` and `/etc/apt/keyrings/` are listed with their format and size (key material is never emitted). The yum/dnf `.repo` family follows as its own PR: until then the leg only lists `/etc/yum.repos.d` (names, no `.repo` file is opened) and, when that directory has entries, reports `CONSTRAINED` with `linux:rpm_repo:planned`, so an rpm host never reads as having no sources. The macOS Software Update read and the Windows leg are planned and each answers with one `unsupported` status row until it lands. Files are opened without following symlinks and read with a 1 MiB cap.
 
 ```mermaid
 flowchart LR
   OP[Operator / workflow] --> SRV[Server<br/>authz: Security.Read]
   SRV -- gRPC mTLS --> HOST[Agent plugin host] --> EX[update_source_trust.execute]
   EX --> WIN[Windows leg<br/>planned: one unsupported status row]
-  EX --> MAC[macOS leg<br/>CFPropertyList over the two SoftwareUpdate plists]
-  EX --> LIN[Linux leg<br/>apt sources and keyrings, yum/dnf .repo reads]
+  EX --> MAC[macOS leg<br/>planned: one unsupported status row]
+  EX --> LIN[Linux leg<br/>apt sources and keyrings; rpm/dnf family planned]
   WIN & MAC & LIN --> ROWS[rows + typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
@@ -46,10 +46,10 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | n/a — the leg is planned and reads nothing | n/a | n/a | n/a — the placeholder reports `unsupported` with `windows:planned` |
-| macOS | agent daemon — **root** by documented exception (`docs/agent-privilege-model.md`: launchd's LaunchDaemon has no `UserName` key) | None to read | Not yet measured; the post-integration capture records it (`docs/samples/macos.txt`) | `CONSTRAINED` / partial with a `macos:swu_local:<detail>` or `macos:swu_managed:<detail>` token; the affected scope's row is absent, never reported as empty policy |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read | Not yet measured; the post-integration capture records it (`docs/samples/linux.txt`) | `CONSTRAINED` / partial with a `linux:apt_sources:<detail>`, `linux:apt_keyring:<detail>` or `linux:rpm_repo:<detail>` token; the unreadable source is absent from the rows, never reported as unsigned or absent |
+| macOS | n/a — the leg is planned and reads nothing | n/a | n/a | n/a — the placeholder reports `unsupported` with `macos:planned` |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None to read | Not yet measured; the post-integration capture records it (`docs/samples/linux.txt`) | `CONSTRAINED` / partial with a `linux:apt_sources:<detail>` or `linux:apt_keyring:<detail>` token (or `linux:rpm_repo:<detail>` when the `/etc/yum.repos.d` listing itself is refused); the unreadable source is absent from the rows, never reported as unsigned or absent |
 
-No external binaries, no subprocesses, no shell-out and no network use: every leg is an in-process, bounded read of local files.
+No external binaries, no subprocesses, no shell-out and no network use: the Linux leg is an in-process, bounded read of local files, and the macOS and Windows legs read nothing.
 
 ## Data contract
 
@@ -61,7 +61,7 @@ The action takes no parameters.
 
 ### Outputs
 
-Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|sources|<supported\|constrained\|unsupported>|<reason or ->`. The kinds are `apt_source`, `apt_keyring`, `rpm_repo` and `macos_swu` (a `wsus` kind is planned for the Windows leg and is not emitted today); every row of a kind has the same field count, and `-` is an absent value. Booleans use one four-value vocabulary: `yes`, `no`, `unset` (the key is absent) and `unmodelled` (the key is present with a value the plugin does not recognise). A host that has none of a source family reports zero rows for it and stays `supported`: an absent thing is not a failure. Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design) and URL userinfo (`user:pass@`) is redacted. `update_source_trust` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`. The columns below are the widest shapes; narrower shapes use a prefix of them.
+Every row is pipe-delimited; field 0 is the row kind and the first row is always `status|sources|<supported\|constrained\|unsupported>|<reason or ->`. The kinds are `apt_source` and `apt_keyring` (the `rpm_repo`, `macos_swu` and `wsus` kinds are planned for the follow-up legs and are not emitted today); every row of a kind has the same field count, and `-` is an absent value. Booleans use one four-value vocabulary: `yes`, `no`, `unset` (the key is absent) and `unmodelled` (the key is present with a value the plugin does not recognise). A host that has no apt configuration reports zero rows and stays `supported`: an absent thing is not a failure (the deferred rpm/dnf family is the exception, see Result status). Free text is escaped for the server's pipe grammar (`safe_output_field`, lossy on backslash by design) and URL userinfo (`user:pass@`) is redacted. `update_source_trust` is not in the server's key/value plugin set, so rows are decoded as pipe-separated fields, not as `key|rest`. The columns below are the widest shapes; narrower shapes use a prefix of them.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.security.update_source_trust` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7|field_8|field_9|field_10`**
@@ -83,20 +83,22 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 
 ### Result status
 
-`sources` sets `OK`/`FULL` when every read completed, including a host with no sources at all. Any read that failed for a reason other than the file being absent (permission, symlink, oversize, short read, listing error, entry cap, an entry that would not parse) makes the whole result `CONSTRAINED`/`PARTIAL` with the failure tokens as the reason, and the same tokens appear in the leading `status` row. Windows reports `UNAVAILABLE` until its leg lands. No exception crosses the plugin boundary: a leg that throws is reported as `UNAVAILABLE` with an exception token.
+`sources` sets `OK`/`FULL` when every read completed, including a host with no sources at all. Any read that failed for a reason other than the file being absent (permission, symlink, oversize, short read, listing error, entry cap, an entry that would not parse) makes the whole result `CONSTRAINED`/`PARTIAL` with the failure tokens as the reason, and the same tokens appear in the leading `status` row. A Linux host whose `/etc/yum.repos.d` has entries is `CONSTRAINED`/`PARTIAL` with `linux:rpm_repo:planned`: the rpm/dnf family is not read yet, and a skipped family never reads as an empty one. Windows and macOS report `UNAVAILABLE` until their legs land. No exception crosses the plugin boundary: a leg that throws is reported as `UNAVAILABLE` with an exception token.
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `OK` | full | (empty) | Linux and macOS: every read completed, populated or genuinely empty |
-| `CONSTRAINED` | partial | `linux:apt_sources:<detail>` / `linux:apt_keyring:<detail>` / `linux:rpm_repo:<detail>` / `macos:swu_local:<detail>` / `macos:swu_managed:<detail>`, with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `not_regular`, `io_error`, `open_failed`, `read_failed`, `dir_open_failed`, `oversized`, `short_read`, `enumeration_error`, `entry_cap`, `unparsed_entry` (apt and rpm) or `unparseable` (macOS plist) | a source exists but could not be read completely or decoded; the rows that were read are still emitted |
+| `OK` | full | (empty) | Linux: every read completed, populated or genuinely empty (no `/etc/yum.repos.d` entries) |
+| `CONSTRAINED` | partial | `linux:apt_sources:<detail>` / `linux:apt_keyring:<detail>` / `linux:rpm_repo:<detail>`, with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `not_regular`, `io_error`, `open_failed`, `read_failed`, `dir_open_failed`, `oversized`, `short_read`, `enumeration_error`, `entry_cap` or `unparsed_entry` (apt only) | a source exists but could not be read completely or decoded; the rows that were read are still emitted |
+| `CONSTRAINED` | partial | `linux:rpm_repo:planned` | `/etc/yum.repos.d` has entries and the rpm/dnf `.repo` family is planned, not yet read; the apt rows that were read are still emitted |
 | `UNAVAILABLE` | unknown | `windows:planned` | Windows: the leg is planned; one `status\|sources\|unsupported\|windows:planned` row |
+| `UNAVAILABLE` | unknown | `macos:planned` | macOS: the leg is planned; one `status\|sources\|unsupported\|macos:planned` row |
 | `UNAVAILABLE` | unknown | `windows:leg:exception` / `linux:leg:exception` / `macos:leg:exception` | a leg threw; reported instead of unwinding across the plugin boundary |
 
 ### Where the data goes
 
 - **Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `sources` is also a gathered definition (`crossplatform.security.update_source_trust`, 300s TTL).
 - **Not consumed by** daily-sync, TAR, DEX, or metrics.
-- **Sensitivity.** Rows name the repositories a device installs software from (URIs, repo ids, key paths), which discloses part of its software supply chain. URL userinfo is redacted; a secret carried in a URL query string cannot be recognised and is emitted as written. Key material is never emitted, only key file paths, formats and sizes. No row carries a username.
+- **Sensitivity.** Rows name the repositories a device installs software from (URIs, key paths), which discloses part of its software supply chain. URL userinfo is redacted; a secret carried in a URL query string cannot be recognised and is emitted as written. Key material is never emitted, only key file paths, formats and sizes. No row carries a username.
 - **Siblings:** `windows_updates` (patch compliance and reachability of update sources, not their trust) and `installed_apps` (what is installed, not where it came from).
 
 ## Sample output
@@ -135,9 +137,9 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 
 1. **No documented customer driver.** Zero documented driver: `docs/capability-map.md` section 8.8 "Patch Connectivity Testing" tests reachability to update sources, never their trust or authenticity, and every "supply chain" mention in the SOC 2 doc (Workstream C) is about Yuzu's own build and release pipeline, never a customer endpoint's OS or package update-source configuration. Pure capability-gap reasoning.
 2. **Facts only.** The plugin is read-only and reports how sources are configured; an unsigned or rogue source is a row, not a verdict. It does not enforce, fetch, verify a signature or resolve a key, and enforcement posture belongs to the sibling posture plugins.
-3. **macOS: managed leg verified against fixtures only; no MDM-enrolled host in this run.** The local Software Update policy is verified against a real capture of a Mac; the MDM-managed plist is verified against a reconstruction built from Apple's documented payload keys, so the macOS leg stays constrained.
-4. **Windows leg planned.** The WSUS and Automatic Updates policy read under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` follows as its own PR; until then Windows reports one `unsupported` status row. When it lands, a host with no WSUS policy will report `policy_configured=no` as a fact, distinct from `constrained`.
-5. **Known limits.** Keys referenced by an apt `Signed-By` are reported by path, not resolved or fingerprinted, and `/usr/share/keyrings` is not inventoried. Only `.repo` files in `/etc/yum.repos.d` are read, not `dnf.conf`/`yum.conf` defaults or `/etc/zypp`, so `gpgcheck=unset` means the `.repo` file does not say, not that the effective value is off.
+3. **rpm/dnf family planned.** The yum/dnf `.repo` read (`gpgcheck`, `repo_gpgcheck`, `gpgkey`, `sslverify`) follows as its own PR. Until then a Linux host whose `/etc/yum.repos.d` has entries reports `CONSTRAINED` with `linux:rpm_repo:planned` and no `rpm_repo` rows, so it never reads as having no sources; a host without that directory (Debian, Ubuntu) is unaffected and stays `supported`.
+4. **macOS and Windows legs planned.** The macOS Software Update policy read (the local and the MDM-managed `com.apple.SoftwareUpdate.plist`, including its Managed Preferences read) and the Windows WSUS and Automatic Updates policy read under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` each follow as their own PR; until then each reports one `unsupported` status row. When the Windows leg lands, a host with no WSUS policy will report `policy_configured=no` as a fact, distinct from `constrained`.
+5. **Known limits.** Keys referenced by an apt `Signed-By` are reported by path, not resolved or fingerprinted, and `/usr/share/keyrings` is not inventoried.
 
 ## Source and tests
 

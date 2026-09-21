@@ -4,10 +4,9 @@
  *
  * Everything here is a free function over plain data: no OS calls, no file
  * I/O, no logging, no platform headers, no <dirent.h>/<fcntl.h>. It compiles
- * and is unit-tested on EVERY OS (test_update_source_trust_parsers.cpp,
- * test_update_source_trust_ini.cpp). The walk/read shells live in
- * update_source_trust_linux_parsers.hpp / update_source_trust_macos_parsers.hpp
- * (POSIX only) and feed these functions bytes.
+ * and is unit-tested on EVERY OS (test_update_source_trust_parsers.cpp). The
+ * walk/read shell lives in update_source_trust_linux_parsers.hpp (POSIX only)
+ * and feeds these functions bytes.
  *
  * WHAT THIS PLUGIN REPORTS. One read-only action, `sources`: FACTS about how a
  * device's package/update sources are configured to trust signing authorities.
@@ -23,9 +22,10 @@
  *   status|sources|<supported|constrained|unsupported>|<reason or ->
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
  *   apt_keyring|<path>|<scope>|<format armored|binary|empty|unmodelled>|<size_bytes>
- *   rpm_repo|<file>|<repo_id>|<name>|<enabled>|<gpgcheck>|<repo_gpgcheck>|<gpgkey>|<baseurl>|<mirror>|<sslverify>
- *   macos_swu|<scope local|managed>|<catalog_url>|<auto_check>|<auto_download>|<auto_install_macos>|<config_data_install>|<critical_update_install>|<allow_prerelease>
- *   wsus|...                                        (PLANNED -- Windows leg follows as its own PR; never emitted here)
+ *   rpm_repo|...   macos_swu|...   wsus|...
+ *       PLANNED shapes, never emitted here: each follows as its own PR (the
+ *       rpm/dnf .repo family, the macOS Software Update leg, the Windows WSUS
+ *       leg) and is documented in content/definitions/update_source_trust.yaml.
  *
  * TRISTATE. Every boolean-ish OS value maps to exactly one of
  * yes | no | unset | unmodelled. `unset` = the key is absent (a fact: the
@@ -33,9 +33,7 @@
  * one this plugin recognises (present-but-unreadable is NOT absent and is NOT
  * silently coerced). `apt_source.enabled` is yes/no/unmodelled (deb822's
  * default is enabled). For apt_source `types` a token that is neither `deb`
- * nor `deb-src` is emitted as the literal `unmodelled`; for macos_swu a key of
- * the wrong plist type is `unmodelled` (a catalog_url of `unmodelled` cannot
- * collide with a real URL, which always contains "://").
+ * nor `deb-src` is emitted as the literal `unmodelled`.
  *
  * `signed_by` is the raw Signed-By/signed-by value with whitespace collapsed
  * (paths and/or fingerprints), the literal `inline_key` when a deb822
@@ -43,19 +41,12 @@
  * when absent (apt then falls back to its global trusted keyrings -- reported
  * as the fact it is).
  *
- * INI GRAMMAR. There is NO reusable INI/TOML parser library available to
- * plugins: vcpkg.json carries none, and autoruns_parsers.hpp:1446 has only a
- * narrow systemd-unit INI-section reader ([Timer]/[Install] only) that is not
- * reusable here. yum/dnf .repo files are plain INI, so parse_ini below is a
- * PRIVATE, deliberately small grammar with its own dedicated test TU
- * (test_update_source_trust_ini.cpp). See parse_ini for the exact rules.
- *
  * KNOWN LIMITS (facts-only scope, stated so no consumer infers more):
  *   - apt: /usr/share/keyrings is not inventoried; keys referenced by
  *     Signed-By are reported by path, not resolved or fingerprinted.
- *   - rpm: only the .repo files in /etc/yum.repos.d; dnf.conf/yum.conf [main] defaults and
- *     /etc/zypp are not read, so `gpgcheck=unset` means "the .repo file does
- *     not say", not "the effective value is off".
+ *   - rpm/dnf (the .repo files under /etc/yum.repos.d) and macOS Software
+ *     Update are not read at all yet: both follow as their own PRs. The Linux
+ *     leg reports the rpm family as a planned constraint rather than as absent.
  *   - URLs: userinfo (`user:pass@`) is redacted; a secret carried in a query
  *     string cannot be recognised and is emitted as written.
  */
@@ -253,125 +244,6 @@ enum class IoStage { open_file, read_file, open_dir };
     case IoStage::open_dir:  return "dir_open_failed";
     }
     return "open_failed";
-}
-
-// ── INI (yum/dnf .repo) ──────────────────────────────────────────────────
-
-struct IniEntry {
-    std::string key;
-    std::string value;
-};
-
-struct IniSection {
-    std::string name;
-    std::vector<IniEntry> entries;
-
-    /// Value of `key` (exact, case-sensitive match -- dnf keys are lowercase);
-    /// the LAST occurrence wins, as in dnf. nullopt when absent.
-    [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const {
-        for (auto it = entries.rbegin(); it != entries.rend(); ++it)
-            if (it->key == key)
-                return std::string_view{it->value};
-        return std::nullopt;
-    }
-};
-
-struct IniDocument {
-    std::vector<IniSection> sections;
-    /// Lines that broke the grammar and were dropped (key before any section,
-    /// header without ']', line without '=', empty key, orphan indented line).
-    /// A caller MUST surface a non-zero count as a constraint: a dropped line
-    /// may have been the one that mattered.
-    std::size_t malformed_lines = 0;
-};
-
-/// Parses INI text. Grammar (deliberately small):
-///   - LF or CRLF line endings; a leading UTF-8 BOM is ignored.
-///   - blank lines are skipped; a line whose first non-space char is '#' or ';'
-///     is a comment. There are NO inline comments (yum keeps '#' in a value).
-///   - `[name]` opens a section (name trimmed, must be non-empty). Text after
-///     the closing ']' is ignored. A header with no ']' is malformed AND the
-///     keys that follow are dropped until the next valid header -- they must
-///     never be attributed to the previous section.
-///   - `key = value` splits at the FIRST '=' (':' is NOT a delimiter); key and
-///     value are trimmed; the value may be empty and may itself contain '='.
-///   - a line starting with a space/tab continues the previous key's value
-///     (joined with one space) -- the multi-URL `baseurl=`/`gpgkey=` form. A
-///     blank line ends the continuation.
-///   - a key before any section, a non-comment line without '=', and an empty
-///     key are malformed and counted, never guessed at.
-/// Pure over its input: reading the file (and capping its size) is the shell's
-/// job.
-[[nodiscard]] inline IniDocument parse_ini(std::string_view text) {
-    IniDocument doc;
-    if (text.starts_with("\xEF\xBB\xBF"))
-        text.remove_prefix(3);
-
-    bool skipping = false;      // inside a malformed-header block
-    bool can_continue = false;  // previous line was a key we may extend
-    std::size_t pos = 0;
-    while (pos <= text.size()) {
-        const std::size_t nl = text.find('\n', pos);
-        std::string_view line =
-            text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
-        pos = (nl == std::string_view::npos) ? text.size() + 1 : nl + 1;
-        if (!line.empty() && line.back() == '\r')
-            line.remove_suffix(1);
-
-        const std::string_view t = trim(line);
-        if (t.empty()) {
-            can_continue = false;
-            continue;
-        }
-        if (t.front() == '#' || t.front() == ';')
-            continue; // comment (does not end a continuation)
-
-        if (line.front() == ' ' || line.front() == '\t') {
-            if (skipping)
-                continue;
-            if (can_continue && !doc.sections.empty() && !doc.sections.back().entries.empty()) {
-                auto& v = doc.sections.back().entries.back().value;
-                if (!v.empty())
-                    v += ' ';
-                v.append(t);
-            } else {
-                ++doc.malformed_lines;
-            }
-            continue;
-        }
-
-        can_continue = false;
-        if (t.front() == '[') {
-            const std::size_t close = t.find(']');
-            const std::string_view name =
-                close == std::string_view::npos ? std::string_view{} : trim(t.substr(1, close - 1));
-            if (name.empty()) {
-                ++doc.malformed_lines;
-                skipping = true;
-                continue;
-            }
-            skipping = false;
-            doc.sections.push_back(IniSection{std::string{name}, {}});
-            continue;
-        }
-
-        const std::size_t eq = t.find('=');
-        const std::string_view key = eq == std::string_view::npos ? std::string_view{} : trim(t.substr(0, eq));
-        if (key.empty()) {
-            ++doc.malformed_lines;
-            continue;
-        }
-        if (skipping)
-            continue; // already counted at the bad header
-        if (doc.sections.empty()) {
-            ++doc.malformed_lines;
-            continue;
-        }
-        doc.sections.back().entries.push_back(
-            IniEntry{std::string{key}, std::string{trim(t.substr(eq + 1))}});
-        can_continue = true;
-    }
-    return doc;
 }
 
 // ── apt sources ──────────────────────────────────────────────────────────
@@ -596,40 +468,6 @@ struct AptParseResult {
     return KeyFormat::unmodelled;
 }
 
-// ── rpm repos ────────────────────────────────────────────────────────────
-
-struct RpmRepoFacts {
-    std::string repo_id;
-    std::string name;
-    Tri enabled = Tri::unset;
-    Tri gpgcheck = Tri::unset;
-    Tri repo_gpgcheck = Tri::unset;
-    std::string gpgkey;
-    std::string baseurl;
-    std::string mirror; // metalink if set, else mirrorlist
-    Tri sslverify = Tri::unset;
-};
-
-[[nodiscard]] inline RpmRepoFacts rpm_repo_from_section(const IniSection& s) {
-    RpmRepoFacts f;
-    f.repo_id = s.name;
-    if (auto v = s.get("name"))
-        f.name = std::string{*v};
-    f.enabled = tri_from_value(s.get("enabled"));
-    f.gpgcheck = tri_from_value(s.get("gpgcheck"));
-    f.repo_gpgcheck = tri_from_value(s.get("repo_gpgcheck"));
-    f.sslverify = tri_from_value(s.get("sslverify"));
-    if (auto v = s.get("gpgkey"))
-        f.gpgkey = collapse_ws(*v);
-    if (auto v = s.get("baseurl"))
-        f.baseurl = collapse_ws(*v);
-    if (auto v = s.get("metalink"))
-        f.mirror = collapse_ws(*v);
-    else if (auto m = s.get("mirrorlist"))
-        f.mirror = collapse_ws(*m);
-    return f;
-}
-
 // ── row formatters ───────────────────────────────────────────────────────
 //
 // Return the row WITHOUT a trailing newline (append_output() inserts the
@@ -682,37 +520,13 @@ struct RpmRepoFacts {
     return out;
 }
 
-[[nodiscard]] inline std::string format_rpm_repo_row(std::string_view file, const RpmRepoFacts& f) {
-    std::string out = "rpm_repo|";
-    out += field(file);
-    out += '|';
-    out += field(f.repo_id);
-    out += '|';
-    out += field(f.name);
-    out += '|';
-    out.append(tri_token(f.enabled));
-    out += '|';
-    out.append(tri_token(f.gpgcheck));
-    out += '|';
-    out.append(tri_token(f.repo_gpgcheck));
-    out += '|';
-    out += url_field(f.gpgkey);
-    out += '|';
-    out += url_field(f.baseurl);
-    out += '|';
-    out += url_field(f.mirror);
-    out += '|';
-    out.append(tri_token(f.sslverify));
-    return out;
-}
-
-// ── file text -> rows (pure composition the walk shells delegate to) ────────
+// ── file text -> rows (pure composition the walk shell delegates to) ─────────
 //
 // The Linux walk shell only OPENS and READS files; turning file text into wire
-// rows is these two pure functions, so the whole text -> row path is unit-tested
-// on every OS without touching a filesystem. Each returns the number of
-// malformed entries it had to drop; the caller records a non-zero count as a
-// constraint (an unparsed source is never silently absent).
+// rows is this pure function, so the whole text -> row path is unit-tested on
+// every OS without touching a filesystem. It returns the number of malformed
+// entries it had to drop; the caller records a non-zero count as a constraint
+// (an unparsed source is never silently absent).
 
 [[nodiscard]] inline std::size_t apt_rows_from_text(std::string_view logical_file, AptFormat fmt,
                                                     std::string_view text,
@@ -722,52 +536,6 @@ struct RpmRepoFacts {
     for (const auto& s : parsed.sources)
         rows.push_back(format_apt_source_row(logical_file, fmt, s));
     return parsed.malformed;
-}
-
-[[nodiscard]] inline std::size_t rpm_rows_from_text(std::string_view logical_file,
-                                                    std::string_view text,
-                                                    std::vector<std::string>& rows) {
-    const IniDocument doc = parse_ini(text);
-    for (const auto& sec : doc.sections)
-        rows.push_back(format_rpm_repo_row(logical_file, rpm_repo_from_section(sec)));
-    return doc.malformed_lines;
-}
-
-/// macOS Software Update policy facts (one plist's worth).
-struct SwuFacts {
-    std::string catalog_url; // "" absent; "unmodelled" wrong plist type
-    Tri auto_check = Tri::unset;
-    Tri auto_download = Tri::unset;
-    Tri auto_install_macos = Tri::unset;
-    Tri config_data_install = Tri::unset;
-    Tri critical_update_install = Tri::unset;
-    Tri allow_prerelease = Tri::unset;
-};
-
-enum class SwuScope { local, managed };
-
-[[nodiscard]] constexpr std::string_view swu_scope_token(SwuScope s) noexcept {
-    return s == SwuScope::managed ? "managed" : "local";
-}
-
-[[nodiscard]] inline std::string format_swu_row(SwuScope scope, const SwuFacts& f) {
-    std::string out = "macos_swu|";
-    out.append(swu_scope_token(scope));
-    out += '|';
-    out += url_field(f.catalog_url);
-    out += '|';
-    out.append(tri_token(f.auto_check));
-    out += '|';
-    out.append(tri_token(f.auto_download));
-    out += '|';
-    out.append(tri_token(f.auto_install_macos));
-    out += '|';
-    out.append(tri_token(f.config_data_install));
-    out += '|';
-    out.append(tri_token(f.critical_update_install));
-    out += '|';
-    out.append(tri_token(f.allow_prerelease));
-    return out;
 }
 
 } // namespace yuzu::update_source_trust

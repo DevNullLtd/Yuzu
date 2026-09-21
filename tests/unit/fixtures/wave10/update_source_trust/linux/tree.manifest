@@ -1,4 +1,4 @@
-# tree.manifest -- ONE composite injected root for lnx::apt_rows_at / lnx::rpm_rows_at.
+# tree.manifest -- ONE composite injected root for lnx::apt_rows_at / lnx::linux_rows_at.
 # Line grammar: <relative path>TAB<payload>; '#' lines and blank lines are skipped.
 #   F:<path>   copy the committed fixture at <path> (relative to this file's directory)
 #   T:<text>   literal text; escapes \n \t \\ (RECONSTRUCTION lines only)
@@ -13,11 +13,11 @@ etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc	F:debian-bookworm/etc/a
 # REAL CAPTURE (ubuntu:22.04, 2026-09-21): one-line sources.list + binary keyring.
 etc/apt/sources.list	F:ubuntu-2204/etc/apt/sources.list
 etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg	F:ubuntu-2204/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg
-# REAL CAPTURE (rockylinux:9, 2026-09-21): the four shipped .repo files.
-etc/yum.repos.d/rocky.repo	F:rocky-9/etc/yum.repos.d/rocky.repo
-etc/yum.repos.d/rocky-addons.repo	F:rocky-9/etc/yum.repos.d/rocky-addons.repo
-etc/yum.repos.d/rocky-devel.repo	F:rocky-9/etc/yum.repos.d/rocky-devel.repo
-etc/yum.repos.d/rocky-extras.repo	F:rocky-9/etc/yum.repos.d/rocky-extras.repo
+# RECONSTRUCTION (hand-written, not a capture): ONE placeholder .repo standing for the deferred
+# rpm/dnf family. Its content is never parsed -- the leg only lists /etc/yum.repos.d and records
+# `linux:rpm_repo:planned` -- so the file exists purely to prove that tripwire on the same root as
+# the apt rows above and below.
+etc/yum.repos.d/placeholder.repo	T:[placeholder]\nname=RECONSTRUCTION placeholder, never parsed\n
 # RECONSTRUCTION (hand-written, not a capture): a third-party one-line source that pins a
 # Signed-By keyring under /etc/apt/keyrings, and an insecure one (trusted=yes allow-insecure=yes).
 etc/apt/sources.list.d/thirdparty.list	T:deb [signed-by=/etc/apt/keyrings/thirdparty.gpg] https://repo.example.com/apt stable main\ndeb [trusted=yes allow-insecure=yes] http://insecure.example.com/apt ./\n

@@ -1,7 +1,8 @@
 /**
  * update_source_trust_linux_parsers.hpp -- the INJECTED-ROOT walk shell for the
- * Linux leg (apt sources + keyrings, rpm .repo files), plus the POSIX bounded
- * read/list primitives the macOS leg reuses.
+ * Linux leg (apt sources + keyrings, and the planned-constraint tripwire for the
+ * deferred rpm .repo family), plus the POSIX bounded read/list primitives
+ * (`posix_io`) both are built on.
  *
  * SHAPE (X2 contract). The portable pure parsers live in
  * update_source_trust_parsers.hpp and compile everywhere. THIS header is the
@@ -29,8 +30,16 @@
  * entry-cap truncation, a listing I/O error and an unparseable entry is a token
  * in the shared ConstraintAccumulator (`<os>:<source>:<detail>`); the caller
  * reports constrained + those tokens. Only a genuinely absent file/directory
- * (ENOENT) is zero rows and still `supported` -- a host with no rpm repo
- * directory simply has no rpm repos.
+ * (ENOENT) is zero rows and still `supported` -- a host with no apt
+ * configuration simply has no apt sources.
+ *
+ * DEFERRED rpm/dnf FAMILY. The `.repo` family follows as its own PR, and a
+ * skipped family must not read as an empty one: rpm_family_planned_at records
+ * `linux:rpm_repo:planned` whenever /etc/yum.repos.d has entries, so an rpm host
+ * reports constrained -- exactly as a planned OS leg reports `unsupported` --
+ * rather than `supported` with zero rows. linux_rows_at is the composition
+ * run_linux_at reports; the unit suite drives it, so dropping the tripwire from
+ * the leg fails a test.
  *
  * Namespace `lnx`, not `linux` (a predefined macro under GNU extension modes).
  */
@@ -186,7 +195,7 @@ namespace pio = yuzu::update_source_trust::posix_io;
 
 inline constexpr std::string_view kAptSourcesPrefix = "linux:apt_sources";
 inline constexpr std::string_view kAptKeyringPrefix = "linux:apt_keyring";
-inline constexpr std::string_view kRpmRepoPrefix = "linux:rpm_repo";
+inline constexpr std::string_view kRpmRepoPrefix = "linux:rpm_repo"; // planned family: tripwire token only
 
 namespace detail {
 
@@ -261,29 +270,29 @@ apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulat
     return rows;
 }
 
-/// rpm/dnf facts under `root`: one `rpm_repo` row per `[section]` of every
-/// /etc/yum.repos.d/*.repo. A host with no such directory returns zero rows and
-/// no failure token.
-[[nodiscard]] inline std::vector<std::string>
-rpm_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
-    std::vector<std::string> rows;
-    constexpr std::string_view kRepoDir = "/etc/yum.repos.d";
+/// The rpm/dnf family is DEFERRED (its own PR): no `.repo` file is opened or
+/// parsed and no row is emitted. What this records instead is the fact that the
+/// family exists here but is not yet read -- `linux:rpm_repo:planned` -- when
+/// /etc/yum.repos.d lists at least one entry, so the caller reports constrained
+/// rather than a clean, complete "no sources" for a Rocky/RHEL/Fedora host. A
+/// missing or empty directory is silent (nothing was skipped); an unreadable or
+/// over-cap one is the usual `linux:rpm_repo:<detail>` token from list_dir.
+inline void rpm_family_planned_at(const std::filesystem::path& root,
+                                  yuzu::shared::ConstraintAccumulator& acc) {
     std::vector<std::string> names;
-    if (pio::list_dir(pio::under(root, kRepoDir), names, acc, kRpmRepoPrefix) ==
-        pio::Outcome::failed)
-        return rows;
-    for (const auto& n : names) {
-        if (!pio::ends_with(n, ".repo"))
-            continue;
-        const std::string logical = std::string{kRepoDir} + '/' + n;
-        std::string data;
-        std::uint64_t size = 0;
-        if (pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false, data, size, acc,
-                           kRpmRepoPrefix) != pio::Outcome::ok)
-            continue;
-        if (rpm_rows_from_text(logical, data, rows) != 0)
-            pio::note_failure(acc, kRpmRepoPrefix, "unparsed_entry");
-    }
+    if (pio::list_dir(pio::under(root, "/etc/yum.repos.d"), names, acc, kRpmRepoPrefix) ==
+            pio::Outcome::ok &&
+        !names.empty())
+        pio::note_failure(acc, kRpmRepoPrefix, "planned");
+}
+
+/// Everything the Linux leg reports under `root`: the apt rows, plus the rpm
+/// family's planned constraint (a token, never a row). run_linux_at is exactly
+/// this call followed by report_sources.
+[[nodiscard]] inline std::vector<std::string>
+linux_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
+    std::vector<std::string> rows = apt_rows_at(root, acc);
+    rpm_family_planned_at(root, acc);
     return rows;
 }
 
