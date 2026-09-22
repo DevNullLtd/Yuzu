@@ -9,17 +9,17 @@
 ##            formats: signed-by, trusted, allow-insecure) and the apt keyrings
 ##            /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/*.
 ##            The yum/dnf /etc/yum.repos.d/*.repo family (gpgcheck,
-##            repo_gpgcheck, gpgkey, sslverify) is PLANNED — follows as its own
-##            PR. Until then a host whose /etc/yum.repos.d has entries reports
+##            repo_gpgcheck, gpgkey, sslverify) is PLANNED and not read yet:
+##            a host whose /etc/yum.repos.d has entries reports
 ##            CONSTRAINED with linux:rpm_repo:planned and no rpm_repo rows.
-##   macOS:   PLANNED — follows as its own PR (CFPropertyListCreateWithData over
+##   macOS:   PLANNED, not read yet (CFPropertyListCreateWithData over
 ##            the local /Library/Preferences/com.apple.SoftwareUpdate.plist and
 ##            the MDM-delivered /Library/Managed Preferences/com.apple.SoftwareUpdate.plist).
-##            Until then `sources` on macOS answers with exactly one row,
+##            Today `sources` on macOS answers with exactly one row,
 ##            `status|sources|unsupported|macos:planned`.
-##   Windows: PLANNED — follows as its own PR (WSUS / Automatic Updates policy
+##   Windows: PLANNED, not read yet (WSUS / Automatic Updates policy
 ##            under HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate{,\AU}).
-##            Until then `sources` on Windows answers with exactly one row,
+##            Today `sources` on Windows answers with exactly one row,
 ##            `status|sources|unsupported|windows:planned`.
 ##
 ## WHY: there is no documented customer driver for this plugin. Capability-map
@@ -49,10 +49,10 @@ metadata:
     trust their signing authorities, as facts only. On Linux, one row per apt
     source (one-line and deb822, with signed-by, trusted and allow-insecure)
     and one row per apt keyring file. The yum/dnf repository family is planned
-    and follows as its own PR; a Linux host whose /etc/yum.repos.d has entries
+    and not yet read; a Linux host whose /etc/yum.repos.d has entries
     reports a constrained status with linux:rpm_repo:planned instead of rows.
-    The macOS Software Update and Windows WSUS legs are planned and each
-    follows as its own PR. A leading status row states whether the read was
+    The macOS Software Update and Windows WSUS legs are planned and not yet
+    read. A leading status row states whether the read was
     complete. The plugin never enforces, fetches or changes anything.
   tags: [security, supply-chain, update-sources, packages]
 
@@ -80,7 +80,7 @@ spec:
     #   apt_source|<file>|<one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
     #   apt_keyring|<path>|<scope>|<armored|binary|empty|unmodelled>|<size_bytes>
     #
-    # Three more shapes are PLANNED (each leg follows as its own PR), documented
+    # Three more shapes are PLANNED (not read yet), documented
     # in the column descriptions below and never emitted today:
     #   rpm_repo|<file>|<repo_id>|<name>|<enabled>|<gpgcheck>|<repo_gpgcheck>|<gpgkey>|<baseurl>|<mirror>|<sslverify>
     #   macos_swu|<local|managed>|<catalog_url>|<auto_check>|<auto_download>|<auto_install_macos>|<config_data_install>|<critical_update_install>|<allow_prerelease>
@@ -89,6 +89,10 @@ spec:
     # field_1..field_10 carry the data fields of the widest shapes (apt_source
     # and the planned rpm_repo, 10 each); narrower shapes leave the tail fields
     # off the row.
+    #
+    # A column's `platforms` lists the OSes whose declared leg (planned legs
+    # included) carries it; today only the status row's columns are populated on
+    # macOS and Windows.
     columns:
       - name: row_kind
         type: string
@@ -103,22 +107,22 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained or unsupported (Windows and macOS report unsupported until their legs land). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type.'
+        description: 'status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type.'
         example: deb822
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows, macos:planned on macOS, linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries). apt_source: source types (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.'
+        description: 'status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows, macos:planned on macOS, linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.'
         example: deb
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'apt_source: URIs, userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled.'
+        description: 'apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled.'
         example: https://deb.debian.org/debian
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'apt_source: suites. Planned, not emitted today: rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos.'
+        description: 'apt_source: suites, space-separated when several. Planned, not emitted today: rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos.'
         example: bookworm
         platforms: [linux, darwin]
       - name: field_6

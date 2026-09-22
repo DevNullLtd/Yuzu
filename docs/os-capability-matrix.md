@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(57).
+(58).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -142,7 +142,7 @@ duplicates.
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
 | tags | ✅ | ✅ | ✅ | portable — `std::filesystem` |
 | **tar** | ✅ | 🟡 | 🟡 | Uneven by design — richest on Windows (ETW/dnsapi/registry), `/proc`-based on Linux, ES + scattered branches on macOS. Per-source depth is the **TAR warehouse capture sources** section above (`tar_schema_registry.cpp`) |
-| update_source_trust | 🔜 | ✅ | 🔜 | Package/update-source trust posture, facts only. Linux apt full (one-line + deb822 sources, apt keyrings; config file reads, rung 1); the yum/dnf `.repo` family is planned and follows as its own PR, and a host with `/etc/yum.repos.d` entries reports constrained `linux:rpm_repo:planned`. macOS planned: the `com.apple.SoftwareUpdate.plist` read (local and MDM-managed) follows as its own PR; until then one `unsupported` status row (`macos:planned`). Windows planned: the WSUS/Automatic Updates policy read follows as its own PR; until then one `unsupported` status row. See `agents/plugins/update_source_trust/README.md` |
+| update_source_trust | 🔜 | ✅ | 🔜 | Package/update-source trust posture, facts only. Linux apt full (one-line + deb822 sources, apt keyrings; config file reads, rung 1); the yum/dnf `.repo` family is planned (not read yet), and a host with `/etc/yum.repos.d` entries reports constrained `linux:rpm_repo:planned`. macOS planned: the `com.apple.SoftwareUpdate.plist` read (local and MDM-managed) is not done yet; one `unsupported` status row (`macos:planned`). Windows planned: the WSUS/Automatic Updates policy read is not done yet; one `unsupported` status row (`windows:planned`). See `agents/plugins/update_source_trust/README.md` |
 | users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`); Windows `primary_user`/`session_history` now read the Security channel natively via wevtapi, and the POSIX account tools run as bounded argv invocations instead of a shell |
 | vuln_scan | ✅ | ✅ | ✅ | linux/apple/win branches |
 | wifi | ✅ | 🟡 | 🟡 | win/linux/apple all implemented; Linux 🟡 and macOS 🟡 — both declare `constrained` (see the generated block); macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
@@ -191,12 +191,6 @@ processes, worst) — rung states *how* a leg acquires its capability per
 docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
 implementation is.
 
-<!-- TODO(integrator, Wave 10 PR10.1-d update_source_trust): the generated block below has NOT been
-     regenerated for this plugin (no built plugin artifact was available to the engineer; the block is never
-     hand-edited). On the canonical Linux host run tools/capmatrix-gen over the built plugins and splice the
-     result so it gains three rows, `update_source_trust | sources | linux|macos|windows` (supported /
-     constrained / planned, rung 1 each, sorted between `tar` and `users`), then delete this comment and re-run
-     `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all`. -->
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
