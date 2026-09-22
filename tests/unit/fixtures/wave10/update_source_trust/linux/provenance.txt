@@ -1,8 +1,8 @@
 Directory: tests/unit/fixtures/wave10/update_source_trust/linux/
-Package: P1d-1 (update_source_trust, row PR10.1-d). Each subdirectory is an injected root
+Fixtures for the update_source_trust Linux leg tests. Each subdirectory is an injected root
 for lnx::apt_rows_at / lnx::linux_rows_at: the paths below sit under it exactly as they do
 on a real host (etc/apt/...). One provenance file for the directory. The rpm/dnf family
-(etc/yum.repos.d) is deferred to its own PR, so no rpm capture is kept here.
+(etc/yum.repos.d) is not read yet, so no rpm capture is kept here.
 
 ALL files are REAL CAPTURES, byte-for-byte, captured 2026-09-21 from command-only Docker
 containers (`docker run --rm <image> tar -C / -cf - <paths>` piped to a local `tar -x`;

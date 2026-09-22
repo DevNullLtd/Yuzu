@@ -1,6 +1,6 @@
 /**
  * update_source_trust_parsers.hpp -- the PURE, PORTABLE parsing + row-formatting
- * layer for update_source_trust (row PR10.1-d).
+ * layer for update_source_trust.
  *
  * Everything here is a free function over plain data: no OS calls, no file
  * I/O, no logging, no platform headers, no <dirent.h>/<fcntl.h>. It compiles
@@ -23,7 +23,7 @@
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
  *   apt_keyring|<path>|<scope>|<format armored|binary|empty|unmodelled>|<size_bytes>
  *   rpm_repo|...   macos_swu|...   wsus|...
- *       PLANNED shapes, never emitted here: each follows as its own PR (the
+ *       PLANNED shapes, never emitted here (not read yet): the
  *       rpm/dnf .repo family, the macOS Software Update leg, the Windows WSUS
  *       leg) and is documented in content/definitions/update_source_trust.yaml.
  *
@@ -45,7 +45,7 @@
  *   - apt: /usr/share/keyrings is not inventoried; keys referenced by
  *     Signed-By are reported by path, not resolved or fingerprinted.
  *   - rpm/dnf (the .repo files under /etc/yum.repos.d) and macOS Software
- *     Update are not read at all yet: both follow as their own PRs. The Linux
+ *     Update are not read at all yet. The Linux
  *     leg reports the rpm family as a planned constraint rather than as absent.
  *   - URLs: userinfo (`user:pass@`) is redacted; a secret carried in a query
  *     string cannot be recognised and is emitted as written.

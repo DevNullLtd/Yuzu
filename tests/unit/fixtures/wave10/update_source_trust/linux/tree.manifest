@@ -13,6 +13,12 @@ etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc	F:debian-bookworm/etc/a
 # REAL CAPTURE (ubuntu:22.04, 2026-09-21): one-line sources.list + binary keyring.
 etc/apt/sources.list	F:ubuntu-2204/etc/apt/sources.list
 etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg	F:ubuntu-2204/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg
+# RECONSTRUCTION (hand-written, not a capture): names apt itself ignores -- in trusted.gpg.d only
+# *.gpg and *.asc are keyrings, in sources.list.d only *.list and *.sources are read. They exist
+# purely to prove the two name filters on this root: none of the three may yield a row.
+etc/apt/trusted.gpg.d/README	T:not a key\n
+etc/apt/trusted.gpg.d/z.txt	T:not a key either\n
+etc/apt/sources.list.d/notes.txt	T:deb http://ignored.example/ x main\n
 # RECONSTRUCTION (hand-written, not a capture): ONE placeholder .repo standing for the deferred
 # rpm/dnf family. Its content is never parsed -- the leg only lists /etc/yum.repos.d and records
 # `linux:rpm_repo:planned` -- so the file exists purely to prove that tripwire on the same root as

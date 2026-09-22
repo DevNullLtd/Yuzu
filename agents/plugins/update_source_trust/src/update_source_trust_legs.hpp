@@ -2,9 +2,12 @@
  * update_source_trust_legs.hpp -- shared seam between the update_source_trust
  * plugin TU and its three per-OS leg TUs.
  *
- * Holds (a) the per-OS entry-point declarations and (b) the CC-07 status
- * reporting helper every leg funnels through, so no leg can pair a status and
- * a completeness by hand. Modelled on peripherals_legs.hpp / disk_actions_legs.hpp.
+ * Holds (a) the per-OS entry-point declarations, (b) the CC-07 status
+ * reporting helpers every leg funnels through, so no leg can pair a status and
+ * a completeness by hand, and (c) execute_sources, the plugin's whole execute()
+ * body (dispatch + ABI containment), so the plugin TU is a two-line shell and
+ * the unit suite drives the body through a real CommandContext. Modelled on
+ * peripherals_legs.hpp / disk_actions_legs.hpp.
  *
  * Each entry point is a READ and returns 0 unconditionally: a degraded read is
  * not a failed command, and the degradation is reported through the leading
@@ -20,6 +23,7 @@
 
 #include <constraint_accumulator.hpp>
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp>
 
 #include <string>
 #include <string_view>
@@ -55,16 +59,46 @@ inline void report_sources(yuzu::CommandContext& ctx, const std::vector<std::str
     ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
 }
 
-/// The Windows and macOS legs are PLANNED: a single, exact status row and an
-/// UNAVAILABLE result -- never an empty success. Kept here (not in the per-OS
-/// TUs) so the row is unit-testable on every host.
+/// A leg that reads nothing reports ONE exact `unsupported` status row and an
+/// UNAVAILABLE/UNKNOWN result carrying the same token -- never an empty
+/// success. Two callers: the Windows and macOS legs (planned; their tokens
+/// below) and execute_sources' catch arm (a leg that threw, `<os>:leg:exception`).
+/// Kept here (not in the per-OS TUs) so the row is unit-testable on every host.
 inline constexpr const char* kWindowsPlannedToken = "windows:planned";
 inline constexpr const char* kMacosPlannedToken = "macos:planned";
 
-inline void report_planned(yuzu::CommandContext& ctx, std::string_view os_token) {
-    ctx.write_output(format_status_row(StatusState::unsupported, os_token));
+inline void report_unavailable(yuzu::CommandContext& ctx, std::string_view token) {
+    ctx.write_output(format_status_row(StatusState::unsupported, token));
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
-                          os_token);
+                          token);
+}
+
+/// One per-OS leg entry point (run_windows / run_linux / run_macos).
+using LegFn = int (*)(yuzu::CommandContext&);
+
+/// The WHOLE body of the plugin's execute(): action dispatch, the host leg and
+/// the ABI containment. No exception may cross the plugin ABI, so everything --
+/// the unknown-action write included -- sits inside the try, and the catch arm
+/// reports the leg as unavailable instead of unwinding into the host.
+/// `leg_exception_token` is the host OS's `<os>:leg:exception`. The unit suite
+/// drives this through a real CommandContext with a throwing leg and with an
+/// unknown action (test_update_source_trust_local_dispatcher.cpp).
+inline int execute_sources(yuzu::CommandContext& ctx, std::string_view action, LegFn leg,
+                           std::string_view leg_exception_token) {
+    try {
+        if (action != "sources") {
+            // `action` is request-supplied and lands in a pipe-delimited stream, so
+            // it goes through the shared escaper like any other untrusted field.
+            // Deliberately not a row (no leading kind token).
+            ctx.write_output(std::string{"unknown action: "} +
+                             yuzu::util::safe_output_field(action));
+            return 1;
+        }
+        return leg(ctx);
+    } catch (...) {
+        report_unavailable(ctx, leg_exception_token);
+        return 0;
+    }
 }
 
 } // namespace yuzu::update_source_trust

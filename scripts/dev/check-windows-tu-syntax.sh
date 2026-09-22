@@ -58,6 +58,7 @@ tus=(
     agents/plugins/peripherals/src/peripherals_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
+    agents/plugins/update_source_trust/src/update_source_trust_win.cpp
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
 )

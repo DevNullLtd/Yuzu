@@ -22,6 +22,9 @@
  * is 0 (a degraded read is not a failed command), and every data row has the
  * exact field count of its kind under an escape-aware split. The Windows and
  * macOS legs are PLANNED placeholders and are pinned to their exact single row.
+ * The [seam] case drives execute_sources (update_source_trust_legs.hpp) through
+ * a synthetic descriptor with a leg that throws, so the ABI containment and the
+ * unknown-action path are pinned on every OS without loading the plugin.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -31,12 +34,15 @@
 
 #include "local_dispatcher.hpp"
 
+#include "update_source_trust_legs.hpp" // execute_sources (the plugin's whole execute body)
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -190,6 +196,17 @@ bool file_has_line_starting(const fs::path& p, std::string_view prefix) {
 }
 #endif
 
+/// The execute-seam probes: a leg that throws, run through the production
+/// execute_sources exactly as the plugin TU wires its host leg.
+int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
+
+int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
+                 std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return yuzu::update_source_trust::execute_sources(ctx, action, &throwing_leg,
+                                                      "linux:leg:exception");
+}
+
 } // namespace
 
 TEST_CASE("update_source_trust plugin: status row first, agrees with the typed result, rc 0",
@@ -244,6 +261,27 @@ TEST_CASE("update_source_trust plugin: status row first, agrees with the typed r
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
         CHECK_FALSE(result.result_provenance.empty()); // the reason travels with the status
     }
+
+    // The rpm-family tripwire, two-sided on whatever THIS host is: a populated
+    // /etc/yum.repos.d must surface as `linux:rpm_repo:planned` (the deferred
+    // family never reads as absent) and its absence must not. This is the one
+    // assertion that reaches run_linux -> "/" in the built .so. MUTATION: the leg
+    // dropping the tripwire fails the first arm on an rpm host; an unconditional
+    // token fails the second on every Debian/Ubuntu runner.
+    std::error_code yum_ec;
+    bool yum_has_entries = false;
+    for (const auto& entry : fs::directory_iterator("/etc/yum.repos.d", yum_ec)) {
+        (void)entry;
+        yum_has_entries = true;
+        break;
+    }
+    const bool planned = status[3].find("linux:rpm_repo:planned") != std::string::npos;
+    if (yum_has_entries) {
+        CHECK(status[2] == "constrained");
+        CHECK(planned);
+    } else {
+        CHECK_FALSE(planned);
+    }
 #endif
 }
 
@@ -286,6 +324,7 @@ TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this hos
     const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
     REQUIRE_FALSE(rows.empty());
     const auto status = split_fields_escape_aware(rows[0]);
+    REQUIRE(status.size() == 4);
     if (status[2] != "supported")
         SKIP("leg reported constrained on this host; populated-row assertions need a clean read");
 
@@ -307,3 +346,49 @@ TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this hos
         WARN("no known apt trust input on this host; only row shape was asserted");
 }
 #endif
+
+TEST_CASE("update_source_trust plugin: an unknown action is refused, not silently ignored",
+          "[update_source_trust][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "no_such_action");
+    CHECK(result.rc == 1);
+    // Deliberately not a data or status row, and the diagnostic text is pinned.
+    // MUTATION: deleting the `unknown action:` write in execute_sources fails here.
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "unknown action: no_such_action");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED); // no status is reported
+}
+
+TEST_CASE("update_source_trust execute seam: a leg that throws is contained as one unsupported row + UNAVAILABLE; a hostile action name is escaped",
+          "[update_source_trust][dispatcher][seam]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &seam_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    const auto thrown = dispatcher.run(&descriptor, "sources");
+    CHECK(thrown.rc == 0); // contained: a leg that threw is reported, never unwound
+    const auto rows = captured_rows(thrown.captured);
+    // MUTATION: removing the catch arm lets the exception escape to Catch2 (red);
+    // writing `constrained` (the r1 shape) or CONSTRAINED here fails the pair below.
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|sources|unsupported|linux:leg:exception");
+    CHECK(thrown.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(thrown.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+    CHECK(thrown.result_provenance == "linux:leg:exception"); // one seam, two views
+
+    // The unknown-action write sits INSIDE the same try. The request-supplied
+    // name goes through safe_output_field, so a pipe and a trailing backslash can
+    // neither open a second field nor swallow a delimiter.
+    const auto hostile = dispatcher.run(&descriptor, "no|such\\");
+    CHECK(hostile.rc == 1);
+    const auto hrows = captured_rows(hostile.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "unknown action: no\\|such/");
+    CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
+}

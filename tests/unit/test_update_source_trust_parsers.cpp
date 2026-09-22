@@ -5,14 +5,14 @@
  * process or a clock. The final POSIX-only section (`#if !defined(_WIN32)`)
  * drives the injected-root walk shell (update_source_trust_linux_parsers.hpp)
  * over the REAL CAPTURE trees in fixtures/wave10/update_source_trust/linux/ and
- * over `yuzu_test_ust_*` temp roots for the filesystem fault cases (FIFO,
+ * over `yuzu_test_update_source_trust_walk_*` temp roots for the filesystem fault cases (FIFO,
  * symlink leaf, oversized file, directory cap, EACCES).
  *
  * Inputs are labelled. The apt texts in the parser cases are RECONSTRUCTIONS
  * written from sources.list(5) / apt's deb822 documentation; the walk section
  * reads the REAL CAPTURES (debian:bookworm, ubuntu:22.04 containers -- see
- * linux/provenance.txt). P1d-2's tree suite layers manifest-described trees on
- * top. Every behaviour asserted here is
+ * linux/provenance.txt). test_update_source_trust_linux_parsers.cpp layers
+ * manifest-described trees on top. Every behaviour asserted here is
  * a value flowing from input text to an emitted wire row, so removing the
  * wiring (the parse, the tri mapping, the redaction, the escape) fails a test:
  * see the "MUTATION" notes on the individual cases.
@@ -30,13 +30,14 @@
 #if !defined(_WIN32)
 #include "update_source_trust_linux_parsers.hpp"
 
+#include "test_helpers.hpp" // yuzu::test::TempDir
+
 #include <constraint_accumulator.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -288,7 +289,7 @@ TEST_CASE("apt_source row: credentials are redacted; pipes and backslashes canno
     CHECK(row.find("s3cret") == std::string::npos);
     CHECK(row.find("REDACTED@repo.example") != std::string::npos);
 
-    // X12: escape-aware split (the server decoder's grammar) sees EXACTLY 11
+    // Escape-aware split (the server decoder's grammar) sees EXACTLY 11
     // fields, and the trailing-backslash value cannot swallow the delimiter.
     const auto fields = split_wire(row);
     REQUIRE(fields.size() == 11);
@@ -365,23 +366,12 @@ fs::path linux_fixture_root(const char* distro) {
 #endif
 }
 
-/// A scratch injected root under the temp dir (`yuzu_test_` prefix: Defender
-/// exclusion on Windows CI), removed on scope exit.
+/// A scratch injected root: a yuzu::test::TempDir (the `yuzu_test_` prefix) that
+/// exists from construction (TempDir only names the path), plus two path helpers.
 struct TempRoot {
+    yuzu::test::TempDir dir{"yuzu_test_update_source_trust_walk_"};
     fs::path path;
-    TempRoot() {
-        static std::atomic<unsigned> counter{0};
-        path = fs::temp_directory_path() / ("yuzu_test_ust_" + std::to_string(::getpid()) + "_" +
-                                            std::to_string(counter.fetch_add(1)));
-        fs::remove_all(path);
-        fs::create_directories(path);
-    }
-    ~TempRoot() {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-    }
-    TempRoot(const TempRoot&) = delete;
-    TempRoot& operator=(const TempRoot&) = delete;
+    TempRoot() : path(dir.path) { fs::create_directories(path); }
     fs::path apt() const { return path / "etc/apt"; }
     void write(const fs::path& rel, std::string_view text) const {
         fs::create_directories((path / rel).parent_path());
@@ -494,6 +484,32 @@ TEST_CASE("a symlink leaf is refused, not followed", "[update_source_trust][walk
     CHECK(rows.empty());
     CHECK(reason_has(acc, "linux:apt_sources:symlink_refused"));
     CHECK(acc.incomplete());
+}
+
+TEST_CASE("a malformed apt entry is unparsed_entry, never silently absent (one-line and deb822)",
+          "[update_source_trust][walk][fault]") {
+    const TempRoot root;
+    // One malformed entry per format beside a well-formed one: the good entry
+    // still yields its row; the bad one becomes a constraint, not silence.
+    root.write("etc/apt/sources.list",
+               "deb [arch=amd64 http://x.example/ y main\n" // unterminated `[`
+               "deb http://ok.example/ suite main\n");
+    root.write("etc/apt/sources.list.d/bad.sources",
+               "Types: deb\nURIs: http://x.example/\n\n" // stanza without Suites
+               "Types: deb\nURIs: http://ok.example/\nSuites: s\n");
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto rows = lnx::apt_rows_at(root.path, acc);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0] == "apt_source|/etc/apt/sources.list|one_line|deb|http://ok.example/|suite|main|-|"
+                     "unset|unset|yes");
+    CHECK(rows[1] == "apt_source|/etc/apt/sources.list.d/bad.sources|deb822|deb|http://ok.example/|s|"
+                     "-|-|unset|unset|yes");
+    // MUTATION (an orchestrator probe confirmed it survived before this case
+    // existed): deleting the unparsed_entry note_failure in add_apt_file leaves
+    // the accumulator clean and the host reads `supported` with a source missing.
+    CHECK(acc.any_failure());
+    CHECK(acc.incomplete());
+    CHECK(acc.reason() == "linux:apt_sources:unparsed_entry"); // one token for both files (exact-string dedupe)
 }
 
 TEST_CASE("a file over 1 MiB is oversized, never silently truncated",

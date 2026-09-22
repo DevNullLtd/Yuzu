@@ -8,7 +8,7 @@
  * (`status|sources|unsupported|windows:planned`) -- never an empty success.
  * No decision logic lives here, and none is a candidate for a Windows-only
  * code path: the row is formatted by the portable, unit-tested
- * report_planned in update_source_trust_legs.hpp.
+ * report_unavailable in update_source_trust_legs.hpp.
  */
 #include "update_source_trust_legs.hpp"
 
@@ -17,7 +17,7 @@
 namespace yuzu::update_source_trust {
 
 int run_windows(yuzu::CommandContext& ctx) {
-    report_planned(ctx, kWindowsPlannedToken);
+    report_unavailable(ctx, kWindowsPlannedToken);
     return 0;
 }
 

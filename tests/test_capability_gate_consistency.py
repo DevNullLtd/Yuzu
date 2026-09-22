@@ -122,9 +122,6 @@ FRAGMENT_FILES = [
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (update_source_trust) = 210.
-# NOTE for the integrator: every other Wave 10/Wave 8 PR adds its own rows to
-# this same total. This PR states base + 1 only; after merging fresh dev,
-# re-sum the fragments above and set the final value (do not trust this line).
 EXPECTED_TOTAL_ROWS = 210
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair

@@ -1,21 +1,25 @@
 /**
  * test_update_source_trust_linux_parsers.cpp -- manifest-materialised tree
  * suite for the update_source_trust Linux leg (lnx::apt_rows_at /
- * lnx::rpm_family_planned_at / lnx::linux_rows_at in
+ * lnx::rpm_family_planned_at / lnx::linux_rows_at / lnx::run_linux_at in
  * update_source_trust_linux_parsers.hpp).
  *
  * WHAT THIS ADDS. test_update_source_trust_parsers.cpp drives the same walk
  * over the per-distro wave-1 capture trees. This TU layers ONE composite root
  * on top: tests/unit/fixtures/wave10/update_source_trust/linux/tree.manifest
  * merges a real debian:bookworm deb822 source and a real ubuntu:22.04 one-line
- * sources.list with three labelled RECONSTRUCTION entries (a third-party apt
- * source pair, a keyring, and a placeholder /etc/yum.repos.d/placeholder.repo
- * standing for the deferred rpm/dnf family) into a single host-shaped tree, so
+ * sources.list with labelled RECONSTRUCTION entries (a third-party apt source
+ * pair, a keyring, three names the apt filters must ignore, and a placeholder
+ * /etc/yum.repos.d/placeholder.repo standing for the deferred rpm/dnf family)
+ * into a single host-shaped tree, so
  * the apt rows and the rpm family's planned constraint come from the SAME root:
  * one mixed host, walked once. Row bytes are asserted exactly, and the
  * tripwire's three cases (directory with entries -> constrained `planned`;
  * empty or absent -> supported; unreadable -> a real failure token) plus the
  * failure paths (absent, EACCES) are checked on that tree.
+ * The [seam] cases drive the PRODUCTION leg body (lnx::run_linux_at) through
+ * a real CommandContext, so the wire status row AND the typed result are what
+ * is asserted, not only the walk's return values.
  *
  * MANIFEST GRAMMAR (defined and unit-tested HERE). One line per file:
  *     <relative path> TAB <payload>
@@ -37,9 +41,11 @@
 
 #include "update_source_trust_linux_parsers.hpp"
 
+#include "local_dispatcher.hpp"
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <constraint_accumulator.hpp>
+#include <yuzu/plugin.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -49,6 +55,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -278,6 +285,42 @@ struct Tree {
     }
 };
 
+std::vector<std::string> captured_rows(const std::string& captured) {
+    std::vector<std::string> out;
+    std::istringstream ss(captured);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!line.empty())
+            out.push_back(line);
+    }
+    return out;
+}
+
+// ── CommandContext-level harness ─────────────────────────────────────────
+// Drives the PRODUCTION leg body (lnx::run_linux_at) through a real
+// yuzu::CommandContext via LocalDispatcher (the synthetic-descriptor precedent
+// in test_filesystem_posture_local_dispatcher.cpp), so what is asserted is the
+// emitted status row AND the CC-07 typed status the command actually reports.
+const fs::path* g_leg_root = nullptr;
+
+int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
+                std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return lnx::run_linux_at(ctx, *g_leg_root);
+}
+
+yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root) {
+    g_leg_root = &root;
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &leg_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(&descriptor, "sources");
+    g_leg_root = nullptr;
+    return result;
+}
+
 } // namespace
 
 // ── the manifest grammar itself ───────────────────────────────────────────
@@ -357,13 +400,23 @@ TEST_CASE("apt_rows_at over the composite tree: deb822 + one-line sources with s
     CHECK(rows[13] == "apt_source|/etc/apt/sources.list.d/thirdparty.list|one_line|deb|"
                       "http://insecure.example.com/apt|./|-|-|yes|yes|yes");
 
-    // MUTATION: the trusted.gpg.d .asc/.gpg filter and the etc_apt_keyrings scan each
-    // add, drop or re-scope one of these.
+    // MUTATION: dropping the etc_apt_keyrings scan loses rows[16]; re-scoping either
+    // directory changes the scope field. The two name filters are pinned below.
     CHECK(rows[14] == "apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc|"
                       "trusted_gpg_d|armored|461");
     CHECK(rows[15] == "apt_keyring|/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg|"
                       "trusted_gpg_d|binary|1733");
     CHECK(rows[16] == "apt_keyring|/etc/apt/keyrings/thirdparty.gpg|etc_apt_keyrings|binary|4");
+    // MUTATION (an orchestrator probe confirmed the filter half survived before
+    // these lines existed): dropping the trusted.gpg.d .gpg/.asc filter turns
+    // README and z.txt into two `unmodelled` keyring rows (19 rows; rows[16]
+    // shifts); dropping the sources.list.d suffix dispatch parses notes.txt into
+    // an 18th apt_source row. The 17 REQUIRE above is the kill for both.
+    for (const auto& r : rows) {
+        CHECK(r.find("/etc/apt/trusted.gpg.d/README") == std::string::npos);
+        CHECK(r.find("/etc/apt/trusted.gpg.d/z.txt") == std::string::npos);
+        CHECK(r.find("ignored.example") == std::string::npos);
+    }
 
     // The acceptance shape, stated directly: apt_source rows WITH a signed-by value.
     std::size_t signed_by = 0;
@@ -379,21 +432,45 @@ TEST_CASE("apt_rows_at over the composite tree: deb822 + one-line sources with s
         }
     }
     CHECK(signed_by == 3); // both debian stanzas + the thirdparty signed-by line
+}
 
-    // The deferred rpm family: the placeholder .repo in this host-shaped tree must
-    // surface as a family-level planned constraint -- a token, never a row and never
-    // silence -- so the leg reports constrained/partial rather than a clean "no rpm
-    // sources". linux_rows_at is the exact composition run_linux_at reports.
-    // MUTATION: dropping rpm_family_planned_at from linux_rows_at (or the directory
-    // check inside it) leaves the leg `supported` and fails the token/status asserts.
-    yuzu::shared::ConstraintAccumulator leg_acc;
-    const auto leg_rows = lnx::linux_rows_at(t.dir.path, leg_acc);
-    CHECK(leg_rows == rows);
-    CHECK(leg_acc.any_failure());
-    CHECK(leg_acc.incomplete());
-    CHECK(leg_acc.reason() == "linux:rpm_repo:planned");
-    CHECK(ust::format_status_row(ust::StatusState::constrained, leg_acc.reason()) ==
-          "status|sources|constrained|linux:rpm_repo:planned");
+// ── the shipped leg through the real emission seam ───────────────────────
+
+TEST_CASE("update_source_trust seam: the composite tree reaches the wire as constrained linux:rpm_repo:planned through run_linux_at",
+          "[update_source_trust][walk][seam]") {
+    const Tree t;
+    const auto result = run_leg(t.dir.path);
+    CHECK(result.rc == 0); // a degraded read is never a failed command
+    const auto rows = captured_rows(result.captured);
+    // MUTATION (an orchestrator probe confirmed it survived before this case
+    // existed): run_linux_at calling apt_rows_at instead of linux_rows_at turns
+    // rows[0] into supported|- and the typed status into OK/FULL.
+    REQUIRE(rows.size() == 18); // the status row + the 17 apt rows
+    CHECK(rows[0] == "status|sources|constrained|linux:rpm_repo:planned");
+    CHECK(rows[1] == "apt_source|/etc/apt/sources.list|one_line|deb|"
+                     "http://ports.ubuntu.com/ubuntu-ports/|jammy|main restricted|-|"
+                     "unset|unset|yes");
+    CHECK(rows[17] == "apt_keyring|/etc/apt/keyrings/thirdparty.gpg|etc_apt_keyrings|binary|4");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "linux:rpm_repo:planned"); // one seam, two views
+}
+
+TEST_CASE("update_source_trust seam: without /etc/yum.repos.d the same tree reaches the wire as supported + OK/FULL",
+          "[update_source_trust][walk][seam]") {
+    const Tree t;
+    std::error_code ec;
+    REQUIRE(fs::remove_all(t.dir.path / "etc" / "yum.repos.d", ec) == 2); // the dir + placeholder.repo
+    REQUIRE_FALSE(ec);
+    const auto result = run_leg(t.dir.path);
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+    // MUTATION: an unconditional `planned` token, or mapping ENOENT to it, fails here.
+    REQUIRE(rows.size() == 18);
+    CHECK(rows[0] == "status|sources|supported|-");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(result.result_provenance.empty());
 }
 
 // ── rpm-family tripwire: empty or absent is silent ───────────────────────

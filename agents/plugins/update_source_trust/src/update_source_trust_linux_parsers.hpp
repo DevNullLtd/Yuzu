@@ -4,7 +4,7 @@
  * deferred rpm .repo family), plus the POSIX bounded read/list primitives
  * (`posix_io`) both are built on.
  *
- * SHAPE (X2 contract). The portable pure parsers live in
+ * SHAPE. The portable pure parsers live in
  * update_source_trust_parsers.hpp and compile everywhere. THIS header is the
  * POSIX-only walk shell: it needs <dirent.h>/<fcntl.h> (agents/shared/
  * posix_dir_walk.hpp is `#if !defined(_WIN32)`), so the whole body is guarded
@@ -33,13 +33,14 @@
  * (ENOENT) is zero rows and still `supported` -- a host with no apt
  * configuration simply has no apt sources.
  *
- * DEFERRED rpm/dnf FAMILY. The `.repo` family follows as its own PR, and a
+ * DEFERRED rpm/dnf FAMILY. The `.repo` family is not read yet, and a
  * skipped family must not read as an empty one: rpm_family_planned_at records
  * `linux:rpm_repo:planned` whenever /etc/yum.repos.d has entries, so an rpm host
  * reports constrained -- exactly as a planned OS leg reports `unsupported` --
- * rather than `supported` with zero rows. linux_rows_at is the composition
- * run_linux_at reports; the unit suite drives it, so dropping the tripwire from
- * the leg fails a test.
+ * rather than `supported` with zero rows. run_linux_at (bottom of this header)
+ * is linux_rows_at followed by report_sources; the unit suite drives
+ * run_linux_at itself through a real CommandContext, so dropping the tripwire
+ * from the SHIPPED leg fails a test.
  *
  * Namespace `lnx`, not `linux` (a predefined macro under GNU extension modes).
  */
@@ -48,6 +49,7 @@
 #if !defined(_WIN32)
 
 #include "update_source_trust_parsers.hpp"
+#include "update_source_trust_legs.hpp"
 
 #include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
@@ -270,7 +272,7 @@ apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulat
     return rows;
 }
 
-/// The rpm/dnf family is DEFERRED (its own PR): no `.repo` file is opened or
+/// The rpm/dnf family is not read yet: no `.repo` file is opened or
 /// parsed and no row is emitted. What this records instead is the fact that the
 /// family exists here but is not yet read -- `linux:rpm_repo:planned` -- when
 /// /etc/yum.repos.d lists at least one entry, so the caller reports constrained
@@ -294,6 +296,21 @@ linux_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumul
     std::vector<std::string> rows = apt_rows_at(root, acc);
     rpm_family_planned_at(root, acc);
     return rows;
+}
+
+/// The production Linux leg body over an INJECTED root: the walk above, then
+/// the one emission seam (report_sources), so the wire status row and the
+/// CC-07 typed status are produced here. run_linux
+/// (update_source_trust_linux.cpp) calls it with "/"; the unit suite drives it
+/// over a fixture tree through a real CommandContext. MUTATION: calling
+/// apt_rows_at instead of linux_rows_at here (dropping the rpm tripwire from
+/// the shipped leg) fails the [seam] cases in
+/// test_update_source_trust_linux_parsers.cpp.
+inline int run_linux_at(yuzu::CommandContext& ctx, const std::filesystem::path& root) {
+    yuzu::shared::ConstraintAccumulator acc;
+    const std::vector<std::string> rows = linux_rows_at(root, acc);
+    report_sources(ctx, rows, acc);
+    return 0;
 }
 
 } // namespace yuzu::update_source_trust::lnx
