@@ -50,8 +50,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/etc/apt/sources.list{,.d/*} (one-line + deb822), /etc/apt/trusted.gpg{,.d/*} and "
          "/etc/apt/keyrings/* config file reads",
-         "rpm/dnf .repo files under /etc/yum.repos.d are not read yet; a host whose "
-         "/etc/yum.repos.d has entries reports constrained linux:rpm_repo:planned"},
+         "rpm/dnf .repo files under /etc/yum.repos.d are not read yet (a host whose "
+         "/etc/yum.repos.d has entries reports constrained linux:rpm_repo:planned); zypper, "
+         "pacman and apk sources are not read, so zero rows there is not evidence of none"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_PLANNED, 1,
          "CFPropertyListCreateWithData over /Library/Preferences and /Library/Managed "

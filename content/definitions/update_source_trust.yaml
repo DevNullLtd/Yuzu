@@ -52,7 +52,9 @@ metadata:
     and not yet read; a Linux host whose /etc/yum.repos.d has entries
     reports a constrained status with linux:rpm_repo:planned instead of rows.
     The macOS Software Update and Windows WSUS legs are planned and not yet
-    read. A leading status row states whether the read was
+    read. Only the apt family is read: on a Linux host whose sources live
+    elsewhere (zypper, pacman, apk) zero rows is not evidence that no
+    sources exist. A leading status row states whether the read was
     complete. The plugin never enforces, fetches or changes anything.
   tags: [security, supply-chain, update-sources, packages]
 
@@ -107,17 +109,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_2
         type: string
-        description: 'status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type.'
+        description: 'status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, and a leg that threw report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, "-" when the plist sets none, or unmodelled for a value of the wrong type.'
         example: deb822
         platforms: [windows, linux, darwin]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (windows:planned on Windows, macos:planned on macOS, linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.'
+        description: 'status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries) or <os>:<state> (windows:planned on Windows, macos:planned on macOS). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.'
         example: deb
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status. Values for booleans: yes, no, unset, unmodelled.'
+        description: 'apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status.'
         example: https://deb.debian.org/debian
         platforms: [linux, darwin]
       - name: field_5
@@ -137,12 +139,12 @@ spec:
         platforms: [linux, darwin]
       - name: field_8
         type: string
-        description: 'apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source). Planned, not emitted today: rpm_repo: baseurl. macos_swu: allow_prerelease.'
+        description: 'apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source; only the apt boolean words are recognised and any other value is unmodelled; unset means the source does not say, not that signatures are enforced). Planned, not emitted today: rpm_repo: baseurl. macos_swu: allow_prerelease.'
         example: unset
         platforms: [linux, darwin]
       - name: field_9
         type: string
-        description: 'apt_source: allow_insecure (yes, no, unset, unmodelled). Planned, not emitted today: rpm_repo: mirror (mirrorlist or metalink) URL.'
+        description: 'apt_source: allow_insecure (yes, no, unset, unmodelled; read from the one-line [allow-insecure=...] option only: apt ignores it in deb822, so it is unset there). Planned, not emitted today: rpm_repo: mirror (mirrorlist or metalink) URL.'
         example: unset
         platforms: [linux]
       - name: field_10
