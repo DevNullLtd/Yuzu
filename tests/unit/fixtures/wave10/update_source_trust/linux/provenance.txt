@@ -4,7 +4,8 @@ for lnx::apt_rows_at / lnx::linux_rows_at: the paths below sit under it exactly 
 on a real host (etc/apt/...). One provenance file for the directory. The rpm/dnf family
 (etc/yum.repos.d) is not read yet, so no rpm capture is kept here.
 
-ALL files are REAL CAPTURES, byte-for-byte, captured 2026-09-21 from command-only Docker
+Every file below (the per-distro subdirectories) is a REAL CAPTURE, byte-for-byte; the only
+hand-written content is the entries of tree.manifest labelled RECONSTRUCTION. Captured 2026-09-21 from command-only Docker
 containers (`docker run --rm <image> tar -C / -cf - <paths>` piped to a local `tar -x`;
 no daemon or package manager was run in the container, so nothing was installed or
 modified). Only the files the plugin reads are kept; the keyring directories carry ONE

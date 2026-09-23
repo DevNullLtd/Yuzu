@@ -3,7 +3,7 @@
  *
  * The macOS Software Update policy read (the local and the MDM-managed
  * com.apple.SoftwareUpdate.plist, decoded in-process with CoreFoundation)
- * follows as its own PR; the descriptor in update_source_trust_plugin.cpp
+ * is not implemented yet; the descriptor in update_source_trust_plugin.cpp
  * declares the leg PLANNED. Until then `sources` on macOS answers with exactly
  * one status row (`status|sources|unsupported|macos:planned`) -- never an empty
  * success. No decision logic lives here, and none is a candidate for a

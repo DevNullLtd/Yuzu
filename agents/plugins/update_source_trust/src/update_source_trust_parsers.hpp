@@ -164,7 +164,8 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
 /// the union of the apt (yes/no/true/false/with/without/on/off/enable/disable/
 /// 1/0) and yum/dnf (1/0/yes/no/true/false/on/off/enabled/disabled)
 /// vocabularies -> yes/no; anything else (including an empty value) ->
-/// unmodelled, never silently coerced.
+/// unmodelled, never silently coerced. The rpm/dnf leg uses this union; the
+/// apt legs use tri_from_apt_value, because apt does not accept the yum words.
 [[nodiscard]] inline Tri tri_from_value(std::optional<std::string_view> v) {
     if (!v)
         return Tri::unset;
@@ -178,9 +179,32 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return Tri::unmodelled;
 }
 
+/// apt's own boolean vocabulary (apt-pkg StringToBool): 1/yes/true/with/on/
+/// enable and 0/no/false/without/off/disable, case-insensitive. The yum/dnf
+/// words `enabled`/`disabled` are NOT apt vocabulary: apt ignores
+/// `Trusted: enabled` and leaves an `Enabled: disabled` source active, so a
+/// value outside this list is `unmodelled` (present, not one apt honours).
+[[nodiscard]] inline Tri tri_from_apt_value(std::optional<std::string_view> v) {
+    if (!v)
+        return Tri::unset;
+    const std::string s = ascii_lower(trim(*v));
+    for (std::string_view t : {"yes", "true", "1", "on", "enable", "with"})
+        if (s == t)
+            return Tri::yes;
+    for (std::string_view t : {"no", "false", "0", "off", "disable", "without"})
+        if (s == t)
+            return Tri::no;
+    return Tri::unmodelled;
+}
+
 /// Replaces the `user[:pass]@` userinfo of every `scheme://authority` in `text`
 /// with `REDACTED@`. Repo definitions routinely embed credentials in baseurl /
-/// URIs; a trust-posture fact must never carry them onto the wire.
+/// URIs; a trust-posture fact must never carry them onto the wire. The
+/// authority ends at the first `/` or whitespace, exactly as apt's URI parser
+/// ends it: a `?` or `#` is a legal character of a password (apt resolves
+/// `http://bob:pa?ss@host/`), so stopping there would leak the tail. The
+/// userinfo is everything up to the LAST `@` of the authority; a query string
+/// containing `@` therefore over-redacts, which is the safe direction.
 [[nodiscard]] inline std::string redact_url_userinfo(std::string_view text) {
     std::string out;
     std::size_t pos = 0;
@@ -193,8 +217,7 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
         const std::size_t auth_start = scheme + 3;
         out.append(text.substr(pos, auth_start - pos));
         std::size_t auth_end = auth_start;
-        while (auth_end < text.size() && text[auth_end] != '/' && text[auth_end] != '?' &&
-               text[auth_end] != '#' && !is_ascii_space(text[auth_end]))
+        while (auth_end < text.size() && text[auth_end] != '/' && !is_ascii_space(text[auth_end]))
             ++auth_end;
         const std::string_view authority = text.substr(auth_start, auth_end - auth_start);
         const std::size_t at = authority.rfind('@');
@@ -209,12 +232,64 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return out;
 }
 
-/// One wire field: "-" when empty, otherwise the untrusted text escaped for the
+/// Length of the well-formed UTF-8 scalar starting at s[i] (1-4), or 0 when the
+/// byte there is NUL or does not start one (stray continuation byte, overlong
+/// form, surrogate, above U+10FFFF, truncated sequence).
+[[nodiscard]] inline std::size_t utf8_scalar_len(std::string_view s, std::size_t i) noexcept {
+    const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+    const auto cont = [&](std::size_t k) { return k < s.size() && (at(k) & 0xC0u) == 0x80u; };
+    const unsigned c = at(i);
+    if (c == 0)
+        return 0;
+    if (c < 0x80)
+        return 1;
+    if (c >= 0xC2 && c <= 0xDF)
+        return cont(i + 1) ? 2 : 0;
+    if (c >= 0xE0 && c <= 0xEF) {
+        if (!cont(i + 1) || !cont(i + 2))
+            return 0;
+        if ((c == 0xE0 && at(i + 1) < 0xA0) || (c == 0xED && at(i + 1) >= 0xA0))
+            return 0; // overlong / UTF-16 surrogate
+        return 3;
+    }
+    if (c >= 0xF0 && c <= 0xF4) {
+        if (!cont(i + 1) || !cont(i + 2) || !cont(i + 3))
+            return 0;
+        if ((c == 0xF0 && at(i + 1) < 0x90) || (c == 0xF4 && at(i + 1) >= 0x90))
+            return 0; // overlong / above U+10FFFF
+        return 4;
+    }
+    return 0;
+}
+
+/// Replaces every byte that may not reach the wire -- NUL (the plugin ABI
+/// carries C strings, so a NUL cuts the row) and anything outside well-formed
+/// UTF-8 (the ABI is UTF-8; an invalid byte makes the whole response
+/// unparseable downstream) -- with '?'. Returns how many bytes were replaced.
+inline std::size_t scrub_wire_bytes(std::string& s) {
+    std::size_t replaced = 0;
+    for (std::size_t i = 0; i < s.size();) {
+        const std::size_t n = utf8_scalar_len(s, i);
+        if (n == 0) {
+            s[i] = '?';
+            ++replaced;
+            ++i;
+        } else {
+            i += n;
+        }
+    }
+    return replaced;
+}
+
+/// One wire field: "-" when empty, otherwise the untrusted text scrubbed of
+/// bytes that cannot cross the plugin ABI (scrub_wire_bytes) and escaped for the
 /// shared server decoder (safe_output_field; lossy on backslash by design).
 [[nodiscard]] inline std::string field(std::string_view v) {
     if (v.empty())
         return "-";
-    return yuzu::util::safe_output_field(v);
+    std::string s{v};
+    scrub_wire_bytes(s);
+    return yuzu::util::safe_output_field(s);
 }
 
 [[nodiscard]] inline std::string url_field(std::string_view v) {
@@ -286,12 +361,58 @@ struct AptParseResult {
     return collapse_ws(raw);
 }
 
+/// Splits on ASCII whitespace like split_ws, except that whitespace inside a
+/// `[...]` group does not split: apt keeps a bracket group inside ONE word
+/// (`cdrom:[Debian GNU/Linux 12 ...]/`, and the `[opt=val ...]` block). An
+/// unterminated `[` runs to the end of the text.
+[[nodiscard]] inline std::vector<std::string_view> split_apt_words(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && is_ascii_space(s[i]))
+            ++i;
+        const std::size_t start = i;
+        int depth = 0;
+        for (; i < s.size(); ++i) {
+            if (s[i] == '[')
+                ++depth;
+            else if (s[i] == ']' && depth > 0)
+                --depth;
+            else if (depth == 0 && is_ascii_space(s[i]))
+                break;
+        }
+        if (i > start)
+            out.push_back(s.substr(start, i - start));
+    }
+    return out;
+}
+
+/// The text before the first `#` that is outside a `[...]` group. apt ends a
+/// line at ANY such `#` (`main#c` is `main`; `http://h/a#b suite main` is a
+/// malformed entry), not only at one preceded by whitespace.
+[[nodiscard]] inline std::string_view strip_apt_comment(std::string_view line) noexcept {
+    int depth = 0;
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '[')
+            ++depth;
+        else if (line[i] == ']' && depth > 0)
+            --depth;
+        else if (line[i] == '#' && depth == 0)
+            return line.substr(0, i);
+    }
+    return line;
+}
+
 /// Parses classic sources.list text (`deb [opt=val ...] uri suite [component...]`).
-/// Whole-line `#` comments and trailing ` #` comments are ignored. Options are
-/// `key=value` tokens inside `[...]` (also `key+=`/`key-=`); only signed-by,
-/// trusted and allow-insecure are surfaced -- every other option, and any
-/// option token without '=', is tolerated and ignored. A line needs a type, a
-/// uri and a suite; an unterminated `[` or too few tokens is malformed.
+/// Comments (whole-line or after an entry, see strip_apt_comment) are ignored.
+/// Options are `key=value` tokens inside `[...]` (also `key+=`/`key-=`); only
+/// signed-by, trusted and allow-insecure are surfaced, and their KEYS are
+/// case-sensitive exactly as in apt (`[Trusted=yes]` is ignored by apt, so it
+/// is ignored here). A `+=`/`-=` on a surfaced key is `unmodelled`: the effective
+/// value depends on earlier options, which this plugin does not evaluate. Every
+/// other option, and any option token without '=', is tolerated and ignored. A
+/// line needs a type, a uri and a suite; an unterminated `[` or too few words
+/// is malformed.
 [[nodiscard]] inline AptParseResult parse_apt_one_line(std::string_view text) {
     AptParseResult res;
     std::size_t pos = 0;
@@ -301,64 +422,50 @@ struct AptParseResult {
             text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
         pos = (nl == std::string_view::npos) ? text.size() + 1 : nl + 1;
 
-        line = trim(line);
-        if (line.empty() || line.front() == '#')
+        line = trim(strip_apt_comment(trim(line)));
+        if (line.empty())
             continue;
-        for (std::size_t i = 1; i < line.size(); ++i) {
-            if (line[i] == '#' && (line[i - 1] == ' ' || line[i - 1] == '\t')) {
-                line = trim(line.substr(0, i));
-                break;
-            }
-        }
 
-        // type token
-        std::size_t p = 0;
-        while (p < line.size() && !is_ascii_space(line[p]) && line[p] != '[')
-            ++p;
-        const std::string_view type_tok = line.substr(0, p);
-        while (p < line.size() && is_ascii_space(line[p]))
-            ++p;
-
+        const auto words = split_apt_words(line);
+        std::size_t next = 1; // index of the uri word
         std::string_view options;
-        if (p < line.size() && line[p] == '[') {
-            const std::size_t close = line.find(']', p);
-            if (close == std::string_view::npos) {
-                ++res.malformed;
+        if (words.size() > 1 && words[1].front() == '[') {
+            if (words[1].size() < 2 || words[1].back() != ']') {
+                ++res.malformed; // unterminated option block
                 continue;
             }
-            options = line.substr(p + 1, close - p - 1);
-            p = close + 1;
+            options = words[1].substr(1, words[1].size() - 2);
+            next = 2;
         }
-        const auto rest = split_ws(line.substr(p));
-        if (type_tok.empty() || rest.size() < 2) {
+        if (words.size() < next + 2) { // type + uri + suite
             ++res.malformed;
             continue;
         }
 
         AptSourceFacts f;
-        f.types = apt_type_token(type_tok);
-        f.uris = std::string{rest[0]};
-        f.suites = std::string{rest[1]};
-        for (std::size_t i = 2; i < rest.size(); ++i) {
+        f.types = apt_type_token(words[0]);
+        f.uris = std::string{words[next]};
+        f.suites = std::string{words[next + 1]};
+        for (std::size_t i = next + 2; i < words.size(); ++i) {
             if (!f.components.empty())
                 f.components += ' ';
-            f.components.append(rest[i]);
+            f.components.append(words[i]);
         }
         for (auto opt : split_ws(options)) {
             const std::size_t eq = opt.find('=');
             if (eq == std::string_view::npos)
                 continue; // tolerated
             std::string_view key = opt.substr(0, eq);
-            while (!key.empty() && (key.back() == '+' || key.back() == '-'))
+            const bool appends = !key.empty() && (key.back() == '+' || key.back() == '-');
+            if (appends)
                 key.remove_suffix(1);
-            const std::string k = ascii_lower(key);
             const std::string_view val = opt.substr(eq + 1);
-            if (k == "signed-by")
-                f.signed_by = apt_signed_by_value(val);
-            else if (k == "trusted")
-                f.trusted = tri_from_value(val);
-            else if (k == "allow-insecure")
-                f.allow_insecure = tri_from_value(val);
+            if (key == "signed-by")
+                f.signed_by = appends ? "unmodelled" : apt_signed_by_value(val);
+            else if (key == "trusted")
+                f.trusted = appends ? Tri::unmodelled : tri_from_apt_value(val);
+            else if (key == "allow-insecure")
+                f.allow_insecure = appends ? Tri::unmodelled : tri_from_apt_value(val);
             // any other option: tolerated, ignored
         }
         res.sources.push_back(std::move(f));
@@ -366,12 +473,16 @@ struct AptParseResult {
     return res;
 }
 
-/// Parses deb822 .sources text: stanzas separated by blank lines; `Field:
-/// value` lines; continuation lines start with space/tab (a lone " ." is a
-/// blank line inside the value); whole-line `#` comments skipped; field names
-/// case-insensitive. A stanza needs Types, URIs and Suites (Components is
-/// optional -- an absolute-path Suites has none); otherwise it, and any
-/// non-field line, is malformed.
+/// Parses deb822 .sources text: stanzas separated by EMPTY lines (a line of
+/// only whitespace is a continuation line for apt, so it does not end a stanza);
+/// `Field: value` lines; continuation lines start with space/tab (a lone " ."
+/// is a blank line inside the value); whole-line `#` comments skipped; field
+/// names case-insensitive; a repeated field keeps its LAST value, as in apt.
+/// Only `Signed-By`, `Trusted` and `Enabled` are surfaced. `Allow-Insecure` is
+/// NOT read: apt ignores it in deb822 (only the one-line `[allow-insecure=yes]`
+/// is honoured), so `allow_insecure` is always `unset` here. A stanza needs
+/// Types, URIs and Suites (Components is optional -- an absolute-path Suites
+/// has none); otherwise it, and any non-field line, is malformed.
 [[nodiscard]] inline AptParseResult parse_apt_deb822(std::string_view text) {
     AptParseResult res;
     using Stanza = std::vector<std::pair<std::string, std::string>>;
@@ -387,7 +498,7 @@ struct AptParseResult {
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
 
-        if (trim(line).empty()) {
+        if (line.empty()) {
             if (!cur.empty())
                 stanzas.push_back(std::move(cur));
             cur.clear();
@@ -445,13 +556,30 @@ struct AptParseResult {
             f.components = collapse_ws(*c);
         if (auto s = get("signed-by"))
             f.signed_by = apt_signed_by_value(*s);
-        f.trusted = tri_from_value(get("trusted"));
-        f.allow_insecure = tri_from_value(get("allow-insecure"));
+        f.trusted = tri_from_apt_value(get("trusted"));
         if (auto e = get("enabled"))
-            f.enabled = tri_from_value(e);
+            f.enabled = tri_from_apt_value(e);
         res.sources.push_back(std::move(f));
     }
     return res;
+}
+
+// ── apt directory file names ─────────────────────────────────────────────
+
+/// apt's own rule for the files of its `*.d` directories (sources.list.d,
+/// trusted.gpg.d; `GetListOfFilesInDir`): hidden names and any name with a
+/// character outside [A-Za-z0-9_.-] are skipped ("bad filenames ala
+/// run-parts"). The walk applies it BEFORE the suffix test so the plugin
+/// reports exactly the files apt itself reads and no phantom sources.
+[[nodiscard]] inline bool apt_dir_name_ok(std::string_view name) noexcept {
+    if (name.empty() || name.front() == '.')
+        return false;
+    for (const char c : name) {
+        const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        if (!alnum && c != '_' && c != '-' && c != '.')
+            return false;
+    }
+    return true;
 }
 
 // ── apt keyrings ─────────────────────────────────────────────────────────

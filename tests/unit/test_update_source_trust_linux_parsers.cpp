@@ -5,7 +5,7 @@
  * update_source_trust_linux_parsers.hpp).
  *
  * WHAT THIS ADDS. test_update_source_trust_parsers.cpp drives the same walk
- * over the per-distro wave-1 capture trees. This TU layers ONE composite root
+ * over the per-distro capture trees. This TU layers ONE composite root
  * on top: tests/unit/fixtures/wave10/update_source_trust/linux/tree.manifest
  * merges a real debian:bookworm deb822 source and a real ubuntu:22.04 one-line
  * sources.list with labelled RECONSTRUCTION entries (a third-party apt source
@@ -47,6 +47,7 @@
 #include <constraint_accumulator.hpp>
 #include <yuzu/plugin.h>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -336,8 +337,9 @@ TEST_CASE("tree.manifest grammar: T/B/F/L payloads, comments and CRLF materialis
         "c/copy.sources\tF:debian-bookworm/etc/apt/sources.list.d/debian.sources\n"
         "d/link\tL:/nonexistent-target\n";
     std::string error;
-    REQUIRE(materialize_tree(manifest, fixture_dir(), dir.path, error));
+    const bool built = materialize_tree(manifest, fixture_dir(), dir.path, error);
     INFO(error);
+    REQUIRE(built);
     // MUTATION: a wrong unescape, a base64 decoder off by one, or F: not reading the
     // committed fixture each change one of these.
     CHECK(slurp(dir.path / "a/t.txt") == "one\ntwo\tx\\y");
@@ -407,8 +409,7 @@ TEST_CASE("apt_rows_at over the composite tree: deb822 + one-line sources with s
     CHECK(rows[15] == "apt_keyring|/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg|"
                       "trusted_gpg_d|binary|1733");
     CHECK(rows[16] == "apt_keyring|/etc/apt/keyrings/thirdparty.gpg|etc_apt_keyrings|binary|4");
-    // MUTATION (an orchestrator probe confirmed the filter half survived before
-    // these lines existed): dropping the trusted.gpg.d .gpg/.asc filter turns
+    // MUTATION: dropping the trusted.gpg.d .gpg/.asc filter turns
     // README and z.txt into two `unmodelled` keyring rows (19 rows; rows[16]
     // shifts); dropping the sources.list.d suffix dispatch parses notes.txt into
     // an 18th apt_source row. The 17 REQUIRE above is the kill for both.
@@ -442,8 +443,7 @@ TEST_CASE("update_source_trust seam: the composite tree reaches the wire as cons
     const auto result = run_leg(t.dir.path);
     CHECK(result.rc == 0); // a degraded read is never a failed command
     const auto rows = captured_rows(result.captured);
-    // MUTATION (an orchestrator probe confirmed it survived before this case
-    // existed): run_linux_at calling apt_rows_at instead of linux_rows_at turns
+    // MUTATION: run_linux_at calling apt_rows_at instead of linux_rows_at turns
     // rows[0] into supported|- and the typed status into OK/FULL.
     REQUIRE(rows.size() == 18); // the status row + the 17 apt rows
     CHECK(rows[0] == "status|sources|constrained|linux:rpm_repo:planned");
@@ -517,10 +517,12 @@ TEST_CASE("a root that does not exist is absent for every family: zero rows, sup
 TEST_CASE("an unreadable root is constrained with a token per source, never absent",
           "[update_source_trust][walk][eacces]") {
     const Tree t;
-    if (::geteuid() == 0)
-        SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
     const PermRestore restore{t.dir.path};
     REQUIRE(::chmod(t.dir.path.c_str(), 0000) == 0);
+    // Probe rather than test the uid: root and CAP_DAC_OVERRIDE both bypass mode 0000.
+    if (const yuzu::agent::ScopedFd probe(::open(t.dir.path.c_str(), O_RDONLY | O_DIRECTORY));
+        probe.valid())
+        SKIP("permission bits are bypassed here (root or CAP_DAC_OVERRIDE)");
 
     yuzu::shared::ConstraintAccumulator acc;
     CHECK(lnx::linux_rows_at(t.dir.path, acc).empty());

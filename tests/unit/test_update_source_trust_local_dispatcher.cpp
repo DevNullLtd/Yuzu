@@ -35,11 +35,12 @@
 #include "local_dispatcher.hpp"
 
 #include "update_source_trust_legs.hpp" // execute_sources (the plugin's whole execute body)
+#if defined(__linux__)
+#include "update_source_trust_linux_parsers.hpp" // lnx::linux_rows_at: the in-process oracle
+#endif
 
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -169,33 +170,6 @@ std::size_t expected_field_count(const std::string& kind) {
     return 0; // unknown (or planned, never emitted) kind
 }
 
-#if defined(__linux__)
-/// A readable, non-symlink regular file (what the leg is documented to read).
-bool readable_regular_file(const fs::path& p) {
-    std::error_code ec;
-    if (fs::is_symlink(fs::symlink_status(p, ec)) || !fs::is_regular_file(p, ec))
-        return false;
-    std::ifstream f(p, std::ios::binary);
-    return static_cast<bool>(f);
-}
-
-std::size_t count_kind(const std::vector<std::string>& rows, std::string_view kind) {
-    std::size_t n = 0;
-    for (const auto& r : rows)
-        if (split_fields_escape_aware(r)[0] == kind)
-            ++n;
-    return n;
-}
-
-/// True when some LINE of the file starts with `prefix`.
-bool file_has_line_starting(const fs::path& p, std::string_view prefix) {
-    std::ifstream f(p, std::ios::binary);
-    std::string text = "\n";
-    text.append(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-    return text.find("\n" + std::string{prefix}) != std::string::npos;
-}
-#endif
-
 /// The execute-seam probes: a leg that throws, run through the production
 /// execute_sources exactly as the plugin TU wires its host leg.
 int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
@@ -262,26 +236,22 @@ TEST_CASE("update_source_trust plugin: status row first, agrees with the typed r
         CHECK_FALSE(result.result_provenance.empty()); // the reason travels with the status
     }
 
-    // The rpm-family tripwire, two-sided on whatever THIS host is: a populated
-    // /etc/yum.repos.d must surface as `linux:rpm_repo:planned` (the deferred
-    // family never reads as absent) and its absence must not. This is the one
-    // assertion that reaches run_linux -> "/" in the built .so. MUTATION: the leg
-    // dropping the tripwire fails the first arm on an rpm host; an unconditional
-    // token fails the second on every Debian/Ubuntu runner.
-    std::error_code yum_ec;
-    bool yum_has_entries = false;
-    for (const auto& entry : fs::directory_iterator("/etc/yum.repos.d", yum_ec)) {
-        (void)entry;
-        yum_has_entries = true;
-        break;
-    }
-    const bool planned = status[3].find("linux:rpm_repo:planned") != std::string::npos;
-    if (yum_has_entries) {
-        CHECK(status[2] == "constrained");
-        CHECK(planned);
-    } else {
-        CHECK_FALSE(planned);
-    }
+    // The shipped root wiring, observed on whatever THIS host is. The oracle is the
+    // SAME walk body run in-process over the host's real root: the built .so's
+    // run_linux -> "/" must report exactly what lnx::linux_rows_at("/") reports
+    // here -- deb822-only hosts (Debian 13, Ubuntu 24.04), one-line hosts, rpm
+    // hosts (`linux:rpm_repo:planned`) and hosts with neither. MUTATIONS: a leg
+    // walking another root fails the row comparison wherever apt config exists;
+    // dropping the rpm tripwire fails the state/token comparison on an rpm host;
+    // an unconditional token fails it everywhere else.
+    yuzu::shared::ConstraintAccumulator oracle;
+    const auto oracle_rows = yuzu::update_source_trust::lnx::linux_rows_at("/", oracle);
+    CHECK((status[2] == "constrained") == oracle.any_failure());
+    CHECK(status[3] == (oracle.any_failure() ? oracle.reason() : std::string{"-"}));
+    const std::vector<std::string> data_rows(rows.begin() + 1, rows.end());
+    CHECK(data_rows == oracle_rows);
+    if (oracle_rows.empty() && !oracle.any_failure())
+        WARN("no apt or yum configuration on this host: the shipped root wiring was not exercised");
 #endif
 }
 
@@ -311,41 +281,6 @@ TEST_CASE("update_source_trust plugin: every data row has its kind's exact field
 #endif
     }
 }
-
-#if defined(__linux__)
-TEST_CASE("update_source_trust plugin (Linux): readable trust inputs on this host produce their rows",
-          "[update_source_trust][dispatcher]") {
-    auto plugin = load_plugin();
-    if (!plugin) {
-        require_plugin_or_skip();
-        return;
-    }
-    yuzu::agent::LocalDispatcher dispatcher;
-    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "sources").captured);
-    REQUIRE_FALSE(rows.empty());
-    const auto status = split_fields_escape_aware(rows[0]);
-    REQUIRE(status.size() == 4);
-    if (status[2] != "supported")
-        SKIP("leg reported constrained on this host; populated-row assertions need a clean read");
-
-    // Each assertion is guarded on THIS host having the input the leg reads
-    // (a readable, non-symlink regular file with content); a host without it
-    // asserts nothing about that family. Populated rows on injected trees are
-    // pinned in test_update_source_trust_linux_parsers.cpp.
-    std::size_t asserted = 0;
-    if (readable_regular_file("/etc/apt/trusted.gpg")) {
-        ++asserted;
-        CHECK(count_kind(rows, "apt_keyring") >= 1);
-    }
-    if (readable_regular_file("/etc/apt/sources.list") &&
-        file_has_line_starting("/etc/apt/sources.list", "deb ")) {
-        ++asserted;
-        CHECK(count_kind(rows, "apt_source") >= 1);
-    }
-    if (asserted == 0)
-        WARN("no known apt trust input on this host; only row shape was asserted");
-}
-#endif
 
 TEST_CASE("update_source_trust plugin: an unknown action is refused, not silently ignored",
           "[update_source_trust][dispatcher]") {

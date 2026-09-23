@@ -17,19 +17,39 @@
  * root-prefixed one. There is no subprocess of any kind
  * (scripts/ci/check-plugin-spawn-lexical.sh).
  *
- * HARDENING. Files and directories are opened with O_NOFOLLOW (a symlink leaf
- * is refused and reported as `symlink_refused`, never followed). Files also get
- * O_NONBLOCK so a writer-less FIFO cannot block open() before the regular-file
- * check rejects it as `not_regular`. File reads are capped at 1 MiB (same cap as
- * autoruns_macos.cpp's kMaxPlistBytes; an oversized file is `oversized`, never
- * silently truncated -- a truncated parse could drop later sources; a file that
- * shrinks mid-read is `short_read`). Directory listings go through
- * yuzu::shared::walk_dir_capped, and directory_iterator is never used.
+ * HARDENING. Files and directories are opened with O_NOFOLLOW: a symlink as the
+ * FINAL path component is refused, never followed (`symlink_refused` for a
+ * file; a symlinked directory fails the O_DIRECTORY open with `not_a_directory`
+ * on Linux). Intermediate directories resolve normally, as they do for apt
+ * itself. Files also get O_NONBLOCK so a writer-less FIFO cannot block open()
+ * before the regular-file check rejects it as `not_regular`. File reads are
+ * capped at 1 MiB (same cap as autoruns_macos.cpp's kMaxPlistBytes; an oversized
+ * file is `oversized`, never silently truncated -- a truncated parse could drop
+ * later sources; a file that shrinks mid-read is `short_read`). Directory
+ * listings go through yuzu::shared::walk_dir_capped, and directory_iterator is
+ * never used.
  *
  * OUTPUT BUDGET. The rows of one whole walk share a single 1 MiB budget
  * (kMaxOutputBytes): the per-file and per-directory caps bound each read, not
  * their sum. Past it the newest rows are dropped, no further file is read and
- * `output_cap` is recorded.
+ * `output_cap` is recorded. It bounds the rows KEPT, not the work of reading
+ * them: each file is parsed transiently (at most 1 MiB of text, the rows of one
+ * file exist before the trim), and a walk may still read every file of a
+ * 1,024-entry directory.
+ *
+ * FILES apt READS. Names in sources.list.d and trusted.gpg.d must pass apt's own
+ * filter (apt_dir_name_ok: not hidden, only [A-Za-z0-9_.-]) before the suffix
+ * test, so the plugin reports the files apt reads and no phantom sources.
+ *
+ * WIRE SAFETY. File text and names are OS-supplied bytes. Any NUL or byte outside
+ * well-formed UTF-8 is replaced with '?' (scrub_wire_bytes) and recorded as
+ * `invalid_bytes`: a NUL would cut the row at the C-string ABI and an invalid
+ * byte makes the whole response unparseable downstream.
+ *
+ * STABLE READS. A file is read between two fstat calls on the same fd; a changed
+ * size or mtime means an in-place writer raced the read, which is recorded as
+ * `modified_during_read` (an emptied-then-rewritten sources.list must not read as
+ * "no sources").
  *
  * FAILURE NEVER READS AS ABSENT. Every non-ENOENT open/read/list failure, an
  * entry-cap truncation, a listing I/O error and an unparseable entry is a token
@@ -88,6 +108,31 @@ inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 
 enum class Outcome { ok, absent, failed };
 
+/// (size, mtime) of an open file: what two fstat calls on one fd are compared by.
+struct FileStamp {
+    std::uint64_t size = 0;
+    std::int64_t mtime_ns = 0;
+    friend bool operator==(const FileStamp&, const FileStamp&) = default;
+};
+
+[[nodiscard]] inline FileStamp stamp_of(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    const timespec& ts = st.st_mtimespec;
+#else
+    const timespec& ts = st.st_mtim;
+#endif
+    return {static_cast<std::uint64_t>(st.st_size),
+            static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000LL +
+                static_cast<std::int64_t>(ts.tv_nsec)};
+}
+
+/// The default `after_read` hook of read_file: does nothing. The unit suite passes
+/// a hook that rewrites the file between the read and the second fstat, the only
+/// deterministic way to observe the stability check.
+struct NoHook {
+    void operator()() const noexcept {}
+};
+
 /// Records `<source_prefix>:<detail>` (e.g. "linux:apt_sources:permission_denied").
 inline void note_failure(yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix,
                          std::string_view detail) {
@@ -114,10 +159,14 @@ inline void note_failure(yuzu::shared::ConstraintAccumulator& acc, std::string_v
 /// reads at most `cap` leading bytes of a file of ANY size (keyring sniffing);
 /// otherwise a file larger than `cap` is `oversized`. `size_bytes` is the
 /// file's full size from fstat. ENOENT -> absent (no token); anything else
-/// (including a non-regular file and a short read) -> a token and `failed`.
+/// (including a non-regular file, a short read and a file rewritten while it was
+/// read) -> a token and `failed`. `after_read` runs once, after the bytes are
+/// read and before the closing fstat (test seam, see NoHook).
+template <class AfterRead = NoHook>
 inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, bool head_only,
                          std::string& out, std::uint64_t& size_bytes,
-                         yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix) {
+                         yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix,
+                         AfterRead&& after_read = AfterRead{}) {
     // O_NONBLOCK: open(2) of a writer-less FIFO blocks forever otherwise, before
     // the S_ISREG guard below can reject it. It is a no-op for regular files.
     yuzu::agent::ScopedFd fd(
@@ -162,6 +211,19 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
             return Outcome::failed;
         }
         total += static_cast<std::size_t>(n);
+    }
+    after_read();
+    struct stat after{};
+    if (::fstat(fd.get(), &after) != 0) {
+        note_failure(acc, source_prefix, errno_detail(errno, IoStage::read_file));
+        return Outcome::failed;
+    }
+    if (stamp_of(after) != stamp_of(st)) {
+        // An in-place writer (truncate + write) raced the read: what was read may
+        // be an empty or torn file, and an empty sources.list is normal on a host
+        // with no apt sources, so it must not read as one.
+        note_failure(acc, source_prefix, "modified_during_read");
+        return Outcome::failed;
     }
     return Outcome::ok;
 }
@@ -240,6 +302,8 @@ inline bool add_apt_file(const std::filesystem::path& root, const std::string& l
     if (pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false, data, size, acc,
                        kAptSourcesPrefix) != pio::Outcome::ok)
         return true; // this file failed (token recorded); the walk goes on
+    if (scrub_wire_bytes(data) != 0)
+        pio::note_failure(acc, kAptSourcesPrefix, "invalid_bytes");
     if (apt_rows_from_text(logical, fmt, data, rows) != 0)
         pio::note_failure(acc, kAptSourcesPrefix, "unparsed_entry");
     return within_output_budget(rows, acc, kAptSourcesPrefix);
@@ -253,6 +317,10 @@ inline bool add_keyring_file(const std::filesystem::path& root, const std::strin
     if (pio::read_file(pio::under(root, logical), pio::kKeyringHeadBytes, true, head, size, acc,
                        kAptKeyringPrefix) != pio::Outcome::ok)
         return true;
+    // The row's path field is scrubbed by format_apt_keyring_row; the name only
+    // needs the constraint (a /etc/apt/keyrings name is not filtered like apt's *.d).
+    if (std::string shown = logical; scrub_wire_bytes(shown) != 0)
+        pio::note_failure(acc, kAptKeyringPrefix, "invalid_bytes");
     rows.push_back(format_apt_keyring_row(logical, scope, sniff_keyring(head), size));
     return within_output_budget(rows, acc, kAptKeyringPrefix);
 }
@@ -266,7 +334,7 @@ inline bool add_keyring_dir(const std::filesystem::path& root, std::string_view 
         pio::Outcome::failed)
         return true;
     for (const auto& n : names) {
-        if (gpg_asc_only && !pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))
+        if (gpg_asc_only && (!apt_dir_name_ok(n) || (!pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))))
             continue; // apt itself ignores every other name in trusted.gpg.d
         if (!add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc))
             return false;
@@ -297,8 +365,8 @@ apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulat
         pio::Outcome::failed) {
         for (const auto& n : names) {
             const bool deb822 = pio::ends_with(n, ".sources");
-            if (!deb822 && !pio::ends_with(n, ".list"))
-                continue;
+            if (!apt_dir_name_ok(n) || (!deb822 && !pio::ends_with(n, ".list")))
+                continue; // apt skips hidden and oddly named files and any other suffix
             if (!detail::add_apt_file(root, std::string{kListDir} + '/' + n,
                                       deb822 ? AptFormat::deb822 : AptFormat::one_line, rows, acc))
                 return rows;

@@ -11,7 +11,9 @@
  *
  * Each entry point is a READ and returns 0 unconditionally: a degraded read is
  * not a failed command, and the degradation is reported through the leading
- * `status|sources|...` row AND set_result_status (the two always agree). Only
+ * `status|sources|...` row AND set_result_status, written together so they agree.
+ * (If write_output itself throws mid-emission, execute_sources contains it and
+ * appends an `unsupported` row + UNAVAILABLE, so the LAST status row wins.) Only
  * the DEFINITION is self-gated (each leg .cpp wraps its own body in
  * `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin TU calls only the
  * host leg under the same #if -- a single-OS build never needs the other
