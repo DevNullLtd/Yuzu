@@ -73,20 +73,6 @@ std::vector<std::string> split_wire(const std::string& row) {
 
 // ── tri mapping ──────────────────────────────────────────────────────────
 
-TEST_CASE("tri_from_value: absent is unset, known tokens map, the rest is unmodelled",
-          "[update_source_trust][parsers]") {
-    CHECK(ust::tri_from_value(std::nullopt) == ust::Tri::unset);
-    for (std::string_view v : {"yes", "YES", "true", "1", "on", "enabled", " 1 "})
-        CHECK(ust::tri_from_value(v) == ust::Tri::yes);
-    for (std::string_view v : {"no", "No", "false", "0", "off", "disabled"})
-        CHECK(ust::tri_from_value(v) == ust::Tri::no);
-    // Present-but-unrecognised is NOT absent and is NOT coerced.
-    for (std::string_view v : {"maybe", "", "2", "ye"})
-        CHECK(ust::tri_from_value(v) == ust::Tri::unmodelled);
-    CHECK(ust::tri_token(ust::Tri::unmodelled) == "unmodelled");
-    CHECK(ust::tri_token(ust::Tri::unset) == "unset");
-}
-
 TEST_CASE("tri_from_apt_value is apt's vocabulary: the yum words are not apt tokens",
           "[update_source_trust][parsers]") {
     CHECK(ust::tri_from_apt_value(std::nullopt) == ust::Tri::unset);
@@ -96,9 +82,11 @@ TEST_CASE("tri_from_apt_value is apt's vocabulary: the yum words are not apt tok
         CHECK(ust::tri_from_apt_value(v) == ust::Tri::no);
     // apt ignores `Trusted: enabled` and keeps an `Enabled: disabled` source active
     // (both verified on apt 3.0.3), so neither is a yes/no here. MUTATION: the
-    // shared union vocabulary reads them as yes and no.
-    for (std::string_view v : {"enabled", "disabled", "maybe", ""})
+    // yum vocabulary reads them as yes and no.
+    for (std::string_view v : {"enabled", "disabled", "maybe", "", "2", "ye"})
         CHECK(ust::tri_from_apt_value(v) == ust::Tri::unmodelled);
+    CHECK(ust::tri_token(ust::Tri::unmodelled) == "unmodelled");
+    CHECK(ust::tri_token(ust::Tri::unset) == "unset");
 }
 
 // ── redaction / escaping ─────────────────────────────────────────────────
@@ -123,6 +111,35 @@ TEST_CASE("redact_url_userinfo strips credentials from every URL in a list",
     CHECK(ust::redact_url_userinfo("http://u:p@ss@h.example/x") == "http://REDACTED@h.example/x");
     // A '@' in a query string over-redacts (the safe direction).
     CHECK(ust::redact_url_userinfo("http://h.example?x=a@b") == "http://REDACTED@b");
+    // apt's own URI split (URI::CopyFrom), verified on apt 2.6-3.0: a scheme with no
+    // "//", a '/' inside `[...]` (the authority ends at the first '/' OUTSIDE it), a
+    // backslash, and a percent-encoded scheme all resolve the host after the LAST
+    // '@'. MUTATION: requiring "://" or ending the authority at any '/' leaks each.
+    CHECK(ust::redact_url_userinfo("http:bob:SEKRET@127.0.0.9:9/apt") ==
+          "http:REDACTED@127.0.0.9:9/apt");
+    CHECK(ust::redact_url_userinfo("http://u:p[/]SEKRET@127.0.0.20:9/apt") ==
+          "http://REDACTED@127.0.0.20:9/apt");
+    CHECK(ust::redact_url_userinfo("http://user:[s3/cr3t]@h.example/y") ==
+          "http://REDACTED@h.example/y");
+    CHECK(ust::redact_url_userinfo("http:\\u:SEKRET@127.0.0.9:9/apt") ==
+          "http:REDACTED@127.0.0.9:9/apt");
+    CHECK(ust::redact_url_userinfo("http%3a//u:SEKRET@h.example/x") == "http://REDACTED@h.example/x");
+    CHECK(ust::redact_url_userinfo("http%3A%2F%2Fu:secretpw@h.example/x") ==
+          "http://REDACTED@h.example/x");
+    // Not userinfo: a cdrom label, an IPv6 authority and an '@' in a path stay.
+    CHECK(ust::redact_url_userinfo("cdrom:[Debian GNU/Linux 12 DVD 1]/") ==
+          "cdrom:[Debian GNU/Linux 12 DVD 1]/");
+    CHECK(ust::redact_url_userinfo("http://[::1]:8080/x") == "http://[::1]:8080/x");
+    CHECK(ust::redact_url_userinfo("http://h.example/a@b") == "http://h.example/a@b");
+    // Each word of a list is split on its own; the credential may sit in a LATER
+    // word after a URL that has no '/' (only the whitespace ends its authority).
+    CHECK(ust::redact_url_userinfo("http://a.example http://u:p@b.example/x") ==
+          "http://a.example http://REDACTED@b.example/x");
+    // A replaced byte can create a URL shape apt never saw (`http:<NUL>//u:pw@h/`),
+    // so url_field drops everything up to the last '@' of any word it had to scrub.
+    const std::string poisoned("http:\0//u:pw@h.example/x", sizeof("http:\0//u:pw@h.example/x") - 1);
+    CHECK(ust::url_field(poisoned).find("pw") == std::string::npos);
+    CHECK(ust::url_field(std::string("http://a.example/x\xff")) == "http://a.example/x?");
 }
 
 // ── apt one-line ─────────────────────────────────────────────────────────
@@ -136,7 +153,7 @@ TEST_CASE("parse_apt_one_line: types, options, comments, unknown options tolerat
         "deb [arch=amd64 signed-by=/usr/share/keyrings/docker.gpg] "
         "https://download.docker.com/linux/ubuntu jammy stable\n"
         "deb [trusted=yes allow-insecure=no] http://repo.local/ ./\n"
-        "deb [ arch+=i386 weird lang=en ] http://x.example/ y main # trailing comment\n"
+        "deb [ arch+=i386 lang=en ] http://x.example/ y main # trailing comment\n"
         "\n");
     REQUIRE(r.sources.size() == 5);
     CHECK(r.malformed == 0);
@@ -160,8 +177,8 @@ TEST_CASE("parse_apt_one_line: types, options, comments, unknown options tolerat
     CHECK(r.sources[3].suites == "./");
     CHECK(r.sources[3].components.empty());
 
-    // Unknown option keys, a bare option token and a `key+=` operator are
-    // tolerated; the trailing comment is not part of the components.
+    // Unknown option keys and a `key+=` operator are tolerated; the trailing
+    // comment is not part of the components.
     CHECK(r.sources[4].uris == "http://x.example/");
     CHECK(r.sources[4].suites == "y");
     CHECK(r.sources[4].components == "main");
@@ -178,13 +195,24 @@ TEST_CASE("parse_apt_one_line: unterminated options and short lines are malforme
     CHECK(r.sources[0].uris == "http://ok.example/");
 }
 
-TEST_CASE("parse_apt_one_line: an unrecognised type and a garbled trusted value are unmodelled",
+TEST_CASE("parse_apt_one_line: a garbled trusted value is unmodelled; entries apt refuses are malformed",
           "[update_source_trust][parsers][apt]") {
-    const auto r = ust::parse_apt_one_line("rpm http://x.example/ y main\n"
-                                           "deb [trusted=maybe] http://y.example/ z main\n");
-    REQUIRE(r.sources.size() == 2);
-    CHECK(r.sources[0].types == "unmodelled");
-    CHECK(r.sources[1].trusted == ust::Tri::unmodelled);
+    const auto r = ust::parse_apt_one_line(
+        "deb [trusted=maybe] http://y.example/ z main\n" // one source
+        "rpm http://a.example/ y main\n"                 // unknown type
+        "DEB http://b.example/ y main\n"                 // type is case-sensitive
+        "deb[arch=amd64] http://c.example/ y main\n"     // glued option block
+        "deb [foo] http://d.example/ y main\n"           // option without '='
+        "deb [trusted = yes] http://e.example/ y main\n" // spaces around '='
+        "deb [a=b] [c=d] http://f.example/ y main\n"     // a second block
+        "deb [%74rusted=yes] http://g.example/ y main\n" // apt de-quotes %XX
+        "deb \"http://h.example/a b\" y main\n"          // quoted word
+        "\xef\xbb\xbf" "deb http://i.example/ y main\n");  // a BOM before the type
+    REQUIRE(r.sources.size() == 1);
+    CHECK(r.sources[0].trusted == ust::Tri::unmodelled);
+    // apt refuses each of these (verified on apt 3.0.3); reporting a row for one
+    // would show a source apt does not use. MUTATION: dropping a refuse rule emits it.
+    CHECK(r.malformed == 9);
 }
 
 // ── apt deb822 ───────────────────────────────────────────────────────────
@@ -274,7 +302,7 @@ TEST_CASE("parse_apt_one_line follows apt: bracket words, comments, option keys,
         "deb [Trusted=yes Signed-By=/k.gpg] http://c.example/d stable main\n"               // 2
         "deb [trusted=enabled] http://d.example/d stable main\n"                            // 3
         "deb [signed-by=/a.gpg signed-by+=/b.gpg trusted-=yes] http://e.example/d s main\n" // 4
-        "deb[arch=amd64] http://f.example/d stable main\n");                                // 5
+        "deb [arch=amd64] http://f.example/d stable main\n");                               // 5
     REQUIRE(r.sources.size() == 6);
     CHECK(r.malformed == 1); // a '#' ends the line, so the URI-with-fragment entry has no suite
     // MUTATION: splitting on whitespace inside `[...]` shifts uris/suites/components.
@@ -289,8 +317,7 @@ TEST_CASE("parse_apt_one_line follows apt: bracket words, comments, option keys,
     // `+=` / `-=` on a surfaced key depends on earlier options: reported, not guessed.
     CHECK(r.sources[4].signed_by == "unmodelled");
     CHECK(r.sources[4].trusted == ust::Tri::unmodelled);
-    // apt refuses `deb[arch=amd64]` (unknown type), so it is not a `deb` source.
-    CHECK(r.sources[5].types == "unmodelled");
+    CHECK(r.sources[5].types == "deb");
 }
 
 TEST_CASE("parse_apt_deb822 follows apt: whitespace-only line, Allow-Insecure, vocabulary, last wins",
@@ -322,12 +349,17 @@ TEST_CASE("parse_apt_deb822 follows apt: whitespace-only line, Allow-Insecure, v
 
 TEST_CASE("apt_dir_name_ok is apt's own file-name rule for its *.d directories",
           "[update_source_trust][parsers][apt]") {
-    for (std::string_view ok : {"debian.sources", "docker.list", "a_b-c.1.gpg", "X9.asc"})
+    // apt reads exactly [A-Za-z0-9_.:-] here (an all-bytes sweep on apt 2.2-3.2):
+    // the colon is legal, so `docker:ce.list` is a source.
+    for (std::string_view ok : {"debian.sources", "docker.list", "a_b-c.1.list", "X9.list", "zZ0.list",
+                                "a.list", "9.list", "docker:ce.list", "a:.list"})
         CHECK(ust::apt_dir_name_ok(ok));
-    // Hidden, spaces, '+', '~', non-ASCII and the empty name are skipped by apt
-    // (verified against apt 3.0.3). MUTATION: suffix-only selection reports them.
+    // Hidden, spaces, '+', '~', '@', brackets, backtick, DEL, control bytes,
+    // non-ASCII and the empty name are skipped. MUTATION: suffix-only selection
+    // reports them; a range off by one in the alphanumeric test admits `a@`/`a[`.
     for (std::string_view bad : {"", ".hidden.list", "my repo.list", "plus+.list", "tilde~.list",
-                                 "caf\xc3\xa9.list", "a:b.list", "back\\slash.list"})
+                                 "caf\xc3\xa9.list", "back\\slash.list", "a@.list", "a[.list",
+                                 "a`.list", "a{.list", "a/b.list", "a\x7f.list", "a\x01.list"})
         CHECK_FALSE(ust::apt_dir_name_ok(bad));
 }
 
@@ -362,6 +394,69 @@ TEST_CASE("scrub_wire_bytes and field: NUL and non-UTF-8 never reach the wire",
     REQUIRE(fields.size() == 11);
     CHECK(fields[4] == "http://a.example/x?y");
     CHECK(fields[8] == "yes"); // the trust columns behind the NUL survive
+}
+
+TEST_CASE("scrub_wire_bytes accepts exactly RFC 3629 (boundaries of every lead-byte range)",
+          "[update_source_trust][parsers][wire]") {
+    // The sole guard for a response the receiver would reject whole: each boundary of
+    // the table, valid and one step past it. MUTATION: any loosened lead range or
+    // continuation check flips one of these.
+    for (std::string_view ok : {std::string_view("\xc2\x80"), std::string_view("\xdf\xbf"),
+                                std::string_view("\xe0\xa0\x80"), std::string_view("\xed\x9f\xbf"),
+                                std::string_view("\xef\xbf\xbd"), std::string_view("\xf0\x90\x80\x80"),
+                                std::string_view("\xf4\x8f\xbf\xbf")}) {
+        std::string t{ok};
+        CHECK(ust::scrub_wire_bytes(t) == 0);
+        CHECK(t == ok);
+    }
+    for (std::string_view bad : {std::string_view("\xc1\xbf"), std::string_view("\xe0\x9f\xbf"),
+                                 std::string_view("\xf0\x8f\xbf\xbf"), std::string_view("\xf5\x80\x80\x80"),
+                                 std::string_view("\xe2\x28\xa1"), std::string_view("\xf1\x28\x80\x80"),
+                                 std::string_view("\xf0\x9f\x28\x8c"), std::string_view("\xc3\x28"),
+                                 std::string_view("\xc3\xc3"), std::string_view("\xe2\x82\xe2"),
+                                 std::string_view("\xf0\x9f\x98"), std::string_view("\xc3")}) {
+        std::string t{bad};
+        CHECK(ust::scrub_wire_bytes(t) > 0);
+        CHECK(ust::count_invalid_wire_bytes(bad) > 0);
+        for (const char c : t)
+            CHECK(static_cast<unsigned char>(c) < 0x80);
+    }
+}
+
+TEST_CASE("parse_apt_one_line: '#' inside [...] is not a comment, a stray ']' is a plain character, allow-insecure follows trusted",
+          "[update_source_trust][parsers][apt]") {
+    const auto r = ust::parse_apt_one_line(
+        "deb [signed-by=/etc/apt/k#1.gpg] http://a.example/ s main\n"
+        "deb cdrom:[Disc #1]/ bookworm main\n"
+        "deb http://c.example/d] stable main\n"
+        "deb [allow-insecure+=yes] http://d.example/ s main\n"
+        "deb [allow-insecure=enabled] http://e.example/ s main\n"
+        "deb [Allow-Insecure=yes] http://f.example/ s main\n"
+        "deb [allow-insecure=YES] http://g.example/ s main\n");
+    CHECK(r.malformed == 0);
+    REQUIRE(r.sources.size() == 7);
+    CHECK(r.sources[0].signed_by == "/etc/apt/k#1.gpg");
+    CHECK(r.sources[1].uris == "cdrom:[Disc #1]/");
+    CHECK(r.sources[2].uris == "http://c.example/d]");
+    CHECK(r.sources[3].allow_insecure == ust::Tri::unmodelled); // `+=`
+    CHECK(r.sources[4].allow_insecure == ust::Tri::unmodelled); // a yum word
+    CHECK(r.sources[5].allow_insecure == ust::Tri::unset);      // option keys are case-sensitive
+    CHECK(r.sources[6].allow_insecure == ust::Tri::yes);
+}
+
+TEST_CASE("parse_apt_deb822: CRLF stanzas separate on the empty line, and a whitespace-only line before any field is not an entry",
+          "[update_source_trust][parsers][apt]") {
+    // Since only an EMPTY line ends a stanza, the CR strip is what makes "\r\n" one.
+    const auto r = ust::parse_apt_deb822("Types: deb\r\nURIs: http://a.example/\r\nSuites: s\r\n\r\n"
+                                         "Types: deb\r\nURIs: http://b.example/\r\nSuites: t\r\n");
+    CHECK(r.malformed == 0);
+    REQUIRE(r.sources.size() == 2);
+    CHECK(r.sources[1].suites == "t");
+    // apt reads these cleanly (verified on apt 3.0.3), so they are not malformed entries.
+    const auto lead = ust::parse_apt_deb822("   \nTypes: deb\nURIs: http://a.example/\nSuites: s\n"
+                                            "\n \t \nTypes: deb\nURIs: http://b.example/\nSuites: t\n \n");
+    CHECK(lead.malformed == 0);
+    CHECK(lead.sources.size() == 2);
 }
 
 // ── rows: exact wire text ────────────────────────────────────────────────
@@ -707,29 +802,36 @@ TEST_CASE("the rows of one walk share a budget: output_cap, newest rows dropped,
     CHECK(acc.incomplete());
 }
 
-TEST_CASE("only the files apt itself reads are reported: hidden and oddly named files are skipped",
+TEST_CASE("sources are the files apt itself reads; keyrings are selected by suffix, never by name",
           "[update_source_trust][walk][apt]") {
     const TempRoot root;
     const std::string src = "deb http://x.example/ y main\n";
-    // sources.list.d: two names apt reads, five it skips (verified on apt 3.0.3).
-    for (const char* name : {"ok.list", ".hidden.list", "my repo.list", "plus+.list", "tilde~.list",
-                             "caf\xc3\xa9.list", "notes.txt"})
+    const std::string deb822 = "Types: deb\nURIs: http://y.example/\nSuites: z\n";
+    // sources.list.d: names apt reads (`ok`, and `a:b` because ':' is legal) versus names
+    // it skips (hidden, space, '+', '~', non-ASCII), in BOTH formats (verified on apt 3.0.3).
+    for (const char* name : {"ok.list", "a:b.list", ".hidden.list", "my repo.list", "plus+.list",
+                             "tilde~.list", "caf\xc3\xa9.list", "notes.txt"})
         root.write(std::string("etc/apt/sources.list.d/") + name, src);
-    root.write("etc/apt/sources.list.d/ok.sources",
-               "Types: deb\nURIs: http://y.example/\nSuites: z\n");
-    // trusted.gpg.d: same helper in apt; keyrings/ is not scanned by apt, so no filter.
+    for (const char* name : {"ok.sources", ".hidden.sources", "my repo.sources", "plus+.sources"})
+        root.write(std::string("etc/apt/sources.list.d/") + name, deb822);
+    // trusted.gpg.d: apt before 3.0 trusts a key under ANY name ending .gpg/.asc
+    // (verified against real signed repos on apt 2.0-2.8), so nothing is filtered by name.
     for (const char* name : {"good.gpg", ".hid.gpg", "b ad.gpg", "we+ird.asc"})
         root.write(std::string("etc/apt/trusted.gpg.d/") + name, "\x99\x01");
     root.write("etc/apt/keyrings/any name.txt", "text");
     yuzu::shared::ConstraintAccumulator acc;
     const auto rows = lnx::apt_rows_at(root.path, acc);
-    // MUTATION: selecting by suffix alone reports the five phantom sources and
-    // the two phantom global keyrings.
-    REQUIRE(rows.size() == 4);
-    CHECK(rows[0].find("/etc/apt/sources.list.d/ok.list|") != std::string::npos);
-    CHECK(rows[1].find("/etc/apt/sources.list.d/ok.sources|") != std::string::npos);
-    CHECK(rows[2] == "apt_keyring|/etc/apt/trusted.gpg.d/good.gpg|trusted_gpg_d|binary|2");
-    CHECK(rows[3] == "apt_keyring|/etc/apt/keyrings/any name.txt|etc_apt_keyrings|unmodelled|4");
+    // MUTATION: suffix-only source selection reports the seven phantom sources; a name
+    // filter on trusted.gpg.d hides three global trust anchors; a filter without ':' hides a:b.
+    REQUIRE(rows.size() == 8);
+    CHECK(rows[0].find("/etc/apt/sources.list.d/a:b.list|") != std::string::npos);
+    CHECK(rows[1].find("/etc/apt/sources.list.d/ok.list|") != std::string::npos);
+    CHECK(rows[2].find("/etc/apt/sources.list.d/ok.sources|") != std::string::npos);
+    CHECK(rows[3] == "apt_keyring|/etc/apt/trusted.gpg.d/.hid.gpg|trusted_gpg_d|binary|2");
+    CHECK(rows[4] == "apt_keyring|/etc/apt/trusted.gpg.d/b ad.gpg|trusted_gpg_d|binary|2");
+    CHECK(rows[5] == "apt_keyring|/etc/apt/trusted.gpg.d/good.gpg|trusted_gpg_d|binary|2");
+    CHECK(rows[6] == "apt_keyring|/etc/apt/trusted.gpg.d/we+ird.asc|trusted_gpg_d|binary|2");
+    CHECK(rows[7] == "apt_keyring|/etc/apt/keyrings/any name.txt|etc_apt_keyrings|unmodelled|4");
     CHECK_FALSE(acc.any_failure());
 }
 
@@ -763,7 +865,8 @@ TEST_CASE("NUL and invalid UTF-8 in a sources file are replaced and reported, th
           "[update_source_trust][walk][fault]") {
     const TempRoot root;
     root.write("etc/apt/sources.list",
-               std::string("deb [trusted=yes] http://a.example/x stable ma\0in universe\n", 58));
+               std::string("deb [trusted=yes] http://a.example/x stable ma\0in universe\n",
+                           sizeof("deb [trusted=yes] http://a.example/x stable ma\0in universe\n") - 1));
     root.write("etc/apt/sources.list.d/b.list", "deb http://b.example/\xff stable main\n");
     yuzu::shared::ConstraintAccumulator acc;
     const auto rows = lnx::apt_rows_at(root.path, acc);
@@ -816,6 +919,74 @@ TEST_CASE("the output budget trims to fit: many small rows from one file, not ju
     CHECK(total + 200 > pio::kMaxOutputBytes); // trimmed to just fit, not emptied
     CHECK(rows.size() < 20000);
     CHECK(reason_has(acc, "linux:apt_sources:output_cap"));
+}
+
+TEST_CASE("invalid_bytes names a replaced byte that reached a field, not bytes in comments or ignored fields",
+          "[update_source_trust][walk][fault]") {
+    const TempRoot root;
+    // A legacy-encoded comment and an unsurfaced deb822 field: nothing reaches the wire.
+    root.write("etc/apt/sources.list", "# Miroir fran\xe7" "ais\ndeb http://ok.example/ s main\n");
+    root.write("etc/apt/sources.list.d/x.sources",
+               std::string("Types: deb\nURIs: http://y.example/\nSuites: z\nX-Repolib-Name: caf\xe9\n"));
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto rows = lnx::apt_rows_at(root.path, acc);
+    CHECK(rows.size() == 2);
+    // MUTATION: scrubbing the whole file (or counting every replaced byte) makes every
+    // legacy-encoded comment a constrained result on a healthy host.
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("a keyring name with invalid bytes is invalid_bytes under the keyring source",
+          "[update_source_trust][walk][fault]") {
+    const TempRoot root;
+    const std::string name = "k\xff" "y.gpg";
+    fs::create_directories(root.apt() / "keyrings");
+    {
+        std::ofstream f(root.apt() / "keyrings" / name, std::ios::binary);
+        f << "\x99\x01";
+        if (!f)
+            SKIP("this filesystem refuses a non-UTF-8 file name (APFS)");
+    }
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto rows = lnx::apt_rows_at(root.path, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].find("k?y.gpg") != std::string::npos);
+    CHECK(reason_has(acc, "linux:apt_keyring:invalid_bytes")); // MUTATION: dropping it, or the wrong prefix
+}
+
+TEST_CASE("a same-size rewrite is caught by the mtime, and a just-emptied text file is not a clean empty read",
+          "[update_source_trust][walk][fault]") {
+    const TempRoot root;
+    const std::string body = "deb http://ok.example/ suite main\n";
+    root.write("etc/apt/sources.list", body);
+    const auto path = root.apt() / "sources.list";
+    const auto orig = fs::last_write_time(path);
+    yuzu::shared::ConstraintAccumulator acc;
+    std::string data;
+    std::uint64_t size = 0;
+    // The hook rewrites the SAME bytes (the size is unchanged) and moves the mtime, the
+    // real shape of an in-place writer. MUTATION: comparing sizes only misses it.
+    auto rc = pio::read_file(path, pio::kMaxFileBytes, false, data, size, acc, "linux:apt_sources", [&] {
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << body; }
+        fs::last_write_time(path, orig + std::chrono::milliseconds(1500));
+    });
+    CHECK(rc == pio::Outcome::failed);
+    CHECK(reason_has(acc, "linux:apt_sources:modified_during_read"));
+
+    // An empty text file touched within the last two seconds may be mid-rewrite (the
+    // truncate bumped its mtime); one that has been empty for longer is genuinely empty.
+    // MUTATION: dropping the guard reads the fresh empty file as `ok`.
+    root.write("etc/apt/empty.list", "");
+    const auto empty = root.apt() / "empty.list";
+    yuzu::shared::ConstraintAccumulator fresh;
+    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, fresh, "linux:apt_sources") ==
+          pio::Outcome::failed);
+    CHECK(reason_has(fresh, "linux:apt_sources:modified_during_read"));
+    fs::last_write_time(empty, fs::file_time_type::clock::now() - std::chrono::hours(1));
+    yuzu::shared::ConstraintAccumulator old;
+    CHECK(pio::read_file(empty, pio::kMaxFileBytes, false, data, size, old, "linux:apt_sources") ==
+          pio::Outcome::ok);
+    CHECK_FALSE(old.any_failure());
 }
 
 TEST_CASE("an unreadable file is constrained with permission_denied, never absent",

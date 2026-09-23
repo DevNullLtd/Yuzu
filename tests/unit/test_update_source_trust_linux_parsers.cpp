@@ -519,10 +519,12 @@ TEST_CASE("an unreadable root is constrained with a token per source, never abse
     const Tree t;
     const PermRestore restore{t.dir.path};
     REQUIRE(::chmod(t.dir.path.c_str(), 0000) == 0);
-    // Probe rather than test the uid: root and CAP_DAC_OVERRIDE both bypass mode 0000.
-    if (const yuzu::agent::ScopedFd probe(::open(t.dir.path.c_str(), O_RDONLY | O_DIRECTORY));
+    // Probe the traversal the walk needs (opening `etc` through the 0000 root) rather
+    // than the uid or the root itself: root, CAP_DAC_OVERRIDE and some FUSE mounts
+    // (virtiofs) let a mode-0000 directory be traversed.
+    if (const yuzu::agent::ScopedFd probe(::open((t.dir.path / "etc").c_str(), O_RDONLY | O_DIRECTORY));
         probe.valid())
-        SKIP("permission bits are bypassed here (root or CAP_DAC_OVERRIDE)");
+        SKIP("permission bits do not stop traversal here (root, CAP_DAC_OVERRIDE or a FUSE mount)");
 
     yuzu::shared::ConstraintAccumulator acc;
     CHECK(lnx::linux_rows_at(t.dir.path, acc).empty());

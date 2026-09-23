@@ -37,19 +37,26 @@
  * file exist before the trim), and a walk may still read every file of a
  * 1,024-entry directory.
  *
- * FILES apt READS. Names in sources.list.d and trusted.gpg.d must pass apt's own
- * filter (apt_dir_name_ok: not hidden, only [A-Za-z0-9_.-]) before the suffix
- * test, so the plugin reports the files apt reads and no phantom sources.
+ * FILES apt READS. Names in sources.list.d must pass apt's own filter
+ * (apt_dir_name_ok: not hidden, only [A-Za-z0-9_.:-]) before the suffix test, so
+ * the plugin reports the sources apt reads and no phantom ones. trusted.gpg.d is
+ * selected by suffix (.gpg/.asc) ONLY: apt before 3.0 trusts a key under any such
+ * name, so a name filter there would hide a global trust anchor. /etc/apt/keyrings
+ * is listed by any name (apt never scans it; a Signed-By names its files).
  *
- * WIRE SAFETY. File text and names are OS-supplied bytes. Any NUL or byte outside
- * well-formed UTF-8 is replaced with '?' (scrub_wire_bytes) and recorded as
- * `invalid_bytes`: a NUL would cut the row at the C-string ABI and an invalid
- * byte makes the whole response unparseable downstream.
+ * WIRE SAFETY. File text and names are OS-supplied bytes. Every wire field
+ * replaces a NUL or a byte outside well-formed UTF-8 with '?' (scrub_wire_bytes:
+ * a NUL would cut the row at the C-string ABI and an invalid byte makes the whole
+ * response unparseable downstream). A replacement inside an EMITTED field is
+ * recorded as `invalid_bytes`; bytes in a comment or an ignored field never reach
+ * the wire and are not flagged.
  *
  * STABLE READS. A file is read between two fstat calls on the same fd; a changed
- * size or mtime means an in-place writer raced the read, which is recorded as
- * `modified_during_read` (an emptied-then-rewritten sources.list must not read as
- * "no sources").
+ * size or mtime means an in-place writer raced the read, and so does a text file
+ * that is empty and was modified within the last two seconds: both are recorded
+ * as `modified_during_read`, so an emptied-then-rewritten sources.list does not
+ * read as "no sources". A writer that keeps the file empty for longer than that
+ * cannot be told from a genuinely empty file.
  *
  * FAILURE NEVER READS AS ABSENT. Every non-ENOENT open/read/list failure, an
  * entry-cap truncation, a listing I/O error and an unparseable entry is a token
@@ -58,8 +65,9 @@
  * (ENOENT) is zero rows and still `supported` -- a host with no apt
  * configuration simply has no apt sources.
  *
- * DEFERRED rpm/dnf FAMILY. The `.repo` family is not read yet, and a
- * skipped family must not read as an empty one: rpm_family_planned_at records
+ * DEFERRED rpm/dnf FAMILY. The `.repo` family is not read yet, and the skipped
+ * rpm/dnf family must not read as an empty one (other families -- zypper, pacman,
+ * apk -- are not detected at all): rpm_family_planned_at records
  * `linux:rpm_repo:planned` whenever /etc/yum.repos.d has entries, so an rpm host
  * reports constrained -- exactly as a planned OS leg reports `unsupported` --
  * rather than `supported` with zero rows. run_linux_at (bottom of this header)
@@ -89,6 +97,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -109,9 +118,12 @@ inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 enum class Outcome { ok, absent, failed };
 
 /// (size, mtime) of an open file: what two fstat calls on one fd are compared by.
+/// The seconds and nanoseconds stay separate: a flattened nanosecond product
+/// overflows int64 for an mtime after 2262, which ext4 allows.
 struct FileStamp {
     std::uint64_t size = 0;
-    std::int64_t mtime_ns = 0;
+    std::int64_t sec = 0;
+    std::int64_t nsec = 0;
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 
@@ -121,9 +133,8 @@ struct FileStamp {
 #else
     const timespec& ts = st.st_mtim;
 #endif
-    return {static_cast<std::uint64_t>(st.st_size),
-            static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000LL +
-                static_cast<std::int64_t>(ts.tv_nsec)};
+    return {static_cast<std::uint64_t>(st.st_size), static_cast<std::int64_t>(ts.tv_sec),
+            static_cast<std::int64_t>(ts.tv_nsec)};
 }
 
 /// The default `after_read` hook of read_file: does nothing. The unit suite passes
@@ -218,10 +229,19 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
         note_failure(acc, source_prefix, errno_detail(errno, IoStage::read_file));
         return Outcome::failed;
     }
-    if (stamp_of(after) != stamp_of(st)) {
-        // An in-place writer (truncate + write) raced the read: what was read may
-        // be an empty or torn file, and an empty sources.list is normal on a host
-        // with no apt sources, so it must not read as one.
+    const FileStamp seen = stamp_of(after);
+    // An in-place writer (truncate + write) raced the read: what was read may be an
+    // empty or torn file, and an empty sources.list is normal on a host with no apt
+    // sources, so it must not read as one. A changed size or mtime is the direct
+    // signal. A text file that is EMPTY and was modified within the last two
+    // seconds is treated the same way: a writer that empties the file for the whole
+    // read window changes nothing between the two fstat calls, but its truncate
+    // just bumped the mtime. (A file left empty for longer, or emptied by a writer
+    // slower than that, cannot be told from a genuinely empty one: a documented
+    // limit.)
+    const auto now_s = static_cast<std::int64_t>(::time(nullptr));
+    const bool just_emptied = !head_only && seen.size == 0 && seen.sec >= now_s - 2 && seen.sec <= now_s + 2;
+    if (seen != stamp_of(st) || just_emptied) {
         note_failure(acc, source_prefix, "modified_during_read");
         return Outcome::failed;
     }
@@ -302,9 +322,11 @@ inline bool add_apt_file(const std::filesystem::path& root, const std::string& l
     if (pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false, data, size, acc,
                        kAptSourcesPrefix) != pio::Outcome::ok)
         return true; // this file failed (token recorded); the walk goes on
-    if (scrub_wire_bytes(data) != 0)
-        pio::note_failure(acc, kAptSourcesPrefix, "invalid_bytes");
-    if (apt_rows_from_text(logical, fmt, data, rows) != 0)
+    std::size_t altered = 0;
+    const std::size_t malformed = apt_rows_from_text(logical, fmt, data, rows, &altered);
+    if (altered != 0)
+        pio::note_failure(acc, kAptSourcesPrefix, "invalid_bytes"); // a replaced byte reached a field
+    if (malformed != 0)
         pio::note_failure(acc, kAptSourcesPrefix, "unparsed_entry");
     return within_output_budget(rows, acc, kAptSourcesPrefix);
 }
@@ -318,8 +340,8 @@ inline bool add_keyring_file(const std::filesystem::path& root, const std::strin
                        kAptKeyringPrefix) != pio::Outcome::ok)
         return true;
     // The row's path field is scrubbed by format_apt_keyring_row; the name only
-    // needs the constraint (a /etc/apt/keyrings name is not filtered like apt's *.d).
-    if (std::string shown = logical; scrub_wire_bytes(shown) != 0)
+    // needs the constraint (a keyring name is not filtered by the walk).
+    if (count_invalid_wire_bytes(logical) != 0)
         pio::note_failure(acc, kAptKeyringPrefix, "invalid_bytes");
     rows.push_back(format_apt_keyring_row(logical, scope, sniff_keyring(head), size));
     return within_output_budget(rows, acc, kAptKeyringPrefix);
@@ -334,8 +356,8 @@ inline bool add_keyring_dir(const std::filesystem::path& root, std::string_view 
         pio::Outcome::failed)
         return true;
     for (const auto& n : names) {
-        if (gpg_asc_only && (!apt_dir_name_ok(n) || (!pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))))
-            continue; // apt itself ignores every other name in trusted.gpg.d
+        if (gpg_asc_only && !pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))
+            continue; // apt ignores every other suffix in trusted.gpg.d (see apt_dir_name_ok for the name rule)
         if (!add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc))
             return false;
     }

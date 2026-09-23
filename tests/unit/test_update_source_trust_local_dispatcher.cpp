@@ -12,10 +12,10 @@
  *
  * WHAT THIS DOES NOT ASSERT. It runs against the LIVE host (CI runners are
  * shared, unknown hardware), so it never asserts that a real-host source
- * exists. Where a row is asserted it is guarded on the host actually having
- * the input (a readable regular file that the leg is documented to read) AND
- * on the leg reporting `supported`; the populated-row assertions on injected
- * fixture trees live in test_update_source_trust_linux_parsers.cpp.
+ * exists. On Linux the shipped leg is compared with the same walk body run
+ * in-process over the host's own root (an oracle), so whatever the host has --
+ * or lacks -- is asserted consistently; the populated-row assertions on
+ * injected fixture trees live in test_update_source_trust_linux_parsers.cpp.
  *
  * What it DOES pin on every host: the first row is the status row, the status
  * row agrees with the typed CC-07 result the plugin reported, the return code
@@ -240,16 +240,21 @@ TEST_CASE("update_source_trust plugin: status row first, agrees with the typed r
     // SAME walk body run in-process over the host's real root: the built .so's
     // run_linux -> "/" must report exactly what lnx::linux_rows_at("/") reports
     // here -- deb822-only hosts (Debian 13, Ubuntu 24.04), one-line hosts, rpm
-    // hosts (`linux:rpm_repo:planned`) and hosts with neither. MUTATIONS: a leg
-    // walking another root fails the row comparison wherever apt config exists;
-    // dropping the rpm tripwire fails the state/token comparison on an rpm host;
-    // an unconditional token fails it everywhere else.
+    // hosts (`linux:rpm_repo:planned`) and hosts with neither. The oracle shares the
+    // walk body with the leg, so it pins the WIRING (the root, the emission seam),
+    // not the walk: a leg walking another root fails the row comparison wherever
+    // apt config exists, and `apt_rows_at` swapped in for `linux_rows_at` fails
+    // the state comparison on an rpm host. The tripwire itself is pinned by the
+    // [seam] cases and the fixture trees in test_update_source_trust_linux_parsers.cpp.
     yuzu::shared::ConstraintAccumulator oracle;
     const auto oracle_rows = yuzu::update_source_trust::lnx::linux_rows_at("/", oracle);
     CHECK((status[2] == "constrained") == oracle.any_failure());
     CHECK(status[3] == (oracle.any_failure() ? oracle.reason() : std::string{"-"}));
     const std::vector<std::string> data_rows(rows.begin() + 1, rows.end());
-    CHECK(data_rows == oracle_rows);
+    // A boolean, not the vectors: a failure must not print the CI host's own rows.
+    const bool same_rows = data_rows == oracle_rows;
+    INFO("plugin data rows: " << data_rows.size() << ", oracle rows: " << oracle_rows.size());
+    CHECK(same_rows);
     if (oracle_rows.empty() && !oracle.any_failure())
         WARN("no apt or yum configuration on this host: the shipped root wiring was not exercised");
 #endif

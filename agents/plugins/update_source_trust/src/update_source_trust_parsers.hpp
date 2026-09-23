@@ -25,9 +25,9 @@
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
  *   apt_keyring|<path>|<scope>|<format armored|binary|empty|unmodelled>|<size_bytes>
  *   rpm_repo|...   macos_swu|...   wsus|...
- *       PLANNED shapes, never emitted here (not read yet): the
- *       rpm/dnf .repo family, the macOS Software Update leg, the Windows WSUS
- *       leg) and is documented in content/definitions/update_source_trust.yaml.
+ *       PLANNED shapes, never emitted here (not read yet): the rpm/dnf .repo
+ *       family, the macOS Software Update leg and the Windows WSUS leg. They are
+ *       documented in content/definitions/update_source_trust.yaml.
  *
  * TRISTATE. Every boolean-ish OS value maps to exactly one of
  * yes | no | unset | unmodelled. `unset` = the key is absent (a fact: the
@@ -46,11 +46,15 @@
  * KNOWN LIMITS (facts-only scope, stated so no consumer infers more):
  *   - apt: /usr/share/keyrings is not inventoried; keys referenced by
  *     Signed-By are reported by path, not resolved or fingerprinted.
- *   - rpm/dnf (the .repo files under /etc/yum.repos.d) and macOS Software
- *     Update are not read at all yet. The Linux
- *     leg reports the rpm family as a planned constraint rather than as absent.
- *   - URLs: userinfo (`user:pass@`) is redacted; a secret carried in a query
- *     string cannot be recognised and is emitted as written.
+ *   - rpm/dnf (the .repo files under /etc/yum.repos.d), macOS Software Update
+ *     and the Windows WSUS policy are not read at all yet. The Linux leg reports
+ *     the rpm family as a planned constraint rather than as absent; other
+ *     families (zypper, pacman, apk) are not detected.
+ *   - Global apt configuration (apt.conf, apt.conf.d) is not read: a per-source
+ *     `unset` means the source does not say, not that signatures are enforced.
+ *   - URLs: userinfo (`user:pass@`) is redacted as apt's own URI split finds it;
+ *     a secret carried in a query string or a path cannot be recognised and is
+ *     emitted as written.
  */
 #pragma once
 
@@ -160,30 +164,12 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return out;
 }
 
-/// Maps a boolean-ish config value to a Tri. nullopt (key absent) -> unset;
-/// the union of the apt (yes/no/true/false/with/without/on/off/enable/disable/
-/// 1/0) and yum/dnf (1/0/yes/no/true/false/on/off/enabled/disabled)
-/// vocabularies -> yes/no; anything else (including an empty value) ->
-/// unmodelled, never silently coerced. The rpm/dnf leg uses this union; the
-/// apt legs use tri_from_apt_value, because apt does not accept the yum words.
-[[nodiscard]] inline Tri tri_from_value(std::optional<std::string_view> v) {
-    if (!v)
-        return Tri::unset;
-    const std::string s = ascii_lower(trim(*v));
-    for (std::string_view t : {"yes", "true", "1", "on", "enabled", "enable", "with"})
-        if (s == t)
-            return Tri::yes;
-    for (std::string_view t : {"no", "false", "0", "off", "disabled", "disable", "without"})
-        if (s == t)
-            return Tri::no;
-    return Tri::unmodelled;
-}
-
-/// apt's own boolean vocabulary (apt-pkg StringToBool): 1/yes/true/with/on/
-/// enable and 0/no/false/without/off/disable, case-insensitive. The yum/dnf
-/// words `enabled`/`disabled` are NOT apt vocabulary: apt ignores
-/// `Trusted: enabled` and leaves an `Enabled: disabled` source active, so a
-/// value outside this list is `unmodelled` (present, not one apt honours).
+/// Maps an apt boolean-ish config value to a Tri. nullopt (key absent) ->
+/// unset. apt's own vocabulary (apt-pkg StringToBool): 1/yes/true/with/on/enable
+/// and 0/no/false/without/off/disable, case-insensitive. The yum/dnf words
+/// `enabled`/`disabled` are NOT apt vocabulary: apt ignores `Trusted: enabled`
+/// and leaves an `Enabled: disabled` source active, so a value outside the list
+/// is `unmodelled` (present, not one apt honours), never silently coerced.
 [[nodiscard]] inline Tri tri_from_apt_value(std::optional<std::string_view> v) {
     if (!v)
         return Tri::unset;
@@ -197,37 +183,117 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return Tri::unmodelled;
 }
 
-/// Replaces the `user[:pass]@` userinfo of every `scheme://authority` in `text`
-/// with `REDACTED@`. Repo definitions routinely embed credentials in baseurl /
-/// URIs; a trust-posture fact must never carry them onto the wire. The
-/// authority ends at the first `/` or whitespace, exactly as apt's URI parser
-/// ends it: a `?` or `#` is a legal character of a password (apt resolves
-/// `http://bob:pa?ss@host/`), so stopping there would leak the tail. The
-/// userinfo is everything up to the LAST `@` of the authority; a query string
-/// containing `@` therefore over-redacts, which is the safe direction.
+/// Splits on ASCII whitespace like split_ws, except that whitespace inside a
+/// `[...]` group does not split: apt keeps a bracket group inside ONE word
+/// (`cdrom:[Debian GNU/Linux 12 ...]/`, and the `[opt=val ...]` block). An
+/// unterminated `[` runs to the end of the text.
+[[nodiscard]] inline std::vector<std::string_view> split_apt_words(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && is_ascii_space(s[i]))
+            ++i;
+        const std::size_t start = i;
+        std::size_t depth = 0;
+        for (; i < s.size(); ++i) {
+            if (s[i] == '[')
+                ++depth;
+            else if (s[i] == ']' && depth > 0)
+                --depth;
+            else if (depth == 0 && is_ascii_space(s[i]))
+                break;
+        }
+        if (i > start)
+            out.push_back(s.substr(start, i - start));
+    }
+    return out;
+}
+
+/// The %XX-decoded form of `s`: apt de-quotes the words of a source line before
+/// it splits a URI, so `http%3a//u:pw@h/` names host h. A '%' that is not followed
+/// by two hex digits stays as written. Only used to LOCATE a userinfo.
+[[nodiscard]] inline std::string percent_decoded(std::string_view s) {
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
+            out += static_cast<char>(hex(s[i + 1]) * 16 + hex(s[i + 2]));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+/// One word of a URI list with the `user[:pass]@` userinfo replaced by
+/// `REDACTED@`. The split is apt's own (URI::CopyFrom): the scheme ends at the
+/// FIRST ':'; a "//" right after it belongs to the authority; the authority ends
+/// at the first '/' OUTSIDE a `[...]` group; the userinfo is everything in the
+/// authority before its LAST '@'. That makes a '?' or '#' in a password, a
+/// second '@', a '/' inside `[...]`, a scheme without "//" (`http:u:pw@h/`) and
+/// a backslash all redact exactly where apt would resolve them. A word that
+/// contains '%' is analysed, and returned, in its %XX-decoded form. A word with
+/// no userinfo is returned unchanged; a query string or path holding a secret
+/// cannot be recognised and is emitted as written (documented).
+[[nodiscard]] inline std::string redact_apt_word(std::string_view word) {
+    const std::string d = word.find('%') == std::string_view::npos ? std::string{word}
+                                                                   : percent_decoded(word);
+    const std::size_t colon = d.find(':');
+    if (colon == std::string::npos)
+        return std::string{word}; // no scheme, so no authority
+    std::size_t begin = colon + 1;
+    if (d.compare(colon + 1, 2, "//") == 0)
+        begin = colon + 3;
+    std::size_t end = begin;
+    bool in_bracket = false;
+    for (; end < d.size() && (d[end] != '/' || in_bracket); ++end) {
+        if (d[end] == '[')
+            in_bracket = true;
+        else if (d[end] == ']')
+            in_bracket = false;
+    }
+    const std::size_t at = std::string_view{d}.substr(begin, end - begin).rfind('@');
+    if (at == std::string_view::npos)
+        return std::string{word};
+    return d.substr(0, begin) + "REDACTED@" + d.substr(begin + at + 1);
+}
+
+/// Every word of `text` (split as apt splits a source line, so a `[...]` group
+/// stays whole) through redact_apt_word, re-joined with single spaces.
 [[nodiscard]] inline std::string redact_url_userinfo(std::string_view text) {
     std::string out;
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        const std::size_t scheme = text.find("://", pos);
-        if (scheme == std::string_view::npos) {
-            out.append(text.substr(pos));
-            break;
-        }
-        const std::size_t auth_start = scheme + 3;
-        out.append(text.substr(pos, auth_start - pos));
-        std::size_t auth_end = auth_start;
-        while (auth_end < text.size() && text[auth_end] != '/' && !is_ascii_space(text[auth_end]))
-            ++auth_end;
-        const std::string_view authority = text.substr(auth_start, auth_end - auth_start);
-        const std::size_t at = authority.rfind('@');
-        if (at != std::string_view::npos) {
-            out += "REDACTED@";
-            out.append(authority.substr(at + 1));
-        } else {
-            out.append(authority);
-        }
-        pos = auth_end;
+    for (const auto w : split_apt_words(text)) {
+        if (!out.empty())
+            out += ' ';
+        out += redact_apt_word(w);
+    }
+    return out;
+}
+
+/// The conservative fallback for text whose bytes had to be replaced: a replaced
+/// byte can turn text into a URL shape apt never saw (`http:<NUL>//u:pw@h/`
+/// becomes `http:?//u:pw@h/`), which no faithful split recognises. Every word
+/// containing an '@' loses everything up to its LAST '@'.
+[[nodiscard]] inline std::string redact_after_last_at(std::string_view text) {
+    std::string out;
+    for (const auto w : split_apt_words(text)) {
+        if (!out.empty())
+            out += ' ';
+        const std::size_t at = w.rfind('@');
+        if (at == std::string_view::npos)
+            out.append(w);
+        else
+            out.append("REDACTED@").append(w.substr(at + 1));
     }
     return out;
 }
@@ -262,6 +328,21 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return 0;
 }
 
+/// How many bytes scrub_wire_bytes would replace in `s`, without changing it.
+[[nodiscard]] inline std::size_t count_invalid_wire_bytes(std::string_view s) noexcept {
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < s.size();) {
+        const std::size_t n = utf8_scalar_len(s, i);
+        if (n == 0) {
+            ++bad;
+            ++i;
+        } else {
+            i += n;
+        }
+    }
+    return bad;
+}
+
 /// Replaces every byte that may not reach the wire -- NUL (the plugin ABI
 /// carries C strings, so a NUL cuts the row) and anything outside well-formed
 /// UTF-8 (the ABI is UTF-8; an invalid byte makes the whole response
@@ -293,7 +374,10 @@ inline std::size_t scrub_wire_bytes(std::string& s) {
 }
 
 [[nodiscard]] inline std::string url_field(std::string_view v) {
-    return field(redact_url_userinfo(v));
+    std::string s = redact_url_userinfo(v);
+    if (scrub_wire_bytes(s) != 0)
+        s = redact_after_last_at(s);
+    return field(s);
 }
 
 // ── errno -> failure-detail token ────────────────────────────────────────
@@ -361,37 +445,11 @@ struct AptParseResult {
     return collapse_ws(raw);
 }
 
-/// Splits on ASCII whitespace like split_ws, except that whitespace inside a
-/// `[...]` group does not split: apt keeps a bracket group inside ONE word
-/// (`cdrom:[Debian GNU/Linux 12 ...]/`, and the `[opt=val ...]` block). An
-/// unterminated `[` runs to the end of the text.
-[[nodiscard]] inline std::vector<std::string_view> split_apt_words(std::string_view s) {
-    std::vector<std::string_view> out;
-    std::size_t i = 0;
-    while (i < s.size()) {
-        while (i < s.size() && is_ascii_space(s[i]))
-            ++i;
-        const std::size_t start = i;
-        int depth = 0;
-        for (; i < s.size(); ++i) {
-            if (s[i] == '[')
-                ++depth;
-            else if (s[i] == ']' && depth > 0)
-                --depth;
-            else if (depth == 0 && is_ascii_space(s[i]))
-                break;
-        }
-        if (i > start)
-            out.push_back(s.substr(start, i - start));
-    }
-    return out;
-}
-
 /// The text before the first `#` that is outside a `[...]` group. apt ends a
 /// line at ANY such `#` (`main#c` is `main`; `http://h/a#b suite main` is a
 /// malformed entry), not only at one preceded by whitespace.
 [[nodiscard]] inline std::string_view strip_apt_comment(std::string_view line) noexcept {
-    int depth = 0;
+    std::size_t depth = 0;
     for (std::size_t i = 0; i < line.size(); ++i) {
         if (line[i] == '[')
             ++depth;
@@ -410,9 +468,13 @@ struct AptParseResult {
 /// case-sensitive exactly as in apt (`[Trusted=yes]` is ignored by apt, so it
 /// is ignored here). A `+=`/`-=` on a surfaced key is `unmodelled`: the effective
 /// value depends on earlier options, which this plugin does not evaluate. Every
-/// other option, and any option token without '=', is tolerated and ignored. A
-/// line needs a type, a uri and a suite; an unterminated `[` or too few words
-/// is malformed.
+/// other well-formed option is tolerated and ignored. apt refuses the WHOLE list
+/// for an entry it cannot read, so such an entry is malformed here (reported as
+/// unparsed, never as a row apt does not use): a type other than exactly `deb` or
+/// `deb-src`, an unterminated `[`, a second `[...]` block, an option without '=',
+/// a double quote or a '%' in the type or option block (apt de-quotes those and
+/// this plugin does not), a double quote anywhere in the entry, and too few words
+/// (a type, a uri and a suite are needed).
 [[nodiscard]] inline AptParseResult parse_apt_one_line(std::string_view text) {
     AptParseResult res;
     std::size_t pos = 0;
@@ -429,15 +491,27 @@ struct AptParseResult {
         const auto words = split_apt_words(line);
         std::size_t next = 1; // index of the uri word
         std::string_view options;
+        bool refused = words[0] != "deb" && words[0] != "deb-src"; // apt: "Type ... is not known"
         if (words.size() > 1 && words[1].front() == '[') {
             if (words[1].size() < 2 || words[1].back() != ']') {
-                ++res.malformed; // unterminated option block
-                continue;
+                refused = true; // unterminated option block
+            } else {
+                options = words[1].substr(1, words[1].size() - 2);
+                next = 2;
+                if (options.find('%') != std::string_view::npos)
+                    refused = true; // apt de-quotes %XX in options; this plugin does not
+                for (const auto opt : split_ws(options))
+                    if (opt.find('=') == std::string_view::npos)
+                        refused = true; // `[trusted = yes]`, `[foo]`
             }
-            options = words[1].substr(1, words[1].size() - 2);
-            next = 2;
         }
-        if (words.size() < next + 2) { // type + uri + suite
+        if (words.size() < next + 2 ||                        // type + uri + suite
+            (words.size() > next && words[next].front() == '[')) // a second option block
+            refused = true;
+        for (const auto w : words)
+            if (w.find('"') != std::string_view::npos)
+                refused = true; // apt keeps a "..." word whole and de-quotes it
+        if (refused) {
             ++res.malformed;
             continue;
         }
@@ -508,8 +582,9 @@ struct AptParseResult {
             continue;
         if (line.front() == ' ' || line.front() == '\t') {
             if (cur.empty()) {
-                ++res.malformed;
-                continue;
+                if (!trim(line).empty())
+                    ++res.malformed; // a continuation with no field to continue
+                continue;            // a whitespace-only line before any field is not an entry
             }
             std::string_view c = trim(line);
             if (c == ".")
@@ -566,17 +641,20 @@ struct AptParseResult {
 
 // ── apt directory file names ─────────────────────────────────────────────
 
-/// apt's own rule for the files of its `*.d` directories (sources.list.d,
-/// trusted.gpg.d; `GetListOfFilesInDir`): hidden names and any name with a
-/// character outside [A-Za-z0-9_.-] are skipped ("bad filenames ala
-/// run-parts"). The walk applies it BEFORE the suffix test so the plugin
-/// reports exactly the files apt itself reads and no phantom sources.
+/// apt's own rule for the files of sources.list.d (verified against apt 2.0-3.2
+/// with every printable ASCII byte): hidden names and any name with a character
+/// outside [A-Za-z0-9_.:-] are skipped. The walk applies it BEFORE the suffix
+/// test so the plugin reports the sources apt reads and no phantom ones. It is
+/// NOT applied to trusted.gpg.d: apt before 3.0 trusts a key under ANY name that
+/// ends in .gpg or .asc (hidden, spaces, '+', '~', non-ASCII), so filtering there
+/// would hide a global trust anchor; apt 3.0 and later apply the rule there too,
+/// where reporting the extra file errs on the safe side.
 [[nodiscard]] inline bool apt_dir_name_ok(std::string_view name) noexcept {
     if (name.empty() || name.front() == '.')
         return false;
     for (const char c : name) {
         const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-        if (!alnum && c != '_' && c != '-' && c != '.')
+        if (!alnum && c != '_' && c != '-' && c != '.' && c != ':')
             return false;
     }
     return true;
@@ -656,15 +734,25 @@ struct AptParseResult {
 // rows is this pure function, so the whole text -> row path is unit-tested on
 // every OS without touching a filesystem. It returns the number of malformed
 // entries it had to drop; the caller records a non-zero count as a constraint
-// (an unparsed source is never silently absent).
+// (an unparsed source is never silently absent). `altered`, when given, gains the
+// number of bytes in the EMITTED fields that scrub_wire_bytes replaced (a NUL or
+// non-UTF-8 byte in a comment or an ignored field never reaches the wire and is
+// not counted).
 
 [[nodiscard]] inline std::size_t apt_rows_from_text(std::string_view logical_file, AptFormat fmt,
                                                     std::string_view text,
-                                                    std::vector<std::string>& rows) {
+                                                    std::vector<std::string>& rows,
+                                                    std::size_t* altered = nullptr) {
     const AptParseResult parsed =
         fmt == AptFormat::deb822 ? parse_apt_deb822(text) : parse_apt_one_line(text);
-    for (const auto& s : parsed.sources)
+    for (const auto& s : parsed.sources) {
+        if (altered != nullptr)
+            *altered += count_invalid_wire_bytes(logical_file) + count_invalid_wire_bytes(s.types) +
+                        count_invalid_wire_bytes(s.uris) + count_invalid_wire_bytes(s.suites) +
+                        count_invalid_wire_bytes(s.components) +
+                        count_invalid_wire_bytes(s.signed_by);
         rows.push_back(format_apt_source_row(logical_file, fmt, s));
+    }
     return parsed.malformed;
 }
 
