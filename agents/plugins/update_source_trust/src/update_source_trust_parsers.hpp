@@ -17,7 +17,9 @@
  * Every row of a kind carries the same field count, "-" where a value is
  * absent. Free text is untrusted OS-supplied data and goes through
  * yuzu::util::safe_output_field (lossy on backslash -> '/', pipes escaped);
- * URL-carrying fields additionally have any `user:pass@` userinfo redacted.
+ * every apt_source field a URL could land in (uris, suites, components,
+ * signed_by) additionally has any `user:pass@` userinfo redacted -- per field:
+ * a whole-row pass would scan across the `|` separators.
  *
  *   status|sources|<supported|constrained|unsupported>|<reason or ->
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
@@ -492,11 +494,11 @@ struct AptParseResult {
     out += '|';
     out += url_field(f.uris);
     out += '|';
-    out += field(f.suites);
+    out += url_field(f.suites);
     out += '|';
-    out += field(f.components);
+    out += url_field(f.components);
     out += '|';
-    out += field(f.signed_by);
+    out += url_field(f.signed_by);
     out += '|';
     out.append(tri_token(f.trusted));
     out += '|';

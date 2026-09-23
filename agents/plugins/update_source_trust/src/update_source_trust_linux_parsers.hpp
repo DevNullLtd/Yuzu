@@ -26,6 +26,11 @@
  * shrinks mid-read is `short_read`). Directory listings go through
  * yuzu::shared::walk_dir_capped, and directory_iterator is never used.
  *
+ * OUTPUT BUDGET. The rows of one whole walk share a single 1 MiB budget
+ * (kMaxOutputBytes): the per-file and per-directory caps bound each read, not
+ * their sum. Past it the newest rows are dropped, no further file is read and
+ * `output_cap` is recorded.
+ *
  * FAILURE NEVER READS AS ABSENT. Every non-ENOENT open/read/list failure, an
  * entry-cap truncation, a listing I/O error and an unparseable entry is a token
  * in the shared ConstraintAccumulator (`<os>:<source>:<detail>`); the caller
@@ -75,6 +80,11 @@ namespace yuzu::update_source_trust::posix_io {
 inline constexpr std::size_t kMaxFileBytes = 1024 * 1024; // 1 MiB, matches autoruns
 inline constexpr std::size_t kMaxDirEntries = 1024;
 inline constexpr std::size_t kKeyringHeadBytes = 64;
+/// One budget for the wire rows of the WHOLE walk. The per-file and per-directory
+/// caps above bound each read, not their sum: 1,024 files of 1 MiB each would
+/// otherwise build a multi-gigabyte row vector before any downstream cap applies.
+/// A real host reports a few KiB, so this is ~250x headroom.
+inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 
 enum class Outcome { ok, absent, failed };
 
@@ -201,42 +211,67 @@ inline constexpr std::string_view kRpmRepoPrefix = "linux:rpm_repo"; // planned 
 
 namespace detail {
 
-inline void add_apt_file(const std::filesystem::path& root, const std::string& logical,
+/// Enforces the aggregate row budget (pio::kMaxOutputBytes) after a file's rows
+/// were appended. Over budget: drops the newest rows until the total fits (every
+/// earlier file already passed this check, so only the file just read loses
+/// rows), records `<prefix>:output_cap` and returns false -- the caller stops
+/// reading further files. Every add_* below returns this "keep walking" flag.
+[[nodiscard]] inline bool within_output_budget(std::vector<std::string>& rows,
+                                               yuzu::shared::ConstraintAccumulator& acc,
+                                               std::string_view source_prefix) {
+    std::size_t total = 0;
+    for (const auto& r : rows)
+        total += r.size() + 1; // + the row separator
+    if (total <= pio::kMaxOutputBytes)
+        return true;
+    while (total > pio::kMaxOutputBytes && !rows.empty()) {
+        total -= rows.back().size() + 1;
+        rows.pop_back();
+    }
+    pio::note_failure(acc, source_prefix, "output_cap");
+    return false;
+}
+
+inline bool add_apt_file(const std::filesystem::path& root, const std::string& logical,
                          AptFormat fmt, std::vector<std::string>& rows,
                          yuzu::shared::ConstraintAccumulator& acc) {
     std::string data;
     std::uint64_t size = 0;
     if (pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false, data, size, acc,
                        kAptSourcesPrefix) != pio::Outcome::ok)
-        return;
+        return true; // this file failed (token recorded); the walk goes on
     if (apt_rows_from_text(logical, fmt, data, rows) != 0)
         pio::note_failure(acc, kAptSourcesPrefix, "unparsed_entry");
+    return within_output_budget(rows, acc, kAptSourcesPrefix);
 }
 
-inline void add_keyring_file(const std::filesystem::path& root, const std::string& logical,
+inline bool add_keyring_file(const std::filesystem::path& root, const std::string& logical,
                              std::string_view scope, std::vector<std::string>& rows,
                              yuzu::shared::ConstraintAccumulator& acc) {
     std::string head;
     std::uint64_t size = 0;
     if (pio::read_file(pio::under(root, logical), pio::kKeyringHeadBytes, true, head, size, acc,
                        kAptKeyringPrefix) != pio::Outcome::ok)
-        return;
+        return true;
     rows.push_back(format_apt_keyring_row(logical, scope, sniff_keyring(head), size));
+    return within_output_budget(rows, acc, kAptKeyringPrefix);
 }
 
-inline void add_keyring_dir(const std::filesystem::path& root, std::string_view logical_dir,
+inline bool add_keyring_dir(const std::filesystem::path& root, std::string_view logical_dir,
                             std::string_view scope, bool gpg_asc_only,
                             std::vector<std::string>& rows,
                             yuzu::shared::ConstraintAccumulator& acc) {
     std::vector<std::string> names;
     if (pio::list_dir(pio::under(root, logical_dir), names, acc, kAptKeyringPrefix) ==
         pio::Outcome::failed)
-        return;
+        return true;
     for (const auto& n : names) {
         if (gpg_asc_only && !pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))
             continue; // apt itself ignores every other name in trusted.gpg.d
-        add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc);
+        if (!add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc))
+            return false;
     }
+    return true;
 }
 
 } // namespace detail
@@ -246,28 +281,33 @@ inline void add_keyring_dir(const std::filesystem::path& root, std::string_view 
 /// keyrings /etc/apt/trusted.gpg (legacy, global trust),
 /// /etc/apt/trusted.gpg.d/*.{gpg,asc} (global trust) and /etc/apt/keyrings/*
 /// (referenced via Signed-By). A host with no apt configuration returns zero
-/// rows and no failure token.
+/// rows and no failure token. The rows of the whole walk share one budget
+/// (pio::kMaxOutputBytes): once it is spent no further file is read and
+/// `<prefix>:output_cap` is recorded.
 [[nodiscard]] inline std::vector<std::string>
 apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
     std::vector<std::string> rows;
 
-    detail::add_apt_file(root, "/etc/apt/sources.list", AptFormat::one_line, rows, acc);
+    if (!detail::add_apt_file(root, "/etc/apt/sources.list", AptFormat::one_line, rows, acc))
+        return rows;
 
     constexpr std::string_view kListDir = "/etc/apt/sources.list.d";
     std::vector<std::string> names;
     if (pio::list_dir(pio::under(root, kListDir), names, acc, kAptSourcesPrefix) !=
         pio::Outcome::failed) {
         for (const auto& n : names) {
-            const std::string logical = std::string{kListDir} + '/' + n;
-            if (pio::ends_with(n, ".sources"))
-                detail::add_apt_file(root, logical, AptFormat::deb822, rows, acc);
-            else if (pio::ends_with(n, ".list"))
-                detail::add_apt_file(root, logical, AptFormat::one_line, rows, acc);
+            const bool deb822 = pio::ends_with(n, ".sources");
+            if (!deb822 && !pio::ends_with(n, ".list"))
+                continue;
+            if (!detail::add_apt_file(root, std::string{kListDir} + '/' + n,
+                                      deb822 ? AptFormat::deb822 : AptFormat::one_line, rows, acc))
+                return rows;
         }
     }
 
-    detail::add_keyring_file(root, "/etc/apt/trusted.gpg", "legacy_trusted_gpg", rows, acc);
-    detail::add_keyring_dir(root, "/etc/apt/trusted.gpg.d", "trusted_gpg_d", true, rows, acc);
+    if (!detail::add_keyring_file(root, "/etc/apt/trusted.gpg", "legacy_trusted_gpg", rows, acc) ||
+        !detail::add_keyring_dir(root, "/etc/apt/trusted.gpg.d", "trusted_gpg_d", true, rows, acc))
+        return rows;
     detail::add_keyring_dir(root, "/etc/apt/keyrings", "etc_apt_keyrings", false, rows, acc);
     return rows;
 }

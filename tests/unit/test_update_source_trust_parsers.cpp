@@ -300,6 +300,29 @@ TEST_CASE("apt_source row: credentials are redacted; pipes and backslashes canno
     CHECK(fields[8] == "unset");
 }
 
+TEST_CASE("apt_source row: a credential in the suite, component or signed_by field is redacted too",
+          "[update_source_trust][parsers][wire]") {
+    // Redaction is per field (a whole-row pass would scan across the `|`
+    // separators). MUTATION: plain field() on suites/components/signed_by emits
+    // the credential verbatim (an adversarial-review probe confirmed it).
+    ust::AptSourceFacts f;
+    f.types = "deb";
+    f.uris = "https://a.example/x";
+    f.suites = "https://suiteuser:pw1@evil.example/";
+    f.components = "https://compuser:pw2@evil.example/ main";
+    f.signed_by = "https://keyuser:pw3@evil.example/k.gpg";
+    const std::string row = ust::format_apt_source_row("/etc/apt/x.list", ust::AptFormat::one_line, f);
+
+    for (const char* secret : {"suiteuser", "pw1", "compuser", "pw2", "keyuser", "pw3"})
+        CHECK(row.find(secret) == std::string::npos);
+    const auto fields = split_wire(row);
+    REQUIRE(fields.size() == 11);
+    CHECK(fields[4] == "https://a.example/x"); // a URI without userinfo is untouched
+    CHECK(fields[5] == "https://REDACTED@evil.example/");
+    CHECK(fields[6] == "https://REDACTED@evil.example/ main");
+    CHECK(fields[7] == "https://REDACTED@evil.example/k.gpg");
+}
+
 // ── keyrings ─────────────────────────────────────────────────────────────
 
 TEST_CASE("sniff_keyring classifies armored, binary, empty and unmodelled heads",
@@ -534,6 +557,32 @@ TEST_CASE("a directory over the entry cap reports entry_cap but keeps the names 
     CHECK(lnx::apt_rows_at(root.path, acc).empty()); // empty files: no sources
     // MUTATION: ignoring walk.truncated loses this token.
     CHECK(reason_has(acc, "linux:apt_sources:entry_cap"));
+    CHECK(acc.incomplete());
+}
+
+TEST_CASE("the rows of one walk share a budget: output_cap, newest rows dropped, no further file read",
+          "[update_source_trust][walk][fault]") {
+    const TempRoot root;
+    // Three sources of ~400 KiB each (one giant, legal URI token per file): two fit
+    // the 1 MiB budget, the third does not. Files are read in sorted order.
+    const std::string big(400000, 'a');
+    for (const char* name : {"a.list", "b.list", "c.list"})
+        root.write(std::string("etc/apt/sources.list.d/") + name,
+                   "deb http://" + big + "/ suite main\n");
+    // d.list is over the per-file cap: if the walk kept reading past the spent
+    // budget it would add an `oversized` token.
+    root.write("etc/apt/sources.list.d/d.list", "deb http://x.example/ y main\n");
+    fs::resize_file(root.apt() / "sources.list.d" / "d.list", pio::kMaxFileBytes + 1); // sparse
+
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto rows = lnx::apt_rows_at(root.path, acc);
+    // MUTATIONS: no budget -> 3 rows and no token; a budget that does not trim ->
+    // 3 rows; a budget that does not stop the walk -> the `oversized` token below.
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].find("/etc/apt/sources.list.d/a.list") != std::string::npos);
+    CHECK(rows[1].find("/etc/apt/sources.list.d/b.list") != std::string::npos);
+    CHECK(reason_has(acc, "linux:apt_sources:output_cap"));
+    CHECK_FALSE(reason_has(acc, "oversized"));
     CHECK(acc.incomplete());
 }
 
