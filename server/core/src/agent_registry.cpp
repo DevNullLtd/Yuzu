@@ -788,7 +788,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // update_source_trust
         {"update_source_trust.sources",
          "Package and update-source trust posture, facts only: Linux apt sources (one-line and "
-         "deb822; signed-by, trusted, allow-insecure) and apt keyrings; read-only, no subprocess; "
+         "deb822; signed-by, trusted, and allow-insecure for one-line entries) and apt keyrings; "
+         "read-only, no subprocess; "
          "other package families are not read, so an empty result on them is not evidence of no "
          "sources"},
         // status

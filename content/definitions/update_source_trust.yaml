@@ -47,14 +47,16 @@ metadata:
   description: >
     Reports how the device's package and update sources are configured to
     trust their signing authorities, as facts only. On Linux, one row per apt
-    source (one-line and deb822, with signed-by, trusted and allow-insecure)
-    and one row per apt keyring file. The yum/dnf repository family is planned
+    source (one-line and deb822, with signed-by, trusted and, for one-line
+    entries only, allow-insecure) and one row per apt keyring file. The yum/dnf repository family is planned
     and not yet read; a Linux host whose /etc/yum.repos.d has entries
     reports a constrained status with linux:rpm_repo:planned instead of rows.
     The macOS Software Update and Windows WSUS legs are planned and not yet
     read. Only the apt family is read: on a Linux host whose sources live
     elsewhere (zypper, pacman, apk) zero rows is not evidence that no
-    sources exist. A leading status row states whether the read was
+    sources exist. Global apt configuration (apt.conf, apt.conf.d) is not
+    read, so an unset trust field is not evidence that signatures are
+    enforced. A leading status row states whether the read was
     complete. The plugin never enforces, fetches or changes anything.
   tags: [security, supply-chain, update-sources, packages]
 
@@ -134,7 +136,7 @@ spec:
         platforms: [linux, darwin]
       - name: field_7
         type: string
-        description: 'apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), or "-" when absent (apt then uses its global trusted keyrings). Planned, not emitted today: rpm_repo: gpgkey URL(s). macos_swu: critical_update_install.'
+        description: 'apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), the literal unmodelled when a one-line signed-by uses += or -=, or "-" when absent (apt then uses its global trusted keyrings). Planned, not emitted today: rpm_repo: gpgkey URL(s). macos_swu: critical_update_install.'
         example: /usr/share/keyrings/debian-archive-keyring.gpg
         platforms: [linux, darwin]
       - name: field_8
