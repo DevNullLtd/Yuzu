@@ -11,7 +11,8 @@
  * (sources and keyrings) is read today. The rpm/dnf `.repo` family is not read
  * yet; a host whose /etc/yum.repos.d has entries reports constrained with
  * `linux:rpm_repo:planned` (lnx::rpm_family_planned_at), never a clean "no
- * sources" -- a skipped family must not read as an empty one.
+ * sources" -- the skipped rpm/dnf family must not read as an empty one. Other
+ * families (zypper, pacman, apk) are not detected at all.
  */
 #include "update_source_trust_legs.hpp"
 #include "update_source_trust_linux_parsers.hpp"
