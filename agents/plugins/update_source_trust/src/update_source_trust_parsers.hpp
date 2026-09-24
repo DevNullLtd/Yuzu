@@ -25,9 +25,9 @@
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
  *   apt_keyring|<path>|<scope>|<format armored|binary|empty|unmodelled>|<size_bytes>
  *   rpm_repo|...   macos_swu|...   wsus|...
- *       PLANNED shapes, never emitted here (not read yet): the rpm/dnf .repo
- *       family, the macOS Software Update leg and the Windows WSUS leg. They are
- *       documented in content/definitions/update_source_trust.yaml.
+ *       PLANNED shapes, never emitted here (not read yet): the
+ *       rpm/dnf .repo family, the macOS Software Update leg, the Windows WSUS
+ *       leg) and is documented in content/definitions/update_source_trust.yaml.
  *
  * TRISTATE. Every boolean-ish OS value maps to exactly one of
  * yes | no | unset | unmodelled. `unset` = the key is absent (a fact: the
@@ -46,15 +46,11 @@
  * KNOWN LIMITS (facts-only scope, stated so no consumer infers more):
  *   - apt: /usr/share/keyrings is not inventoried; keys referenced by
  *     Signed-By are reported by path, not resolved or fingerprinted.
- *   - rpm/dnf (the .repo files under /etc/yum.repos.d), macOS Software Update
- *     and the Windows WSUS policy are not read at all yet. The Linux leg reports
- *     the rpm family as a planned constraint rather than as absent; other
- *     families (zypper, pacman, apk) are not detected.
- *   - Global apt configuration (apt.conf, apt.conf.d) is not read: a per-source
- *     `unset` means the source does not say, not that signatures are enforced.
- *   - URLs: userinfo (`user:pass@`) is redacted as apt's own URI split finds it;
- *     a secret carried in a query string or a path cannot be recognised and is
- *     emitted as written.
+ *   - rpm/dnf (the .repo files under /etc/yum.repos.d) and macOS Software
+ *     Update are not read at all yet. The Linux
+ *     leg reports the rpm family as a planned constraint rather than as absent.
+ *   - URLs: userinfo (`user:pass@`) is redacted; a secret carried in a query
+ *     string cannot be recognised and is emitted as written.
  */
 #pragma once
 
@@ -209,9 +205,34 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return out;
 }
 
-/// The %XX-decoded form of `s`: apt de-quotes the words of a source line before
-/// it splits a URI, so `http%3a//u:pw@h/` names host h. A '%' that is not followed
-/// by two hex digits stays as written. Only used to LOCATE a userinfo.
+/// Splits an option block (the inside of `[...]`) into `key=value` tokens like
+/// split_ws, except that whitespace inside a matching pair of double quotes does
+/// not split: apt de-quotes a quoted option VALUE as one token even when it
+/// contains a space (`[signed-by="/etc/apt/a b.gpg"]`). An unterminated quote
+/// runs to the end of the block, same shape as split_apt_words' bracket handling.
+[[nodiscard]] inline std::vector<std::string_view> split_apt_options(std::string_view s) {
+    std::vector<std::string_view> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && is_ascii_space(s[i]))
+            ++i;
+        const std::size_t start = i;
+        bool quoted = false;
+        for (; i < s.size(); ++i) {
+            if (s[i] == '"')
+                quoted = !quoted;
+            else if (!quoted && is_ascii_space(s[i]))
+                break;
+        }
+        if (i > start)
+            out.push_back(s.substr(start, i - start));
+    }
+    return out;
+}
+
+/// The %XX-decoded form of `s`: used only to decode a surfaced option's VALUE
+/// (apt does the same before reading signed-by/trusted/allow-insecure). A '%'
+/// that is not followed by two hex digits stays as written.
 [[nodiscard]] inline std::string percent_decoded(std::string_view s) {
     const auto hex = [](char c) -> int {
         if (c >= '0' && c <= '9')
@@ -236,36 +257,51 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
 }
 
 /// One word of a URI list with the `user[:pass]@` userinfo replaced by
-/// `REDACTED@`. The split is apt's own (URI::CopyFrom): the scheme ends at the
-/// FIRST ':'; a "//" right after it belongs to the authority; the authority ends
-/// at the first '/' OUTSIDE a `[...]` group; the userinfo is everything in the
-/// authority before its LAST '@'. That makes a '?' or '#' in a password, a
-/// second '@', a '/' inside `[...]`, a scheme without "//" (`http:u:pw@h/`) and
-/// a backslash all redact exactly where apt would resolve them. A word that
-/// contains '%' is analysed, and returned, in its %XX-decoded form. A word with
-/// no userinfo is returned unchanged; a query string or path holding a secret
-/// cannot be recognised and is emitted as written (documented).
+/// `REDACTED@`. Every position below is a RAW byte offset into `word` -- NOTHING
+/// is percent-decoded before the split. An earlier version decoded the whole
+/// word first, so a %XX-encoded byte in the password (`bob:%2fSEKR3T@host`)
+/// could be read as the path separator and stop the authority scan short,
+/// missing the '@' entirely and returning the WHOLE credential unredacted; real
+/// apt does not decode %XX when it locates the authority either (verified: its
+/// own resolved URI still shows `%2fSEKR3T` literally), so working on raw bytes
+/// matches apt AND cannot under-run. The one place apt's lexer does recognise a
+/// percent form is the scheme separator itself (`http%3a//u:pw@h/` resolves as
+/// `http://u:pw@h/`, verified), so ':' and "%3a"/"%3A" are both accepted there,
+/// whichever comes first. From there the authority ends at the first raw '/'
+/// OUTSIDE a `[...]` group -- an encoded slash (%2f/%2F) does NOT end it, which
+/// is what makes the authority span reach the real '@' even when a password
+/// contains one. The userinfo is everything in that authority before its LAST
+/// '@'; a query string or path holding a secret is not syntactically a userinfo
+/// and is emitted as written (documented) -- widening the search past the
+/// authority boundary would redact a bare '@' in a path (`h.example/a@b`),
+/// which is not a credential and must stay untouched.
 [[nodiscard]] inline std::string redact_apt_word(std::string_view word) {
-    const std::string d = word.find('%') == std::string_view::npos ? std::string{word}
-                                                                   : percent_decoded(word);
-    const std::size_t colon = d.find(':');
-    if (colon == std::string::npos)
+    std::size_t colon = word.find(':');
+    std::size_t colon_len = 1;
+    for (const std::string_view enc : {std::string_view{"%3a"}, std::string_view{"%3A"}}) {
+        const std::size_t p = word.find(enc);
+        if (p != std::string_view::npos && (colon == std::string_view::npos || p < colon)) {
+            colon = p;
+            colon_len = 3;
+        }
+    }
+    if (colon == std::string_view::npos)
         return std::string{word}; // no scheme, so no authority
-    std::size_t begin = colon + 1;
-    if (d.compare(colon + 1, 2, "//") == 0)
-        begin = colon + 3;
+    std::size_t begin = colon + colon_len;
+    if (word.compare(begin, 2, "//") == 0)
+        begin += 2;
     std::size_t end = begin;
     bool in_bracket = false;
-    for (; end < d.size() && (d[end] != '/' || in_bracket); ++end) {
-        if (d[end] == '[')
+    for (; end < word.size() && (word[end] != '/' || in_bracket); ++end) {
+        if (word[end] == '[')
             in_bracket = true;
-        else if (d[end] == ']')
+        else if (word[end] == ']')
             in_bracket = false;
     }
-    const std::size_t at = std::string_view{d}.substr(begin, end - begin).rfind('@');
+    const std::size_t at = std::string_view{word}.substr(begin, end - begin).rfind('@');
     if (at == std::string_view::npos)
         return std::string{word};
-    return d.substr(0, begin) + "REDACTED@" + d.substr(begin + at + 1);
+    return std::string{word.substr(0, begin)} + "REDACTED@" + std::string{word.substr(begin + at + 1)};
 }
 
 /// Every word of `text` (split as apt splits a source line, so a `[...]` group
@@ -472,9 +508,10 @@ struct AptParseResult {
 /// for an entry it cannot read, so such an entry is malformed here (reported as
 /// unparsed, never as a row apt does not use): a type other than exactly `deb` or
 /// `deb-src`, an unterminated `[`, a second `[...]` block, an option without '=',
-/// a double quote or a '%' in the type or option block (apt de-quotes those and
-/// this plugin does not), a double quote anywhere in the entry, and too few words
-/// (a type, a uri and a suite are needed).
+/// and too few words (a type, a uri and a suite are needed). apt de-quotes a
+/// quoted option value and decodes %XX within it; this plugin does the same for
+/// the three options it surfaces (see the option loop below), so neither a `%`
+/// nor a `"` refuses the entry on its own.
 [[nodiscard]] inline AptParseResult parse_apt_one_line(std::string_view text) {
     AptParseResult res;
     std::size_t pos = 0;
@@ -498,9 +535,7 @@ struct AptParseResult {
             } else {
                 options = words[1].substr(1, words[1].size() - 2);
                 next = 2;
-                if (options.find('%') != std::string_view::npos)
-                    refused = true; // apt de-quotes %XX in options; this plugin does not
-                for (const auto opt : split_ws(options))
+                for (const auto opt : split_apt_options(options))
                     if (opt.find('=') == std::string_view::npos)
                         refused = true; // `[trusted = yes]`, `[foo]`
             }
@@ -508,9 +543,6 @@ struct AptParseResult {
         if (words.size() < next + 2 ||                        // type + uri + suite
             (words.size() > next && words[next].front() == '[')) // a second option block
             refused = true;
-        for (const auto w : words)
-            if (w.find('"') != std::string_view::npos)
-                refused = true; // apt keeps a "..." word whole and de-quotes it
         if (refused) {
             ++res.malformed;
             continue;
@@ -525,7 +557,7 @@ struct AptParseResult {
                 f.components += ' ';
             f.components.append(words[i]);
         }
-        for (auto opt : split_ws(options)) {
+        for (auto opt : split_apt_options(options)) {
             const std::size_t eq = opt.find('=');
             if (eq == std::string_view::npos)
                 continue; // tolerated
@@ -533,7 +565,19 @@ struct AptParseResult {
             const bool appends = !key.empty() && (key.back() == '+' || key.back() == '-');
             if (appends)
                 key.remove_suffix(1);
-            const std::string_view val = opt.substr(eq + 1);
+            // apt de-quotes a single matching pair of double quotes around an option
+            // value and decodes %XX within it (verified: [signed-by="/a b.gpg"] and
+            // [lang=%65n] are both read by apt); only the three surfaced options need
+            // that done here -- an ignored option's value is never looked at.
+            std::string_view raw_val = opt.substr(eq + 1);
+            std::string decoded_val;
+            if (raw_val.size() >= 2 && raw_val.front() == '"' && raw_val.back() == '"')
+                raw_val = raw_val.substr(1, raw_val.size() - 2);
+            if (raw_val.find('%') != std::string_view::npos) {
+                decoded_val = percent_decoded(raw_val);
+                raw_val = decoded_val;
+            }
+            const std::string_view val = raw_val;
             if (key == "signed-by")
                 f.signed_by = appends ? "unmodelled" : apt_signed_by_value(val);
             else if (key == "trusted")

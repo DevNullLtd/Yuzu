@@ -123,9 +123,16 @@ TEST_CASE("redact_url_userinfo strips credentials from every URL in a list",
           "http://REDACTED@h.example/y");
     CHECK(ust::redact_url_userinfo("http:\\u:SEKRET@127.0.0.9:9/apt") ==
           "http:REDACTED@127.0.0.9:9/apt");
-    CHECK(ust::redact_url_userinfo("http%3a//u:SEKRET@h.example/x") == "http://REDACTED@h.example/x");
-    CHECK(ust::redact_url_userinfo("http%3A%2F%2Fu:secretpw@h.example/x") ==
-          "http://REDACTED@h.example/x");
+    // The scheme's own %3a is recognised structurally (to find the authority) but
+    // never decoded for DISPLAY: the literal bytes the admin wrote are kept, only
+    // the credential span is replaced.
+    CHECK(ust::redact_url_userinfo("http%3a//u:SEKRET@h.example/x") ==
+          "http%3a//REDACTED@h.example/x");
+    // A DOUBLE-encoded "//" (the scheme's %3A is recognised, but the slashes after
+    // it are not) is over-redacted into the authority span rather than risking a
+    // miss: the secret still never appears on the wire.
+    CHECK(ust::redact_url_userinfo("http%3A%2F%2Fu:secretpw@h.example/x").find("secretpw") ==
+          std::string::npos);
     // Not userinfo: a cdrom label, an IPv6 authority and an '@' in a path stay.
     CHECK(ust::redact_url_userinfo("cdrom:[Debian GNU/Linux 12 DVD 1]/") ==
           "cdrom:[Debian GNU/Linux 12 DVD 1]/");
@@ -205,14 +212,46 @@ TEST_CASE("parse_apt_one_line: a garbled trusted value is unmodelled; entries ap
         "deb [foo] http://d.example/ y main\n"           // option without '='
         "deb [trusted = yes] http://e.example/ y main\n" // spaces around '='
         "deb [a=b] [c=d] http://f.example/ y main\n"     // a second block
-        "deb [%74rusted=yes] http://g.example/ y main\n" // apt de-quotes %XX
-        "deb \"http://h.example/a b\" y main\n"          // quoted word
         "\xef\xbb\xbf" "deb http://i.example/ y main\n");  // a BOM before the type
     REQUIRE(r.sources.size() == 1);
     CHECK(r.sources[0].trusted == ust::Tri::unmodelled);
     // apt refuses each of these (verified on apt 3.0.3); reporting a row for one
     // would show a source apt does not use. MUTATION: dropping a refuse rule emits it.
-    CHECK(r.malformed == 9);
+    CHECK(r.malformed == 7);
+}
+
+TEST_CASE("parse_apt_one_line: apt reads a %-encoded or quoted option value, and even a quoted URI word",
+          "[update_source_trust][parsers][apt]") {
+    // Real apt accepts every line below (verified on apt 2.0.10-3.2.0): a '%' or a
+    // '\"' anywhere in the entry must not refuse it on its own (round-2 regression,
+    // hp8r2-1/hp8r2-2). An OPTION KEY is never decoded (apt does not either for the
+    // keys this plugin cares about), so a percent-encoded key is simply unrecognised
+    // and tolerated, not the surfaced option it spells out.
+    const auto r = ust::parse_apt_one_line(
+        "deb [%74rusted=yes] http://g.example/ y main\n"    // key stays literal, unrecognised
+        "deb \"http://h.example/a b\" y main\n");           // apt de-quotes the whole word
+    REQUIRE(r.malformed == 0);
+    REQUIRE(r.sources.size() == 2);
+    CHECK(r.sources[0].trusted == ust::Tri::unset); // "%74rusted" is not "trusted"
+    // MUTATION: a quote or '%' anywhere refusing the entry drops this row entirely,
+    // hiding a source apt actually uses; this plugin does not re-tokenise a quoted
+    // word (a rare shape), so the space inside it still splits the fields.
+    CHECK(r.sources[1].uris == "\"http://h.example/a");
+}
+
+TEST_CASE("parse_apt_one_line: an option VALUE is de-quoted and %XX-decoded, matching apt",
+          "[update_source_trust][parsers][apt]") {
+    // Verified on apt 3.0.3: [signed-by="/a b.gpg"] and [signed-by=%2Fa%2Fb.gpg] are
+    // both read; MUTATION: skipping either step reports the raw quoted/encoded text.
+    const auto r = ust::parse_apt_one_line(
+        "deb [signed-by=\"/etc/apt/a b.gpg\"] http://x.example/ s main\n"
+        "deb [signed-by=%2Fetc%2Fapt%2Fk.gpg] http://y.example/ s main\n"
+        "deb [trusted=\"yes\"] http://z.example/ s main\n");
+    REQUIRE(r.malformed == 0);
+    REQUIRE(r.sources.size() == 3);
+    CHECK(r.sources[0].signed_by == "/etc/apt/a b.gpg");
+    CHECK(r.sources[1].signed_by == "/etc/apt/k.gpg");
+    CHECK(r.sources[2].trusted == ust::Tri::yes);
 }
 
 // ── apt deb822 ───────────────────────────────────────────────────────────
