@@ -508,8 +508,7 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
 // this TU's private type.
 StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
                                                  std::unordered_map<std::string, std::string> config)
-    : impl_(new PluginContextImpl{std::move(config), nullptr, nullptr, std::move(plugin_name)},
-            [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
+    : StandalonePluginContext(std::move(plugin_name), std::move(config), nullptr) {}
 
 StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
                                                  std::unordered_map<std::string, std::string> config,

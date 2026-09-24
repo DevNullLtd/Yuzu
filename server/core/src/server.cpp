@@ -5123,7 +5123,7 @@ public:
                     if (!audit_store_ || !audit_store_->is_open())
                         return std::nullopt;
                     AuditQuery q;
-                    q.action = "tar.db.corruption_quarantined";
+                    q.action = detail::kTarCorruptionAuditAction;
                     q.target_id = agent_id;
                     q.limit = 1;
                     auto rows = audit_store_->query(q);
@@ -5147,8 +5147,8 @@ public:
                                        .count();
                     ev.principal = "system";
                     ev.principal_role = "system";
-                    ev.action = "tar.db.corruption_quarantined";
-                    ev.target_type = "Agent";
+                    ev.action = detail::kTarCorruptionAuditAction;
+                    ev.target_type = detail::kTarCorruptionAuditTargetType;
                     ev.target_id = agent_id;
                     ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
                     ev.result = "success";

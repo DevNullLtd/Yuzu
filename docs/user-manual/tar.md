@@ -389,7 +389,7 @@ The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` 
 
 ### Corrupt-database quarantine
 
-When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. `tar.db.corruption_detected` is an agent-local log line (`spdlog`, error level); the quarantine itself reaches the server as a `tar.db.corruption_quarantined` audit row via the heartbeat — see "Fleet visibility" below. Consequences an operator should know:
 
 - **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
 - **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.

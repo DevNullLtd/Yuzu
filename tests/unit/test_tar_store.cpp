@@ -2270,7 +2270,7 @@ TEST_CASE("TarDatabase: StateWrite with empty events writes only the baseline (#
     CHECK(count_rows(t.db, "process_live") == 0);
 
     // nullopt state keeps the historical contract for an open handle byte-for-byte
-    // (a closed handle now returns false for every call).
+    // (a closed handle now returns false for the state-carrying overloads).
     CHECK(t.db.insert_process_events({}));
     CHECK(t.db.insert_process_events({}, std::nullopt));
     CHECK(t.db.get_state("process") == "only-state");

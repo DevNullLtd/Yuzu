@@ -2255,7 +2255,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
         // #1567: agents whose plugin-published corruption total parses > 0, and the
         // per-plugin count of agents reporting a failed init. Both tags are
-        // agent-controlled: bounded token count/length, in-place reads (no copies).
+        // agent-controlled: bounded token count, in-place reads (no copies).
         if (auto it = snap.status_tags.find(kTarTagCorruptionTotal);
             it != snap.status_tags.end() && parse_tar_corruption_total(it->second))
             ++tar_db_corruption_agents;

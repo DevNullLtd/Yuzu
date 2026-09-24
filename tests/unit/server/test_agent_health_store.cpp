@@ -1993,10 +1993,13 @@ TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newes
     using yuzu::server::detail::TarCorruptionAuditGate;
     int lookups = 0;
     std::optional<std::optional<std::string>> answer = std::optional<std::string>{}; // no row
-    TarCorruptionAuditGate gate([&](const std::string&) {
-        ++lookups;
-        return answer;
-    });
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return answer;
+        },
+        [&] { return clock; });
 
     // No prior row -> log; mark -> no further lookup.
     CHECK(gate.should_log("a", "1:f"));
@@ -2016,12 +2019,17 @@ TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newes
     // Newest row is a different quarantine -> log.
     CHECK(gate.should_log("b", "3:h"));
 
-    // Degraded store: no write, NOT marked, retried on the next call.
+    // Degraded store: no write, NOT marked; one probe, then no lookups inside
+    // the retry window, and a probe again after it.
     answer = std::nullopt;
     const int before = lookups;
     CHECK_FALSE(gate.should_log("c", "4:i"));
     CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK(lookups == before + 1);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK_FALSE(gate.should_log("c", "4:i"));
     CHECK(lookups == before + 2);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
 
     // Two agents with the same quarantine string are independent.
     answer = std::optional<std::string>{};
@@ -2035,12 +2043,16 @@ TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable on
     using yuzu::server::detail::TarCorruptionAuditGate;
     int lookups = 0;
     std::optional<std::optional<std::string>> answer = std::nullopt; // degraded
-    TarCorruptionAuditGate gate([&](const std::string&) {
-        ++lookups;
-        return answer;
-    });
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return answer;
+        },
+        [&] { return clock; });
     // Degraded store: no write, not marked.
     CHECK_FALSE(gate.should_log("a", "1:f"));
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
     // Healthy, no row -> log; the caller's log() fails (does not mark) -> retried.
     answer = std::optional<std::string>{};
     CHECK(gate.should_log("a", "1:f"));
@@ -2052,9 +2064,55 @@ TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable on
     CHECK(lookups == before);
 }
 
+TEST_CASE("TarCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    TarCorruptionAuditGate gate([&](const std::string&) {
+        ++lookups;
+        return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+    });
+    for (int i = 0; i < 5000; ++i)
+        gate.mark_logged("agent-" + std::to_string(i), "1:f");
+    for (int i = 0; i < 5000; ++i)
+        CHECK_FALSE(gate.should_log("agent-" + std::to_string(i), "1:f"));
+    CHECK(lookups == 0);
+}
+
+TEST_CASE("TarCorruptionAuditGate: a rotating identity is rate-limited per agent",
+          "[health_store][tar][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    int lookups = 0;
+    int64_t clock = 5000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    REQUIRE(gate.should_log("a", "1:f"));
+    gate.mark_logged("a", "1:f");
+    const int before = lookups;
+    // Rotating identities inside the window: no row, no lookup.
+    clock += 1;
+    CHECK_FALSE(gate.should_log("a", "2:g"));
+    clock += 1;
+    CHECK_FALSE(gate.should_log("a", "3:h"));
+    CHECK(lookups == before);
+    // A different agent is unaffected.
+    CHECK(gate.should_log("b", "2:g"));
+    // Past the window the next identity logs.
+    clock += kTarCorruptionAuditMinRowInterval;
+    CHECK(gate.should_log("a", "3:h"));
+    CHECK(lookups == before + 2);
+}
+
 TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink composition",
           "[health_store][tar][corruption][gate]") {
     using namespace yuzu::server::detail;
+    // Pins the verb/target documented in audit-log.md; server.cpp uses the same constants.
+    CHECK(std::string(kTarCorruptionAuditAction) == "tar.db.corruption_quarantined");
+    CHECK(std::string(kTarCorruptionAuditTargetType) == "Agent");
     const auto d = encode_tar_corruption_detail(3, "1700000000:tar.db.corrupt-1700000000");
     CHECK(d == "corruption_total=3 quarantine=1700000000:tar.db.corrupt-1700000000");
     CHECK(decode_tar_quarantine_from_detail(d) == "1700000000:tar.db.corrupt-1700000000");

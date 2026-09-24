@@ -5,30 +5,39 @@
  *
  * Agents report `yuzu.plugin.tar.db_corruption_total` / `db_quarantine_last`
  * heartbeat tags. AgentHealthStore SURFACES a candidate on every heartbeat whose tags
- * parse (valid tag pair); the gate provides the dedup: a bounded in-process
- * seen-set of (agent_id, quarantine_last) and, on a miss, ONE lookup of the
- * newest `tar.db.corruption_quarantined` audit row for the agent. Net effect:
- * exactly one audit row per (agent, quarantine identity) across store prunes,
- * server restarts and HA node switches, and a failed or skipped write is
- * retried on the next heartbeat (the pair is only marked once the row is
- * durable).
+ * parse (valid tag pair); the gate provides the dedup: ONE map entry per agent
+ * (agent_id -> last known quarantine identity + time of the last row this
+ * process wrote), bounded by kMaxAgents (one arbitrary entry is evicted at the
+ * cap, never a wholesale clear), and, on a miss, ONE lookup of the newest
+ * `tar.db.corruption_quarantined` audit row for the agent. Net effect: exactly
+ * one audit row per (agent, quarantine identity) across store prunes, server
+ * restarts and HA node switches, and a failed or skipped write is retried on
+ * the next heartbeat (the pair is only marked once the row is durable).
+ *
+ * The identity is agent-asserted and only shape-validated, so the gate also
+ * bounds a rotating identity: at most one row per agent per
+ * kTarCorruptionAuditMinRowInterval seconds (a genuine second quarantine is
+ * delayed, never lost: its identity persists in the agent's `last` tag and
+ * logs on the first heartbeat after the window). A degraded audit store is
+ * probed at most once per kTarCorruptionAuditDegradedRetry seconds gate-wide.
  *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
- * seen-set answers with a hash lookup; while it is not, that is one lookup per
- * heartbeat for agents with corruption > 0. If candidates ever become frequent
- * this must move to a queue.
+ * map answers with a hash lookup. If candidates ever become frequent this must
+ * move to a queue.
  *
- * Pure: the audit-store query is injected.
+ * Pure: the audit-store query and the clock are injected.
  */
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
+#include <unordered_map>
+#include <utility>
 
 namespace yuzu::server::detail {
 
@@ -36,6 +45,17 @@ namespace yuzu::server::detail {
 /// `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last` KV keys.
 inline constexpr const char* kTarTagCorruptionTotal = "yuzu.plugin.tar.db_corruption_total";
 inline constexpr const char* kTarTagQuarantineLast = "yuzu.plugin.tar.db_quarantine_last";
+
+/// Audit-row verb and target type for a tar.db quarantine (documented in
+/// docs/user-manual/audit-log.md). Shared by the dedup query and the emit.
+inline constexpr const char* kTarCorruptionAuditAction = "tar.db.corruption_quarantined";
+inline constexpr const char* kTarCorruptionAuditTargetType = "Agent";
+
+/// Minimum seconds between two rows for one agent (bounds a rotating,
+/// agent-asserted identity to 144 rows/day/agent).
+inline constexpr int64_t kTarCorruptionAuditMinRowInterval = 600;
+/// While the audit store answers "degraded", skip lookups for this long.
+inline constexpr int64_t kTarCorruptionAuditDegradedRetry = 60;
 
 /// Parse `yuzu.plugin.tar.db_corruption_total`: digits only, <= 18 chars, > 0.
 [[nodiscard]] inline std::optional<int64_t> parse_tar_corruption_total(std::string_view raw) {
@@ -98,42 +118,66 @@ public:
     /// audit store is degraded/unqueryable; inner nullopt = no prior row.
     using LatestFn =
         std::function<std::optional<std::optional<std::string>>(const std::string& agent_id)>;
+    using NowFn = std::function<int64_t()>;
 
-    explicit TarCorruptionAuditGate(LatestFn latest) : latest_(std::move(latest)) {}
+    explicit TarCorruptionAuditGate(LatestFn latest, NowFn now_s = &steady_seconds)
+        : latest_(std::move(latest)), now_s_(std::move(now_s)) {}
 
     /// True iff a new audit row should be written for (agent, quarantine).
     [[nodiscard]] bool should_log(const std::string& agent_id, const std::string& quarantine) {
-        const auto key = make_key(agent_id, quarantine);
+        const auto now = now_s_();
         {
             std::lock_guard lock(mu_);
-            if (seen_.contains(key))
-                return false;
+            if (now < degraded_until_)
+                return false; // degraded store: no lookup until the window ends
+            if (const auto it = agents_.find(agent_id); it != agents_.end()) {
+                if (it->second.identity == quarantine)
+                    return false; // already durable
+                if (it->second.last_row_at &&
+                    now - *it->second.last_row_at < kTarCorruptionAuditMinRowInterval)
+                    return false; // rotating identity: rate-limited, retried later
+            }
         }
         const auto latest = latest_(agent_id); // outside mu_: a store round-trip
-        if (!latest)
-            return false; // degraded store: no write, not marked -> retried later
+        if (!latest) {
+            std::lock_guard lock(mu_);
+            degraded_until_ = now + kTarCorruptionAuditDegradedRetry;
+            return false; // no write, not marked -> retried after the window
+        }
         if (*latest && **latest == quarantine) {
-            mark_logged(agent_id, quarantine); // already durable (prior run / other node)
+            remember(agent_id, quarantine, std::nullopt); // durable (prior run / other node)
             return false;
         }
         return true;
     }
 
     void mark_logged(const std::string& agent_id, const std::string& quarantine) {
-        std::lock_guard lock(mu_);
-        if (seen_.size() >= kMaxSeen)
-            seen_.clear(); // bounded; the audit-store lookup backs it
-        seen_.insert(make_key(agent_id, quarantine));
+        remember(agent_id, quarantine, now_s_());
     }
 
 private:
-    static constexpr std::size_t kMaxSeen = 4096;
-    static std::string make_key(const std::string& a, const std::string& q) {
-        return a + "\n" + q;
+    static constexpr std::size_t kMaxAgents = 65536;
+    struct Entry {
+        std::string identity;
+        std::optional<int64_t> last_row_at; // set only for rows this process wrote
+    };
+    static int64_t steady_seconds() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    void remember(const std::string& agent_id, const std::string& quarantine,
+                  std::optional<int64_t> row_at) {
+        std::lock_guard lock(mu_);
+        if (agents_.size() >= kMaxAgents && !agents_.contains(agent_id))
+            agents_.erase(agents_.begin()); // bounded; the audit-store lookup backs it
+        agents_[agent_id] = Entry{quarantine, row_at};
     }
     LatestFn latest_;
+    NowFn now_s_;
     std::mutex mu_;
-    std::unordered_set<std::string> seen_;
+    std::unordered_map<std::string, Entry> agents_;
+    int64_t degraded_until_{0};
 };
 
 } // namespace yuzu::server::detail

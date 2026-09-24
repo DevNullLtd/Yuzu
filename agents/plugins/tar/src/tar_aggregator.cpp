@@ -20,6 +20,7 @@
 #include <ctime>
 #include <format>
 #include <limits>
+#include <memory>
 #include <tuple>
 #include <mutex>
 #include <optional>
@@ -155,11 +156,14 @@ constexpr const char* kUpsertConfig = "INSERT INTO tar_config (key, value) VALUE
 // Prepare + bind (all text) + step one UPSERT on the transaction's connection.
 // Any failure poisons the handle exactly like TransactionHandle::exec().
 bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::string_view> params) {
+    if (h.poisoned())
+        return false;
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(h.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
         h.fail(sqlite3_errmsg(h.raw()));
         return false;
     }
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard{stmt, &sqlite3_finalize};
     bool ok = true;
     for (std::size_t i = 0; ok && i < params.size(); ++i)
         ok = sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].data() ? params[i].data() : "",
@@ -168,7 +172,6 @@ bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::str
         ok = sqlite3_step(stmt) == SQLITE_DONE;
     if (!ok)
         h.fail(sqlite3_errmsg(h.raw()));
-    sqlite3_finalize(stmt);
     return ok;
 }
 

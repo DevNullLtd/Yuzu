@@ -18,6 +18,8 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <sqlite3.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -119,9 +121,12 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
             CHECK(desc->init(ctx.get()) == 0);
 
             size_t quarantined_files = 0;
+            std::string quarantine_name;
             for (const auto& e : fs::directory_iterator(dir_guard.path))
-                if (e.path().filename().string().rfind("tar.db.corrupt-", 0) == 0)
+                if (e.path().filename().string().rfind("tar.db.corrupt-", 0) == 0) {
                     ++quarantined_files;
+                    quarantine_name = e.path().filename().string();
+                }
             CHECK(quarantined_files == 1);
 
             yuzu::agent::LocalDispatcher d;
@@ -138,7 +143,7 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
             CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
             const auto last = kv->get("tar", "heartbeat.db_quarantine_last");
             REQUIRE(last.has_value());
-            CHECK(last->rfind(epoch + ":tar.db.corrupt-", 0) == 0);
+            CHECK(last == std::optional<std::string>{epoch + ":" + quarantine_name});
             desc->shutdown(ctx.get());
 
             // Second init on the same data dir: replay is idempotent.
@@ -149,6 +154,80 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
             CHECK(kv->get("tar", "heartbeat.db_quarantine_last") == last);
             desc->shutdown(ctx2.get());
         }
+    }
+
+    SECTION("failed `last` publish is not re-counted; counter advances once per quarantine") {
+        const auto quarantine_basenames = [&] {
+            std::vector<std::string> names;
+            for (const auto& e : fs::directory_iterator(dir_guard.path)) {
+                const auto n = e.path().filename().string();
+                if (n.rfind("tar.db.corrupt-", 0) == 0)
+                    names.push_back(n);
+            }
+            return names;
+        };
+        const auto corrupt_db = [&] {
+            std::ofstream bad(dir_guard.path / "tar.db", std::ios::binary | std::ios::trunc);
+            bad << std::string(8192, 'X');
+        };
+        const auto init_shutdown = [&] {
+            yuzu::agent::StandalonePluginContext ctx("tar", {{"agent.data_dir", dir_guard.path.string()}},
+                                                     &*kv);
+            REQUIRE(desc->init(ctx.get()) == 0);
+            desc->shutdown(ctx.get());
+        };
+
+        // Block only the `last` key on the kv table (INSERT and UPDATE).
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open((dir_guard.path / "kv_store.db").string().c_str(), &raw) == SQLITE_OK);
+        const auto exec = [&](const char* sql) {
+            char* err = nullptr;
+            const int rc = sqlite3_exec(raw, sql, nullptr, nullptr, &err);
+            sqlite3_free(err);
+            return rc == SQLITE_OK;
+        };
+        REQUIRE(exec("CREATE TRIGGER block_last_ins BEFORE INSERT ON kv_store "
+                     "WHEN NEW.key = 'heartbeat.db_quarantine_last' "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+        REQUIRE(exec("CREATE TRIGGER block_last_upd BEFORE UPDATE ON kv_store "
+                     "WHEN NEW.key = 'heartbeat.db_quarantine_last' "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+        corrupt_db();
+        init_shutdown();
+        init_shutdown(); // replay with `last` still failing: must not re-increment
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
+        CHECK_FALSE(kv->get("tar", "heartbeat.db_quarantine_last").has_value());
+
+        REQUIRE(exec("DROP TRIGGER block_last_ins"));
+        REQUIRE(exec("DROP TRIGGER block_last_upd"));
+        init_shutdown();
+        auto names = quarantine_basenames();
+        REQUIRE(names.size() == 1);
+        const auto first_last = kv->get("tar", "heartbeat.db_quarantine_last");
+        REQUIRE(first_last.has_value());
+        CHECK(first_last->size() > names[0].size());
+        CHECK(first_last->substr(first_last->size() - names[0].size()) == names[0]);
+        CHECK((*first_last)[first_last->size() - names[0].size() - 1] == ':');
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
+
+        // A second quarantine advances the counter exactly once and `last` names the newer file.
+        corrupt_db();
+        init_shutdown();
+        names = quarantine_basenames();
+        CHECK(names.size() == 2);
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"2"});
+        const auto second_last = kv->get("tar", "heartbeat.db_quarantine_last");
+        REQUIRE(second_last.has_value());
+        CHECK(second_last != first_last);
+        bool names_a_listed_file = false;
+        for (const auto& n : names)
+            if (second_last->size() > n.size() &&
+                second_last->substr(second_last->size() - n.size()) == n &&
+                n != first_last->substr(first_last->find(':') + 1))
+                names_a_listed_file = true;
+        CHECK(names_a_listed_file);
+        sqlite3_close(raw);
     }
 
     SECTION("clean boot -> db_health|ok|0") {

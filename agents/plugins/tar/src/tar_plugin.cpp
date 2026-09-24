@@ -1110,9 +1110,9 @@ public:
     // into `yuzu.plugin.tar.*` heartbeat tags. Runs at init and at the top of
     // every collect_slow tick, so a crash between the quarantine and the publish,
     // or a failed storage_set, is replayed rather than lost. The counter is
-    // monotonic per agent and is never overwritten when it exists but is
-    // unreadable (storage_get returns "" for absent AND read-failure). The one
-    // windows where the fact is lost are a crash between the quarantine rename and
+    // monotonic per agent and the ledger is never overwritten when it
+    // exists but is unreadable (storage_get returns "" for absent AND
+    // read-failure). The two windows where the fact is lost are a crash between the quarantine rename and
     // the fresh DB's config write inside TarDatabase::open(), and that config
     // write failing (logged by open(); db_health|quarantined still shows for
     // this process).
@@ -1131,23 +1131,45 @@ public:
         const std::string want = std::format("{}:{}", epoch, file);
         constexpr std::string_view kLastKey = "heartbeat.db_quarantine_last";
         constexpr std::string_view kTotalKey = "heartbeat.db_corruption_total";
-        if (pctx.storage_exists(kLastKey) && pctx.storage_get(kLastKey) == want)
-            return; // already published
-        int64_t total = 0;
-        if (pctx.storage_exists(kTotalKey)) {
-            const auto raw = pctx.storage_get(kTotalKey);
-            const auto [p, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), total);
-            if (raw.empty() || ec != std::errc{} || p != raw.data() + raw.size() || total < 0) {
-                spdlog::warn("TAR: heartbeat.db_corruption_total unreadable; not overwriting");
+        // One atomic ledger record `<count>:<epoch>:<basename>` in a private,
+        // non-bridged key holds the truth; the two published keys are derived
+        // from it by idempotent sets. A failed publish therefore replays the
+        // same computation on the next tick instead of re-counting.
+        constexpr std::string_view kLedgerKey = "db_health.ledger";
+        int64_t count = 0;
+        std::string ledger_identity;
+        if (pctx.storage_exists(kLedgerKey)) {
+            const auto raw = pctx.storage_get(kLedgerKey);
+            const auto colon = raw.find(':');
+            bool ok = colon != std::string::npos && colon > 0;
+            if (ok) {
+                const auto [p, ec] = std::from_chars(raw.data(), raw.data() + colon, count);
+                ok = ec == std::errc{} && p == raw.data() + colon && count >= 0;
+            }
+            if (!ok) {
+                spdlog::warn("TAR: db_health.ledger unreadable; not overwriting");
+                return;
+            }
+            ledger_identity = raw.substr(colon + 1);
+        }
+        if (ledger_identity != want) {
+            ++count;
+            if (!pctx.storage_set(kLedgerKey, std::format("{}:{}", count, want))) {
+                spdlog::warn("TAR: failed to record db quarantine ledger; will retry");
                 return;
             }
         }
-        // Order: total first. A crash between the two re-runs the reconcile and
-        // increments at most once more (documented, acceptable).
-        if (!pctx.storage_set(kTotalKey, std::to_string(total + 1)) ||
-            !pctx.storage_set(kLastKey, want)) {
+        bool published = true;
+        const auto publish = [&](std::string_view key, const std::string& value) {
+            if (pctx.storage_exists(key) && pctx.storage_get(key) == value)
+                return;
+            if (!pctx.storage_set(key, value))
+                published = false;
+        };
+        publish(kTotalKey, std::to_string(count));
+        publish(kLastKey, want);
+        if (!published)
             spdlog::warn("TAR: failed to publish db quarantine heartbeat keys; will retry");
-        }
     }
 
 private:

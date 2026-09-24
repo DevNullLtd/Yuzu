@@ -793,7 +793,8 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     if (quarantined_at) {
         // Durable source of truth for the fleet-visible corruption fact; the
         // plugin reconciles it into its heartbeat KV keys (a crash between the
-        // rename above and this write is the one window where the fact is lost).
+        // rename above and this write is one of two windows where the fact is lost;
+        // the other is the config write below failing).
         // Basename only — never a full path in status or heartbeat.
         db.quarantined_at_ = quarantined_at;
         // A failed write loses the durable record (the plugin reconcile and the
