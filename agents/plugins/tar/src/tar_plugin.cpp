@@ -31,6 +31,7 @@
 #include "tar_db.hpp"
 #include "tar_usage.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_source_health.hpp"
 #include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
 #include "tar_netqual_boot.hpp"
@@ -50,6 +51,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <charconv>
 #include <chrono>
 #include <format>
 #include <iterator>
@@ -585,6 +588,7 @@ public:
                 yuzu::PluginError{1, std::format("TAR: failed to open db: {}", result.error())});
         }
         db_ = std::make_unique<yuzu::tar::TarDatabase>(std::move(*result));
+        reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
 
         // Load config
         int fast_interval = 60;
@@ -1090,8 +1094,69 @@ public:
         return 1;
     }
 
+    // Record a source's terminal outcome for this tick in the health ledger.
+    // `registry_name` is a capture_sources() name (NOT a tar_state key).
+    void note_health(std::string_view registry_name, std::string_view token) {
+        const auto now = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        std::lock_guard lock(health_mu_);
+        health_.record(registry_name, token, now);
+    }
+
+    // #1567: idempotent reconcile of the persisted quarantine fact (tar_config)
+    // into the plugin's heartbeat KV keys. The agent bridges `heartbeat.*` keys
+    // into `yuzu.plugin.tar.*` heartbeat tags. Runs at init and at the top of
+    // every collect_slow tick, so a crash between the quarantine and the publish,
+    // or a failed storage_set, is replayed rather than lost. The counter is
+    // monotonic per agent and is never overwritten when it exists but is
+    // unreadable (storage_get returns "" for absent AND read-failure). The one
+    // window where the fact is lost is a crash between the quarantine rename and
+    // the fresh DB's config write inside TarDatabase::open().
+    void reconcile_db_health_publish(yuzu::PluginContext& pctx) {
+        if (!db_ || !db_->is_open())
+            return;
+        int64_t epoch = 0;
+        try {
+            epoch = std::stoll(db_->get_config("db_health_last_quarantine_epoch", "0"));
+        } catch (...) {
+            return;
+        }
+        const auto file = db_->get_config("db_health_last_quarantine_file", "");
+        if (epoch <= 0 || file.empty())
+            return;
+        const std::string want = std::format("{}:{}", epoch, file);
+        constexpr std::string_view kLastKey = "heartbeat.db_quarantine_last";
+        constexpr std::string_view kTotalKey = "heartbeat.db_corruption_total";
+        if (pctx.storage_exists(kLastKey) && pctx.storage_get(kLastKey) == want)
+            return; // already published
+        int64_t total = 0;
+        if (pctx.storage_exists(kTotalKey)) {
+            const auto raw = pctx.storage_get(kTotalKey);
+            const auto [p, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), total);
+            if (raw.empty() || ec != std::errc{} || p != raw.data() + raw.size() || total < 0) {
+                spdlog::warn("TAR: heartbeat.db_corruption_total unreadable; not overwriting");
+                return;
+            }
+        }
+        // Order: total first. A crash between the two re-runs the reconcile and
+        // increments at most once more (documented, acceptable).
+        if (!pctx.storage_set(kTotalKey, std::to_string(total + 1)) ||
+            !pctx.storage_set(kLastKey, want)) {
+            spdlog::warn("TAR: failed to publish db quarantine heartbeat keys; will retry");
+        }
+    }
+
 private:
     YuzuPluginContext* plugin_ctx_{nullptr};
+    std::mutex health_mu_;
+    yuzu::tar::SourceHealthLedger health_;
+    std::atomic<int64_t> procperf_procs_seen_{0};
+    // Set when the stream-fallback baseline seed failed: the poll must re-seed
+    // (no diff) on the next tick instead of diffing against a stale baseline.
+    // Guarded by collect_mu_.
+    bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
@@ -1295,6 +1360,7 @@ private:
                 }
                 if (!typed.empty()) {
                     if (!db_->insert_process_events(typed)) {
+                        note_health("process", "insert_failed");
                         spdlog::error("TAR: process stream insert failed — re-queuing {} events "
                                       "for the next tick",
                                       evs.size());
@@ -1314,6 +1380,7 @@ private:
                     }
                     total_events += static_cast<int>(typed.size());
                 }
+                note_health("process", "events_recorded");
                 // No state save — the stream is continuous, not a snapshot.
 
                 // Ring-overflow visibility: dropped() is cumulative, so warn only
@@ -1355,7 +1422,16 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state(proc_key, processes_to_json(current).dump());
+                    // Checked (#1654): a failed seed must not be followed by a diff
+                    // against a stale/empty baseline (ghost `started` storm), so the
+                    // poll re-seeds WITHOUT diffing on the next tick.
+                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                        spdlog::error("TAR: process poll-baseline seed failed after stream "
+                                      "fallback; will re-seed next tick");
+                        ctx.write_output("error|process state_save_failed");
+                        note_health("process", "state_save_failed");
+                        proc_poll_seed_pending_ = true;
+                    }
                 }
             } else {
                 // No active stream (poll-only platform, or stream unavailable):
@@ -1374,22 +1450,48 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state(proc_key);
-                auto previous = json_to_processes(prev_json);
+                if (proc_poll_seed_pending_) {
+                    // A previous stream-fallback seed failed: re-seed the baseline
+                    // without diffing (no ghost `started` for every process).
+                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                        spdlog::error("TAR: process poll-baseline re-seed failed");
+                        ctx.write_output("error|process state_save_failed");
+                        note_health("process", "state_save_failed");
+                        return 1;
+                    }
+                    proc_poll_seed_pending_ = false;
+                    note_health("process", "baseline");
+                } else {
+                    auto prev_json = db_->get_state(proc_key);
+                    auto previous = json_to_processes(prev_json);
 
-                auto typed =
-                    yuzu::tar::compute_process_events(previous, current, ts, snap_id, redaction);
-                if (!typed.empty()) {
-                    if (!db_->insert_process_events(typed)) {
-                        spdlog::error("TAR: failed to insert process events, skipping state save");
-                        ctx.write_output("error|process insert failed");
+                    auto typed = yuzu::tar::compute_process_events(previous, current, ts, snap_id,
+                                                                   redaction);
+                    // Events + baseline commit in ONE transaction (#1654): a failed
+                    // baseline save can no longer leave events durable with a stale
+                    // baseline that the next tick would re-diff and double-emit.
+                    const std::string state_json = processes_to_json(current).dump();
+                    const bool ok =
+                        typed.empty()
+                            ? db_->set_state(proc_key, state_json)
+                            : db_->insert_process_events(
+                                  typed, yuzu::tar::StateWrite{proc_key, state_json});
+                    if (!ok) {
+                        const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                        spdlog::error("TAR: process poll {} — nothing persisted, next tick "
+                                      "re-diffs",
+                                      tok);
+                        ctx.write_output(typed.empty() ? "error|process state_save_failed"
+                                                       : "error|process insert failed");
+                        note_health("process", tok);
                         return 1;
                     }
                     total_events += static_cast<int>(typed.size());
+                    note_health("process", "events_recorded");
                 }
-
-                db_->set_state(proc_key, processes_to_json(current).dump());
             }
+        } else {
+            note_health("process", "source_disabled");
         }
 
         // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
@@ -1402,12 +1504,16 @@ private:
         // process_enabled, and on the lifecycle state internally -- a
         // disabled or not-yet-baselined source is not a failure.
         if (auto fold = yuzu::tar::usage::run_usage_fold(*db_, ts); !fold.ok) {
+            note_health("usage", "insert_failed");
             if (ts - usage_last_fold_warn_ts_ >= 60) {
                 spdlog::warn("TAR: usage fold failed this tick ({}) -- hwm unchanged, retrying "
                             "next tick",
                             fold.error);
                 usage_last_fold_warn_ts_ = ts;
             }
+        } else {
+            note_health("usage", source_enabled(*db_, "usage") ? "events_recorded"
+                                                               : "source_disabled");
         }
 
         // Network diff
@@ -1568,26 +1674,37 @@ private:
                 // self-heal seeding above.
                 diff_previous = &current;
             }
-            nstat_tcp_primary_prev_ = nstat_primary;
+            // `nstat_tcp_primary_prev_` shadows the stored baseline's shape, so it
+            // advances only after the events + baseline commit (below): a rolled
+            // back fallback tick must re-prime next tick, not diff a udp-only
+            // baseline against the full snapshot (#1654).
 
             auto typed = yuzu::tar::compute_network_events(*diff_previous, *diff_current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_network_events(typed)) {
-                    spdlog::error("TAR: failed to insert network events, skipping state save");
-                    ctx.write_output("error|network insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
-            }
 
             // While nstat is primary, persist the udp-only view so the next
             // tick's poll diff stays apples-to-apples (never mistakes
             // nstat-owned tcp state for a poll-observed disconnect);
             // otherwise persist the full snapshot as before (the poll owns
-            // both protocols).
-            db_->set_state(net_key,
-                           connections_to_json(nstat_primary ? *diff_current : current).dump());
+            // both protocols). Events + baseline commit in ONE transaction.
+            const std::string state_json =
+                connections_to_json(nstat_primary ? *diff_current : current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state(net_key, state_json)
+                                : db_->insert_network_events(
+                                      typed, yuzu::tar::StateWrite{net_key, state_json});
+            if (!ok) {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: network {} — nothing persisted, next tick re-diffs", tok);
+                ctx.write_output(typed.empty() ? "error|network state_save_failed"
+                                               : "error|network insert failed");
+                note_health("tcp", tok);
+                return 1;
+            }
+            nstat_tcp_primary_prev_ = nstat_primary;
+            total_events += static_cast<int>(typed.size());
+            note_health("tcp", "events_recorded");
         } else if (nstat_client_) {
+            note_health("tcp", "source_disabled");
             // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat
             // client keeps its reader thread running and filling its ring
             // even while the `tcp` source is disabled (the whole block above
@@ -1602,6 +1719,8 @@ private:
             // discarded here.
             nstat_client_->drain();
             pending_nstat_evs_.clear();
+        } else {
+            note_health("tcp", "source_disabled");
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -1626,11 +1745,18 @@ private:
                 // committed, so returning 1 here would misreport a healthy cycle
                 // as failed (and suppress the events_recorded line the server
                 // reads for retention-pause detection). Log and skip instead.
-                if (db_->insert_netqual_samples(rows))
+                if (db_->insert_netqual_samples(rows)) {
                     total_events += static_cast<int>(rows.size());
-                else
+                    note_health("netqual", "sample_recorded");
+                } else {
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
+                    note_health("netqual", "insert_failed");
+                }
+            } else {
+                note_health("netqual", "sample_recorded");
             }
+        } else {
+            note_health("netqual", "source_disabled");
         }
 
         // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
@@ -1670,17 +1796,27 @@ private:
             if (current) {
                 auto previous = json_to_arp(db_->get_state("arp"));
                 auto typed = yuzu::tar::compute_arp_events(previous, *current, ts, snap_id);
-                bool ok = true;
-                if (!typed.empty()) {
-                    ok = db_->insert_arp_events(typed);
-                    if (ok)
-                        total_events += static_cast<int>(typed.size());
-                    else
-                        spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+                // Events + baseline in one transaction (#1654); non-fatal, so a
+                // failure emits no `error|` line (the tick's events_recorded
+                // contract holds) and the ledger records the token.
+                const std::string state_json = arp_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state("arp", state_json)
+                                    : db_->insert_arp_events(
+                                          typed, yuzu::tar::StateWrite{"arp", state_json});
+                if (ok) {
+                    total_events += static_cast<int>(typed.size());
+                    note_health("arp", "events_recorded");
+                } else {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: arp {} this tick (nothing persisted)", tok);
+                    note_health("arp", tok);
                 }
-                if (ok)
-                    db_->set_state("arp", arp_to_json(*current).dump());
+            } else {
+                note_health("arp", "capture_incomplete");
             }
+        } else {
+            note_health("arp", "source_disabled");
         }
 
         // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
@@ -1690,16 +1826,21 @@ private:
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_dns_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: dns insert failed this tick (state not advanced)");
+            const std::string state_json = dns_to_json(current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state("dns", state_json)
+                                : db_->insert_dns_events(
+                                      typed, yuzu::tar::StateWrite{"dns", state_json});
+            if (ok) {
+                total_events += static_cast<int>(typed.size());
+                note_health("dns", "events_recorded");
+            } else {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: dns {} this tick (nothing persisted)", tok);
+                note_health("dns", tok);
             }
-            if (ok)
-                db_->set_state("dns", dns_to_json(current).dump());
+        } else {
+            note_health("dns", "source_disabled");
         }
 
         // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
@@ -1724,6 +1865,7 @@ private:
         if (!module_enabled) {
             module_start_failed_ = false; // re-enable should retry a previously-failed start
         }
+        const char* module_tok = nullptr; // ledger token for this tick (see below)
         if (module_stream_active_ && !module_enabled) {
             // Disabled mid-run (a true→false toggle): drain-and-discard so the
             // paused window is never stored, keeping the session warm. Mirrors
@@ -1731,6 +1873,7 @@ private:
             module_stream_->drain();
             pending_module_evs_.clear();
         } else if (module_stream_active_ && module_enabled) {
+            module_tok = "events_recorded";
             // drain() resolves signing (cached) and redacts module_dir off the
             // ETW thread, so events arrive fully populated + privacy-scrubbed.
             auto mevs = module_stream_->drain();
@@ -1762,6 +1905,7 @@ private:
                     // OPT-IN source: like netqual, do NOT fail the whole tick (the
                     // always-on legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
+                    module_tok = "insert_failed";
                     spdlog::error("TAR: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -1789,6 +1933,17 @@ private:
                 module_stream_active_ = false;
             }
         }
+
+        if (!module_enabled) {
+            module_tok = "source_disabled";
+        } else if (!module_tok) {
+            const auto st = yuzu::tar::os_support_status("module", yuzu::tar::current_platform_os());
+            module_tok = (st == yuzu::tar::OsSupportStatus::kSupported ||
+                          st == yuzu::tar::OsSupportStatus::kSupportedConstrained)
+                             ? "capture_incomplete"
+                             : "unsupported_platform";
+        }
+        note_health("module", module_tok);
 
         ctx.write_output(std::format("tar|collect_fast|{}|events_recorded", total_events));
         return 0;
@@ -1862,13 +2017,18 @@ private:
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
         if (!source_enabled(*db_, "perf")) {
+            note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_perf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
-                ctx.write_output(std::format("tar|collect_perf|0|{}",
-                                             yuzu::tar::kCollectStatusUnsupportedPlatform));
+                // counters_unavailable on an OS whose registry row says a perf
+                // collector exists; unsupported_platform where none does (#1846).
+                const auto tok = yuzu::tar::read_failure_token(
+                    yuzu::tar::os_support_status("perf", yuzu::tar::current_platform_os()));
+                note_health("perf", tok);
+                ctx.write_output(std::format("tar|collect_perf|0|{}", tok));
             } else {
                 bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
@@ -1886,9 +2046,11 @@ private:
                     }
                 }
                 if (!perf_enabled_now) {
+                    note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
                     ctx.write_output(std::format("tar|collect_perf|0|{}",
                                                  yuzu::tar::kCollectStatusSourceDisabled));
                 } else if (!sample.valid) {
+                    note_health("perf", yuzu::tar::kCollectStatusBaseline);
                     ctx.write_output(std::format("tar|collect_perf|0|{}",
                                                  yuzu::tar::kCollectStatusBaseline));
                 } else {
@@ -1905,9 +2067,11 @@ private:
                     row.net_rx_bps = sample.net_rx_bps;
                     row.net_tx_bps = sample.net_tx_bps;
                     if (!db_->insert_perf_sample(row)) {
+                        note_health("perf", "insert_failed");
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
                     } else {
+                        note_health("perf", yuzu::tar::kCollectStatusSampleRecorded);
                         ctx.write_output(std::format("tar|collect_perf|1|{}",
                                                      yuzu::tar::kCollectStatusSampleRecorded));
                     }
@@ -1926,16 +2090,21 @@ private:
         // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
         // memory project-telemetry-privacy-works-council.
         if (db_->get_config("procperf_enabled", "false") != "true") {
+            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
         if (!proc_cur.valid) {
-            ctx.write_output(std::format("tar|collect_procperf|0|{}",
-                                         yuzu::tar::kCollectStatusUnsupportedPlatform));
+            const auto tok = yuzu::tar::read_failure_token(
+                yuzu::tar::os_support_status("procperf", yuzu::tar::current_platform_os()));
+            note_health("procperf", tok);
+            ctx.write_output(std::format("tar|collect_procperf|0|{}", tok));
             return rc;
         }
+        procperf_procs_seen_.store(static_cast<int64_t>(proc_cur.procs.size()),
+                                   std::memory_order_relaxed);
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
         bool procperf_enabled_now = true;
@@ -1954,11 +2123,13 @@ private:
             }
         }
         if (!procperf_enabled_now) {
+            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         if (samples.empty()) {
+            note_health("procperf", yuzu::tar::kCollectStatusBaseline);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusBaseline));
             return rc;
@@ -1986,9 +2157,11 @@ private:
             rows.push_back(std::move(r));
         }
         if (!db_->insert_proc_perf_samples(rows)) {
+            note_health("procperf", "insert_failed");
             ctx.write_output("error|procperf insert failed");
             return 1;
         }
+        note_health("procperf", yuzu::tar::kCollectStatusAppsRecorded);
         ctx.write_output(std::format("tar|collect_procperf|{}|{}", rows.size(),
                                      yuzu::tar::kCollectStatusAppsRecorded));
         return rc;
@@ -2025,6 +2198,7 @@ private:
                              res.skip_reason);
                 if (skipped_sources)
                     skipped_sources->push_back("service");
+                note_health("service", "capture_incomplete");
             }
             if (current) {
                 const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
@@ -2032,17 +2206,25 @@ private:
                 auto previous = json_to_services(prev_json);
 
                 auto typed = yuzu::tar::compute_service_events(previous, *current, ts, snap_id);
-                if (!typed.empty()) {
-                    if (!db_->insert_service_events(typed)) {
-                        spdlog::error("TAR: failed to insert service events, skipping state save");
-                        ctx.write_output("error|service insert failed");
-                        return 1;
-                    }
-                    total_events += static_cast<int>(typed.size());
+                // Events + baseline in ONE transaction (#1654).
+                const std::string state_json = services_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state(svc_key, state_json)
+                                    : db_->insert_service_events(
+                                          typed, yuzu::tar::StateWrite{svc_key, state_json});
+                if (!ok) {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: service {} — nothing persisted, next tick re-diffs", tok);
+                    ctx.write_output(typed.empty() ? "error|service state_save_failed"
+                                                   : "error|service insert failed");
+                    note_health("service", tok);
+                    return 1;
                 }
-
-                db_->set_state(svc_key, services_to_json(*current).dump());
+                total_events += static_cast<int>(typed.size());
+                note_health("service", "events_recorded");
             }
+        } else {
+            note_health("service", "source_disabled");
         }
 
         // User diff
@@ -2053,16 +2235,24 @@ private:
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_user_events(typed)) {
-                    spdlog::error("TAR: failed to insert user events, skipping state save");
-                    ctx.write_output("error|user insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
+            // Events + baseline in ONE transaction (#1654).
+            const std::string state_json = users_to_json(current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state(usr_key, state_json)
+                                : db_->insert_user_events(
+                                      typed, yuzu::tar::StateWrite{usr_key, state_json});
+            if (!ok) {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: user {} — nothing persisted, next tick re-diffs", tok);
+                ctx.write_output(typed.empty() ? "error|user state_save_failed"
+                                               : "error|user insert failed");
+                note_health("user", tok);
+                return 1;
             }
-
-            db_->set_state(usr_key, users_to_json(current).dump());
+            total_events += static_cast<int>(typed.size());
+            note_health("user", "events_recorded");
+        } else {
+            note_health("user", "source_disabled");
         }
 
         // netconn: OS-logged connectivity transitions (ADR-0020). OPT-IN with an
@@ -2097,6 +2287,7 @@ private:
                 // Empty/backward window (lookback 0 forward-only, or clock skew):
                 // read nothing, but advance the hwm so forward reads begin.
                 db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                note_health("netconn", "baseline");
             } else {
                 auto rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
                 for (auto& r : rows)
@@ -2105,13 +2296,18 @@ private:
                     // Nothing in the window (or channels missing) — still advance
                     // so the next tick doesn't re-scan the same empty window.
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                    note_health("netconn", "events_recorded");
                 } else if (db_->insert_netconn_events(rows)) {
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     total_events += static_cast<int>(rows.size());
+                    note_health("netconn", "events_recorded");
                 } else {
                     spdlog::error("TAR: netconn insert failed this tick (skipped)");
+                    note_health("netconn", "insert_failed");
                 }
             }
+        } else {
+            note_health("netconn", "source_disabled");
         }
 
         // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
@@ -2142,22 +2338,28 @@ private:
                              res.skip_reason);
                 if (skipped_sources)
                     skipped_sources->push_back("mapdrive");
+                note_health("mapdrive", "capture_incomplete");
             }
             if (current) {
                 const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::tar::compute_mapdrive_events(previous, *current, ts, snap_id);
-                bool ok = true;
-                if (!typed.empty()) {
-                    ok = db_->insert_mapdrive_events(typed);
-                    if (ok)
-                        total_events += static_cast<int>(typed.size());
-                    else
-                        spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+                const std::string state_json = mapdrive_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state(md_key, state_json)
+                                    : db_->insert_mapdrive_events(
+                                          typed, yuzu::tar::StateWrite{md_key, state_json});
+                if (ok) {
+                    total_events += static_cast<int>(typed.size());
+                    note_health("mapdrive", "events_recorded");
+                } else {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: mapdrive {} this tick (nothing persisted)", tok);
+                    note_health("mapdrive", tok);
                 }
-                if (ok)
-                    db_->set_state(md_key, mapdrive_to_json(*current).dump());
             }
+        } else {
+            note_health("mapdrive", "source_disabled");
         }
 
         // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
@@ -2171,6 +2373,7 @@ private:
         for (auto& src : cursor_sources_) {
             const std::string src_name = src->name();
             if (!source_enabled(*db_, src_name)) {
+                note_health(src_name, yuzu::tar::kCollectStatusSourceDisabled);
                 ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
                                              yuzu::tar::kCollectStatusSourceDisabled));
                 continue;
@@ -2185,6 +2388,7 @@ private:
                 // between the durable cursor and now, with no capture_gap.
                 spdlog::warn("TAR: {} cursor read failed ({}) -- retaining cursor, skipping tick",
                             src_name, cursor_read.error());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2222,6 +2426,7 @@ private:
                 // same -- so record WHEN this source last completed a tick.
                 // Staleness relative to slow_interval is then an expressible
                 // alert, which absence never was.
+                note_health(src_name, token);
                 db_->set_config(std::string(src_name) + "_last_collect_ts",
                                 std::to_string(now_epoch_seconds()));
                 ctx.write_output(std::format("tar|collect_{}|{}|{}", src_name,
@@ -2234,6 +2439,7 @@ private:
                 // as service/mapdrive above (tar_capture_status.hpp:187).
                 spdlog::warn("TAR: {} cursor collect incomplete ({}) -- retaining cursor",
                             src_name, e.what());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2261,6 +2467,7 @@ private:
                               "a CursorSource must map failures to IncompleteCaptureError or "
                               "CursorOutcome::CursorLost, never throw",
                               src_name, e.what());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2273,6 +2480,7 @@ private:
             } catch (...) {
                 spdlog::error("TAR: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2292,6 +2500,10 @@ private:
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {
+        {
+            yuzu::PluginContext pctx{plugin_ctx_};
+            reconcile_db_health_publish(pctx);
+        }
         std::lock_guard lock(collect_mu_);
         return collect_slow_impl(ctx);
     }
@@ -2323,6 +2535,7 @@ private:
         db_->set_config("software_last_run_ts", std::to_string(ts));
 
         if (!source_enabled(*db_, "software")) {
+            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
@@ -2335,6 +2548,7 @@ private:
         // paused window nor re-seed a baseline after the disable cleared it
         // (mirrors the perf/procperf post-lock re-check).
         if (!source_enabled(*db_, "software")) {
+            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
@@ -2357,24 +2571,41 @@ private:
         case Kind::kCorruptSkip:
             spdlog::error("TAR: software state is not a JSON array — skipping tick "
                           "(baseline preserved, not re-seeded)");
+            note_health("software", "state_unreadable");
             ctx.write_output("tar|collect_software|0|state_unreadable");
             return 0;
         case Kind::kColdStartSeed:
-            db_->set_state("software", result.new_state_json);
+            // Checked (#1654): on failure the next run re-detects the empty
+            // baseline and re-seeds, so nothing is emitted against a stale one.
+            if (!db_->set_state("software", result.new_state_json)) {
+                spdlog::error("TAR: software baseline seed failed");
+                note_health("software", "state_save_failed");
+                ctx.write_output("tar|collect_software|0|state_save_failed");
+                return 1;
+            }
+            note_health("software", "baseline_seeded");
             ctx.write_output("tar|collect_software|0|baseline_seeded");
             return 0;
-        case Kind::kSteady:
-            if (!result.events.empty()) {
-                if (!db_->insert_software_events(result.events)) {
-                    spdlog::error("TAR: failed to insert software events, skipping state save");
-                    ctx.write_output("error|software insert failed");
-                    return 1;
-                }
+        case Kind::kSteady: {
+            // Events + baseline in ONE transaction (#1654).
+            const bool ok = result.events.empty()
+                                ? db_->set_state("software", result.new_state_json)
+                                : db_->insert_software_events(
+                                      result.events,
+                                      yuzu::tar::StateWrite{"software", result.new_state_json});
+            if (!ok) {
+                const char* tok = result.events.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: software {} — nothing persisted, next run re-diffs", tok);
+                ctx.write_output(result.events.empty() ? "error|software state_save_failed"
+                                                       : "error|software insert failed");
+                note_health("software", tok);
+                return 1;
             }
-            db_->set_state("software", result.new_state_json);
+            note_health("software", "events_recorded");
             ctx.write_output(
                 std::format("tar|collect_software|{}|events_recorded", result.events.size()));
             return 0;
+        }
         }
         return 0; // unreachable — switch is exhaustive over Kind
     }
@@ -2409,6 +2640,16 @@ private:
             return 1;
         }
         ctx.write_output("storage_state|ok");
+        {
+            // #1567: db_health|<ok|quarantined>|<epoch>. The epoch survives restarts
+            // (tar_config); "quarantined" is true only for the open that did it.
+            int64_t last_q = 0;
+            try {
+                last_q = std::stoll(db_->get_config("db_health_last_quarantine_epoch", "0"));
+            } catch (...) {}
+            const auto q = db_->quarantined_this_open();
+            ctx.write_output(yuzu::tar::format_db_health_line(q.has_value(), q ? *q : last_q));
+        }
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -2613,6 +2854,30 @@ private:
 #else
         ctx.write_output("config|mapdrive_capture_method|getfsstat");
 #endif
+
+        // #1846(4): registry-derived perf capture method for the running OS
+        // ("none" when the OS has no perf collector), and (3) the process count of
+        // the last valid per-process counter snapshot.
+        {
+            const auto os = yuzu::tar::current_platform_os();
+            const auto st = yuzu::tar::os_support_status("perf", os);
+            const bool supported = st == yuzu::tar::OsSupportStatus::kSupported ||
+                                   st == yuzu::tar::OsSupportStatus::kSupportedConstrained;
+            ctx.write_output(std::format("config|perf_capture_method|{}",
+                                         supported ? yuzu::tar::supported_capture_method("perf", os)
+                                                   : std::string_view{"none"}));
+        }
+        ctx.write_output(std::format("config|procperf_procs_seen|{}",
+                                     procperf_procs_seen_.load(std::memory_order_relaxed)));
+
+        // #1846(2): per-source health ledger (process memory only; an agent
+        // restart resets every source to never_ran/0).
+        {
+            std::lock_guard hlock(health_mu_);
+            for (const auto& line :
+                 yuzu::tar::format_source_health_lines(health_, yuzu::tar::capture_sources()))
+                ctx.write_output(line);
+        }
         return 0;
     }
 
@@ -3583,16 +3848,13 @@ private:
                 }
             }
             if (!transition_ok) {
-                // #538/UP-1: a disable that could not clear the baseline leaves
-                // the source ENABLED (fail-safe). This is an apply-time I/O failure
-                // (a busy DB), not a validation failure — Phase 1 already validated
-                // every parameter — so the two-phase atomicity contract still holds:
-                // the only writes that could precede this are the scalar set_config
-                // calls above, and the source stays enabled rather than being left
-                // disabled with a stale baseline. Report it so the operator retries.
+                // #538/UP-1 + #1654: the transition (baseline clear, flag, paused_at)
+                // is one transaction, so a failure leaves the source in its previous
+                // state. This is an apply-time I/O failure (a busy DB), not a
+                // validation failure -- Phase 1 already validated every parameter.
                 ctx.write_output(std::format(
-                    "error|{}_enabled disable failed: could not clear collection baseline "
-                    "(database busy); source left enabled",
+                    "error|{}_enabled transition failed: could not persist (database busy); "
+                    "source left in its previous state",
                     src_name));
                 return 1;
             }

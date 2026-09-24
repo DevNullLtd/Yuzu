@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <map>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +19,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
+#include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -1868,14 +1871,49 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog() {
 
 void AgentHealthStore::upsert(const std::string& agent_id,
                               const google::protobuf::Map<std::string, std::string>& tags) {
-    std::lock_guard lock(mu_);
-    auto& snap = snapshots_[agent_id];
-    snap.agent_id = agent_id;
-    snap.status_tags.clear();
-    for (const auto& [k, v] : tags) {
-        snap.status_tags[k] = v;
+    CorruptionSink sink;
+    int64_t corruption_total = 0;
+    std::string quarantine_last;
+    {
+        std::lock_guard lock(mu_);
+        const auto prev_it = snapshots_.find(agent_id);
+        std::string prev_quarantine;
+        const bool had_prev = prev_it != snapshots_.end();
+        if (had_prev) {
+            if (auto q = prev_it->second.status_tags.find(kTarTagQuarantineLast);
+                q != prev_it->second.status_tags.end())
+                prev_quarantine = q->second;
+        }
+        auto& snap = snapshots_[agent_id];
+        snap.agent_id = agent_id;
+        snap.status_tags.clear();
+        for (const auto& [k, v] : tags) {
+            snap.status_tags[k] = v;
+        }
+        snap.last_seen = std::chrono::steady_clock::now();
+
+        // #1567 candidate: surfaced (not deduped) when valid and new to THIS store.
+        if (corruption_sink_) {
+            const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
+            const auto ql = snap.status_tags.find(kTarTagQuarantineLast);
+            if (tot != snap.status_tags.end() && ql != snap.status_tags.end()) {
+                const auto parsed = parse_tar_corruption_total(tot->second);
+                if (parsed && valid_tar_quarantine_last(ql->second) &&
+                    (!had_prev || prev_quarantine != ql->second)) {
+                    sink = corruption_sink_;
+                    corruption_total = *parsed;
+                    quarantine_last = ql->second;
+                }
+            }
+        }
     }
-    snap.last_seen = std::chrono::steady_clock::now();
+    if (sink)
+        sink(agent_id, corruption_total, quarantine_last); // outside mu_
+}
+
+void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
+    std::lock_guard lock(mu_);
+    corruption_sink_ = std::move(sink);
 }
 
 void AgentHealthStore::remove(const std::string& agent_id) {
@@ -1944,6 +1982,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Clear labeled gauge families before rebuilding
     metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
+    metrics.clear_gauge_family("yuzu_fleet_plugin_init_failed"); // #1567
     metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
     // A4 perf families cleared too: when no agent reports a metric this cycle
@@ -2203,6 +2242,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     };
 
     int ota_signature_refusing = 0;
+    int tar_db_corruption_agents = 0;               // #1567
+    std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2218,6 +2259,32 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (auto it = snap.status_tags.find("yuzu.ota_signature_refused");
             it != snap.status_tags.end() && !it->second.empty() && it->second != "0")
             ++ota_signature_refusing;
+
+        // #1567: agents whose plugin-published corruption total parses > 0, and the
+        // per-plugin count of agents reporting a failed init. Both tags are
+        // agent-controlled: bounded token count/length, in-place reads (no copies).
+        if (auto it = snap.status_tags.find(kTarTagCorruptionTotal);
+            it != snap.status_tags.end() && parse_tar_corruption_total(it->second))
+            ++tar_db_corruption_agents;
+        if (auto it = snap.status_tags.find("yuzu.plugins_failed");
+            it != snap.status_tags.end() && !it->second.empty()) {
+            std::string_view rest{it->second};
+            int tokens = 0;
+            while (!rest.empty() && tokens < 32) {
+                const auto comma = rest.find(',');
+                const auto tok = rest.substr(0, comma);
+                rest = comma == std::string_view::npos ? std::string_view{}
+                                                       : rest.substr(comma + 1);
+                if (tok.empty() || tok.size() > 64 ||
+                    !std::all_of(tok.begin(), tok.end(), [](char ch) {
+                        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                               (ch >= '0' && ch <= '9') || ch == '_';
+                    }))
+                    continue;
+                ++tokens;
+                ++plugin_init_failed[std::string{tok}];
+            }
+        }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
         // by the 4 MB gRPC frame, so `get()` above memcpy's it on every lookup, on every
@@ -2562,6 +2629,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // without this the refusal is invisible outside a per-endpoint log.
     metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
         .set(static_cast<double>(ota_signature_refusing));
+    // #1567: agents reporting a quarantined tar.db (cumulative per agent since
+    // install; a RISING value is the signal), and per-plugin init failures
+    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
+    // lexicographic order, the remainder summed under plugin="other".
+    metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
+        .set(static_cast<double>(tar_db_corruption_agents));
+    {
+        constexpr std::size_t kMaxPluginLabels = 64;
+        std::size_t n = 0;
+        int64_t other = 0;
+        for (const auto& [plugin, count] : plugin_init_failed) {
+            if (n < kMaxPluginLabels) {
+                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                    .set(static_cast<double>(count));
+                ++n;
+            } else {
+                other += count;
+            }
+        }
+        if (other > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
+                .set(static_cast<double>(other));
+    }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
         .set(static_cast<double>(dex_observer_disarmed));

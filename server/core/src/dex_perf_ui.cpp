@@ -272,12 +272,11 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             h += fleet_card("Disk I/O latency (avg)", fmt_lat(now.disk_lat->avg),
                             stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
                             "worst devices by disk latency");
-        const int64_t collecting_online = now.windows_online + now.linux_online + now.macos_online;
         h += fleet_card("Reporting", std::to_string(now.reporting),
-                        "of " + std::to_string(collecting_online) + " online (Windows " +
-                            std::to_string(now.windows_online) + " &middot; Linux " +
-                            std::to_string(now.linux_online) + " &middot; macOS " +
-                            std::to_string(now.macos_online) + ")",
+                        "of " + std::to_string(now.perf_capable_online) +
+                            " perf-capable online (Windows " + std::to_string(now.windows_online) +
+                            " &middot; Linux " + std::to_string(now.linux_online) + "; macOS " +
+                            std::to_string(now.macos_online) + " online, no collector yet)",
                         "filter=not_reporting&window=" + w, "devices not reporting");
         h += "</div>";
         h += "<div class=\"gp-note\">Perf telemetry is collected on <b>Windows and Linux</b> "

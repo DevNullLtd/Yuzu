@@ -82,6 +82,8 @@ DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap) {
             ++out.linux_online;
         else if (d.os == "macos")
             ++out.macos_online;
+        if (detail::dex_perf_os_collects(d.os))
+            ++out.perf_capable_online;
         const bool reported = reports_any(d);
         if (reported) {
             ++out.reporting;

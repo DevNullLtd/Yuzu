@@ -1956,7 +1956,7 @@
       "definition_id": "crossplatform.tar.user_sessions"
     }
   ],
-  "outputs_note": "Every action writes its response as a sequence of independent lines (one `ctx.write_output` call\nper line); most, but not all, actions follow the plugin-wide `discriminator\\|field\\|field...`\npipe-delimited convention (`tar_status_format.hpp:3-20`, `tar_collectors.hpp:39-57`). The four\ncollection actions share one line shape, `tar\\|collect_<leg>\\|<events_recorded>\\|<token>`, where\n`<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,\n`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete` (`tar_collectors.hpp:47-66`).\n`status`'s wire format is line-oriented `key\\|value` pairs (`storage_state\\|ok`,\n`record_count\\|<n>`, `config\\|<key>\\|<value>`, ...), not one positional row — the five YAML columns\nbelow correspond to five of those lines; the rest (`config\\|*`, `retention_guard\\|*`,\n`retention_guard_failed\\|*`) are operational fields the YAML schema does not model. `query`'s rows\nmatch its five columns exactly, followed by an un-modelled `total\\|<n>` summary line. `sql` (and\nevery canned query in `tar_warehouse.yaml`) emits a leading `__schema__\\|<col>\\|<col>...` line,\nthen one pipe-joined data line per row, then a trailing `__total__\\|<n>` line — all three land in\nthe single declared `output` column. `snapshot`'s and `rollup`'s actual lines do not decompose into\ntheir declared columns at all; see Caveats.\n\n\n\n**Actions without a definition.** `collect_perf` writes `tar\\|collect_perf\\|<n>\\|<token>`, the same\nshape as `collect_fast`/`collect_slow` (`tar_plugin.cpp:1822-1826`). `collect_software` follows the\nsame convention. `purge_source` writes a single JSON line,\n`{\"source\":\"<name>\",\"rows_deleted\":<n>,\"status\":\"purged\"}` (`tar_plugin.cpp:3037-3038`), or an\n`error|` line if the named source is unknown or still enabled.\n\n**Empty-result / not-yet-collected convention.** `module` (image-load capture) ships its schema and\nconfig key with no collector registered yet — the `$Module_*` tables stay queryable and empty,\nwhich means \"not yet collecting,\" never \"nothing happened\" (`tar.yaml` `module_enabled`\ndescription). `power` and `removable` were in this state until PRs #4017/#4023 landed real\ncollectors for all three OSes on both (`tar_schema_registry.cpp:969-1094`); see How it works.",
+  "outputs_note": "Every action writes its response as a sequence of independent lines (one `ctx.write_output` call\nper line); most, but not all, actions follow the plugin-wide `discriminator\\|field\\|field...`\npipe-delimited convention (`tar_status_format.hpp:3-20`, `tar_collectors.hpp:39-57`). The four\ncollection actions share one line shape, `tar\\|collect_<leg>\\|<events_recorded>\\|<token>`, where\n`<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,\n`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete` (`tar_collectors.hpp:47-66`).\n`status`'s wire format is line-oriented `key\\|value` pairs (`storage_state\\|ok`,\n`record_count\\|<n>`, `config\\|<key>\\|<value>`, ...), not one positional row — the five YAML columns\nbelow correspond to five of those lines; the rest (`config\\|*`, `retention_guard\\|*`,\n`retention_guard_failed\\|*`) are operational fields the YAML schema does not model. `query`'s rows\nmatch its five columns exactly, followed by an un-modelled `total\\|<n>` summary line. `sql` (and\nevery canned query in `tar_warehouse.yaml`) emits a leading `__schema__\\|<col>\\|<col>...` line,\nthen one pipe-joined data line per row, then a trailing `__total__\\|<n>` line — all three land in\nthe single declared `output` column. `snapshot`'s and `rollup`'s actual lines do not decompose into\ntheir declared columns at all; see Caveats.\n\n\n\n**Actions without a definition.** `collect_perf` writes `tar\\|collect_perf\\|<n>\\|<token>`, the same\nshape as `collect_fast`/`collect_slow` (see `do_collect_perf` in `tar_plugin.cpp`). `collect_software` follows the\nsame convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `purge_source` writes a single JSON line,\n`{\"source\":\"<name>\",\"rows_deleted\":<n>,\"status\":\"purged\"}` (see `do_purge_source` in `tar_plugin.cpp`), or an\n`error|` line if the named source is unknown or still enabled.\n\n**Empty-result / not-yet-collected convention.** `module` (image-load capture) ships its schema and\nconfig key with no collector registered yet — the `$Module_*` tables stay queryable and empty,\nwhich means \"not yet collecting,\" never \"nothing happened\" (`tar.yaml` `module_enabled`\ndescription). `power` and `removable` were in this state until PRs #4017/#4023 landed real\ncollectors for all three OSes on both (`tar_schema_registry.cpp:969-1094`); see How it works.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -2802,6 +2802,9 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
+      "changelog.d/1567-tar-db-corruption-fleet-observability.added.md",
+      "changelog.d/1654-tar-collector-write-durability.fixed.md",
+      "changelog.d/1846-tar-perf-health-tokens.added.md",
       "changelog.d/1986-getting-started-import-examples.fixed.md",
       "changelog.d/20260825-offload-target-store-postgres.changed.md",
       "changelog.d/20260914-wave7b-tar-usage-sql-denied.security.md",
@@ -2879,6 +2882,7 @@
       "agents/plugins/tar/src/tar_software_collector.cpp",
       "agents/plugins/tar/src/tar_software_core.cpp",
       "agents/plugins/tar/src/tar_software_core.hpp",
+      "agents/plugins/tar/src/tar_source_health.hpp",
       "agents/plugins/tar/src/tar_sql_executor.cpp",
       "agents/plugins/tar/src/tar_sql_executor.hpp",
       "agents/plugins/tar/src/tar_status_format.hpp",
@@ -2912,6 +2916,7 @@
       "tests/unit/test_tar_schema_registry.cpp",
       "tests/unit/test_tar_service.cpp",
       "tests/unit/test_tar_software.cpp",
+      "tests/unit/test_tar_source_health.cpp",
       "tests/unit/test_tar_store.cpp",
       "tests/unit/test_tar_usage.cpp",
       "tests/unit/test_tar_warehouse.cpp",

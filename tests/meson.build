@@ -269,6 +269,7 @@ agent_test_exe = executable(
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
+    'unit/test_plugin_heartbeat_tags.cpp', # #1567: plugin KV -> heartbeat tag bridge (pure, lambda-fed)
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -961,6 +962,7 @@ tar_test_exe = executable(
     'unit/test_tar_service.cpp',   # Wave 5 PR5.2: pure systemctl/launchctl list parsers (fixture-fed, no spawn)
     'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
+    'unit/test_tar_source_health.cpp', # #1846: pure per-source health ledger (registry-name keyed)
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
@@ -1218,6 +1220,11 @@ if build_server
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
+      # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
+      # capture_sources() perf row. Registry TU compiled in here; NO tar include dir
+      # (see the include-path constraint below) - the test includes the header by
+      # relative path.
+      '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',

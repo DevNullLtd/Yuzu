@@ -29,6 +29,7 @@
 #include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
+#include "tar_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
 
 #include <yuzu/metrics.hpp>
 
@@ -39,7 +40,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1850,4 +1853,171 @@ TEST_CASE("REAL AgentHealthStore: per-OS perf gauges (C1) reach the shipped fami
     // ABSENT is not a zero: darwin reported no perf tag, so no darwin series at all.
     CHECK(out.find("yuzu_fleet_perf_os_reporting{os=\"darwin\"}") == std::string::npos);
     CHECK(out.find("yuzu_fleet_perf_os_cpu_pct{stat=\"avg\",os=\"darwin\"}") == std::string::npos);
+}
+
+// ── #1567: tar.db corruption fleet signal (REAL store) ────────────────────────
+
+namespace {
+using yuzu::server::detail::AgentHealthStore;
+
+void beat_tags(AgentHealthStore& store, const std::string& id,
+               const std::vector<std::pair<std::string, std::string>>& kv) {
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    for (const auto& [k, v] : kv)
+        tags[k] = v;
+    store.upsert(id, tags);
+}
+
+double series_val(const std::string& out, const std::string& series) {
+    // Anchor at line start so the "# TYPE <name> gauge" line cannot match first.
+    const auto pos = out.find("\n" + series);
+    REQUIRE(pos != std::string::npos);
+    return std::stod(out.substr(pos + 1 + series.size()));
+}
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_tar_db_corruption_agents counts valid totals > 0",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* k = "yuzu.plugin.tar.db_corruption_total";
+    beat_tags(store, "a", {{k, "2"}});
+    beat_tags(store, "b", {{k, "0"}});
+    beat_tags(store, "c", {});
+    beat_tags(store, "d", {{k, "garbage"}});
+    beat_tags(store, "e", {{k, "-1"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_tar_db_corruption_agents ") == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, capped, absent-not-zero",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    std::string forty;
+    for (int i = 0; i < 40; ++i)
+        forty += (i ? ",t" : "t") + std::to_string(i);
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "tar,wmi"}});
+    beat_tags(store, "b", {{"yuzu.plugins_failed", "tar"}});
+    beat_tags(store, "c", {});
+    beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"tar\"} ") == 2.0);
+    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
+    // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
+    CHECK(out.find("plugin=\"t31\"") != std::string::npos);
+    CHECK(out.find("plugin=\"t32\"") == std::string::npos);
+
+    // Fleet-wide label cap: 70 agents each failing a distinct plugin.
+    AgentHealthStore many;
+    yuzu::MetricsRegistry m2;
+    for (int i = 0; i < 70; ++i) {
+        char name[16];
+        std::snprintf(name, sizeof name, "plug_%02d", i);
+        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", name}});
+    }
+    many.recompute_metrics(m2, std::chrono::seconds{300});
+    auto out2 = m2.serialize();
+    size_t named = 0;
+    for (size_t p = out2.find("yuzu_fleet_plugin_init_failed{"); p != std::string::npos;
+         p = out2.find("yuzu_fleet_plugin_init_failed{", p + 1))
+        ++named;
+    CHECK(named == 65); // 64 named + plugin="other"
+    CHECK(series_val(out2, "yuzu_fleet_plugin_init_failed{plugin=\"other\"} ") == 6.0);
+    CHECK(out2.find("plugin=\"plug_63\"") != std::string::npos);
+    CHECK(out2.find("plugin=\"plug_64\"") == std::string::npos);
+
+    // Absent-not-zero: once the reporters are gone the family is cleared.
+    for (int i = 0; i < 70; ++i)
+        many.remove("agent" + std::to_string(i));
+    many.recompute_metrics(m2, std::chrono::seconds{300});
+    CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    struct Call {
+        std::string agent;
+        int64_t total;
+        std::string q;
+    };
+    std::vector<Call> calls;
+
+    // No sink set: must not crash.
+    beat_tags(store, "x", {{"yuzu.plugin.tar.db_corruption_total", "1"},
+                           {"yuzu.plugin.tar.db_quarantine_last", "1:f"}});
+
+    store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
+        calls.push_back({a, t, q});
+    });
+    const char* tot = "yuzu.plugin.tar.db_corruption_total";
+    const char* ql = "yuzu.plugin.tar.db_quarantine_last";
+
+    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}});
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].agent == "a");
+    CHECK(calls[0].total == 1);
+    CHECK(calls[0].q == "100:f1");
+
+    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}}); // same identity
+    CHECK(calls.size() == 1);
+    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}}); // new quarantine
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[1].total == 2);
+    CHECK(calls[1].q == "200:f2");
+
+    beat_tags(store, "b", {{tot, "0"}, {ql, "1:f"}});                     // zero total
+    beat_tags(store, "c", {{tot, "1"}});                                   // no quarantine_last
+    beat_tags(store, "d", {{tot, "1"}, {ql, std::string(200, 'q')}});      // oversized
+    CHECK(calls.size() == 2);
+
+    // remove() then re-upsert surfaces AGAIN: the store surfaces, the gate dedups.
+    store.remove("a");
+    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}});
+    CHECK(calls.size() == 3);
+}
+
+TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newest row",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    std::optional<std::optional<std::string>> answer = std::optional<std::string>{}; // no row
+    TarCorruptionAuditGate gate([&](const std::string&) {
+        ++lookups;
+        return answer;
+    });
+
+    // No prior row -> log; mark -> no further lookup.
+    CHECK(gate.should_log("a", "1:f"));
+    CHECK(lookups == 1);
+    gate.mark_logged("a", "1:f");
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == 1);
+
+    // Newest row already carries this identity (prior run / other HA node): no
+    // write, marked, and the second call makes no lookup.
+    answer = std::optional<std::string>{"2:g"};
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    CHECK(lookups == 2);
+
+    // Newest row is a different quarantine -> log.
+    CHECK(gate.should_log("b", "3:h"));
+
+    // Degraded store: no write, NOT marked, retried on the next call.
+    answer = std::nullopt;
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK(lookups == before + 2);
+
+    // Two agents with the same quarantine string are independent.
+    answer = std::optional<std::string>{};
+    CHECK(gate.should_log("d", "9:z"));
+    gate.mark_logged("d", "9:z");
+    CHECK(gate.should_log("e", "9:z"));
 }

@@ -47,6 +47,7 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
@@ -2102,6 +2103,14 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_tar_db_corruption_agents",
+                          "Agents whose TAR database has ever been quarantined as corrupt "
+                          "(cumulative per agent since install; a rising value is the signal)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_plugin_init_failed",
+                          "Agents reporting a plugin that failed init, by plugin name (absent "
+                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
@@ -5102,6 +5111,55 @@ public:
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
                 (void)audit_store_->log(ev);
+            }
+
+            // #1567: tar.db corruption audit. AgentHealthStore surfaces candidates
+            // from heartbeat tags; the gate dedups DURABLY against the audit store
+            // itself (one row per agent + quarantine identity across health-store
+            // prunes, server restarts and HA node switches).
+            {
+                auto latest = [this](const std::string& agent_id)
+                    -> std::optional<std::optional<std::string>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    AuditQuery q;
+                    q.action = "tar.db.corruption_quarantined";
+                    q.target_id = agent_id;
+                    q.limit = 1;
+                    auto rows = audit_store_->query(q);
+                    if (!rows)
+                        return std::nullopt; // degraded store: retry on a later heartbeat
+                    if (rows->empty())
+                        return std::optional<std::string>{};
+                    constexpr std::string_view kKey = "quarantine=";
+                    const auto& d = rows->front().detail;
+                    const auto pos = d.find(kKey);
+                    if (pos == std::string::npos)
+                        return std::optional<std::string>{};
+                    return std::optional<std::string>{d.substr(pos + kKey.size())};
+                };
+                auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
+                health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
+                                                               int64_t total,
+                                                               const std::string& quarantine) {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return;
+                    if (!gate->should_log(agent_id, quarantine))
+                        return;
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "system";
+                    ev.principal_role = "system";
+                    ev.action = "tar.db.corruption_quarantined";
+                    ev.target_type = "Device";
+                    ev.target_id = agent_id;
+                    ev.detail = std::format("corruption_total={} quarantine={}", total, quarantine);
+                    ev.result = "success";
+                    if (audit_store_->log(ev))
+                        gate->mark_logged(agent_id, quarantine);
+                });
             }
 
             // #802 / W7.4 — mirror the viz-disable audit emission pattern:

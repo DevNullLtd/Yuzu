@@ -1575,7 +1575,8 @@ static const ToolDef kTools[] = {
      // Additive per-OS fields (C1) — appended after the original five, which
      // stay untouched including "required" (unchanged on purpose).
      R"j("linux_online":{"type":"integer"},"macos_online":{"type":"integer"},)j"
-     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"})j"
+     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"},)j"
+     R"j("perf_capable_online":{"type":"integer","description":"Online devices whose OS has a perf collector (Windows + Linux today): the denominator for reporting"})j"
      R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
@@ -1626,7 +1627,7 @@ static const ToolDef kTools[] = {
      "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
-     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices of an OS with a perf collector (Windows + Linux today) with no perf sample this cycle"},)j"
      R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
@@ -14935,6 +14936,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("reporting_windows", now.reporting_windows)
                                   .add("reporting_linux", now.reporting_linux)
                                   .add("reporting_macos", now.reporting_macos)
+                                  // OS-aware denominator (#1845), trailing.
+                                  .add("perf_capable_online", now.perf_capable_online)
                                   .str();
                 } else if (tool_name == "get_dex_perf_cohorts") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);

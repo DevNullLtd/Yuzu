@@ -223,6 +223,7 @@ The `status` action returns database health information:
 
 ```
 storage_state|ok
+db_health|ok|0
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -266,7 +267,51 @@ config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
 config|software_last_run_ts|1711050000
+config|perf_capture_method|procfs
+config|procperf_procs_seen|412
+config|process_last_status|events_recorded
+config|process_consecutive_failures|0
+config|process_last_status_at|1711050400
+config|tcp_last_status|events_recorded
+config|tcp_consecutive_failures|0
+config|tcp_last_status_at|1711050400
 ```
+
+(The sample is abbreviated: `<source>_last_status`, `<source>_consecutive_failures`
+and `<source>_last_status_at` appear once per capture source, in registry order.)
+
+**Database health (`db_health`).** `db_health|ok|<epoch>` reports the epoch of
+the last tar.db quarantine ever recorded on the device (`0` = never);
+`db_health|quarantined|<epoch>` is reported only by the agent process whose
+startup quarantined a corrupt database (see "Corrupt-database quarantine" below).
+The fact is persisted in `tar_config` (`db_health_last_quarantine_epoch` /
+`db_health_last_quarantine_file`, basename only), so it survives restarts.
+
+**Per-source health.** `<source>_last_status` is the terminal outcome token of
+the source's most recent collection (`never_ran` until it has run in this agent
+process), `<source>_consecutive_failures` counts back-to-back failures, and
+`<source>_last_status_at` is the epoch of that outcome (`0` if never). The failure
+tokens are `capture_incomplete`, `counters_unavailable`, `cursor_lost`,
+`state_unreadable`, `insert_failed` and `state_save_failed`; every other token
+(including `source_disabled`, `unsupported_platform` and baseline resets) resets
+the streak. The ledger is **process memory only**: an agent restart resets every
+source to `never_ran` / `0`, which is not a recovery. When one source hits a fatal
+early return in a tick, the sources after it do not run that tick, so read
+`<source>_last_status_at` to spot a source that is frozen by an upstream failure
+rather than healthy. `perf_capture_method` is the registry capture method for the
+running OS (`procfs` on Linux, `ntcounters` on Windows, `none` where there is no
+perf collector), and `procperf_procs_seen` is the process count in the last valid
+per-process counter snapshot.
+
+**Write failures.** Snapshot-diff sources (`process`, `tcp`, `service`, `user`,
+`software`, `arp`, `dns`, `mapdrive`) commit a tick's events and their baseline in
+one transaction, so a failed save can never leave events durable against a stale
+baseline. When a tick that had events fails, the collector emits
+`error|<source> insert failed`; when only a baseline-only save fails (no events
+in the diff, the process fallback seed, the software cold-start seed) it emits
+`error|<source> state_save_failed`. Either way nothing was persisted and the
+next tick re-derives the same delta. `arp`, `dns` and `mapdrive` are non-fatal:
+they emit no `error|` line and record the token in the ledger instead.
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
@@ -335,9 +380,9 @@ table -- see "The retention clock guard" below. The per-table counters are in-me
 (the clock reading they compare against is persisted, so restarting does not
 blind the guard). Scrape this across the fleet to find endpoints whose clocks
 need attention -- the agent has no `/metrics` endpoint, so this action is the
-fleet-readable signal. **Not yet fleet-aggregated**: there is no shipped
+fleet-readable signal. The retention-guard counters are **not yet fleet-aggregated**: there is no shipped
 instruction or heartbeat tag that rolls these up server-side; surfacing them via
-the agent heartbeat is a tracked follow-up.
+the agent heartbeat is a tracked follow-up. (tar.db corruption, by contrast, is fleet-visible: see "Corrupt-database quarantine" below.)
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
@@ -348,6 +393,17 @@ When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agen
 - **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
 - **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
 - **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
+
+**Fleet visibility.** A quarantine is reported off-device: the tar plugin
+publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic) and
+`heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin storage, which the
+agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
+`yuzu.plugin.tar.db_quarantine_last`. The server exposes
+`yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes one
+`tar.db.corruption_quarantined` audit row per quarantine. A plugin that failed to
+initialise (including TAR when the corrupt file cannot be moved aside) is reported
+in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
+which distinguishes "failed to load" from "not installed".
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 
@@ -423,7 +479,7 @@ POST /api/v1/instructions/execute
 }
 ```
 
-**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged; `tar.status` shows no dedicated counter for this today.
+**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged and the source's `<source>_last_status` reads `capture_incomplete` with `<source>_consecutive_failures` counting the streak in `tar.status`.
 
 ## Performance impact
 
@@ -747,6 +803,8 @@ The `$Software_*` tables are populated on **Windows** when the source is enabled
 **User tables:** `ts`, `user`, `domain`, `logon_type`, `action` (login/logout). Daily tier adds `login_count`.
 
 **Perf tables:** `ts`, `cpu_pct`, `mem_used_pct`, `commit_pct`, `disk_read_bps`, `disk_write_bps`, `disk_read_lat_us`, `disk_write_lat_us`, `net_rx_bps`, `net_tx_bps` (all numeric; rates are bytes/sec, latencies are µs per I/O). `$Perf_Hourly` carries per-hour `samples`, `cpu_avg`/`cpu_max`, `mem_avg`/`mem_max`, `commit_avg`, and avg/max throughput and latency columns. Collection is trigger-driven (`tar.collect_perf`, every `perf_interval_seconds`), so the audit trail for perf is the `configure` action that enables/paces it, not a per-sample dispatch record.
+
+**`collect_perf` status tokens.** `sample_recorded`, `baseline` (first tick after start), `source_disabled`, `unsupported_platform` (no perf collector for this OS: macOS today) and `counters_unavailable` (the OS has a perf collector but the counter read failed; the same token is used for `procperf`).
 
 **ProcPerf tables:** `ts`, `name` (image name only — **never a command line**), `instances`, `cpu_pct`, `ws_bytes`. Each tick records the **top 10 applications by CPU plus the top 10 by working set** (union, ≤ 20 rows), aggregated across same-name processes (`instances` = how many). `cpu_pct` is the app's share of *total machine capacity* — one saturated core on an 8-core box reads 12.5, matching `$Perf_Live` and Task Manager. `$ProcPerf_Hourly` aggregates per `(hour, name)`: `samples`, `instances_max`, `cpu_avg`/`cpu_max`, `ws_avg_bytes`/`ws_max_bytes`. Apps matching a redaction pattern are never recorded. Example — yesterday's CPU-hungriest apps on a device:
 

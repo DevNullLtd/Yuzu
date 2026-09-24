@@ -38,6 +38,7 @@ __declspec(allocate(".CRT$XCB"))
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
+#include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
@@ -997,6 +998,7 @@ public:
                     record_module(descriptor->name, descriptor->version,
                                   std::format("{} (init rc={})", descriptor->description, rc),
                                   "init_failed");
+                    plugins_failed_.emplace_back(descriptor->name); // #1567: yuzu.plugins_failed
                     continue;
                 }
             }
@@ -2390,6 +2392,27 @@ public:
                             tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_commands_executed_total").value()));
                             tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                            // #1567: plugins that failed init (vs merely not installed),
+                            // and each plugin's bounded `heartbeat.*` KV facts. Own
+                            // try/catch: the heartbeat loop has no enclosing one, and a
+                            // KV throw must never kill the heartbeat thread.
+                            try {
+                                yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                if (kv_store_) {
+                                    yuzu::agent::emit_plugin_heartbeat_tags(
+                                        tags, plugin_names_,
+                                        [this](std::string_view p, std::string_view prefix) {
+                                            return kv_store_->list(p, prefix);
+                                        },
+                                        [this](std::string_view p, std::string_view k) {
+                                            return kv_store_->get(p, k);
+                                        });
+                                }
+                            } catch (const std::exception& e) {
+                                spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
+                            } catch (...) {
+                                spdlog::warn("Heartbeat plugin-tag bridge failed");
+                            }
                             // HA WS-0 dedup safety-net signals, emitted every
                             // heartbeat (the agent has no /metrics; the server-side
                             // yuzu_fleet_* derivation + alert land with WS-11).
@@ -4173,6 +4196,7 @@ private:
     }
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
+    std::vector<std::string> plugins_failed_; // plugins whose init() failed (#1567)
     std::mutex stream_write_mu_;
     // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
     // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
