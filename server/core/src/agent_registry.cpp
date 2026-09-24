@@ -1876,14 +1876,6 @@ void AgentHealthStore::upsert(const std::string& agent_id,
     std::string quarantine_last;
     {
         std::lock_guard lock(mu_);
-        const auto prev_it = snapshots_.find(agent_id);
-        std::string prev_quarantine;
-        const bool had_prev = prev_it != snapshots_.end();
-        if (had_prev) {
-            if (auto q = prev_it->second.status_tags.find(kTarTagQuarantineLast);
-                q != prev_it->second.status_tags.end())
-                prev_quarantine = q->second;
-        }
         auto& snap = snapshots_[agent_id];
         snap.agent_id = agent_id;
         snap.status_tags.clear();
@@ -1892,14 +1884,15 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         }
         snap.last_seen = std::chrono::steady_clock::now();
 
-        // #1567 candidate: surfaced (not deduped) when valid and new to THIS store.
+        // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
+        // deduped here); TarCorruptionAuditGate dedups, and a write that failed or
+        // was skipped is retried on the next heartbeat.
         if (corruption_sink_) {
             const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
             const auto ql = snap.status_tags.find(kTarTagQuarantineLast);
             if (tot != snap.status_tags.end() && ql != snap.status_tags.end()) {
                 const auto parsed = parse_tar_corruption_total(tot->second);
-                if (parsed && valid_tar_quarantine_last(ql->second) &&
-                    (!had_prev || prev_quarantine != ql->second)) {
+                if (parsed && valid_tar_quarantine_last(ql->second)) {
                     sink = corruption_sink_;
                     corruption_total = *parsed;
                     quarantine_last = ql->second;
@@ -2271,6 +2264,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             std::string_view rest{it->second};
             int tokens = 0;
             while (!rest.empty() && tokens < 32) {
+                ++tokens; // every split counts toward the cap, valid or not
                 const auto comma = rest.find(',');
                 const auto tok = rest.substr(0, comma);
                 rest = comma == std::string_view::npos ? std::string_view{}
@@ -2281,7 +2275,6 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                (ch >= '0' && ch <= '9') || ch == '_';
                     }))
                     continue;
-                ++tokens;
                 ++plugin_init_failed[std::string{tok}];
             }
         }

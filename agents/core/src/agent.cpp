@@ -511,6 +511,12 @@ StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
     : impl_(new PluginContextImpl{std::move(config), nullptr, nullptr, std::move(plugin_name)},
             [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
 
+StandalonePluginContext::StandalonePluginContext(std::string plugin_name,
+                                                 std::unordered_map<std::string, std::string> config,
+                                                 KvStore* kv)
+    : impl_(new PluginContextImpl{std::move(config), kv, nullptr, std::move(plugin_name)},
+            [](void* p) { delete static_cast<PluginContextImpl*>(p); }) {}
+
 YuzuPluginContext* StandalonePluginContext::get() const noexcept {
     return reinterpret_cast<YuzuPluginContext*>(impl_.get());
 }

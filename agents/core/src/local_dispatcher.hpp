@@ -47,6 +47,8 @@
 
 namespace yuzu::agent {
 
+class KvStore;
+
 class YUZU_EXPORT LocalDispatcher {
 public:
     struct Result {
@@ -92,6 +94,10 @@ class YUZU_EXPORT StandalonePluginContext {
 public:
     StandalonePluginContext(std::string plugin_name,
                             std::unordered_map<std::string, std::string> config);
+    /// As above, with a non-owning KV store so the storage ABI calls
+    /// (`yuzu_ctx_storage_*`) work; `kv` must outlive this context.
+    StandalonePluginContext(std::string plugin_name,
+                            std::unordered_map<std::string, std::string> config, KvStore* kv);
     StandalonePluginContext(const StandalonePluginContext&) = delete;
     StandalonePluginContext& operator=(const StandalonePluginContext&) = delete;
 

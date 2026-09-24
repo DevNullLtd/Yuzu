@@ -5131,12 +5131,7 @@ public:
                         return std::nullopt; // degraded store: retry on a later heartbeat
                     if (rows->empty())
                         return std::optional<std::string>{};
-                    constexpr std::string_view kKey = "quarantine=";
-                    const auto& d = rows->front().detail;
-                    const auto pos = d.find(kKey);
-                    if (pos == std::string::npos)
-                        return std::optional<std::string>{};
-                    return std::optional<std::string>{d.substr(pos + kKey.size())};
+                    return detail::decode_tar_quarantine_from_detail(rows->front().detail);
                 };
                 auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
                 health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
@@ -5153,9 +5148,9 @@ public:
                     ev.principal = "system";
                     ev.principal_role = "system";
                     ev.action = "tar.db.corruption_quarantined";
-                    ev.target_type = "Device";
+                    ev.target_type = "Agent";
                     ev.target_id = agent_id;
-                    ev.detail = std::format("corruption_total={} quarantine={}", total, quarantine);
+                    ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
                         gate->mark_logged(agent_id, quarantine);

@@ -346,10 +346,15 @@ header):
    never only in a code comment. Do not read the paragraph above as licence to
    ship a new source opt-in without asking; the ruling is the current posture.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
-   gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
-   `set_state` (advance the diff baseline **only on insert success**). For an
-   opt-in source, an insert failure is non-fatal (log + skip — don't fail the
-   always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   gated on `source_enabled(*db_, "<source>")`: enumerate → diff →
+   `typed.empty() ? db_->set_state(key, json) : db_->insert_<src>_events(typed,
+   StateWrite{key, json})` (events and baseline commit in one transaction, #1654).
+   On failure emit `error|<src> insert failed` (had events) or
+   `error|<src> state_save_failed` (baseline-only) and call
+   `note_health(<registry name>, "insert_failed"|"state_save_failed")`; on success
+   `note_health(<registry name>, "events_recorded")`. A leg that never calls
+   `note_health` reads `never_ran` in status. For an opt-in source a failure is
+   non-fatal (no `error|` line — don't fail the always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
    should appear in those actions.
 7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
    `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).

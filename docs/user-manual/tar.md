@@ -308,8 +308,9 @@ per-process counter snapshot.
 one transaction, so a failed save can never leave events durable against a stale
 baseline. When a tick that had events fails, the collector emits
 `error|<source> insert failed`; when only a baseline-only save fails (no events
-in the diff, the process fallback seed, the software cold-start seed) it emits
-`error|<source> state_save_failed`. Either way nothing was persisted and the
+in the diff, the process fallback seed) it emits
+`error|<source> state_save_failed`; the software cold-start seed reports on the
+software collector's own line, `tar|collect_software|0|state_save_failed`. Either way nothing was persisted and the
 next tick re-derives the same delta. `arp`, `dns` and `mapdrive` are non-fatal:
 they emit no `error|` line and record the token in the ledger instead.
 

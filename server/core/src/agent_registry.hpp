@@ -1230,10 +1230,10 @@ public:
     /// #1567: receives a tar.db corruption CANDIDATE `(agent_id, corruption_total,
     /// quarantine_last)` when a heartbeat carries a valid
     /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
-    /// there was no previous snapshot or the previous quarantine_last differs.
-    /// The store deliberately does NOT dedup (its memory is per-process and
-    /// pruned every ~90 s): the sink (TarCorruptionAuditGate) owns durable
-    /// dedup. Invoked OUTSIDE mu_.
+    /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
+    /// memory is per-process and pruned every ~90 s): the sink
+    /// (TarCorruptionAuditGate) owns durable dedup, and a failed audit write is
+    /// retried on the next heartbeat. Invoked OUTSIDE mu_.
     using CorruptionSink =
         std::function<void(const std::string& agent_id, int64_t corruption_total,
                            const std::string& quarantine_last)>;

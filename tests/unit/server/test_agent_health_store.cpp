@@ -46,6 +46,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <format>
 #include <vector>
 
 // ── Standalone reproduction of AgentHealthStore ─────────────────────────────
@@ -1902,8 +1903,11 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     beat_tags(store, "b", {{"yuzu.plugins_failed", "tar"}});
     beat_tags(store, "c", {});
     beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
+    // 40 empty tokens then a valid name: the 32-split cap bites first, no label.
+    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + "late"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     auto out = metrics.serialize();
+    CHECK(out.find("plugin=\"late\"") == std::string::npos);
     CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"tar\"} ") == 2.0);
     CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
     // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
@@ -1914,8 +1918,7 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     AgentHealthStore many;
     yuzu::MetricsRegistry m2;
     for (int i = 0; i < 70; ++i) {
-        char name[16];
-        std::snprintf(name, sizeof name, "plug_%02d", i);
+        const auto name = std::format("plug_{:02d}", i);
         beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", name}});
     }
     many.recompute_metrics(m2, std::chrono::seconds{300});
@@ -1962,22 +1965,27 @@ TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not dedupe
     CHECK(calls[0].total == 1);
     CHECK(calls[0].q == "100:f1");
 
-    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}}); // same identity
-    CHECK(calls.size() == 1);
-    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}}); // new quarantine
+    // Same identity surfaces AGAIN: a failed/skipped audit write is retried on
+    // the next heartbeat (the gate, not the store, dedups).
+    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}});
     REQUIRE(calls.size() == 2);
-    CHECK(calls[1].total == 2);
-    CHECK(calls[1].q == "200:f2");
+    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}}); // new quarantine
+    REQUIRE(calls.size() == 3);
+    CHECK(calls[2].total == 2);
+    CHECK(calls[2].q == "200:f2");
 
     beat_tags(store, "b", {{tot, "0"}, {ql, "1:f"}});                     // zero total
     beat_tags(store, "c", {{tot, "1"}});                                   // no quarantine_last
     beat_tags(store, "d", {{tot, "1"}, {ql, std::string(200, 'q')}});      // oversized
-    CHECK(calls.size() == 2);
+    beat_tags(store, "d", {{tot, "1"}, {ql, "1:a/b"}});                    // path separator
+    beat_tags(store, "d", {{tot, "1"}, {ql, "100f1"}});                    // missing colon
+    beat_tags(store, "d", {{tot, "1"}, {ql, "x1:f1"}});                    // non-digit epoch
+    CHECK(calls.size() == 3);
 
-    // remove() then re-upsert surfaces AGAIN: the store surfaces, the gate dedups.
+    // remove() then re-upsert surfaces too.
     store.remove("a");
     beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}});
-    CHECK(calls.size() == 3);
+    CHECK(calls.size() == 4);
 }
 
 TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newest row",
@@ -2020,4 +2028,64 @@ TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newes
     CHECK(gate.should_log("d", "9:z"));
     gate.mark_logged("d", "9:z");
     CHECK(gate.should_log("e", "9:z"));
+}
+
+TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable one is not",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    std::optional<std::optional<std::string>> answer = std::nullopt; // degraded
+    TarCorruptionAuditGate gate([&](const std::string&) {
+        ++lookups;
+        return answer;
+    });
+    // Degraded store: no write, not marked.
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    // Healthy, no row -> log; the caller's log() fails (does not mark) -> retried.
+    answer = std::optional<std::string>{};
+    CHECK(gate.should_log("a", "1:f"));
+    CHECK(gate.should_log("a", "1:f"));
+    // log() succeeds -> marked; no further lookup.
+    gate.mark_logged("a", "1:f");
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == before);
+}
+
+TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink composition",
+          "[health_store][tar][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    const auto d = encode_tar_corruption_detail(3, "1700000000:tar.db.corrupt-1700000000");
+    CHECK(d == "corruption_total=3 quarantine=1700000000:tar.db.corrupt-1700000000");
+    CHECK(decode_tar_quarantine_from_detail(d) == "1700000000:tar.db.corrupt-1700000000");
+    CHECK_FALSE(decode_tar_quarantine_from_detail("corruption_total=3").has_value());
+    CHECK(valid_tar_quarantine_last("1700000000:tar.db.corrupt-1700000000-2"));
+
+    // Store surfaces -> gate decides -> sink logs; the "audit store" is a vector.
+    std::vector<std::string> rows; // encoded details, newest last
+    bool log_ok = false;
+    TarCorruptionAuditGate gate([&](const std::string&) -> std::optional<std::optional<std::string>> {
+        if (rows.empty())
+            return std::optional<std::string>{};
+        return decode_tar_quarantine_from_detail(rows.back());
+    });
+    AgentHealthStore store;
+    store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
+        if (!gate.should_log(a, q))
+            return;
+        if (log_ok) {
+            rows.push_back(encode_tar_corruption_detail(t, q));
+            gate.mark_logged(a, q);
+        }
+    });
+    const auto beat = [&] {
+        beat_tags(store, "a", {{kTarTagCorruptionTotal, "1"}, {kTarTagQuarantineLast, "5:f"}});
+    };
+    beat(); // log fails: not marked
+    CHECK(rows.empty());
+    log_ok = true;
+    beat(); // retried on the next heartbeat
+    REQUIRE(rows.size() == 1);
+    beat(); // durable now: no further row
+    CHECK(rows.size() == 1);
 }

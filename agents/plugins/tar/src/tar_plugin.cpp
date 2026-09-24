@@ -1112,8 +1112,10 @@ public:
     // or a failed storage_set, is replayed rather than lost. The counter is
     // monotonic per agent and is never overwritten when it exists but is
     // unreadable (storage_get returns "" for absent AND read-failure). The one
-    // window where the fact is lost is a crash between the quarantine rename and
-    // the fresh DB's config write inside TarDatabase::open().
+    // windows where the fact is lost are a crash between the quarantine rename and
+    // the fresh DB's config write inside TarDatabase::open(), and that config
+    // write failing (logged by open(); db_health|quarantined still shows for
+    // this process).
     void reconcile_db_health_publish(yuzu::PluginContext& pctx) {
         if (!db_ || !db_->is_open())
             return;

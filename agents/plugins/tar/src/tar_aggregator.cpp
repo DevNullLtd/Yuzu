@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <charconv>
@@ -22,6 +23,7 @@
 #include <tuple>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -141,6 +143,37 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
+namespace {
+
+constexpr const char* kUpsertState =
+    "INSERT INTO tar_state (collector, state_json, updated_at) VALUES (?1, ?2, CAST(?3 AS INTEGER)) "
+    "ON CONFLICT(collector) DO UPDATE SET state_json = excluded.state_json, "
+    "updated_at = excluded.updated_at";
+constexpr const char* kUpsertConfig = "INSERT INTO tar_config (key, value) VALUES (?1, ?2) "
+                                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+// Prepare + bind (all text) + step one UPSERT on the transaction's connection.
+// Any failure poisons the handle exactly like TransactionHandle::exec().
+bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::string_view> params) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(h.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        h.fail(sqlite3_errmsg(h.raw()));
+        return false;
+    }
+    bool ok = true;
+    for (std::size_t i = 0; ok && i < params.size(); ++i)
+        ok = sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].data() ? params[i].data() : "",
+                               static_cast<int>(params[i].size()), SQLITE_TRANSIENT) == SQLITE_OK;
+    if (ok)
+        ok = sqlite3_step(stmt) == SQLITE_DONE;
+    if (!ok)
+        h.fail(sqlite3_errmsg(h.raw()));
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+} // namespace
+
 bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
                                      std::string_view new_value, int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
@@ -149,8 +182,8 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // opt-in source (module/procperf/netqual, default false) the first
     // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
     // does not write a spurious paused_at. The `_enabled` flag itself is written
-    // below (in-branch), not here, so the #538 fail-safe ordering holds: on a
-    // disable the flag flips only after the baseline clear persists.
+    // below, inside the one transaction with the baseline clear, so a failed
+    // clear leaves the flag unmoved (#538 ghost-`started` storm unreachable).
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
     // Canonicalise `prev` to the strict tri-state before BOTH transition checks
@@ -170,11 +203,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // `usage` (Wave 7 PR7.2b): every side effect of an enable/disable edge --
     // the flag write, paused_at, and the activation-generation bump that
     // forces a fresh baseline before the NEXT fold -- commits as ONE checked
-    // transaction (yuzu::tar::usage::usage_set_enabled, tar_usage.cpp). This
-    // is `usage`'s own path around the #2490 discarded-write gap every
-    // OTHER source below still has (out of scope to fix generally here): a
-    // failed persist refuses the transition outright rather than report
-    // success while the flag silently did not move. `usage` has no
+    // transaction (yuzu::tar::usage::usage_set_enabled, tar_usage.cpp). Every
+    // other source commits the same way below (#1654): a failed persist
+    // refuses the transition outright rather than report success while the
+    // flag silently did not move. `usage` has no
     // snapshot-diff baseline (diff_state_key maps nothing for it) and needs
     // no marker-clear of its own -- the generation bump on the disable leg
     // already invalidates the current activation, so a later re-enable
@@ -203,11 +235,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // unreachable. A failed persist returns false and leaves the source in its
     // previous state (the caller reports it and does not drain nstat).
     //
-    // SQL is built from a closed vocabulary only (precedent: tar_usage.cpp
-    // usage_set_enabled): new_value is guarded to "true"/"false" here (and by
-    // do_configure), the source must be a registry name, the state key comes
-    // from diff_state_key(), and the epoch is digits. No operator string is ever
-    // interpolated. Guards mirror the usage branch above.
+    // Every value is bound (never interpolated). The in-function guards below are
+    // the input contract: new_value is "true"/"false" (also enforced by
+    // do_configure), and the source must be a registry name. Guards mirror the
+    // usage branch above.
     if (new_value != "true" && new_value != "false")
         return false;
     {
@@ -221,31 +252,27 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     const bool enable_edge = new_value == "true" && prev_canon != "true";
     const std::string_view clear_key = disable_edge ? diff_state_key(source) : std::string_view{};
 
+    const std::string now_str = std::to_string(now_epoch);
     auto result = db.checked_transaction(
         [&](TransactionHandle& h) -> std::expected<void, std::string> {
             if (!clear_key.empty()) {
-                if (!h.exec(std::format(
-                        "INSERT INTO tar_state (collector, state_json, updated_at) "
-                        "VALUES ('{}', '', {}) ON CONFLICT(collector) DO UPDATE SET "
-                        "state_json = excluded.state_json, updated_at = excluded.updated_at",
-                        clear_key, now_epoch)))
+                const std::string_view p[] = {clear_key, std::string_view{}, now_str};
+                if (!bind_upsert(h, kUpsertState, p))
                     return std::unexpected(h.error());
             }
             const auto put_config = [&](const std::string& key,
-                                        const std::string& value) -> bool {
-                return h.exec(std::format(
-                    "INSERT INTO tar_config (key, value) VALUES ('{}', '{}') "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    key, value));
+                                        std::string_view value) -> bool {
+                const std::string_view p[] = {key, value};
+                return bind_upsert(h, kUpsertConfig, p);
             };
-            if (!put_config(enabled_key, std::string{new_value}))
+            if (!put_config(enabled_key, new_value))
                 return std::unexpected(h.error());
             // Clear paused_at whenever we become enabled from a NOT-validly-enabled
             // state -- "false" (paused) OR "errored" (corrupt/tampered); the mirror
             // of the disable edge. An idempotent true->true is a no-op (paused_at
             // is already "0").
             if (disable_edge) {
-                if (!put_config(paused_at_key, std::to_string(now_epoch)))
+                if (!put_config(paused_at_key, now_str))
                     return std::unexpected(h.error());
             } else if (enable_edge) {
                 if (!put_config(paused_at_key, "0"))

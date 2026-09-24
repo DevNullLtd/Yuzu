@@ -301,6 +301,7 @@ TEST_CASE("perf fragment: real aggregations, suppression text, Performance tab",
     CHECK(html.find("Performance") != std::string::npos); // the 5th subnav tab
     CHECK(html.find("n too small") != std::string::npos); // cohort "b" suppressed
     CHECK(html.find("Windows and Linux") != std::string::npos); // coverage honesty (C1)
+    CHECK(html.find("of 16 perf-capable online") != std::string::npos);
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
 }
 

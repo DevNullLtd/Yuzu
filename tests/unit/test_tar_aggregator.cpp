@@ -2381,7 +2381,7 @@ void install_fault(TarDatabase& db, const char* table, const char* col, const ch
 
 TEST_CASE("TAR #1654: a failed enabled-flag write rolls back the baseline clear",
           "[tar][paused_at][issue1654]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-1654-flagfail-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_flagfail_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -2399,7 +2399,7 @@ TEST_CASE("TAR #1654: a failed enabled-flag write rolls back the baseline clear"
 
 TEST_CASE("TAR #1654: a failed baseline clear leaves the flag untouched (transactional)",
           "[tar][paused_at][issue1654]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-1654-clearfail-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_clearfail_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -2415,7 +2415,7 @@ TEST_CASE("TAR #1654: a failed baseline clear leaves the flag untouched (transac
 
 TEST_CASE("TAR #1654: a failed paused_at write leaves an enable transition unapplied",
           "[tar][paused_at][issue1654]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-1654-pausefail-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_pausefail_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -2431,7 +2431,7 @@ TEST_CASE("TAR #1654: a failed paused_at write leaves an enable transition unapp
 
 TEST_CASE("TAR #1654: in-function guard rejects unvalidated values and unknown sources",
           "[tar][paused_at][issue1654]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-1654-guard-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_guard_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);

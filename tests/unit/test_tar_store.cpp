@@ -2205,6 +2205,63 @@ TEST_CASE("TarDatabase: software + network events + baseline are one transaction
     CHECK(t.db.get_state("network") == "n2");
 }
 
+TEST_CASE("TarDatabase: service/user/arp/dns/mapdrive events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+
+    ServiceEvent se; se.ts = 1000; se.snapshot_id = 1; se.action = "started"; se.name = "svc";
+    install_state_fault(t.db, "service");
+    CHECK_FALSE(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 0);
+    CHECK(t.db.get_state("service").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 1);
+    CHECK(t.db.get_state("service") == "b2");
+
+    UserEvent ue; ue.ts = 1000; ue.snapshot_id = 1; ue.action = "login"; ue.user = "alice";
+    install_state_fault(t.db, "user");
+    CHECK_FALSE(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 0);
+    CHECK(t.db.get_state("user").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 1);
+    CHECK(t.db.get_state("user") == "b2");
+
+    ArpEvent ae; ae.ts = 3000; ae.snapshot_id = 1; ae.action = "appeared"; ae.iface = "Ethernet";
+    ae.ip_address = "192.168.1.1"; ae.mac_address = "aa:bb:cc:dd:ee:ff"; ae.entry_type = "dynamic";
+    install_state_fault(t.db, "arp");
+    CHECK_FALSE(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 0);
+    CHECK(t.db.get_state("arp").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 1);
+    CHECK(t.db.get_state("arp") == "b2");
+
+    DnsEvent de; de.ts = 3100; de.snapshot_id = 1; de.action = "appeared"; de.name = "example.com";
+    de.record_type = "A"; de.data = "93.184.216.34"; de.ttl_remaining_s = 60; de.source = "cache";
+    install_state_fault(t.db, "dns");
+    CHECK_FALSE(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 0);
+    CHECK(t.db.get_state("dns").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 1);
+    CHECK(t.db.get_state("dns") == "b2");
+
+    MapDriveEvent me{1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "historical"};
+    install_state_fault(t.db, "mapdrive");
+    CHECK_FALSE(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 0);
+    CHECK(t.db.get_state("mapdrive").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 1);
+    CHECK(t.db.get_state("mapdrive") == "b2");
+}
+
 TEST_CASE("TarDatabase: StateWrite with empty events writes only the baseline (#1654)",
           "[tar][store][corruption][atomic]") {
     auto t = make_test_db();
@@ -2212,7 +2269,8 @@ TEST_CASE("TarDatabase: StateWrite with empty events writes only the baseline (#
     CHECK(t.db.get_state("process") == "only-state");
     CHECK(count_rows(t.db, "process_live") == 0);
 
-    // nullopt state keeps the historical contract byte-for-byte.
+    // nullopt state keeps the historical contract for an open handle byte-for-byte
+    // (a closed handle now returns false for every call).
     CHECK(t.db.insert_process_events({}));
     CHECK(t.db.insert_process_events({}, std::nullopt));
     CHECK(t.db.get_state("process") == "only-state");

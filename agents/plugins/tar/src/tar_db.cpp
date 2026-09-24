@@ -796,8 +796,12 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         // rename above and this write is the one window where the fact is lost).
         // Basename only — never a full path in status or heartbeat.
         db.quarantined_at_ = quarantined_at;
-        db.set_config("db_health_last_quarantine_epoch", std::to_string(*quarantined_at));
-        db.set_config("db_health_last_quarantine_file", quarantined_file);
+        // A failed write loses the durable record (the plugin reconcile and the
+        // status line read these two rows); name the key so it is visible.
+        if (!db.set_config("db_health_last_quarantine_epoch", std::to_string(*quarantined_at)))
+            spdlog::error("TarDatabase: failed to persist db_health_last_quarantine_epoch");
+        if (!db.set_config("db_health_last_quarantine_file", quarantined_file))
+            spdlog::error("TarDatabase: failed to persist db_health_last_quarantine_file");
     }
 
     spdlog::info("TarDatabase opened: {} (schema v{})", path.string(), db.schema_version());
