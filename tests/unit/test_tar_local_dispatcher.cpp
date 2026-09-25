@@ -20,6 +20,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -178,13 +179,13 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
         };
 
         // Block only the `last` key on the kv table (INSERT and UPDATE).
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open((dir_guard.path / "kv_store.db").string().c_str(), &raw) == SQLITE_OK);
+        // Owner declared before the open: sqlite3_open populates the handle even on
+        // failure, so a failing REQUIRE still unwinds through a live owner.
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open((dir_guard.path / "kv_store.db").string().c_str(), &owner.db) ==
+                SQLITE_OK);
         const auto exec = [&](const char* sql) {
-            char* err = nullptr;
-            const int rc = sqlite3_exec(raw, sql, nullptr, nullptr, &err);
-            sqlite3_free(err);
-            return rc == SQLITE_OK;
+            return sqlite3_exec(owner.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
         };
         REQUIRE(exec("CREATE TRIGGER block_last_ins BEFORE INSERT ON kv_store "
                      "WHEN NEW.key = 'heartbeat.db_quarantine_last' "
@@ -206,9 +207,7 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
         REQUIRE(names.size() == 1);
         const auto first_last = kv->get("tar", "heartbeat.db_quarantine_last");
         REQUIRE(first_last.has_value());
-        CHECK(first_last->size() > names[0].size());
-        CHECK(first_last->substr(first_last->size() - names[0].size()) == names[0]);
-        CHECK((*first_last)[first_last->size() - names[0].size() - 1] == ':');
+        CHECK(first_last->ends_with(":" + names[0]));
         CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
 
         // A second quarantine advances the counter exactly once and `last` names the newer file.
@@ -222,12 +221,23 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
         CHECK(second_last != first_last);
         bool names_a_listed_file = false;
         for (const auto& n : names)
-            if (second_last->size() > n.size() &&
-                second_last->substr(second_last->size() - n.size()) == n &&
+            if (second_last->ends_with(":" + n) &&
                 n != first_last->substr(first_last->find(':') + 1))
                 names_a_listed_file = true;
         CHECK(names_a_listed_file);
-        sqlite3_close(raw);
+
+        // Only the two bridged heartbeat keys exist: the private ledger is not
+        // `heartbeat.`-prefixed.
+        auto hb = kv->list("tar", "heartbeat.");
+        std::sort(hb.begin(), hb.end());
+        CHECK(hb == std::vector<std::string>{"heartbeat.db_corruption_total",
+                                             "heartbeat.db_quarantine_last"});
+
+        // An unreadable ledger is warn-only: never overwritten, count not reset.
+        REQUIRE(kv->set("tar", "db_health.ledger", "garbage"));
+        init_shutdown();
+        CHECK(kv->get("tar", "db_health.ledger") == std::optional<std::string>{"garbage"});
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"2"});
     }
 
     SECTION("clean boot -> db_health|ok|0") {

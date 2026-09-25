@@ -1110,12 +1110,12 @@ public:
     // into `yuzu.plugin.tar.*` heartbeat tags. Runs at init and at the top of
     // every collect_slow tick, so a crash between the quarantine and the publish,
     // or a failed storage_set, is replayed rather than lost. The counter is
-    // monotonic per agent and the ledger is never overwritten when it
-    // exists but is unreadable (storage_get returns "" for absent AND
-    // read-failure). The two windows where the fact is lost are a crash between the quarantine rename and
-    // the fresh DB's config write inside TarDatabase::open(), and that config
-    // write failing (logged by open(); db_health|quarantined still shows for
-    // this process).
+    // monotonic per agent and the ledger is never overwritten when it exists but
+    // is unreadable (storage_get returns "" for absent AND read-failure). The two
+    // windows where the fact is lost are a crash between the quarantine rename
+    // and the fresh DB's config write inside TarDatabase::open(), and that config
+    // write failing (logged by open(); db_health|quarantined still shows for this
+    // process).
     void reconcile_db_health_publish(yuzu::PluginContext& pctx) {
         if (!db_ || !db_->is_open())
             return;

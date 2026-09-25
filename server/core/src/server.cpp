@@ -5154,6 +5154,8 @@ public:
                     ev.result = "success";
                     if (audit_store_->log(ev))
                         gate->mark_logged(agent_id, quarantine);
+                    else
+                        gate->mark_failed();
                 });
             }
 

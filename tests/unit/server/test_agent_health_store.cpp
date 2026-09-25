@@ -2018,6 +2018,7 @@ TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newes
 
     // Newest row is a different quarantine -> log.
     CHECK(gate.should_log("b", "3:h"));
+    gate.mark_logged("b", "3:h");
 
     // Degraded store: no write, NOT marked; one probe, then no lookups inside
     // the retry window, and a probe again after it.
@@ -2036,6 +2037,7 @@ TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newes
     CHECK(gate.should_log("d", "9:z"));
     gate.mark_logged("d", "9:z");
     CHECK(gate.should_log("e", "9:z"));
+    gate.mark_logged("e", "9:z");
 }
 
 TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable one is not",
@@ -2053,15 +2055,75 @@ TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable on
     // Degraded store: no write, not marked.
     CHECK_FALSE(gate.should_log("a", "1:f"));
     clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
-    // Healthy, no row -> log; the caller's log() fails (does not mark) -> retried.
+    // Healthy, no row -> log; the caller's log() fails -> mark_failed opens the
+    // degraded window: no lookup inside it, admitted again after it.
     answer = std::optional<std::string>{};
-    CHECK(gate.should_log("a", "1:f"));
-    CHECK(gate.should_log("a", "1:f"));
+    REQUIRE(gate.should_log("a", "1:f"));
+    const int before_fail = lookups;
+    gate.mark_failed();
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == before_fail);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    REQUIRE(gate.should_log("a", "1:f"));
     // log() succeeds -> marked; no further lookup.
     gate.mark_logged("a", "1:f");
     const int before = lookups;
     CHECK_FALSE(gate.should_log("a", "1:f"));
     CHECK(lookups == before);
+}
+
+TEST_CASE("TarCorruptionAuditGate: overlapping calls hold one in-flight slot gate-wide",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    int64_t clock = 1000;
+    std::optional<std::optional<std::string>> answer = std::optional<std::string>{};
+    TarCorruptionAuditGate* gp = nullptr;
+    bool reenter = true;
+    bool inner_same = true, inner_other = true;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            if (reenter) {
+                reenter = false;
+                inner_same = gp->should_log("a", "1:f");
+                inner_other = gp->should_log("b", "2:g");
+            }
+            return answer;
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    // Same-agent and other-agent calls from inside the lookup: no admit, no lookup.
+    REQUIRE(gate.should_log("a", "1:f"));
+    CHECK_FALSE(inner_same);
+    CHECK_FALSE(inner_other);
+    CHECK(lookups == 1);
+    CHECK_FALSE(gate.should_log("a", "1:f")); // slot still held until completion
+    CHECK(lookups == 1);
+    gate.mark_logged("a", "1:f");
+    CHECK_FALSE(gate.should_log("a", "1:f")); // the map answers now
+    CHECK(lookups == 1);
+
+    // mark_failed releases the slot (after the degraded window).
+    REQUIRE(gate.should_log("b", "2:g"));
+    gate.mark_failed();
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("b", "2:g"));
+    gate.mark_logged("b", "2:g");
+
+    // Degraded outer lookup under overlap: exactly one probe, re-admitted after the window.
+    answer = std::nullopt;
+    reenter = true;
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == before + 1);
+    answer = std::optional<std::string>{};
+    CHECK_FALSE(gate.should_log("c", "3:h")); // inside the window
+    CHECK(lookups == before + 1);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("c", "3:h"));
+    gate.mark_logged("c", "3:h");
 }
 
 TEST_CASE("TarCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
@@ -2072,11 +2134,18 @@ TEST_CASE("TarCorruptionAuditGate: per-agent map is bounded by fleet, never wipe
         ++lookups;
         return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
     });
-    for (int i = 0; i < 5000; ++i)
+    // One past the 65,536 cap: exactly one entry is evicted, never a wholesale clear.
+    constexpr int kAgents = 65537;
+    for (int i = 0; i < kAgents; ++i)
         gate.mark_logged("agent-" + std::to_string(i), "1:f");
-    for (int i = 0; i < 5000; ++i)
-        CHECK_FALSE(gate.should_log("agent-" + std::to_string(i), "1:f"));
-    CHECK(lookups == 0);
+    // The single evicted entry is admitted (order-independent) and holds the in-flight
+    // slot, so every other agent is answered by the map with no lookup.
+    int admitted = 0;
+    for (int i = 0; i < kAgents; ++i)
+        if (gate.should_log("agent-" + std::to_string(i), "1:f"))
+            ++admitted;
+    CHECK(admitted == 1);
+    CHECK(lookups == 1);
 }
 
 TEST_CASE("TarCorruptionAuditGate: a rotating identity is rate-limited per agent",
@@ -2100,7 +2169,8 @@ TEST_CASE("TarCorruptionAuditGate: a rotating identity is rate-limited per agent
     CHECK_FALSE(gate.should_log("a", "3:h"));
     CHECK(lookups == before);
     // A different agent is unaffected.
-    CHECK(gate.should_log("b", "2:g"));
+    REQUIRE(gate.should_log("b", "2:g"));
+    gate.mark_logged("b", "2:g");
     // Past the window the next identity logs.
     clock += kTarCorruptionAuditMinRowInterval;
     CHECK(gate.should_log("a", "3:h"));
@@ -2122,11 +2192,12 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
     // Store surfaces -> gate decides -> sink logs; the "audit store" is a vector.
     std::vector<std::string> rows; // encoded details, newest last
     bool log_ok = false;
+    int64_t clock = 1000;
     TarCorruptionAuditGate gate([&](const std::string&) -> std::optional<std::optional<std::string>> {
         if (rows.empty())
             return std::optional<std::string>{};
         return decode_tar_quarantine_from_detail(rows.back());
-    });
+    }, [&] { return clock; });
     AgentHealthStore store;
     store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
         if (!gate.should_log(a, q))
@@ -2134,6 +2205,8 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
         if (log_ok) {
             rows.push_back(encode_tar_corruption_detail(t, q));
             gate.mark_logged(a, q);
+        } else {
+            gate.mark_failed();
         }
     });
     const auto beat = [&] {
@@ -2142,7 +2215,8 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
     beat(); // log fails: not marked
     CHECK(rows.empty());
     log_ok = true;
-    beat(); // retried on the next heartbeat
+    clock += kTarCorruptionAuditDegradedRetry;
+    beat(); // retried after the degraded window
     REQUIRE(rows.size() == 1);
     beat(); // durable now: no further row
     CHECK(rows.size() == 1);

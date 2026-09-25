@@ -85,11 +85,12 @@ public:
 /// (tools/plugin-capture). Carries the configuration map every plugin reads
 /// through `yuzu_ctx_get_config`; no trigger engine, and no KV store unless the
 /// KvStore* overload is used, so the storage and trigger ABI calls fail closed
-/// exactly as they do under the agent when those services are absent. Hand `get()` to `descriptor->init`
-/// before the first dispatch and to `descriptor->shutdown` after the last,
-/// in that order, so a plugin whose init is load-bearing (reads its config,
-/// opens a store, stashes the context) behaves as it does under the real
-/// host. The context must outlive every dispatch made against it.
+/// exactly as they do under the agent when those services are absent. Hand
+/// `get()` to `descriptor->init` before the first dispatch and to
+/// `descriptor->shutdown` after the last, in that order, so a plugin whose init
+/// is load-bearing (reads its config, opens a store, stashes the context)
+/// behaves as it does under the real host. The context must outlive every
+/// dispatch made against it.
 class YUZU_EXPORT StandalonePluginContext {
 public:
     StandalonePluginContext(std::string plugin_name,

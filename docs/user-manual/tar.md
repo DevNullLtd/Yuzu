@@ -404,7 +404,11 @@ agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
 `tar.db.corruption_quarantined` audit row per quarantine. A plugin that failed to
 initialise (including TAR when the corrupt file cannot be moved aside) is reported
 in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
-which distinguishes "failed to load" from "not installed".
+which distinguishes "failed to load" from "not installed". The plugin keeps its
+count in a private storage record; if that record is present but unreadable the
+plugin logs `TAR: db_health.ledger unreadable; not overwriting` and stops updating
+the two heartbeat keys rather than resetting the count — `status` still reports
+`db_health`, and the agent log carries the warning on every collect_slow tick.
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 
