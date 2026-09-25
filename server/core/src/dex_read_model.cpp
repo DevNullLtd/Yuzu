@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdint>
 
@@ -25,12 +26,25 @@ DexDeviceScoreModel build_dex_device_score_model(GuaranteedStateStore* store,
     m.window = window;
     if (!store)
         return m; // score stays -1, signals stays empty -- "no data" degrade
-    m.score = dex_device_score(store, agent_id, since);
-    m.signals = store->dex_device_signal_summary(agent_id, since);
+    // #4855: ONE checked read feeds BOTH score and signals -- closes the
+    // pre-existing torn read (score and signal list used to be two
+    // independent store calls; a failure of only the second used to render a
+    // low/zero score next to "No DEX signals" instead of an honest degrade).
+    const auto checked = store->dex_device_signal_summary_checked(agent_id, since);
+    if (!checked) {
+        m.degraded = true; // score stays -1, signals stays empty
+        return m;
+    }
+    m.signals = *checked;
+    m.score = dex_score_from_signals(*checked);
     return m;
 }
 
 std::string dex_device_score_json(const DexDeviceScoreModel& model, bool audit_persisted) {
+    // #4855: a degraded model has no honest wire shape -- every caller
+    // (device lens / REST / MCP) must have already translated `degraded`
+    // into its own surface's response before reaching this serializer.
+    assert(!model.degraded && "dex_device_score_json: caller must handle model.degraded first");
     json signals = json::array();
     for (const auto& s : model.signals) {
         signals.push_back({{"obs_type", s.obs_type},
@@ -513,8 +527,10 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
         };
         for (const auto& [id, os] : fleet.connected_agents) {
             const int s = dex_device_score(store, id, since);
-            if (s < 0)
+            if (s < 0) {
+                ++m.unscored; // #4855: null store OR a degraded per-device read
                 continue;
+            }
             ds.push_back(s);
             const std::size_t i = seg_idx(os.empty() ? std::string("unknown") : os);
             ++seg_n[i];
@@ -655,6 +671,7 @@ std::string dex_overview_json(const DexOverviewModel& model, bool audit_persiste
              {"great", model.great},
              {"fair", model.fair},
              {"poor", model.poor},
+             {"unscored", model.unscored}, // #4855: additive field, see DexOverviewModel::unscored
              {"coverage_monitored", model.coverage_monitored},
              {"coverage_total", model.coverage_total},
              {"windows_reporting", model.windows_reporting},

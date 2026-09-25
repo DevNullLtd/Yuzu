@@ -1,0 +1,4 @@
+host: braga (Mac16,10, Apple Silicon), macOS 26.6.2 (Darwin 25.6.0); identity alex (uid 501, unprivileged); date 2026-09-21
+status: REAL CAPTURE via a throwaway IOKit probe (not committed): IORegistryEntryFromPath(<node>) + IORegistryEntryCreateCFProperty per key, each CFData hex-dumped exactly as the plugin sees it
+format: "[node <path>] present|absent", then "<key><TAB>data|other|absent<TAB><hex>"
+notes: IODeviceTree:/rom is absent on Apple Silicon (`ioreg -p IODeviceTree -n rom` also has no match); the version is /chosen system-firmware-version = "mBoot-18000.161.10", and firmware-version is the same text in a 256-byte NUL-padded buffer. Intel /rom keys are not captured.

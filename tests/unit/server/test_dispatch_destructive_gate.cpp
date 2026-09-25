@@ -50,6 +50,11 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
+#include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -452,6 +457,39 @@ TEST_CASE("app_usage.summary (real fragment): Forensics single-target rule — 1
     CHECK(refused.refusal_reason == kReasonForensicUntargeted);
 }
 
+// Wave 10 P2a-3 — pins the REAL browser_inventory fragment (not the
+// hand-built kForensicsFixture above) through the same Forensics
+// single-target rule: browser_inventory's two rows are ReadOnly/
+// AdminOrApproval under the Forensics securable (field-for-field copy of
+// execution_artifacts'), so they must be targeted exactly as
+// execution_artifacts is.
+TEST_CASE("browser_inventory (real fragment): Forensics single-target rule — 1 agent Targeted, "
+          "2 agents RefuseUntargeted for both actions",
+          "[server][dispatch][security]") {
+    namespace capdecls = yuzu::server::capdecls;
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_browser_inventory()};
+
+    for (const char* action : {"browsers", "profiles"}) {
+        auto classified = registry.classify("browser_inventory", action);
+        REQUIRE(classified.has_value());
+        CHECK(classified->securable == kForensicsSecurable);
+        CHECK(requires_explicit_targets(*classified));
+
+        const auto targeted = evaluate_destructive_targeting(classified,
+                                                              /*valid_nonempty_agent_ids=*/true,
+                                                              /*scope_key_present=*/false,
+                                                              /*agent_id_count=*/1);
+        CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                             /*valid_nonempty_agent_ids=*/true,
+                                                             /*scope_key_present=*/false,
+                                                             /*agent_id_count=*/2);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+    }
+}
+
 TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
           "Forensics pair",
           "[server][dispatch][security]") {
@@ -528,19 +566,20 @@ TEST_CASE("#3685 defect 4: the two Destructive refusal strings are pinned byte-e
 // (mirrors test_capability_catalogue.cpp's own `build_registry`) and pins
 // the live Destructive row count. #3685's design doc claimed 14 Destructive
 // rows; counting the actual capability_decls/*.hpp fragments during this
-// checkpoint found 17 (verified via `git grep -c ".dispatch_class =
+// checkpoint found 17 (19 once power_health's and printing's rows landed;
+// verified at the time via `git grep -c ".dispatch_class =
 // DispatchClass::Destructive" capability_decls/*.hpp`) — the "four
 // Execution:Execute rows" sub-claim (script_exec.{exec,powershell,bash} +
 // content_dist.execute_staged) IS accurate, but the total is not. This case
 // pins the CORRECTED, live count so a future catalogue change that adds or
 // removes a Destructive row has to touch this test, not silently drift past
 // #3685's own coverage claim the way the design doc's count already did.
-TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17, not the design "
+TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19, not the design "
           "doc's stale 14 (#3685) — a new/removed Destructive row must touch this test",
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 16> sources{{
+    const std::array<std::span<const CommandCapability>, 21> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -556,6 +595,11 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_update_source_trust(),
+        capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_runtimes(),
+        capdecls::plugin_action_catalogue_platform_security(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -576,11 +620,12 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 18, not 17: power_health's set_power_plan is a Destructive row and the
-// mirror must include it, or a FUTURE Destructive row in that fragment
-// lands with the aggregate tripwire still passing -- which is exactly the
-// drift this test's own title forbids.
-    CHECK(destructive_count == 18);
+    // 19, not 17: power_health's set_power_plan and printing's clear_queue are
+// each a Destructive row and the mirror must include both, or a FUTURE
+// Destructive row in either fragment lands with the aggregate tripwire
+// still passing -- which is exactly the drift this test's own title
+// forbids.
+    CHECK(destructive_count == 19);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS
@@ -591,7 +636,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same sixteen spans compose into a real registry
+    // `build_registry`: the same twenty-one spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -610,6 +655,11 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_update_source_trust(),
+        capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_runtimes(),
+        capdecls::plugin_action_catalogue_platform_security(),
+        capdecls::plugin_action_catalogue_browser_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");

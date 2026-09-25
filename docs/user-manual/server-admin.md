@@ -36,10 +36,11 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 | Flag | Default | Description |
 |---|---|---|
-| `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the default location next to the binary. |
-| `--data-dir` | *(config dir)* | Directory for SQLite databases and runtime state files (enrollment tokens, pending agents). Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but databases need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
+| `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
+| `--data-dir` | *(config dir)* | Directory for runtime state files (enrollment tokens, pending agents, auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
+| `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
 | `--no-tls` | off | Disable **all** gRPC TLS (agent listener AND management listener). Plaintext gRPC, no encryption, no peer authentication. **The administrative surface is ungated when this flag is passed.** Intended for local UAT, customer demos, and development. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder when running in this mode. |
 | `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
@@ -88,9 +89,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--allow-unsigned-definitions` | off | **Dangerous.** Accept `InstructionDefinition` imports via `POST /api/v1/instructions/import` without an Ed25519 signature. Default is to reject unsigned imports with `instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)` (security-by-default since #1073 / W7.4 sibling-gap closure). Closes the equivalent fleet-RCE surface that `--allow-unsigned-packs` covers on the ProductPack side: without enforcement, any operator with `InstructionDefinition:Write` (or a MITM on a content sync) can publish a definition that dispatches a malicious plugin invocation on every targeted agent. Durable evidence: startup log line `[SECURITY] instruction-definition signature enforcement DISABLED by configuration` AND a `server.unsigned_definitions_allowed` audit event (`target_type = InstructionDefinition`). Env: `YUZU_ALLOW_UNSIGNED_DEFINITIONS`. |
 | `--mfa-enforcement` | `optional` | MFA enforcement mode: `optional` (users may enroll voluntarily; login never requires it), `admin-only` (an admin without MFA must enroll before login completes), or `required` (every role must enroll). Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the server logs an `INFO` line naming the active mode at startup. **Breaking:** earlier releases accepted `admin-only`/`required` as no-ops — if you staged the flag, read `docs/user-manual/upgrading.md` before upgrading (live enforcement begins immediately, and SSO users require an IdP that asserts `amr`). See `docs/user-manual/authentication.md` § Multi-Factor Authentication and `docs/auth-mfa-design.md`. Env: `YUZU_MFA_ENFORCEMENT`. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 11 high-risk REST + Settings endpoints (PR2 of the MFA ladder) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 24 high-risk REST + Settings endpoints (PR2 of the MFA ladder, since extended) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
-| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) — the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
@@ -99,7 +100,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only an SSO provider mints a session — so the server **refuses to start** unless OIDC (`--oidc-issuer` + `--oidc-client-id`) or, on Linux/macOS with HTTPS enabled, a complete SAML SP config is present. A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
 | `--break-glass-window-secs` | `86400` | Seconds the break-glass account stays armed after `--break-glass-arm` (default 24h). The arm **auto-expires** (evaluated lazily at login like the lockout window) — it is never a permanent standing exemption. Env: `YUZU_BREAK_GLASS_WINDOW_SECS`. |
-| `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + `--data-dir`. Refuses (exit non-zero) if any check fails. |
+| `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` caveat as `--mfa-reset` above. Refuses (exit non-zero) if any check fails. |
 | `--principal-max-concurrency` | `16` | **Engine principals** (ADR-1005 class, PR 4.4). Maximum in-flight requests for a single engine principal at any instant, checked at the server's single pre-routing chokepoint on both REST and MCP. A streaming/SSE request holds its slot for the stream's lifetime, not just until routing hands off. Exceeding it returns HTTP `429`. Human, device-agent, and anonymous traffic is never gated by this cap. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_MAX_CONCURRENCY`. |
 | `--principal-rate-limit` | `20.0` | **Engine principals** (ADR-1005 class, PR 4.4). Sustained request rate cap (requests/second, token bucket, burst = 2x the configured rate) for a single engine principal. Exceeding it returns HTTP `429`. Independent of `--principal-max-concurrency` — either dimension alone can reject a request. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_RATE_LIMIT`. |
 | `--ota-max-concurrent-per-peer` | `2` | **Agent OTA pulls (#913).** Maximum parallel `DownloadUpdate` streams a single peer may hold. This is the PRIMARY bound on the OTA path: the attack it closes is one authenticated agent opening many concurrent streams, each pinning a gRPC thread on blocking disk and network I/O. Exceeding it returns gRPC `RESOURCE_EXHAUSTED` (rejected, never queued). Admission keys on the peer's certificate identity, falling back to peer IP when no client certificate is presented. Env: `YUZU_OTA_MAX_CONCURRENT_PER_PEER`. |
@@ -163,25 +164,28 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ## Configuration Files
 
-The server stores its configuration in files located in the **same directory as the `yuzu-server` binary**. These files are created automatically during first-run setup and updated through the Settings page.
+The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) and its runtime state files live on disk; the state files are written to `--data-dir` (default: the directory containing the config file). Apart from those files, the NVD cache and the `agent-updates/`/`upload-blobs/` file directories, everything — users, sessions, MFA/TOTP, SCIM and every other server store — lives in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)). There is no `auth.db`; legacy `*.db` files left in `--data-dir` by older releases are only probed at startup to warn, never read.
 
 | File | Purpose |
 |---|---|
-| `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt. After first boot, `auth.db` is authoritative and this file is no longer read for live state — keep it as the seed for disaster-recovery (re-creating `auth.db` from scratch). |
-| `auth.db` | SQLite-backed authentication database. Holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256 hashed passwords. Created in `--data-dir` on first boot. Mode `0600` on Linux; restricted ACL on Windows. **This is the live source of truth for authentication state from v0.12.0 onwards.** |
-| `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
+| `yuzu-server.cfg` | First-boot seed for the initial admin. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt, which is seeded into the PostgreSQL `auth` schema on first boot. After that the `auth` schema is authoritative — keep this file as the seed for disaster recovery. |
+| `enrollment-tokens.cfg` | Live Tier-2 enrollment-token store. Holds token hashes, never plaintext tokens. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
+| `auto-approve.cfg` | Auto-approve enrollment policy rules and match mode. |
+| `nvd_cves.db` | NVD CVE cache. The one remaining server SQLite store — a recorded deferral, not a permanent exemption (`docs/postgres-migration-ladder.md`). |
+| `agent-updates/` | Agent OTA package binaries. The package records (`update_registry.update_packages`) are in PostgreSQL; the files they name live here. Relocated by `--update-dir` when that flag is set. |
+| `upload-blobs/` | Blob root for completed agent file uploads (ADR-3004). The records (`upload_grant_store.completed_uploads`) are in PostgreSQL; the blobs live here. Always under `--data-dir`; no flag overrides it. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores, and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
+> **Backup recommendation:** A complete backup is a `pg_dump --format=custom` of the Yuzu database **plus the entire CA/cert directory `--ca-dir`**, captured at the same point in time and restored as a pair — `--ca-dir` holds `default-ca.key` (the per-install CA private key) and the secrets KEK files `secrets-kek-v<N>.key`, without which the secret columns in the dump (TOTP secrets, webhook and plugin-config secrets, runtime-config and offload-target secrets) cannot be decrypted. See [Backup — the KEK pairing rule](../ops-runbooks/auth-db-recovery.md#backup--the-kek-pairing-rule) and [PostgreSQL Substrate](#postgresql-substrate) for the procedure. Retain old KEK versions for as long as the backups that need them. Also back up the `--data-dir` `.cfg` files above, `nvd_cves.db` (use `sqlite3 nvd_cves.db ".backup ..."`, NEVER `cp` against a live DB), and the two blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` — the dump holds only the package and upload records that point into them, so restoring the dump without these directories leaves records with no files behind them. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing the Postgres `auth` schema AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing authentication state alone is a Postgres restore — see `docs/ops-runbooks/auth-db-recovery.md`. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
 > - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
-> **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
+> **File permissions (Unix):** `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are `0600` after every write, and the KEK files in `--ca-dir` are created `0600`. No manual `chmod` is required.
 
-> **Windows Defender exclusion:** On Windows production deploys, exclude `auth.db`, `auth.db-wal`, and `auth.db-shm` from real-time scan. See `docs/ops-runbooks/auth-db-recovery.md` for the `Add-MpPreference` commands.
+> **Windows Defender:** No authentication-file exclusion applies — authentication state is in PostgreSQL, not a local database file. See `docs/ops-runbooks/auth-db-recovery.md`.
 
 ---
 
@@ -194,22 +198,139 @@ When the server starts for the first time and no `yuzu-server.cfg` exists, it en
 
 After setup completes, the server writes `yuzu-server.cfg` and starts normally. Subsequent restarts skip the setup prompt.
 
-> **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time. A sample config with default credentials is provided below for quick evaluation.
+> **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time — first-run setup is interactive and will exit without a TTY.
 
-### Default Credentials (Evaluation Only)
+### Seeded credentials
 
-For Docker, automated, and quick-start deployments, the following `yuzu-server.cfg` ships with pre-hashed credentials so the server starts without interactive setup:
+**No image or installer provisions a default account.** No image `COPY`s a
+`yuzu-server.cfg`, and there is no built-in account: a server started without a
+config runs interactive first-run setup, which prompts for an administrator
+**and** a second user account.
 
-| Username | Password | Role |
-|---|---|---|
-| `admin` | `administrator` | Admin (full access) |
-| `user` | `useroperator` | User (read-only) |
+One checked-in file, `deploy/config/uat/yuzu-server.cfg`, does hold a single
+`admin` entry — with a **fixed salt and a fixed PBKDF2 digest committed to git**,
+for the known password `adminpassword1`. It is orphaned: no script, compose file
+or image reads it (the UAT rigs each generate their own config at a temp path
+with a fresh random salt per run). Never copy it into a deployment, and do not
+read its presence as a supported default — removing it from the tree is tracked
+separately.
 
-> **WARNING: Change these credentials immediately after first login.** These defaults are published in documentation and are not suitable for production. Use the Settings page (User Management) to change passwords and create new accounts. For enterprise deployments, integrate OIDC SSO and disable local accounts.
+> **If you seed an account yourself, change its password before exposing the
+> server.** For enterprise deployments, integrate OIDC SSO and disable local
+> accounts.
 
 ---
 
 ## Upgrade Notes
+
+### vNEXT — `installed_apps list` rows carry two more fields (breaking)
+
+**What changed.** The `installed_apps` agent plugin's operator `list` action (definition
+`crossplatform.software.inventory`) now emits seven `|`-separated fields per row instead of five:
+`app|name|version|publisher|install_date|install_location|bundle_id`. `install_location` is the Windows
+Uninstall-key `InstallLocation` (unexpanded) or the location macOS reports; `bundle_id` is the macOS
+`CFBundleIdentifier`. Either is `-` where the OS has none: every Linux row ends `-|-`, and many Windows rows
+have no `InstallLocation` (182 of 241 on the reference developer workstation). The first five fields keep their
+position; every field is now escape-aware (`\` folds to `/`, `|` to `\|`, CR/LF to a space, a field over 4 KiB
+is cut), a no-op for every value in the three reference captures. Row shape for `query`, `list_per_user` and the
+daily-sync inventory (ADR-0016) is unchanged, though on macOS the collector `list`/`query`/`list_per_user` share
+now sorts same-named apps by (name, install_location) instead of leaving their order arbitrary.
+
+**Who this affects.** Automation reading `installed_apps list` output from `GET /api/v1/responses/{id}`, its
+`/export`, or MCP `query_responses` that (a) unpacks or anchors exactly five fields, or (b) treats the last
+field as `install_date`. The dashboard is unaffected: it has always split these rows into `app` plus one
+remainder cell, so the new fields appear inside that cell (and the search box matches them) but are not
+separate, sortable or filterable columns. A policy or script that substring-matches the raw `output` now also
+matches install paths and bundle identifiers.
+
+**Mixed fleets.** Upgrade order is server first, so agents keep answering with five fields until they take the
+release carrying `installed_apps` 1.2.0 (the definition's `minAgentVersion` stays `1.0.0`). Agents older than
+1.2.0 do not escape `|` in name, version, publisher or install date, so a row from one of them can split into
+any count under the escape-aware split: accept a row only when it has exactly 5 or exactly 7 tokens, reject any
+other count, and read the sixth/seventh columns only for agents known to be on plugin 1.2.0 or later.
+
+**Existing deployments keep the old definition.** The bundled definition is seeded once and never refreshed
+on an existing server (see the InstructionStore note in [`upgrading.md`](upgrading.md); #2555), so
+`get_definition` and `discover_instructions` keep listing four columns at version 1.0.0. Row content is
+unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
+new columns is optional and cosmetic.
+
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
+pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
+
+### vNEXT — `re-eval` on a result set now refuses instead of broadcasting when its recorded parent set has been deleted (#4306, breaking)
+
+**What changed.** `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set`
+previously synthesised the sibling's dispatch scope from the original's live, nullable
+`parent_id` foreign key. If the original's parent result set was later deleted (`parent_id ...
+ON DELETE SET NULL`), the column read as absent, and an absent `parent_id` reaching dispatch
+synthesis meant "broadcast to `__all__`" — silently turning "re-ask the same narrow question"
+into "ask the whole visible fleet." Both routes now refuse (`400 RESULT_SET_BAD_REQUEST`,
+`reason=parent_gone`) when the live parent is gone but the original's persisted `source_payload`
+shows it was narrowed at creation, instead of broadcasting.
+
+**Who this affects.** Any caller (REST or MCP) whose automation re-evaluates a result set that
+was originally narrowed to a `parent_id`, where that parent set has since been deleted.
+Previously such a call silently succeeded with a `202` (REST) or a materialized/pending result
+(MCP) dispatched to the entire visible fleet; it now refuses instead -- REST returns `400
+RESULT_SET_BAD_REQUEST`, MCP returns a JSON-RPC error (`kInvalidParams`) over HTTP 200, per that
+transport's existing error-shape convention. No legitimate caller should have been relying on the
+fleet-wide broadcast — this was the target-erasure defect being fixed — but any automation
+catching only success responses on this route should add handling for the new `400
+reason=parent_gone` case: create a fresh result set from the intended parent instead of
+re-evaluating the orphaned one. A genuinely parentless original (no `parent_id` was ever supplied
+at creation) still broadcasts on re-eval, unchanged.
+
+### vNEXT — a result-set `parent_id` alias longer than 64 bytes is no longer accepted on `from-tar-query`/`from-instruction-result` (#4734, breaking)
+
+**What changed.** `parent_id` accepts either a canonical `rs_...` id or a per-operator alias
+(the set's own `name`, valid up to 256 bytes). `POST /api/v1/result-sets/from-tar-query` and
+`/from-instruction-result` now bound `parent_id` to 64 bytes (`kResultSetParentIdMaxLen`) before
+attempting alias resolution, closing a gap where an oversized value was copied unbounded into
+the persisted `scope_input_id` lineage marker. MCP's equivalent producer tools already enforced
+this bound; REST did not — this change brings REST to parity.
+
+**Who this affects.** Any caller referencing a result set by a `name`-based alias longer than 64
+bytes as `parent_id` on these two REST routes. Previously such a call resolved the alias and
+dispatched normally; it now returns `400` ("parent_id must be at most 64 bytes") before
+resolution is attempted. Use the set's canonical `rs_...` id instead (`GET
+/api/v1/result-sets` lists both `id` and `name` for every set you own).
+
+### vNEXT — `GET /api/v1/result-sets` can now answer `503`; the async result-set producers' post-dispatch fault code changes from `400` to `500` on REST (#4306, breaking)
+
+**What changed.** `GET /api/v1/result-sets` previously always answered `200`, even when the
+underlying store read was degraded — `ResultSetStore::list_by_owner` returned a plain (possibly
+empty) container rather than surfacing the failure, so a degraded Postgres read answered `200`
+with an empty `result_sets` array indistinguishable from a genuinely-empty owner. It now answers
+`503 RESULT_SET_STORE_UNAVAILABLE` (`Retry-After` present) on a genuine store-level read failure.
+Separately, on REST, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`/from-instruction-result`, and `/{id}/re-eval`) previously mapped a post-dispatch store fault —
+the pending result-set row failing to persist *after* a real command had already dispatched to
+agents — to `400`. That was a client-error status for a server-side fault; it is now
+`500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`, matching MCP's `rs_run_async`, which already used its
+`kInternalError` branch for the identical case (the JSON-RPC error type is unchanged). The same
+three REST routes also gained a new PRE-dispatch `503 RESULT_SET_STORE_UNAVAILABLE` when the
+per-owner quota cannot be verified before dispatch — nothing is sent in that case, and the request
+is safe to retry.
+
+**Who this affects.** Any REST caller that treats `GET /api/v1/result-sets` as never-erroring, or
+that pattern-matches the old `400` on the three async producers' post-dispatch failure path. A
+`503` should be retried (`Retry-After` header present); a `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH`
+means a command already dispatched — do not re-send, poll `GET /api/v1/executions/{id}` for its
+outcome instead. MCP's error *type* (`kInternalError`) is unchanged, but the embedded fault-message
+token was also renamed to `RESULT_SET_STORE_FAULT_AFTER_DISPATCH` for the same reason as REST — any
+MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string on this specific
+post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
+document both tokens explicitly).
+
+### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
+
+**What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.
+
+**Who this affects.** Any deployment that previously set `GRPC_SSL_CIPHER_SUITES` in the server's environment to select or restrict its own cipher suites — that variable is now silently ignored, and the server's fixed allow-list applies instead.
+
+**What to do.** There is no override flag and no config option to restore the previous behavior — this is a deliberate policy floor, not an oversight. If your environment relied on a non-default `GRPC_SSL_CIPHER_SUITES` value, remove it (it no longer does anything) and confirm your TLS clients support at least one suite in the pinned list (`tls.md`); operator-issued RSA certificates remain supported via the pinned ECDHE-RSA suites.
 
 ### vNEXT — new `Guardian T_*` diagnostic log lines at `info` level (#4606; NOT breaking)
 
@@ -221,7 +342,7 @@ Guardian T_server event_id=… agent=… rule=… recv_ns=… committed_ns=… a
 
 The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=…` for every Guardian event it attempts to send over the Subscribe stream on the legacy detection path (`domain=legacy`; `sent=0` means the link was down or the local write failed, and that event was dropped and is not retried). Ruleless DEX observations are not logged. Only once the Spark path is the live backend (`prefer_spark`, off by default) does it also write `Guardian T_detect …` for each outbox entry an evaluation pass stages (a pass evaluates every rule on the watched key and stages up to two entries for each, so a key shared by several rules can produce several lines, and a pass that stages nothing produces none), plus the same `T_wire` line for the Spark outbox path (there `sent=0` means the local write failed and the entry is retried; a down stream logs nothing). They exist to measure detect-to-deliver latency for the Spark cutover benchmark (#4606); they are plain log lines, not metrics or audit events, and no shipped component consumes them. If you do consume them, join on the agent and `event_id` (the agent-side lines carry no agent field, so take the agent from which log the line came from and from the server line's `agent=`), and never on log-file line order: a `T_wire` line can appear before its own `T_detect` line.
 
-**What the lines contain.** Only identifiers, times and a few flags and counters: the event id, the agent id, the rule id, instants or elapsed times, and fields such as `sent`, `accepted` and `seq`. They contain no event detail, no detected or expected value, no user name, process name or path. Ids are neutralised before they are written: every byte outside printable ASCII, and any space, `=` or `,` (a line break included), becomes `_`, and an id longer than 256 bytes is shortened to 256 by keeping its head and its last 24 bytes (the part that tells two events apart), identically on the agent and the server and on the server's Guardian ingest replay, conflict, error, oversized-detail and parse-failure lines, so an operator-chosen rule id such as `Disk Full` appears as `Disk_Full` and a non-ASCII rule name appears as underscores. The event id printed on the server's replay, conflict and oversized-detail lines is this neutralised form, so to find that event in the store, match on the agent, the rule and the time rather than pasting the id. This covers only the lines named here and the agent Spark runtime's lines that print a rule id (dormant unless `prefer_spark` is on; a watched key on the same line is not neutralised). Other log lines print a rule id or a watched key as authored, and either can contain a space, `=` or a line break. They include, and are not limited to, the legacy file, registry and service guards (the live detection path today), SparkEngine, the Guardian engine's arm, baseline and rule-parsing messages, the Spark runtime's own lines that name only a watched key, the server's Guardian push enforce-downgrade warning, and the event store's own error lines (not the ingest error line above). A search for `Disk_Full` will not find them, and a log pipeline must not treat an id on those lines as validated or forge-resistant. They are ordinary log output, so how long they are kept is decided by your log pipeline, not by the Guardian event retention period, and they are not an audit record.
+**What the lines contain.** Only identifiers, times and a few flags and counters: the event id, the agent id, the rule id, instants or elapsed times, and fields such as `sent`, `accepted` and `seq`. They contain no event detail, no detected or expected value, no user name, process name or path. Ids are neutralised before they are written: every byte outside printable ASCII, and any space, `=` or `,` (a line break included), becomes `_`, and an id longer than 256 bytes is shortened to 256 by keeping its head and its last 24 bytes (the part that tells two events apart), identically on the agent and the server and on the server's Guardian ingest replay, conflict, error, oversized-detail and parse-failure lines, so an operator-chosen rule id such as `Disk Full` appears as `Disk_Full` and a non-ASCII rule name appears as underscores. The event id printed on the server's replay, conflict and oversized-detail lines is this neutralised form, so to find that event in the store, match on the agent, the rule and the time rather than pasting the id. This covers the lines named here. **#4665 closed the rest of this list**: every other rule-id, Spark-key, path, hive, service-name and unit-name print site across the Guardian/Spark subsystem — the legacy file, registry and service guards, SparkEngine, the Guardian engine's arm/baseline/rule-parsing messages, the Spark runtime's own lines that name only a watched key, the server's Guardian push enforce-downgrade warning, and the event store's own error lines — is now neutralised too. A rule id on any of these lines is wrapped the same way as on the lines above (`log_id_token`: control bytes, DEL, space, `=`, `,` and every non-ASCII byte fold to `_`, then a 256-byte head/tail shorten), so the same `Disk_Full`-style search still finds it. A path, registry hive/key, service or unit name embedded in a `'...'`-quoted fragment is wrapped with the newer, more permissive `log_key_token` (`common/include/yuzu/log_token.hpp`): it preserves spaces and non-ASCII bytes, so a real Windows path or a non-ASCII name still reads naturally, and folds only control bytes, DEL, and three Unicode line-separator sequences (NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR) to `_` — the minimum needed to stop a forged physical log line. A log pipeline may now treat an id or key on any of these lines as forge-resistant. A regression-net test (`tests/test_guardian_spark_log_injection_tripwire.py`) fails the build on a future unwrapped call site in this subsystem — a lexical scanner with one documented, permanent, non-closable blind spot (it cannot trace a value wrapped several lines above its print site through local-variable construction; see the test's own header comment). They are ordinary log output, so how long they are kept is decided by your log pipeline, not by the Guardian event retention period, and they are not an audit record.
 
 **Impact.** Log volume only. There is no API, schema, metric, alert or wire change, and no change to any detection, dispatch or ingest decision. Nothing to do on upgrade.
 
@@ -274,6 +395,49 @@ because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
 
+### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
+
+New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
+
+Before this change, a rogue or compromised gateway process could re-register an agent identity that was already approved and live on a DIFFERENT cluster (`ProxyRegister` needs no per-agent secret for an already-approved agent), then legitimately answer for it — intercepting command payloads and forging terminal results for that agent, despite each `--gateway-cluster-addr` entry conceptually representing a separate trust zone.
+
+**What changes:** each agent now durably binds to the first cluster that legitimately confirms its connection (trust-on-first-use). A later claim from a DIFFERENT cluster for an already-bound agent is refused — for the ordinary case, before anything is published to the routing directory or the in-memory dispatch path; on a definitive conflict caught only at the durable write (a rare defense-in-depth case — the fast pre-check missed it, e.g. under a transient store hiccup), an in-memory placement already published moments earlier is reverted rather than left live — and the refusal is audited (`gateway.cluster_affinity_violation`, see [audit-log.md](audit-log.md)) and counted (`yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="cluster_affinity_violation"}`, alerted via `YuzuGatewayClusterAffinityViolation`). An agent's affinity re-binds when the previously-bound cluster has been genuinely unreachable for the full stale-route grace window **and no session is currently claiming the row** — a single rogue registration alone (with no completed connection) parks the row instead, preserving its affinity, precisely so a rogue cannot force a re-home just by registering (an operator-forced re-home route is tracked as a follow-up, `#4696` — not available in this release).
+
+**Rollout window — read this if you run multi-cluster gateway mode today.** Every agent that was already connected before you upgrade to this version has NO bound affinity until its NEXT `CONNECTED` notification — until then, that agent is still open to a same-shape claim from any cluster, exactly as before this fix. Long-lived gateway↔agent connections may not reconnect on their own for a long time. **To close this window immediately across your whole fleet, restart your gateway processes (or otherwise force your agents to reconnect) after upgrading** — each forced reconnect binds that agent's affinity right away rather than waiting on an organic reconnect.
+
+This does not provide full trust-zone isolation between clusters — a gateway's claimed `cluster_id` is still not cryptographically bound to its actual identity (mitigation 2, tracked separately, not implemented). Do not present multi-cluster gateway mode as providing that guarantee. Multi-cluster gateway mode has no production deployments as of this release.
+
+### vNEXT — a command forwarded to a gateway-connected agent always resolves instead of getting stuck at RUNNING (#4672; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, a command dispatched to a gateway-fronted agent (multi-cluster gateway
+mode — see [ha-postgres.md](ha-postgres.md) and ADR-2002 §7) could get stuck at `RUNNING`
+forever with no terminal signal if the forward itself failed: the gateway's mgmt-plane peer
+pin rejecting this server's certificate, the gateway staying unreachable after retries, a
+target cluster with no configured `--gateway-cluster-addr`, or a response that could not be
+attributed to the intended agent. The executions drawer and any API caller polling that
+command's status saw it idle indefinitely.
+
+**What changes:** every one of those cases now resolves the command to a terminal `FAILURE`,
+at most once, with `error_detail` (the field the REST/MCP response surfaces — there is no
+separate structured `error.code`) prefixed with a specific reason code you can use to
+diagnose the cause, e.g. `[gateway_unavailable] Gateway unreachable after 3 attempts —
+command not delivered`:
+
+| Reason code prefix | Meaning | What to check |
+|---|---|---|
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
+| `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
+| `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
+| `gateway_forward_failed` | Any other gateway `SendCommand` RPC failure | The gateway's own logs for the specific gRPC error |
+
+**Recovery:** there is no automatic re-drive for a gateway-forward failure — re-dispatch the
+command once the underlying cause is fixed. Automatic durable retry is tracked as a follow-up
+in #4690. One case is not yet covered by this fix: a gateway response stream that closes
+cleanly with zero frames still leaves the command stuck at RUNNING (tracked separately, #4691).
+
 ### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
 
 New, non-breaking, purely additive. No operator action required.
@@ -302,6 +466,75 @@ See `docs/user-manual/authentication.md` "Rotating a Token" for the full
 operator-facing detail, and
 `docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
 for the decision record.
+
+### vNEXT — CRL publishing is serialised in Postgres, and a missed CRL now republishes itself (HA WS-6 6.1, #4126; NOT breaking)
+
+Every CRL publish (startup, an operator revoke, a subordinate-CA import, and the
+freshness re-publish) now runs as one Postgres transaction under a lock on the
+`ca_store.ca_crl_versions` table, instead of behind a lock inside one server
+process. The `ca_store` schema migrates to v4: v3 adds a nullable
+`revoked_count` column on `ca_crl_versions` (nothing is backfilled), v4 adds a
+trigger that refuses to delete or change a revoked `ca_issued` row. A
+subordinate-CA import (`POST /api/v1/ca/import-chain`) now waits for any CRL
+publish already in progress before it swaps the root; if that takes longer than
+the database's lock timeout (10 s by default) the import fails with a
+database error and can simply be retried.
+
+What changes on **every** deployment, including single-server:
+
+- **A CRL publish can now fail on lock contention.** A publish that waits more
+  than 5 s for the table lock gives up. On `POST /api/v1/ca/revoke` and MCP
+  `revoke_certificate` that shows as `crl_republished:false` plus a
+  `ca.crl.published` failure audit; every trigger increments
+  `yuzu_server_ca_crl_publish_failures_total`. The revocation itself still
+  takes effect immediately server-side.
+- **A revocation missing from the served CRL is now republished automatically.**
+  Previously, if a revoke's own CRL publish failed, the revocation stayed out of
+  `GET /api/v1/ca/crl` until the next revoke or until the CRL was within 24 h of
+  its `nextUpdate` (up to ~6 days); retrying the revoke returns "already
+  revoked" and does not publish. The freshness pass now also republishes, on its
+  next 15 s tick, whenever the latest CRL was not built from the current revoked
+  set (after a failed attempt it waits 5 minutes before trying again). You may
+  occasionally see a redundant CRL version shortly after a revoke.
+- **A revoked default server certificate now stays revoked.** Previously,
+  regenerating the built-in default certificates (for example after changing
+  `--cert-san`) deleted their old inventory rows, including revoked ones, so a
+  revoked default leaf was accepted again and dropped from the CRL. Revoked rows
+  are now kept, and the database now refuses to delete them (migration v4
+  trigger) — during a rolling upgrade an older server's default-cert purge fails
+  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
+  purged serial is no longer in the inventory, so revoking it again returns
+  `404`. This only affects you if you revoked a default server certificate (for
+  example because its key may have leaked) **and** the default certificates were
+  regenerated **before you upgraded to this release**. Check first: find the
+  serial in the audit log (the `ca.cert.revoked` event for that revocation; if
+  that event has aged out of audit retention — 365 days by default — and you
+  cannot establish the serial another way, you cannot tell whether it was lost:
+  treat it as lost), then
+  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
+  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  -noout -text`). If the serial is still listed as revoked, nothing was lost. If
+  it is missing, re-root
+  the internal CA with the clean re-root in `docs/pki-architecture.md`
+  ("Deliberate clean re-root") — `POST /api/v1/ca/import-chain` is not enough,
+  because it keeps the issuing key the leaked certificate chains to. A re-root
+  re-enrolls the whole fleet.
+
+Single-server remains the only supported topology. If you nevertheless run two
+server versions against one database during an upgrade, a publish from the
+**older** binary does not take the lock and can still publish a CRL that omits a
+revocation the newer binary just recorded; the newer binary's freshness pass
+republishes to cover it (and can do so on every tick for as long as the older
+binary keeps publishing).
+
+**Rollback** to the previous release is safe: an older binary boots against the
+v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
+forward again republishes once), and its default-cert inventory purge fails
+while any revoked default leaf exists (logged, harmless) because the trigger stays
+in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
+needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
+freshness pass runs only on the elected leader, and a leader whose CA directory
+lacks the CA key can never publish.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
@@ -2066,7 +2299,7 @@ enforces before every package is signed stops updating.
 
 Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).
 
-**New on-disk artifact.** `<cert-dir>/plugin-trust-bundle.pem` (Linux/macOS: `/etc/yuzu/certs/plugin-trust-bundle.pem`; Windows: `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem`). Server-managed via Settings → Plugin Code Signing. **Back this up alongside `auth.db`.** A backup that captures the SQLite databases but not the cert dir restores `plugin_signing_required=true` (in `runtime_config`) without the trust bundle file — agents fetching the policy will receive a 500 and require-mode agents will reject every plugin until the bundle is restored.
+**New on-disk artifact.** `plugin-trust-bundle.pem` in the default cert directory (Linux, and macOS as root: `/etc/yuzu/certs/plugin-trust-bundle.pem`; Windows: `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem`). The server always writes it there, even when `--ca-dir` points elsewhere. Server-managed via Settings → Plugin Code Signing. **Back up the default cert directory (the path above), paired with the Postgres dump** (see [Configuration Files](#configuration-files)); that directory is `--ca-dir` only when `--ca-dir` is left at its default. A backup that captures the database but not that directory restores `plugin_signing_required=true` (in `runtime_config`) without the trust bundle file — agents fetching the policy will receive a 500 and require-mode agents will reject every plugin until the bundle is restored.
 
 **Cert-dir collision check.** The server now treats this filename as authoritative. If a prior deployment placed an unrelated PEM at this exact path for a different purpose, it will be interpreted as the plugin trust bundle on first read. This is unlikely (the filename was unused before this release) but worth confirming before upgrade. Run `ls <cert-dir>/plugin-trust-bundle.pem` and rename the file if it pre-exists for any other purpose.
 
@@ -2268,7 +2501,12 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
 2. Optionally type a **reason** (e.g. `key compromise`, `decommissioned`) — it is
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
-   *Revoked* and the public CRL is republished automatically.
+   *Revoked* and the public CRL is republished automatically. If that publish
+   fails (the panel does not show this; the REST/MCP revoke response returns
+   `crl_republished:false` and a `ca.crl.published` failure is audited), the
+   server republishes it on its own: on the next
+   15-second freshness tick once the cause clears, or up to about 5 minutes later
+   if that attempt fails too. You do not need to revoke again.
 
 Revocation takes effect **immediately server-side**: the agent is refused on its
 next connection, and any already-open command stream is torn down by the
@@ -2355,6 +2593,8 @@ The Yuzu server has **two independent TLS surfaces**:
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
+
+Both surfaces pin the same TLS 1.2 cipher allow-list and version floor; see [TLS policy](tls.md) for the exact list, what's proven by CI, and what isn't pinned yet.
 
 ### HTTPS via CLI Flags
 
@@ -2573,11 +2813,10 @@ a misbehaving automation script.
 
 > **Verify persistence after a partial failure.** If the response body
 > reports `db_persisted: false` (or the audit row shows `result=partial`
-> with `db_error=true`), the in-memory wipe succeeded but the
-> persisted `auth.db` rows survive. A server restart will resurrect
-> those sessions. Either retry the revoke after the DB lock clears, or
-> see `docs/ops-runbooks/auth-db-recovery.md` for emergency manual
-> revocation via the SQLite CLI.
+> with `db_error=true`), the in-memory wipe succeeded but the durable
+> session rows in PostgreSQL (`SessionStore`) survive. A server restart,
+> or a cache miss on another replica, will resurrect those sessions.
+> Retry the revoke once the database is healthy again.
 
 ### Self-service "Sign out everywhere"
 
@@ -3069,8 +3308,8 @@ group list contains an **exact match** for `--saml-admin-group`; otherwise
 `NameID` is read from, and `NameID`/email/display name are never treated as
 group-membership evidence. Changing either flag requires a server restart
 (no hot-reload). JIT elevation remains non-functional for SAML users (no
-local `users` row in auth.db) regardless of role — a group-mapped admin gets
-`role=admin` directly at login, not via the elevation endpoint.
+local `users` row in the `auth` schema) regardless of role — a group-mapped
+admin gets `role=admin` directly at login, not via the elevation endpoint.
 
 > **Configuring `--saml-admin-group` against a real IdP:** the value must be
 > the exact identifier the IdP puts in the assertion, not a display name —
@@ -3204,9 +3443,9 @@ single-server deployment model is unaffected.
 
 ## Data Storage and Encryption
 
-Yuzu stores persistent data in SQLite databases, including the response store, analytics event store, audit log, and RBAC store. By default, database files are created in the same directory as the `yuzu-server.cfg` config file. Use `--data-dir` to place databases in a separate writable directory (required for containerized deployments where the config file is on a read-only mount).
+Yuzu stores persistent server data in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)): the response store, audit log, RBAC store, authentication and every other server store. Only the runtime state files, the NVD CVE cache `nvd_cves.db` and the `agent-updates/`/`upload-blobs/` file directories live on disk, in `--data-dir` (or `--update-dir` for agent updates) (see [Configuration Files](#configuration-files)).
 
-> **Important: SQLite databases are not encrypted at rest.** The `.db` files contain query results, audit logs, and agent metadata in plaintext on disk. Any user or process with read access to the filesystem can read this data.
+> **Important: Yuzu does not encrypt the database at rest.** Secret columns (for example TOTP secrets) are envelope-encrypted by the server (ADR-0010; see [Key management](#key-management-secrets-kek)), but query results, audit logs and agent metadata sit in plaintext in PostgreSQL's data directory, and the `--data-dir` files are plaintext too. Any user or process with read access to those files can read this data.
 
 ### Protecting Data at Rest
 
@@ -3214,13 +3453,13 @@ Operators must use full-disk encryption to protect Yuzu data at rest:
 
 | Platform | Recommended Solution | Notes |
 |---|---|---|
-| Linux | dm-crypt / LUKS | Encrypt the partition or volume where Yuzu data resides. Most distributions support LUKS during OS installation. |
+| Linux | dm-crypt / LUKS | Encrypt the partition or volume where Yuzu data resides (PostgreSQL's data directory and `--data-dir`). Most distributions support LUKS during OS installation. |
 | Windows | BitLocker | Enable BitLocker on the drive containing the Yuzu server directory. Requires TPM or startup key. |
 | macOS | FileVault | Enable FileVault in System Settings. Encrypts the entire startup volume. |
 
-For containerized deployments (Docker Compose), ensure the host volume backing `server-data` is on an encrypted filesystem.
+For containerized deployments (Docker Compose), ensure the host volumes backing `server-data` and the PostgreSQL data volume are on an encrypted filesystem.
 
-> **Planned:** A future `--encrypt-db` option will add application-level SQLite encryption using SQLCipher, providing defense-in-depth independent of disk encryption. Track progress in the roadmap (Phase 7).
+> **Planned:** A future `--encrypt-db` option was scoped as SQLCipher encryption for the server's SQLite files. With the server stores on PostgreSQL it would now cover only the NVD cache; database-level encryption for PostgreSQL is the operator's platform choice today.
 
 ---
 
@@ -3230,9 +3469,9 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
 
-**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election — so budget `N_servers × 1` connections against Postgres `max_connections` on top of the pool size below. Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
+**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8) — so budget `N_servers × 2` connections against Postgres `max_connections` on top of the pool size below. (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure, so leave `max_connections` headroom for it — at the limit it is the connection that gets refused.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
-**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
 **Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
@@ -3270,7 +3509,7 @@ The helper is **non-fatal when no local cluster is found** (prints install hints
 
 ### Backing up PostgreSQL state
 
-The SQLite backup guidance in [Configuration Files](#configuration-files) continues to apply while stores migrate incrementally — during the transition, a complete backup covers **both** the remaining SQLite stores **and** the Postgres database.
+A complete backup is the Postgres dump below **plus** the whole `--ca-dir`, taken at the same point in time and restored as a pair (see the restore-pairing invariant under [Key management](#key-management-secrets-kek)), together with the `--data-dir` state files, the NVD cache `nvd_cves.db`, and the blob directories `agent-updates/` (or `--update-dir`) and `upload-blobs/` listed in [Configuration Files](#configuration-files). The dump holds only the OTA-package and completed-upload records; restoring it without those two directories leaves records that point at files that no longer exist.
 
 Use `pg_dump` (logical, consistent-by-construction — safe against a live database, unlike filesystem copies).
 
@@ -3305,7 +3544,7 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
 
-Schedule the dump alongside the existing SQLite/cert-dir backups; verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
+Schedule the dump alongside the `--ca-dir` and `--data-dir` backups (and `--update-dir`, if set outside `--data-dir`); verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
 
 ### Key management (secrets KEK)
 
@@ -3673,9 +3912,10 @@ deciding either way.
    >  WHERE pid = <lock_holder_pid>;
    > ```
    > Match `client_addr`/`client_port` against your known Yuzu server hosts
-   > (Yuzu does not currently set `application_name` on its Postgres
-   > connections, so expect it blank — do not treat a blank
-   > `application_name` as evidence the holder is *not* a Yuzu server). If
+   > (Yuzu's pooled Postgres connections do not set `application_name`, so
+   > expect it blank for the lock holder — do not treat a blank
+   > `application_name` as evidence the holder is *not* a Yuzu server; only
+   > the `/readyz` probe's own connection is tagged, `yuzu-readyz-probe`). If
    > the pid traces to a live Yuzu server process you can reach, stop that
    > **server** cleanly (its own shutdown path releases the advisory lock
    > through the ordinary `KekOpLockGuard` destructor, the same clean-exit
@@ -4140,11 +4380,34 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
+| `/readyz` | Readiness probe for load balancers and orchestrators — "stop routing to me". Covers **runtime Postgres reachability** (the `pg_reachable` row), per-store migration completion at startup, AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["pg_reachable", ...],"pg":"unreachable"}` (503). `pg` appears only when `pg_reachable` fails and names the reason: `unreachable`, `stale`, `read_only` (connected to a standby), or `not_yet_probed`. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, and the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
-**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches.
+**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches. Point an orchestrator's **liveness** probe at `/livez`, never `/readyz`: a database outage turns `/readyz` red on every replica, and restarting them all fixes nothing.
+
+### What `/readyz` checks (HA WS-8)
+
+- **`pg_reachable` — the runtime signal.** Each replica runs a small probe on its **own dedicated Postgres connection** (not the pool, tagged `application_name=yuzu-readyz-probe` unless your DSN sets one) every 2 s: `SELECT pg_is_in_recovery() OR current_setting('transaction_read_only')::boolean`, with client-side deadlines of 2 s per query and, to connect, at most 5 s for a single host (less when `connect_timeout` is shorter; a host list: the pool's own `connect_timeout` per host — see below). `/readyz` reports not ready after **two consecutive failed probes** (`unreachable`), **at once** if the probe reached a server that refuses writes (`read_only` — a standby, or a primary with `default_transaction_read_only` on, which some managed Postgres services set when the disk fills; the server writes to Postgres on nearly every request, so it cannot serve there), or when no probe has succeeded for **15 s** (`stale`). One successful probe makes it ready again; your load balancer's own healthy/unhealthy thresholds add any hysteresis you want. Measured end to end: a stopped database turns `/readyz` red in about 3 s, a frozen one (`docker pause`, a black-holed host) in about 11 s, a read-only primary in about 2 s, and recovery takes about 2 s (`scripts/ha/ha-readyz-scenarios.sh`). The body never carries host names, DSNs or error text — the libpq detail goes to the server log as a `[readyz] Postgres not reachable ...` line, written when a completed probe changes the answer and repeated every 60 s while not ready (a probe stuck outside its deadlines, which is what `stale` means, logs when it completes).
+- **Multi-host DSNs need `target_session_attrs=read-write`, and the server enforces it.** Without it, libpq — and so the server's pool — takes the *first host that accepts a connection, even a standby*, and writes fail on connections nothing can see. So when `--postgres-dsn` lists several hosts (or the server's environment supplies a `PGHOST`/`PGHOSTADDR` list) and there is no `target_session_attrs`, the server adds `target_session_attrs=read-write` and logs a warning at startup; it rebuilds the DSN from libpq's own parse (the same settings, in keyword form) and checks it option by option rather than editing your text. `primary` is accepted as well; any other explicit value (`any`, `read-only`, `standby`, `prefer-standby`) makes the server **refuse to start** — the message names the value only when it is one of libpq's own, never the DSN. `load_balance_hosts` (other than `disable`, in the DSN or `PGLOADBALANCEHOSTS`) also makes the server refuse to start: with read-write only the primary is acceptable, so shuffling balances nothing, and `/readyz` — one held connection — could not see a host that fails only some of the pool's shuffled connections. An empty DSN is left empty, so the server still refuses to start without one. A `service=` entry or `PGSERVICE` is applied by libpq only when it connects, so the server also checks the settings libpq resolved on its first connection at startup and refuses to start (`Invalid Postgres connection settings: ...`) if they set `load_balance_hosts` or list several hosts without `target_session_attrs=read-write` (or `primary`) — set it in the service file. libpq re-reads the service file on every new connection; the readiness probe repeats the check each time *it* connects, but it keeps a healthy connection open, so a later edit that breaks these rules shows on `/readyz` (red, with the reason in the `[readyz]` log line) only at the probe's next reconnect, while new pool connections already use it — **restart the server after editing the service file**. Not visible to either check — set `target_session_attrs=read-write` yourself: one host *name* that resolves to several servers (DNS round-robin, a Kubernetes headless service). List the Postgres servers themselves, not a pooler per node: a pooler such as pgbouncer can keep reporting a demoted node as writable to libpq.
+- **How the probe walks a host list.** libpq walks it for the probe exactly as for the pool — in the DSN's order; it moves on after a refused or failed connect, "cannot connect now" (57P03) or a read-only host, and ends the attempt on anything else (a failed login, too many clients, a missing database, a peer that hangs up), because the pool's connections end there too. The probe connects with exactly the pool's connection settings (the same DSN, environment and default `connect_timeout` of 10 s) and adds one thing: each host address in the list gets its own deadline — the `connect_timeout` in force, timed the way the pool's own connect times it (in whole seconds before libpq 17) — so a frozen host costs one `connect_timeout` instead of holding the probe (a single host is capped at 5 s, so a frozen primary still reads red in about 11 s) (libpq's non-blocking connect never moves past a silent host by itself). That works for a `PGHOST` or `service=` list as well. When the probe's held connection fails and it has to reconnect past a silent host, that reconnect can outlast the 15 s staleness limit (about 1 s over with the default 10 s `connect_timeout`), so `/readyz` briefly reads `stale` — as slow as the pool's own new connections are at that moment. With `connect_timeout=0` (wait for ever) the pool never moves past a silent host, so neither does the probe: it reports `unreachable` instead. One gap: when one *address* of a host name with several addresses is silent, the probe gives up that name's other addresses too, where the pool would try them — `/readyz` can then disagree with the pool either way; list the addresses as separate hosts to avoid it. With `target_session_attrs=read-write`, libpq itself refuses a host that is read-only, so a cluster with no writable host reads `unreachable` rather than `read_only` (the server log says why).
+- **What `/readyz` does not see: the pool's existing connections.** The probe holds one connection of its own, re-checks it every 2 s, and reconnects — walking the host list as a new pool connection does — only when that check fails; it answers "can this replica reach a writable primary", not "is every pooled connection healthy". Precisely: `pg_reachable` is red when the probe's most recent connect — made with the pool's own settings — could not establish a session to a server that accepts writes, or when the probe's own session stops answering or turns read-only. Because it keeps a healthy session open, it does not observe the pool's other held connections, nor anything that changed since it last connected. Known gaps: pooled connections to a server demoted in place (below; #4942); anything that changes whether a *new* connection would succeed — a service-file or environment edit, a password rotation or expiry, a `pg_hba.conf` or certificate change — which shows only at the probe's next reconnect (#4956), so restart or re-check after such a change; a host name with several addresses, one of them silent (#4954); `max_connections` exhaustion, where the probe is the connection refused first (#4943); and timing — about ±1 s from the pool's own connect, and a single host capped at 5 s (it can read red while a slower pool connect succeeds, never green). The pool does not re-check the connections it already holds, and never retires them by age, so a connection whose server turns read-only *in place* keeps failing writes until that connection breaks. If that server is the one a new connection reaches, `/readyz` goes red as well; it stays green only when a new connection reaches a different, writable host. Connecting to Postgres directly, a real demotion restarts the old primary and breaks those connections; the gap needs a server that flips read-only while staying up (for example `default_transaction_read_only` set on a running primary), or a pooler in between that keeps its server connections across the demotion.
+- **Point the DSN at the primary.** A proxy that load-balances plain `SELECT`s across replicas (pgpool-II `load_balance_mode`, a read-any port) can send the probe's query to a standby and report `read_only` while writes still reach the primary. Use the proxy's read-write endpoint.
+- **During a Postgres failover every replica goes red at once**, for roughly the failover time (Patroni: 10–30 s). That is correct — nothing can serve writes until the new primary is up. Many load balancers fail open when every backend is unhealthy and keep forwarding. What the forwarded requests then see depends on the outage: against a stopped or refusing database they fail fast with `503`; against a *frozen* one (a paused VM, a black-holed host) queries on already-open pooled connections can hang for up to ~100 s before failing, so expect slow errors rather than quick ones until the failover completes.
+- **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
+- **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+
+### Load balancers and shutdown drain
+
+On `SIGTERM` the server sets `/readyz` to `503 {"status":"draining"}` and then keeps serving every other route for at least **`--shutdown-drain-seconds`** (env `YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, range 0–60) before it closes its listener, and for as long as executions are still running (up to 30 s). It logs a countdown every 10 s. The two background roll-ups (app-perf and the software catalogue) do not start new work once draining begins. With the default of 0 and nothing running, the listener closes straight away — fine for a single server, but a load balancer in front of several replicas would then find out from refused connections.
+
+For any deployment behind a load balancer:
+
+1. Set `--shutdown-drain-seconds` to at least the load balancer's **health-check interval × unhealthy threshold, plus one interval** (e.g. 5 s interval × 2 failures + 5 s = 15 s).
+2. **Raise the orchestrator's stop timeout by the same N.** The drain grace comes *before* the rest of the shutdown, which is unchanged, so it adds to it: the shipped compose `stop_grace_period` and systemd `TimeoutStopSec` of **210 s** become **210 + N**. Kubernetes' default `terminationGracePeriodSeconds` of 30 s is far too short in any case (see `docs/user-manual/upgrading.md`, the stacked-shutdown section).
+3. Health-check `/readyz`, not `/health`.
+
+A second `SIGTERM` still exits immediately.
 
 ## Deployment
 
@@ -4275,8 +4538,17 @@ triggers a graceful stop on a dedicated watcher thread — HTTP admission stop,
 background thread joins, up to ~115s of stacked waits including webhook/
 offload store quiesce (see the stacked-shutdown-bound section in
 [Upgrading](upgrading.md); a rare thread-creation-exhaustion fallback path can
-push the quiesce portion alone to ~120s, worst case ~175s total, still inside
-the shipped 210s grace period), then store teardown. **A long-seeming wait can
+push the quiesce portion alone to ~120s, worst case ~175s total), then store
+teardown. Those figures leave out two things that can each add to them: a
+background roll-up recompute already in flight at SIGTERM (app-perf up to
+120 s, catalogue up to 60 s — the 210 s shipped grace was sized for these two,
+not for them on top of everything else, so the fallback path plus an in-flight
+app-perf recompute can pass 210 s), and a *frozen* primary, against which the
+execution-drain query and the background-thread joins block in their own
+Postgres calls until it answers. A `--shutdown-drain-seconds` grace of N seconds
+runs before all of this and adds to it — raise the stop timeout by N when you
+set it.
+**A long-seeming wait can
 be completely normal, not evidence of a wedge**: each stage logs a
 `Shutting down server: waiting up to Ns for ...` line at its start, but
 nothing further until it completes or times out — so a silent gap of up to a

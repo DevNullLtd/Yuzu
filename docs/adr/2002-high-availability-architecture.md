@@ -328,7 +328,11 @@ cluster unit; intra-zone scale is more nodes.
 - **Northbound (server→gateway):** the minting server reads the directory and dials the owning
   cluster; an undeliverable command (cluster unreachable, stale/expired lease, agent mid-migration)
   stays `pending` in the outbox (§6) and is re-driven — with receiver dedup absorbing any double
-  delivery during a re-home race.
+  delivery during a re-home race. **Scoped by §7e (#4672):** this design note describes the
+  LEADER-DRIVEN background plane's `route_unreadable` reschedule (§6/WS-3 3.3). The
+  `forward_gateway_pending` detached-thread forwarding path specifically does NOT enqueue into that
+  outbox — see §7e for why and what it does instead (immediate terminal resolution, never a durably
+  re-driven `pending` row).
 - **`gateway_node` convergence is a first-class requirement (finding 6b).** Today an agent's
   proxied-vs-direct routing hinges on `gateway_node` being populated by a **single `NotifyStreamStatus`
   gRPC call** succeeding (`GatewayUpstreamServiceImpl::NotifyStreamStatus`, which calls
@@ -345,7 +349,9 @@ cluster unit; intra-zone scale is more nodes.
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
 `#4324` per-home stream-generation fence done; 4.3a (intra-cluster routing) done; `#4555` (gateway
 multi-node cluster formation) done; 4.4 (`gateway_node` convergence + `#4246` #6 session writeback,
-§7c) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+§7c) done; rest of 4.3 (cross-cluster gateway fan-out, §7d) done.** The remaining WS-4 gate item is
+WS-5 (durable cross-replica session lookup / shared presence). The fenced agent→cluster routing
+directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
 gateway-upstream connect/disconnect/heartbeat paths. **The directory is no longer literally INERT** —
 Task C wired `GatewayRouteStore::lookup_routes` into confined dispatch as a FALLBACK-ONLY consult
@@ -1118,11 +1124,296 @@ WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
 not a WS-4 gate item.
 
+### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
+
+**Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
+different node within one Erlang mesh); this closes the CROSS-cluster case §7's model requires —
+multiple independently-meshed gateway clusters, one per trust zone/region, never merged into one mesh
+(Erlang distribution must never span a DMZ/WAN). Core dialed exactly one gateway mgmt endpoint
+(`gw_mgmt_stub_`, one CLI flag) for every command regardless of which cluster the target agent was
+actually behind; `GatewayPendingCmd::cluster_id` was added in 4.2b Task C specifically "carried
+through for 4.3, inert until then."
+
+**Scope: core-side (C++), plus one small, required Erlang fix.** The gateway's own intra-cluster
+fan-out (4.3a's `pg`-group routing) already handles "every agent in this cluster" correctly and needed
+no change for cross-cluster dispatch itself — the job is entirely "core picks the right cluster to
+dial." The one Erlang change (below) is a response-correlation fix a pre-implementation Fable
+adversarial review surfaced, not a routing change.
+
+**What shipped:**
+- **`AgentSession` gains `cluster_id`**, published by `set_gateway_route` in the SAME call, under the
+  SAME `stream_mu` lock as `gateway_node`/capabilities/`stream_home_id` (mirrors `#4324`'s own
+  addition of `stream_home_id` to this call). Previously only the 4.2b directory-fallback path
+  (`send_via_directory`, fired only on a local-registry miss) carried a `cluster_id` onto
+  `GatewayPendingCmd`; the far more common `send_to`/`send_to_all` gateway-session path (fired whenever
+  the agent IS known locally) always left it `nullopt`. Without this, most gateway dispatches in a
+  multi-cluster deployment would still silently target whatever the "default" cluster happened to be.
+- **`GatewayMgmtStubPool`** (`gateway_mgmt_stub_pool.hpp`) — an EAGER, immutable map of
+  `ManagementService::Stub`s, one per configured cluster, built once at server construction (replacing
+  the pre-4.3 single `gw_mgmt_channel_`/`gw_mgmt_stub_` pair). `grpc::CreateChannel` is itself
+  lazy-connecting, so eager construction costs nothing and needs no lock on the dispatch hot path. One
+  shared credentials object is reused across every cluster's channel — the mgmt-plane peer pin (#1422)
+  lives per-cluster on the GATEWAY side, not something core varies its own identity for.
+- **Resolution rule — two modes, not a uniform "empty means default, non-empty unmapped means drop."**
+  The latter (the plan's original design) would have been a BREAKING CHANGE on upgrade: every existing
+  gateway build announces a non-empty `cluster_id` (`YUZU_GW_CLUSTER_ID`, defaulting to the literal
+  `"default"` when unset, `yuzu_gw_upstream.erl`), never an empty string. Corrected rule:
+  **single-cluster mode** (`--gateway-cluster-addr` unset, the default) ignores whatever `cluster_id` a
+  command carries entirely and always resolves to `gateway_command_address` — byte-for-byte the pre-4.3
+  behavior, zero migration required. **Multi-cluster mode** (the flag IS configured) auto-aliases the
+  key `"default"` to `gateway_command_address` (if set and not already an explicit key) and resolves
+  every `cluster_id` against the configured map; an unmapped id is a real config defect (dropped,
+  logged, counted `status="unknown_cluster"`), never a silent fallback to the wrong cluster. A
+  CONNECTED-time early warning fires once per unmapped id in multi-cluster mode, before the first drop.
+- **Config:** `--gateway-cluster-addr cluster_id=host:port` (repeatable/comma-separated,
+  `YUZU_GATEWAY_CLUSTER_ADDR`), parsed by a pure `parse_gateway_cluster_addrs` helper and validated
+  BEFORE `Server::create()` — a malformed/duplicate entry is a CLI exit, not a lenient boot-time
+  warning (unlike `--trusted-nat-cidr`'s own lenient-parse precedent — this is a routing-correctness
+  input, not an advisory allowlist).
+- **Response-agent guard — closes ONE forgery shape, not cross-trust-zone forgery in general (post-
+  governance Fable review, pre-push, caught a false-assurance doc claim in this bullet's original
+  wording).** `forward_gateway_pending` sends exactly one `agent_id` per request but previously applied
+  `resp.agent_id()` from the wire with no check against the request's own target. Single-cluster, this
+  already let a compromised gateway forge a response for any agent it named. Now refused and counted
+  (`status="agent_mismatch"`) rather than applied — but this ONLY catches "cluster Y answers as agent B
+  while core is dialing it for agent A." It does NOT catch, and this slice does NOT close, the more
+  severe shape: **cluster Y first CLAIMS agent A's own identity, then legitimately answers commands core
+  sends for A** — at which point `resp.agent_id()` genuinely matches and the guard never fires.
+  `ProxyRegister` (`gateway_service_impl.cpp`'s "Fast path: agent already enrolled from a prior
+  connection") re-registers ANY already-approved `agent_id` with no per-agent secret — the enrollment
+  token is checked only on a NOT-yet-approved agent — and `register_fresh`'s guarded upsert mints a
+  NEWER epoch for the claimant, so the real agent's later `announce_connected` LOSES the race and is the
+  one that gets treated as stale. `NotifyStreamStatus.cluster_id` is gateway-asserted with nothing
+  binding it to the peer's identity, and it is the sole input to `GatewayMgmtStubPool::resolve()`. Net:
+  pre-4.3, a session hijack by a rogue gateway was at worst a DoS (every command still went to the one
+  configured address, so a hijacked-but-wrong-cluster agent just got `not_connected`). Post-4.3, in
+  MULTI-CLUSTER MODE ONLY, the SAME pre-existing weakness upgrades to command-payload interception
+  (instruction parameters, secrets) and forged terminal results for an agent nominally in a different
+  trust zone — because core now genuinely dials the claimant's own cluster. **Multi-cluster mode does
+  NOT yet provide trust-zone isolation** — do not describe it that way to an operator, and do not treat
+  this guard as the security boundary between clusters; it is a narrow, correct check on a narrower
+  claim than "cross-trust-zone forgery." Tracked as `#4669` (agent↔cluster affinity in
+  `GatewayRouteStore` + per-cluster peer-identity binding at the gateway-upstream listener) — not
+  blocking this slice per the reviewing pass's own recommendation (multi-cluster mode is opt-in with no
+  production deployments today), but must close before multi-cluster mode is presented as providing
+  trust-zone isolation.
+
+  **Update (#4669, CLOSED via mitigation 1 — agent↔cluster affinity, NOT mitigation 2):**
+  `agent_routes` gains a STICKY `home_cluster_id` column (migration v4), separate from the EPHEMERAL
+  `cluster_id`/`gateway_node` that `register_fresh` NULLs on every fresh registration — `register_fresh`,
+  `deregister`, and an ordinary reap-clean tombstone all leave `home_cluster_id` alone. `announce_connected`
+  now enforces it: a session-matched write is ATOMICALLY refused (its own guarded UPDATE's WHERE clause,
+  no read-then-write TOCTOU) when the presented `cluster_id` differs from an already-bound
+  `home_cluster_id`, reporting a distinct `AnnounceResult::cluster_affinity_violation`; a NULL
+  `home_cluster_id` (never bound, or legitimately cleared — see below) admits and binds on first contact
+  (TOFU). `gateway_service_impl.cpp`'s `NotifyStreamStatus` CONNECTED handler adds a READ-ONLY pre-check
+  (`GatewayRouteStore::has_cluster_affinity_conflict`) BEFORE `registry_.set_gateway_route` — the PRIMARY
+  dispatch path's write (`AgentSession::cluster_id`, read by `send_to`/`send_to_all`) — so a definitive
+  violation caught BY THE PRE-CHECK refuses the whole CONNECTED before EITHER the durable row or the
+  in-memory registry is touched. **Correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the pre-check is fail-OPEN on a DEGRADED read, so `set_gateway_route` can
+  still run and publish BEFORE the write's own independent, atomic re-check catches a violation the
+  pre-check missed — and that write-time catch, before this fix, only emitted a metric+audit, never
+  rolling back the already-published in-memory entry, leaving a rogue's placement live with no
+  reconciliation. Fixed: the write-time `cluster_affinity_violation` branch now calls
+  `registry_.unpublish_gateway_route`, reverting exactly what this same call sequence's earlier
+  `set_gateway_route` published. One compound case remains genuinely open (both the pre-check read AND
+  the write degrading in the same window, so the write never reaches the violation branch at all) — see
+  `gateway_service_impl.cpp`'s own comment and the `YuzuGatewayClusterAffinityCheckDegradedDuringWrite`
+  alert, added to make that window observable. Closing the exact "claims agent A's own identity, then
+  legitimately answers for it" shape above: a rogue's own `register_fresh` still unconditionally wins the
+  epoch race (pre-existing,
+  accepted DoS-shaped churn, unchanged), but its own subsequent `announce_connected`/CONNECTED can no
+  longer make `cluster_id` — and therefore `GatewayMgmtStubPool::resolve()`'s dispatch target — move to
+  the rogue's cluster. **Correction (pr-rev round 1, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22,
+  empirically confirmed):** the sweep this paragraph originally described as removing affinity ("its
+  tombstone-purge sweep already removes the affinity with the row") in fact let a SINGLE rogue
+  `register_fresh` (which never confirms via `announce_connected`) manufacture that same purge predicate
+  and force a re-home window on the real cluster — the sweep hard-deleted ANY `lease_until IS NULL` row
+  past the purge age regardless of a bound `home_cluster_id`. Fixed: the tombstone-purge sweep now NEVER
+  purges a row carrying a bound `home_cluster_id`, full stop; a session-bearing, never-reconfirmed row is
+  instead soft-tombstoned (session/cluster/gateway_node/stream_home_id cleared, `home_cluster_id`
+  PRESERVED) and an already-tombstoned affinity-bound row is left untouched indefinitely — either way it
+  is PARKED, not purged, and the sentence above is corrected accordingly at item (1) below. **Correction
+  (pr-rev round 2, FortitudeEtc/Codex+Kimi, CRITICAL, 2026-09-22, empirically confirmed twice
+  independently):** that same round-1 soft-tombstone, by clearing the durable `session_id` while
+  preserving `home_cluster_id`, reopened the ORIGINAL hijack through a different door — the rogue's
+  original `ProxyRegister` already installed its session in the gateway's own in-memory state, and
+  nothing invalidates that entry when its first CONNECTED is refused, so once the soft-tombstone fires
+  (~300s later) the rogue simply resends CONNECTED under that same still-live session. Both affinity
+  probes (`has_cluster_affinity_conflict` and `announce_connected`'s own diagnostic probe) matched only
+  `session_id=$2` exactly, which a durable NULL can never satisfy, so the resend was invisible to both
+  and classified as an ordinary, unaudited `session_mismatch` — the durable row was never fooled
+  (`home_cluster_id` stays correct throughout), but the IN-MEMORY dispatch route (`AgentSession::cluster_id`,
+  what `send_to`/`send_to_all` actually read) silently took the rogue's cluster. Fixed: both probes'
+  predicates extended to `(session_id=$2 OR session_id IS NULL) AND home_cluster_id IS NOT NULL AND
+  home_cluster_id <> $3` — a session-orphaned row with a bound, differing affinity is now caught by the
+  pre-check itself, before anything is published, exactly like a session-matched violation always was.
+  Safe for a genuine first-ever TOFU contact, which always has `home_cluster_id IS NULL` and so is
+  excluded by the predicate's own `IS NOT NULL` clause regardless of session_id. The real agent's own
+  later reconnect (its own fresh `register_fresh`, always eventually wins the epoch race) self-heals by
+  announcing the matching cluster. Two legitimate re-home triggers, matching the issue's own design:
+  (1) genuine staleness — `reap_stale_routes`' expired-lease sweep now ALSO NULLs `home_cluster_id` (>=
+  the existing grace window past the lease TTL, i.e. requires the real cluster to have been genuinely
+  unreachable that long, not something a rogue can force instantly); the tombstone-purge sweep, per the
+  round-1 correction above, does NOT remove the affinity — it parks the row with the affinity preserved,
+  so re-home via that path still requires the SAME genuine lease-expiry precondition to occur first; (2)
+  `GatewayRouteStore::clear_cluster_affinity` — an explicit, unconditional, operator-invoked clear (the
+  CALLER is responsible for auditing it; no REST/MCP admin route ships in this slice — tracked as
+  `#4696`, which also requires the audit wiring land in the SAME diff as the route). Deliberately NOT
+  gated on multi-cluster mode: `gateway_route_store_` is wired
+  whenever a gateway upstream is configured at all, and a single-cluster gateway announces a STABLE
+  `cluster_id` (`YUZU_GW_CLUSTER_ID`, default `"default"`) on every connection, so TOFU-bind-then-match
+  costs single-cluster deployments nothing. **Scope note:** this closes the `GatewayRouteStore`-side half
+  only (mitigation 1) — mitigation 2 (per-cluster peer-identity binding at the gateway-upstream listener,
+  so a peer physically presenting cluster Y's certificate cannot claim agents whose home is cluster X) is
+  NOT implemented; today's gateway-upstream listener still authenticates the peer as "some gateway",
+  never "gateway Y specifically" (`gateway_mgmt_stub_pool.hpp`'s TRUST BOUNDARY note). **Adjacent,
+  narrower pre-existing consideration this slice does NOT need to change:** `ProxyRegister`'s OTHER adopt
+  path, `reclaim_tombstoned_session`, accepts ANY presented `session_id` string against a row that is
+  CURRENTLY tombstoned — no secret verification, by design, for the legitimate circuit-recovery-replay-
+  after-a-core-restart case. A rogue racing the narrow window right after a genuine disconnect could
+  reclaim SESSION OWNERSHIP of the row with a fabricated session_id — but `reclaim_tombstoned_session`
+  never touches `home_cluster_id` either, so the reclaimed row's affinity is still whatever it was bound
+  to before the tombstone, and the SAME `announce_connected` guard refuses a mismatched cluster for it
+  exactly as for a live row. The `#4669` affinity mitigation therefore also holds against this reclaim-
+  based variant, even though `reclaim_tombstoned_session`'s own no-secret-required session adoption is a
+  separate, pre-existing design choice this slice does not revisit. **Gate 4 unhappy-path refinement
+  (2026-09-21, UP-3): this protection is ORIGIN-DEPENDENT, not universal.** A CLEAN `deregister` tombstone
+  (an ordinary DISCONNECTED) leaves `home_cluster_id` intact — the reclaim-based variant above holds
+  exactly as described, and is now regression-tested end-to-end
+  (`tests/unit/server/test_gateway_route_wiring.cpp`, `[affinity]`). A `reap_stale_routes` sweep (a)
+  tombstone, by contrast, ALSO NULLs `home_cluster_id` (it is the intended "genuine staleness" re-home
+  trigger from this section's own design) — so a session reclaimed from a REAP-origin tombstone has NO
+  bound affinity to protect, and correctly TOFU-rebinds to whichever cluster next legitimately announces
+  (also regression-tested). This is not a new bypass: it is the SAME accepted re-home path #4669 already
+  designs for, reached via `reclaim_tombstoned_session` rather than a fresh `register_fresh` — both require
+  the identical natural-outage precondition (the real cluster genuinely unreachable for the full grace
+  window), and neither is attacker-forceable on demand.
+- **Metric label.** `yuzu_server_gateway_forward_total` gains a `cluster_id` label — always the
+  RESOLVED config key or the fixed literal `"unknown"`, never the raw gateway-asserted wire value, even
+  after the paired ingest clamp (`kMaxClusterIdLen`, mirroring `stream_home_id`'s existing bound) — a
+  bounded-length but still attacker-influenced string remains a metric-cardinality risk.
+- **The one Erlang fix:** `yuzu_gw_mgmt_service.erl`'s `stream_responses/3` (was `/2`) now threads the
+  request's own `CommandId` through and stamps it on a `command_error`-derived response, instead of a
+  hardcoded `command_id => <<>>`. A gateway-side "agent not connected on this cluster" error therefore
+  now correlates to a real command (`forward_gateway_pending` counts it distinctly,
+  `status="not_connected"`, rather than folding it into `"ok"` — `Finish()` still returns `OK` for a
+  streamed error response). This was previously invisible end-to-end (`resolve_execution_id("")` →
+  `nullopt`, no tracker terminal, an orphan response-store row) for a rare case (a genuinely
+  disconnected agent); multi-cluster fan-out makes "agent not connected on the cluster core just
+  dialed" the PRIMARY signal of a stale/wrong cluster resolution, so it had to be correlatable. The
+  `command_error` message tuple itself is unchanged — only what `stream_responses` renders onto the
+  wire — so no other sender/receiver/test needed touching.
+
+**Found by the pre-implementation Fable adversarial review** (same pattern as `#4555` and 4.4 — a
+design-review pass before any code was written): the resolution-rule upgrade-breakage above, the
+response-agent-forgery gap, the metric-label cardinality risk, the pool's original lazy-cache design
+being unnecessary complexity for a closed boot-time config set (switched to eager), and the `1a` Erlang
+fix. All five folded into the shipped design before implementation started, rather than caught in a
+later review round.
+
+**Deliberately unchanged by this slice, closed by #4672 (§7e below):** at the time this slice merged,
+`forward_gateway_pending` was fire-and-forget past `AgentRegistry::gw_pending_` for every
+terminal-failure branch (`unauthenticated`, exhausted `unavailable` retries, and the new
+`unknown_cluster`/`agent_mismatch` branches) — none synthesized a terminal FAILED status the tracker or
+an API caller could see, only a log + counter. This slice's own text originally disclosed the gap here
+without filing a tracking issue; #4672 is that issue, and §7e records how it closed.
+
+**Remaining WS-4 gate items:** WS-5 (durable cross-replica session lookup / shared presence — this is
+also what makes the 4.2b directory-fallback reader BEHAVIORALLY live, not merely wired, since only then
+can a directory row outlive the writing replica's own in-memory registry).
+
+### 7e. `forward_gateway_pending` terminal-failure resolution (#4672, 2026-09-21)
+
+**Status: CLOSED — immediate terminal resolution; durable outbox re-drive explicitly deferred, not
+silently dropped.** §7d's own text disclosed a gap without filing a tracking issue: none of
+`forward_gateway_pending`'s terminal-failure branches (`unauthenticated`, exhausted `unavailable`
+retries, `unknown_cluster`, and a stream that produced no legitimate response for the targeted agent —
+"agent_mismatch") ever resolved the dispatching operator's `command_id`. Each logged, incremented
+`yuzu_server_gateway_forward_total`, and dropped the command — the executions drawer and any API caller
+polling that `command_id` saw it idle at RUNNING (or unresolved) forever.
+
+**What shipped:** every one of those branches, plus the pre-existing (unnamed by #4672, but same shape)
+`"other"` grpc-status branch, now synthesizes a terminal `FAILURE` `CommandResponse`
+(`build_gateway_forward_terminal_failure`, `gateway_mgmt_stub_pool.hpp` — a pure, unit-tested builder)
+and applies it through `process_gateway_response` — the SAME mechanism a real gateway response already
+used on every other line of this function. This keeps command_id resolution to the ONE established
+`notify_exec_tracker` terminal-write path (executions-history-ladder routed concern) rather than a
+bespoke second mechanism.
+
+**Exactly-once guard (post-Gate-2/3 correction):** the first cut of this fix scoped the double-resolve
+guard to the `agent_mismatch` branch only, tracking whether a legitimate frame was applied *within a
+single attempt*. Gate 2/3 governance (security-guardian HIGH, cpp-safety/cpp-expert independently
+confirming) caught that this left the OTHER three synthesizing branches — `unauthenticated`, the generic
+`"other"` branch, and exhausted-retries `unavailable` — able to clobber an already-applied real terminal
+response with a synthetic FAILURE, either within one attempt (a legitimate frame applied, then that same
+attempt's `Finish()` still reports a non-OK transport status) or across attempts (an earlier attempt
+resolves the command while a later attempt independently hits a different terminal-failure branch). The
+shipped guard is a single `applied_response` bool (renamed `applied_terminal`, post-pr-rev correction
+below), declared ONCE before the 3-attempt retry loop (not per-attempt, not per-branch) and consulted by
+ALL FIVE synthesizing call sites — `agent_mismatch`, `unauthenticated`, `"other"`, exhausted-`unavailable`,
+and `unknown_cluster` — so a real TERMINAL response (a genuine terminal apply, or a repaired
+`not_connected` frame, itself always FAILURE by `classify_gateway_forward_response`'s own contract) applied
+at ANY point across the whole command's attempts suppresses every later synthetic write for that same
+command_id.
+
+**Second correction (pr-rev, FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically confirmed by both
+reviewers independently):** the guard above was itself over-broad through PR review — `applied_response`
+was set to `true` by ANY applied frame, including a non-terminal RUNNING progress update, not only a
+terminal one. A gateway streaming a single RUNNING frame, then faulting before a clean close with every
+retry exhausted UNAVAILABLE, left the guard already tripped, so the exhausted-retry synthesis was
+suppressed and the command_id stayed at RUNNING forever — the exact defect #4672 exists to close,
+reintroduced by this guard's own predicate. Fixed: the flag (renamed `applied_terminal`) is now set only
+when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_status`,
+`gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
+unconditionally terminal by its classifier's own contract and needs no such check.
+
+**Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
+re-drive), for two independent, load-bearing reasons — not silently, this time:**
+
+1. **Granularity mismatch with WS-3 3.3's `command_outbox_store`/`command_outbox_delivery`.** That
+   store's producer API (`claim_and_enqueue`) is epoch-fenced, and its one existing producer
+   (`ScheduleRunner`) runs strictly inside a `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the
+   fence exists on the assumption that only a caller who has ALREADY confirmed leadership calls it.
+   `forward_gateway_pending` is reachable from every replica via ordinary operator-synchronous dispatch,
+   never gated on leadership, so an enqueue attempt from inside it would silently no-op on a non-leader
+   replica (`LeaderElector::epoch()` returns `nullopt` there — there is no epoch to embed), producing an
+   inconsistent, replica-dependent retry strictly worse than today's uniform resolution. Separately,
+   `command_outbox_delivery`'s own `sent` means "the confined-dispatch resolution QUEUED the command"
+   (`ConfinedDispatchOutcome::sent`), never "the gateway RPC actually completed" — reusing its generic
+   `DispatchFn` re-dispatch path for a redelivery would mark the occurrence terminal in the outbox the
+   instant `send_to` re-queues it into `gw_pending_`, racing and swallowing the very gateway failure a
+   redelivery would exist to observe.
+2. **#3279** (named in `server.cpp`, "KNOWN GAP, filed as #3279, NOT fixed here"). This function's
+   detached per-command `std::thread(...).detach()` is untracked by every shutdown drain/quiesce
+   mechanism this server has; its raw-pointer capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+   carefully-scoped, individually-justified exception to that gap, not a precedent to extend. A durable
+   retry producer would need that same thread to ALSO touch `command_outbox_store_`/`leader_elector_`,
+   widening #3279's reach into two more `ServerImpl`-owned stores with no existing destruction-order
+   analysis covering them. #3279 is explicitly deferred to a human owner to adjudicate; widening its
+   blast radius as a side effect of #4672 would be scope creep into that separately-tracked decision, not
+   a fix for it.
+
+A durable gateway-forward re-drive therefore stays a documented, scoped-out follow-up — real once #3279
+gives `forward_gateway_pending` its own pooling/draining story (so a retry producer has a safe place to
+touch `command_outbox_store_`), not before. Until then, §7's "stays pending... and is re-driven" design
+note is accurate for the LEADER-DRIVEN background plane (schedule fires, via `route_unreadable`) and
+inaccurate for the gateway-forwarding path specifically — which instead resolves terminally, immediately,
+for every command that reaches the per-command retry loop below, including the previously-silent
+unusable-pool short-circuit above it (now resolved through the same helper, pr-rev finding
+FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, not silently: a clean
+`Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
+every branch this PR's own scope covers, not that one.
+
 ### 8. PKI / CA high availability (Q8)
-Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
-- **CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
-  to **KEK availability**.
-- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence — but numbering alone
+Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
+"collapse into the KEK problem" framing and the first two bullets are superseded — see the Update
+below)*:
+- ~~**CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
+  to **KEK availability**.~~ *Superseded 2026-09-23: the key stays behind `KeyProvider`.*
+- **`CaStore` → Postgres**; **durable CRL numbering** via a Postgres sequence *(superseded
+  2026-09-23: a table lock, not a sequence)* — but numbering alone
   is insufficient: **CRL publication becomes an explicit durable state machine** (allocate → sign →
   store → make-current) with a fencing rule, since a sequence prevents collisions yet can leave gaps
   and does not make publication atomic (`ca_store.cpp:605`).
@@ -1132,6 +1423,41 @@ Collapse CA HA into the KEK problem, with the versioning/rollout gaps review sur
   includes KEK **version rollout, rollback, and node-admission** semantics (an instance without the
   current version must not silently produce unverifiable material). KMS/HSM via the existing seam is
   optional (SaaS / high-security).
+
+**Update (2026-09-23, WS-6 planning + slice 6.1).** Three points above are resolved as follows:
+- **The CA root key does NOT become a `SecretCodec` blob in Postgres.** The first bullet conflicted
+  with ADR-0010 Decision 6 (the CA root key stays behind `KeyProvider`; "no future store migration
+  may" move it) and ADR-0053 §Secrets. ADR-0010 governs. Putting the key under the secrets KEK would
+  make database + KEK sufficient to hold the CA, while saving little operationally, because the KEK
+  files must be distributed to every replica anyway. WS-6 instead uses **shared key custody**: the
+  CA key and KEK files are provisioned to every replica, and a replica must prove it can resolve
+  every required key before it is admitted (slice 6.3, with `/readyz`).
+- **`CaStore` → Postgres** was already done by ADR-0053 before WS-6 began.
+- **CRL publication (slice 6.1, closes #4126)** is one Postgres transaction:
+  `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE` → read `MAX(version)+1` → read
+  the revoked set → sign → `INSERT` → `COMMIT` (`CaStore::publish_next_crl`). Allocate, store and
+  make-current happen together at the commit ("current" is the highest committed version), a
+  rollback consumes no number, so there are no gaps and no sequence is needed. The table lock is
+  the fencing rule — in a different sense from §3's fencing token: there is no leadership to lose,
+  because the lock and the CRL write are one transaction, so a paused publisher cannot hold a
+  silently transferred right. It serialises every publisher on every replica, is released by the
+  commit, and is deliberately not a leader epoch, because the operator revoke path publishes
+  synchronously (the two-dispatch-planes rule). A table lock rather than the codebase's usual
+  `pg_advisory_xact_lock` because it also blocks writers that do not opt in (any other INSERT into
+  `ca_crl_versions`, including an older binary's during a rolling upgrade) — do not "harmonise" it
+  to an advisory lock. The lock wait is bounded per transaction (`set_config('lock_timeout', …)`),
+  and a process-local mutex keeps each replica to one pool connection waiting on it. Reading the
+  revoked set after acquiring the lock makes each CRL a superset of the one before it; re-reading
+  `ca_root`'s fingerprint under the lock stops a publish that raced a subordinate import from
+  landing a CRL under the superseded issuer. The CA key is loaded before the lock is taken; only
+  signing runs under it. A publish that fails (e.g. lock timeout) is healed by the leader's
+  freshness pass, which republishes whenever the latest CRL's recorded `revoked_count` differs from
+  the current revoked count — a count comparison, never cross-replica timestamps, which holds
+  because the revoked set is append-only (`delete_issued_by()` keeps revoked rows, and a migration-v4
+  row trigger rejects deleting or updating a revoked `ca_issued` row). A publisher
+  frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
+- **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
+  `pending-agents.cfg` once at first boot rather than starting fresh.
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
@@ -1237,6 +1563,62 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
+**Update (2026-09-24, WS-8 readyz — monolith).** The monolith's single `/readyz` plays the core role and
+is what the operator LB targets (the tier split is a no-op until ADR-1005's split lands, §1c). Two
+gaps closed:
+- **"Red when core cannot reach `yuzu`" is now true at runtime.** Every store's `is_open()` is latched
+  at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
+  `/readyz` used to stay green through an outage. A dedicated-connection probe
+  (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
+  two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
+  `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
+  client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
+  resolver instead), because a blocking query against a frozen backend was
+  measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
+  probe only gives each host its own deadline (the pool's effective `connect_timeout`, timed as the
+  linked libpq's blocking connect times it),
+  restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
+  timeout is unlimited, because the pool does not either (libpq's non-blocking
+  connect never advances past a silent host); and a read-only answer drops the
+  connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
+  or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
+  turns **every** replica red for the failover window — truthful, since nothing can serve writes.
+  Leadership is deliberately not a readiness condition.
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
+  failures move on and which end the attempt, the pool's connection parameters), so the probe
+  measures the host the pool reaches — every re-implementation of that walk diverged (governance
+  rounds 2–5); and a multi-host DSN must carry
+  `target_session_attrs=read-write` (added when absent, a weaker value refuses boot) and may not set
+  `load_balance_hosts` (refused at boot: the pool would shuffle per connection while the probe holds one),
+  because without
+  it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
+  pool does not re-validate connections it holds, so a server that turns read-only in place (without the
+  restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
+  failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
+  green only when a new connection reaches a different, writable host.
+- **The contract, and a freeze (governance round 9, architecture review adopted by the operator).**
+  Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
+  holds N connections opened at N moments under N resolved settings and never re-validates them, so no
+  single probe connection can represent them. The promise is therefore stated precisely:
+  `pg_reachable` is a one-session signal — red when the probe's most recent connect, made with the pool's
+  own parameters (a single host capped at 5 s), could not establish a session to a server that accepts
+  writes, or when the probe's held session stops answering or turns read-only. It keeps a healthy session
+  open, so it does not observe the pool's other held connections, nor anything that changed after the
+  probe last connected. Named residuals: held pool connections to a server demoted in place (#4942);
+  anything that changes whether a new connection would succeed — service-file/environment edits, a
+  password rotation or expiry, a pg_hba or certificate change — until the probe's next reconnect (#4956);
+  a multi-address host name with one silent address (#4954); `max_connections` exhaustion (#4943); and,
+  accepted and untracked, timing — about ±1 s against the pool's connect, a single host capped at 5 s
+  (red-only). Freeze rule: no further emulation of libpq/pool behaviour in
+  the probe; a newly found divergence is an issue against this contract unless it produces a false green
+  for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
+  fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe
+  emulation.
+- **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
+  turns `503 draining`, so the fronting layer drains before the socket closes.
+The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are
@@ -1281,8 +1663,8 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
 4. **Gateway routing + multi-cluster topology** — fenced agent→cluster directory **and net-new
    distributed intra-cluster agent→node routing** (§7).
 5. **Shared agent presence / health / scope population** (§7a).
-6. **PKI/CA HA** — CA key to `SecretCodec`, CRL publication state machine, KEK versioning/rollout,
-   enrollment to PG (§8).
+6. **PKI/CA HA** — shared CA key custody + node admission (not `SecretCodec`; §8 Update
+   2026-09-23), CRL publication state machine, KEK versioning/rollout, enrollment to PG (§8).
 7. **HA-PG delivery** — Patroni+etcd+HAProxy profile with **selectable durability (3-node quorum
    default)** + operator-plane LB (§11).
 8. **Health contract + BYO-LB doc** (§12).

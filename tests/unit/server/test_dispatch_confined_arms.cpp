@@ -59,6 +59,17 @@ struct RecordingSink {
     std::vector<std::string> reached;
     bool unfiltered_broadcast_used = false;
     std::vector<std::string> fleet{"dev-A", "dev-B", "dev-C"};
+    // HA WS-5 (governance hardening, 2026-09-22): override point for a test
+    // that simulates presence widening known_agent_ids() beyond the local
+    // registry — nullopt (the default) means "no presence", i.e. every id in
+    // `fleet` is locally known, exactly as it was before this field existed.
+    // When set, names the LOCAL-ONLY subset of `fleet`; any candidate not in
+    // it is treated as presence-only (mirrors AgentRegistry::
+    // has_remote_presence's direct-membership-check semantics, not a size
+    // comparison — a size-based mock would reintroduce the exact race class
+    // that method was written to close).
+    std::optional<std::vector<std::string>> local_only_override;
+    std::optional<std::vector<std::string>> route_fallback_candidates;
 
     ConfinedDispatchSink make() {
         return ConfinedDispatchSink{
@@ -70,7 +81,17 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            [this](const std::vector<std::string>& candidates) {
+                route_fallback_candidates = candidates;
+                return false; // never degraded, in this mock
+            },
+            [this](const std::vector<std::string>& candidates) {
+                const auto& local = local_only_override ? *local_only_override : fleet;
+                return std::any_of(candidates.begin(), candidates.end(), [&](const auto& id) {
+                    return std::find(local.begin(), local.end(), id) == local.end();
+                });
+            }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
@@ -242,6 +263,65 @@ TEST_CASE("Broadcast arm: present-EMPTY reaches nobody and never falls back to s
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
+}
+
+// HA WS-5 (ADR-2002 §7a): once known_agent_ids() can include presence-only
+// (remote) ids, an unfiltered Broadcast is no longer safe to answer with the
+// local-only fast path — it must fall through to the per-id walk so a
+// remote id gets a directory-fallback consult via prepare_route_fallback
+// before send_to. This is the exact bug class WS-4 hit twice (a
+// wired-but-behaviorally-dead reader) — see ConfinedDispatchSink::
+// presence_widens's doc comment.
+TEST_CASE("Broadcast arm: presence widening known_agent_ids skips the unfiltered fast path "
+          "and consults the route fallback",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.fleet = {"dev-A", "dev-B", "dev-C", "remote-only"}; // presence added "remote-only"
+    sink.local_only_override = {"dev-A", "dev-B", "dev-C"};  // local registry still has 3
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK_FALSE(sink.unfiltered_broadcast_used); // fast path correctly skipped
+    REQUIRE(sink.route_fallback_candidates.has_value());
+    CHECK(sink.reached_exactly(*sink.route_fallback_candidates));
+    CHECK(sent == 4);
+    CHECK(sink.reached_exactly({"dev-A", "dev-B", "dev-C", "remote-only"}));
+}
+
+TEST_CASE("Broadcast arm: presence adding nothing beyond local keeps the unfiltered fast path",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.local_only_override = sink.fleet; // presence configured, adds nothing this call
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK(sink.unfiltered_broadcast_used);
+    CHECK_FALSE(sink.route_fallback_candidates.has_value()); // fast path never calls it
+    CHECK(sent == 3);
+}
+
+// HA WS-5 governance hardening (Gate 4 unhappy-path finding, 2026-09-22):
+// regression test for the race the size-comparison design had — a
+// COINCIDENTAL size match between known_agent_ids() and a separately-queried
+// local count must NOT fool the gate when the SETS genuinely differ. This
+// mock can't reproduce the original two-call race directly (RecordingSink's
+// presence_widens closure and known_agent_ids share one `fleet`/
+// `local_only_override` snapshot with no window between them), but it does
+// assert the CURRENT single-call membership-check semantics hold even when
+// sizes happen to be equal by construction: replacing one local id with a
+// same-count remote-only id must still force the slow path.
+TEST_CASE("Broadcast arm: a same-size but different-membership candidate set still "
+          "skips the fast path (regression: size comparison is not membership)",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.fleet = {"dev-A", "dev-B", "remote-only"}; // 3 candidates
+    sink.local_only_override = {"dev-A", "dev-B", "dev-C"}; // ALSO 3 — sizes match, sets don't
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK_FALSE(sink.unfiltered_broadcast_used);
+    REQUIRE(sink.route_fallback_candidates.has_value());
+    CHECK(sent == 3);
 }
 
 // --------------------------------------------------------------- None arm ---

@@ -82,24 +82,30 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 /// heartbeat egress" in test_spark_mechanism.cpp.
 ///
 /// The `yuzu.spark_mechs` CSV lists only mechanisms that are registered AND FUNCTIONAL.
-/// An inert mechanism — one that started but could not bind its OS facility (no systemd
-/// system bus in a container, OpenSCManager denied, IOCP creation failed) — is EXCLUDED,
-/// because every watch() on it will be refused. Listing it would advertise a capability
-/// the agent cannot honour: "looks healthy, can detect nothing" (governance Gate-3
-/// cross-platform + Gate-6 sre, reached independently).
+/// An inert mechanism, one that started but could not bind its OS facility (no systemd
+/// system bus in a container, OpenSCManager denied, IOCP creation failed), or one whose
+/// worker is in persistent pass failure (Registry and File; three consecutive failed passes,
+/// cleared on the next success), is EXCLUDED, because it is not currently serviceable:
+/// the first kind refuses every watch(), the second accepts it but cannot serve it until a
+/// pass succeeds. Listing it would advertise a capability the agent cannot honour:
+/// "looks healthy, can detect nothing" (governance Gate-3 cross-platform + Gate-6 sre,
+/// reached independently).
 ///
 /// HOW AN INERT MECHANISM IS OBSERVED, precisely. Inertness suppresses the CAPABILITY CLAIM
 /// (the CSV above), not the telemetry: the per-type counter loop below does NOT skip inert
-/// mechanisms, so a non-zero counter on one WOULD be reported. In practice none ever is —
-/// the Registry and Service mechanisms track none of those counters (they are File-mechanism
-/// concepts, #1979/#1980/#1982), so their stats are all-zero and the sparse rule drops every
-/// tag. So TODAY an inert mechanism emits nothing of its own, but that is a property of which
-/// counters exist, NOT a rule the code enforces — do not rely on it.
+/// mechanisms, so a non-zero counter on one IS reported. The Service mechanism tracks none
+/// of those counters, so its stats are all-zero and the sparse rule drops every tag. File
+/// and Registry do track them (slow_op, watch_rejected, quarantined), so a File or Registry
+/// runtime-inert episode can carry non-zero cumulative counters. That is a property of which
+/// counters exist, NOT a rule the code enforces: do not rely on an inert mechanism emitting
+/// nothing.
 ///
-/// An inert mechanism is therefore visible as a CAPABILITY GAP on the server:
-/// `yuzu_fleet_spark_reporting{os}` exceeds the sum of
-/// `yuzu_fleet_spark_mechanisms{os,mechanism}` for that OS. That is the query to reach for;
-/// it is documented in `docs/user-manual/metrics.md`.
+/// An inert mechanism is therefore visible as a CAPABILITY GAP on the server, per mechanism:
+/// the agents reporting for an OS minus the agents listing that mechanism. That comparison is
+/// only valid where the mechanism is expected on every agent of that OS, and an OS reports
+/// several mechanism series per agent, so comparing `reporting` with their SUM never fires.
+/// The absent-safe query form (a bare subtraction returns nothing when the mechanism series
+/// is missing on every agent) is documented in `docs/user-manual/metrics.md`.
 ///
 /// (Two earlier versions of this comment contradicted each other here — one claimed inert
 /// mechanisms "still report their counters", the next that they "emit NOTHING of their own"
@@ -130,7 +136,7 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
     std::string mechs;
     for (const auto& [type, ms] : by_type) {
         if (ms.inert)
-            continue; // registered but cannot watch — not a capability
+            continue; // registered but not currently serviceable: not a capability
         if (!mechs.empty())
             mechs += ',';
         mechs += spark_type_token(type);
@@ -162,9 +168,10 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
         tags["yuzu.spark_consumer_errors"] = std::to_string(ss.consumer_errors_total);
     // Per-mechanism-type health counters (sparse). Key = "yuzu.spark_<type>_<metric>",
     // composed identically to spark_type_metric_tag() in spark_fleet_tags.hpp.
-    // Deliberately NOT skipped for inert mechanisms — inertness suppresses the capability
-    // claim (the CSV above), not the telemetry. See the header note: today every inert
-    // mechanism's counters happen to be zero, so the sparse rule drops them anyway.
+    // Deliberately NOT skipped for inert mechanisms; inertness suppresses the capability
+    // claim (the CSV above), not the telemetry. See the header note: Service tracks none of
+    // these counters, but File and Registry do, so a File or Registry runtime-inert episode
+    // can report non-zero cumulative values here.
     for (const auto& [type, ms] : by_type) {
         if (ms.watch_rejected_total == 0 && ms.quarantined_total == 0 && ms.slow_op_total == 0)
             continue; // nothing to say — don't build the key prefix (all-zero at rung 1)

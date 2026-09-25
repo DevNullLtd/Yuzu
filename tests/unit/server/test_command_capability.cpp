@@ -156,12 +156,13 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
     // literal at the call site, so exceeding kMaxSources means literally
     // writing kMaxSources + 1 elements. The static_assert keeps that literal
     // count honest if kMaxSources ever changes.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 16,
-                 "this test hardcodes 17 literal sources (kMaxSources + 1); update the "
+    static_assert(CommandCapabilityRegistry::kMaxSources == 24,
+                 "this test hardcodes 25 literal sources (kMaxSources + 1); update the "
                  "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
     CHECK_THROWS_AS(
-        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s}),
+        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
+                                    s, s, s, s}),
         std::invalid_argument);
 }
 

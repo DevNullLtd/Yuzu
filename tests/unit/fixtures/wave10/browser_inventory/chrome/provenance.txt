@@ -1,0 +1,20 @@
+SYNTHETIC + RECONSTRUCTION
+==========================
+Sign-off: Alex, 2026-09-21, run-context.md "Wave 10 run — run context (Phase 0 decisions)" Phase-0 item 2 -- Chrome/Firefox real captures were unavailable on this Mac and no
+-rig session captured Chrome this wave (only Microsoft Edge -- see the sibling edge/ directory's REAL CAPTURE provenance). Chrome fixtures in this directory are SYNTHETIC,
+standing waiver granted, on condition they mirror the real Edge capture's on-disk shape rather than being invented from documentation alone.
+
+Every file in this directory carries a top-level "_provenance" JSON key stating SYNTHETIC or RECONSTRUCTION and citing this sign-off; no value in any file is a real captured
+value -- every string, id, name and version number below is fabricated for test purposes only.
+
+Files
+-----
+Local State                                              SYNTHETIC. Shape mirrors edge/Local State: profile.info_cache (two profiles, "Default" and "Profile 2") +
+                                                          profile.last_used + browser.* version scalars. Deliberately carries fabricated gaia_id/gaia_name/user_name
+                                                          values on both profiles (edge/Local State only ever shows these keys already redacted to the literal string
+                                                          "REDACTED") so the privacy-contract test has a fixture where those fields hold plausible-looking real values,
+                                                          not just a placeholder string, and still asserts BrowserProfileRow never surfaces them.
+Default/*                                                 (not in this directory) The Default/Preferences, Default/Secure Preferences and Extensions/<id>/<ver>/manifest.json synthetic files are the inputs of the per-profile `extensions` action and are committed by that follow-up PR.
+malformed_local_state.json                               RECONSTRUCTION. A Local State file truncated mid-string to make nlohmann::json::parse() throw --
+                                                          exercises profiles_from_local_state()'s parse-failed (std::nullopt) path. Not observed in the wild; built to
+                                                          hit that one code path deterministically.

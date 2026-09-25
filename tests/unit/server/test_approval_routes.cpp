@@ -421,6 +421,26 @@ TEST_CASE("approval_routes: GET /api/approvals filters by status and submitted_b
     CHECK(op1_arr.size() == 2); // def-a (pending) + def-c (approved)
 }
 
+TEST_CASE("GET /api/approvals: an out-of-enum status is rejected with 400, not silently "
+          "producing a false-empty result (Gate 8 governance finding, #2146 A2-R4)",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    REQUIRE(mgr->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire();
+
+    // Pre-fix: this silently produced approvals:[] -- indistinguishable from
+    // a genuinely empty match -- instead of rejecting the malformed input,
+    // same defect class as GET /api/v1/approvals and MCP
+    // list_pending_approvals had before their own #2146 A2-R4 fix.
+    auto res = h.sink.Get("/api/approvals?status=aproved");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_approval_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit

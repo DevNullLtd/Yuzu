@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash 8aea1a515344
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash a6ac30dd4945
 == action=printers
 printer|OneNote (Desktop)|idle|-|0|Send to Microsoft OneNote 16 Driver|nul:|0
 printer|Microsoft XPS Document Writer|idle|-|0|Microsoft XPS Document Writer v4|PORTPROMPT:|0
@@ -9,3 +9,6 @@ printer|Fax|idle|-|0|Microsoft Shared Fax Driver|SHRFAX:|0
 == action=jobs
 job|none
 [result_status] UNDECLARED / UNKNOWN /
+
+== action=clear_queue
+[not captured] Destructive/Irreversible: mutating action, not executed in a docs capture

@@ -1959,21 +1959,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(
                 detail::error_json_a4(
                     403, "break-glass account requires an enrolled second factor", cid,
-                    "the break-glass account has no enrolled second factor; enroll MFA for it "
-                    "(Settings -> Multi-Factor Authentication, reachable by an admin via SSO) "
-                    "before using it under --auth-mode=sso-only"),
+                    "the break-glass account has no enrolled second factor, and no admin can "
+                    "enroll it on its behalf. Recover by restarting with --auth-mode=standard, "
+                    "enrolling as the break-glass account, then restoring sso-only; standard "
+                    "mode re-enables local-password login for every account. Full sequence: "
+                    "docs/ops-runbooks/auth-db-recovery.md (break-glass section)"),
                 "application/json");
             audit_log_for_principal(
                 req, "auth.breakglass.denied", "denied", username,
                 auth::role_to_string(*role_opt), "User", username,
-                "break-glass login refused: no MFA enrolled (enrollment not offered — re-enroll "
-                "out of band)");
+                "break-glass login refused: no MFA enrolled (enrollment not offered — see the "
+                "break-glass section of docs/ops-runbooks/auth-db-recovery.md)");
             emit_event("auth.breakglass.denied", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kCritical);
             spdlog::error("BREAK-GLASS login DENIED for '{}' (source {}): no MFA enrolled — "
                           "refusing to offer enrollment (would defeat the second factor). "
-                          "Re-enroll the break-glass account out of band.",
+                          "Re-enroll it per the break-glass section of "
+                          "docs/ops-runbooks/auth-db-recovery.md.",
                           username, req.remote_addr);
             return;
         }
@@ -4138,8 +4141,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             },
             label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
-    // Default step-up window for the elevation surfaces; floored to 300 s when the
-    // global gate is disabled so the privilege boundary keeps a fresh-proof check.
+    // Step-up window for the elevation surfaces: the global window when it is
+    // positive, else 300 s. So disabling the global gate (<= 0) does not disable
+    // it here, and the privilege boundary keeps a fresh-proof check. A positive
+    // window below 300 is used as-is; this substitutes, it does not floor.
     const int kElevationStepUpWindow =
         cfg_.mfa_step_up_window_secs > 0 ? cfg_.mfa_step_up_window_secs : 300;
 
@@ -4498,8 +4503,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         }
         // High-risk: require a fresh MFA proof (step-up) before granting admin.
-        // window floored to kElevationStepUpWindow so a globally-disabled gate
-        // can't skip the proof for the privilege boundary.
+        // kElevationStepUpWindow (the global window when positive, else 300 s) so
+        // a globally-disabled gate can't skip the proof for the privilege boundary.
         if (!elevation_step_up(req, res, *session, "POST /api/v1/elevate",
                                kElevationStepUpWindow)) {
             // The shared gate set the 401 challenge + audited mfa.step_up; add the

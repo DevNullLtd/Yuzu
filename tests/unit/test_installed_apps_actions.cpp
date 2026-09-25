@@ -9,17 +9,24 @@
  * host, end to end, not just that the pure parsers in
  * installed_apps_parsers.hpp accept a fixture string.
  *
- * `list` is the fast, local, always-available action (no params, no
- * per-app enrichment loop) -- assertions are on rc and output SHAPE
- * (every emitted line matches the `app|` wire prefix), never on specific
- * app names/counts, which are entirely host-dependent.
+ * `list` is the fast, local, always-available action (no params; on macOS one
+ * bounded in-process CFBundle read per listed app for bundle_id, inside the noise
+ * of the single system_profiler call on this Mac, 2026-09-21) -- assertions are on
+ * rc and output SHAPE (every emitted line matches the `app|` wire prefix), never
+ * on specific app names/counts, which are host-dependent, with ONE deliberate
+ * exception: the `list` case asserts value-level facts every Mac guarantees
+ * (`*.app` rows under `/System/Applications/` with `com.apple.*` bundle ids,
+ * absolute locations), because shape-only checks survive reverting either half of the
+ * ADR-0028 wiring (see that case's own comment).
  *
  * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
  * whenever a test's runtime depends on process creation):
  *   - What it costs, measured on this host (macOS 26, arm64, 2026-08-24):
- *     `list` 4.5 s wall, `list_inventory` a few seconds more. Both are
- *     dominated by one `system_profiler` call, not by fan-out; the pkgutil
- *     receipt leg is a bounded per-id loop under kMaxPkgutilPackages.
+ *     `list` 1.4-2.3 s wall (2026-09-21; the 2026-08-24 base figure was 4.5 s),
+ *     `list_inventory` a few seconds more. `list` is
+ *     dominated by one `system_profiler` call plus that in-process pass (no
+ *     process fan-out); the pkgutil receipt leg is a bounded per-id loop under
+ *     kMaxPkgutilPackages.
  *   - Why a pure-function test cannot replace it: the pure parsers in
  *     installed_apps_parsers.hpp are already exhaustively covered by
  *     test_installed_apps_parsers.cpp. What is NOT reachable that way is the
@@ -47,6 +54,7 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -102,9 +110,9 @@ std::optional<LoadedPlugin> load_installed_apps_plugin() {
 }
 
 // Every line of `list`'s output is either a real `app|name|version|publisher|
-// install_date` row or the plugin's own honest-empty sentinel
-// ("app|No applications found|-|-|-") -- both share the `app|` prefix, so a
-// single prefix check covers both shapes.
+// install_date|install_location|bundle_id` row or the plugin's own honest-empty
+// sentinel ("app|No applications found|-|-|-|-|-") -- both share the `app|`
+// prefix, so a single prefix check covers both shapes.
 std::size_t count_non_matching_lines(const std::string& captured, std::string_view prefix) {
     std::istringstream iss(captured);
     std::string line;
@@ -116,6 +124,26 @@ std::size_t count_non_matching_lines(const std::string& captured, std::string_vi
             ++bad;
     }
     return bad;
+}
+
+/// Escape-aware field split (shape of test_peripherals_local_dispatcher.cpp's
+/// helper): a backslash-escaped '|' does not start a new field.
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
 }
 
 } // namespace
@@ -147,6 +175,63 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // real app/package or the plugin's own "No applications found" sentinel
     // -- never a stray error string or fragment from a reverted parser.
     CHECK(count_non_matching_lines(result.captured, "app|") == 0);
+
+    // Wire contract (ADR-0028 binding condition): every row is
+    // app|name|version|publisher|install_date|install_location|bundle_id --
+    // exactly 7 escape-aware tokens on every host, the sentinel included, because
+    // format_app_row escapes every field; a `|` in a real name is escaped, not a
+    // delimiter.
+    std::istringstream iss(result.captured);
+    std::string line;
+    std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
+    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0, bundle_rows = 0,
+                                 non_dash_trailing = 0;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        ++rows;
+        const auto fields = split_fields_escape_aware(line);
+        if (fields.size() != 7) {
+            ++bad_field_count;
+            continue;
+        }
+        // Empty optional columns render "-", never an empty string (a
+        // shifted column would surface here as an empty field).
+        for (std::size_t i = 1; i < fields.size(); ++i)
+            if (fields[i].empty())
+                ++empty_field;
+#if defined(__APPLE__)
+        if (!fields[5].empty() && fields[5].front() == '/')
+            ++abs_location_rows;
+        if (fields[5].starts_with("/System/Applications/") && fields[6].starts_with("com.apple."))
+            ++system_app_rows;
+        if (fields[6] != "-")
+            ++bundle_rows;
+#elif defined(__linux__)
+        if (fields[5] != "-" || fields[6] != "-")
+            ++non_dash_trailing;
+#endif
+    }
+    CHECK(rows > 0);
+    CHECK(bad_field_count == 0);
+    CHECK(empty_field == 0);
+
+    // The shape checks above are satisfied by "-" in both trailing columns, so on
+    // their own they survive reverting either half of the feature: (A) dropping
+    // with_bundle_ids leaves every bundle_id "-"; (B) returning {} for the location
+    // leaves every install_location "-". These value-level checks fail both.
+    // Every Mac lists /System/Applications/*.app with a com.apple.* bundle id.
+#if defined(__APPLE__)
+    CHECK(abs_location_rows > 0);
+#ifdef YUZU_HAVE_SECURITY_FRAMEWORK
+    CHECK(system_app_rows > 0);
+#else
+    CHECK(bundle_rows == 0); // no Security framework: the stub yields "-" for every row
+#endif
+#elif defined(__linux__)
+    // Linux has no install location or bundle id concept: both columns are "-" by design.
+    CHECK(non_dash_trailing == 0);
+#endif
 }
 
 #if defined(__APPLE__)

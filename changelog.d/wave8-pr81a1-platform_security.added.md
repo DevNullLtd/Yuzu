@@ -1,0 +1,1 @@
+- platform_security plugin: read-only Secure Boot and code-integrity enforcement posture (Windows SecureBoot/CI/DeviceGuard registry, Linux efivars + LSM/lockdown, macOS Gatekeeper/SIP via spctl and csrutil, rung 2).

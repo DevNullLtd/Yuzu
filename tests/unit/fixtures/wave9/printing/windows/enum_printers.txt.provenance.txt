@@ -6,4 +6,4 @@ command: probe_wave9_print_win.exe, run via the yuzu-wave9-print-probe SYSTEM sc
          section == EnumPrintersW(LOCAL|CONNECTIONS, level 2) == / == GetDefaultPrinterW ==
 note: cl /std:c++latest /EHsc /nologo /W3 probe_wave9_print_win.cpp winspool.lib compiled clean,
       no warnings. Identical output (module names/drivers/ports/status) also captured under the
-      admin SSH identity (DESKTOP-04DNSIG\Alex) -- see the-rig-print-probe-findings.md.
+      admin SSH identity (DESKTOP-04DNSIG\Alex).

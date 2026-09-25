@@ -58,8 +58,11 @@ class CommandRequest;
 // Forward-declared rather than #include-d: these live under agents/core/src/
 // (agent-internal implementation headers), and no header under
 // agents/core/include/yuzu/agent/ has ever crossed that boundary - this stays
-// consistent. Only used here as std::function<SendResult(const OutboxEntry&)>
-// parameter types, which do not need complete types to declare (only to call).
+// consistent. Only used here as std::function<SendResult(const OutboxEntry&)> /
+// std::function<LegacySendOutcome(const GuaranteedStateEvent&)> (EventSink, #4783)
+// parameter types, which do not need complete types to declare (only to call) -
+// an enum class with a fixed underlying type is itself a complete type once
+// forward-declared this way, so LegacySendOutcome can appear by value in EventSink.
 namespace yuzu::agent {
 class SparkEngine;
 class GuardianSparkRuntime;
@@ -72,8 +75,10 @@ struct GuardianJournalAgeStats;
 struct GuardianArmStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
+class GuardianLegacySinkExecutor;
 struct OutboxEntry;
 enum class SendResult;
+enum class LegacySendOutcome : std::uint8_t;
 } // namespace yuzu::agent
 
 namespace yuzu::agent {
@@ -159,6 +164,15 @@ public:
 
     /// Phase 1 startup (pre-network). Loads cached rules from KvStore
     /// into the in-memory count cache so get_status() is cheap.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: also restores legacy_sink_executor_'s loss
+    /// ledger (counters + open-gap snapshots) from a prior process, if one was
+    /// persisted (see legacy_sink_kick()/stop()) - STRICTLY BEFORE the rule
+    /// re-arm loop below, so a restored gap is already visible before the
+    /// first guard thread (or the first post-boot legacy_sink_kick()) can
+    /// reach the executor. An absent/malformed/schema-mismatched record
+    /// self-heals (logged, skipped, boot proceeds) - same posture as a
+    /// corrupt/absent #4021 baseline record.
     std::expected<void, std::string> start_local();
 
     /// Phase 2 startup (post-Register). No-op in PR 2 — PR 4 uses this
@@ -172,6 +186,62 @@ public:
     /// drain worker so neither can stall the heartbeat on a contended KvStore.
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
+
+    /// #4783 commit 4: legacy-sink loss VISIBILITY, driven by the agent heartbeat
+    /// alongside journal_maintenance_tick() above but DELIBERATELY NOT sharing its
+    /// gate — journal_maintenance_tick() no-ops when `!prefer_spark_` (it drives
+    /// spark-only maintenance passes), whereas legacy_sink_executor_ is the LIVE
+    /// production path regardless of the flip (prefer_spark_ defaults false; see
+    /// the Spark row in routed-concerns.md), so its own loss-repair path MUST run
+    /// unconditionally. Not gated behind mtx_ either: (1) legacy_sink_executor_->
+    /// kick() relaunches a stranded worker and observes a quiet-queue stall, using
+    /// only the executor's own internal lock; (2) gap repair — for up to
+    /// kMaxGapRepairsPerKick sticky integrity gaps (gapped_rules_needing_repair())
+    /// not already mid-repair (GapRecord::repair_seq != 0), synthesizes a
+    /// guard.unhealthy report (kLegacySinkDeliveryGapDetail, a fixed short
+    /// constant) via emit_guard_event(..., is_gap_repair=true, gap.last_lost) —
+    /// which itself takes only sink_mtx_, then the executor's own lock, exactly
+    /// like a real guard's own emission, EXCEPT this call also passes the gap's
+    /// `last_lost` as the event's timestamp override (#4783 follow-up review,
+    /// part (c) — never the kick's own wall-clock `now`; a real verdict delivered
+    /// between two losses is legitimately older than the SECOND loss and should
+    /// still be overwritten by a repair covering that second loss, which stamping
+    /// with `now` instead of `last_lost` would otherwise let a stale repair do to
+    /// a NEWER, already-delivered real verdict, via the server's own
+    /// `updated_at >=` upsert guard — belt-and-braces alongside the executor's own
+    /// seq-guarded clearing and dequeue-time supersession check, see
+    /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
+    /// census goes fail-closed (errored) for a gapped rule until either the
+    /// repair is confirmed delivered or the rule's next real verdict clears it
+    /// (same-or-newer timestamp `>=` ordering — D11's "first verdict clears"
+    /// semantics, docs/spark-legacy-delta-registry.md); locally, the executor's
+    /// own gap ledger can ALSO be cleared by that same next real verdict, before
+    /// any repair for it is ever dispatched — see
+    /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:
+    /// runs on the bare heartbeat thread (agent.cpp), same posture as
+    /// journal_maintenance_tick()'s own firewalling.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: AFTER the repair-dispatch loop above (own
+    /// try/catch), also persists legacy_sink_executor_'s loss ledger
+    /// (counters + open-gap snapshots - GuardianLegacySinkExecutor::Snapshot)
+    /// to KvStore whenever its change_gen has moved since the last successful
+    /// write (legacy_sink_last_persisted_gen_) — a small, restart-durable
+    /// marker, NOT a durable spool of the lost events themselves (see
+    /// guardian_legacy_sink_executor.hpp's "Known limitations" doc comment).
+    /// This is what keeps `yuzu_fleet_guardian_legacy_sink_gap_rules` from
+    /// reading as "resolved" after a mid-outage agent restart the same way a
+    /// genuine repair would (UP-3), and keeps `events_lost` monotonic across
+    /// one (UP-4's restart-durability half - see start_local()/stop() below
+    /// for the read/final-write sides of this same mechanism).
+    ///
+    /// #4783 Gate 8 re-review: the snapshot/decide/persist/record-gen
+    /// sequence below runs under legacy_sink_persist_mu_ (own doc comment
+    /// near that member) for its ENTIRE span, not just the KV write - stop()'s
+    /// own final persist (see stop()'s doc comment) takes the same lock for
+    /// its own entire span, so the two call sites can never interleave a
+    /// stale snapshot from one against a fresher write from the other. See
+    /// that member's doc comment for the lost-update race this closes.
+    void legacy_sink_kick() noexcept;
 
     /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
     /// (#2298 gate 1) this KICKS the drain worker rather than paging inline: it takes mtx_
@@ -261,16 +331,60 @@ public:
     /// prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
 
+    /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
+    /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see
+    /// guardian_legacy_sink_executor.hpp's own loss-table doc comment; LinkDown and
+    /// discarded_at_stop are DELIBERATELY excluded, same doc). Never gated on
+    /// prefer_spark_ — legacy_sink_executor_ is always live. Surfaced as
+    /// `yuzu.guardian_legacy_sink_events_lost` (heartbeat, sparse: 0 omits the tag).
+    /// Production accessor — unlike legacy_sink_executor_for_test() above, this is
+    /// the one production code (agent.cpp's heartbeat) actually calls.
+    [[nodiscard]] std::uint64_t legacy_sink_events_lost() const;
+
+    /// #4783 commit 4: CURRENT count of rules with an open sticky integrity gap -
+    /// a rule's gap shrinks back to 0 as soon as EITHER its repair report is
+    /// confirmed Sent (and not itself since superseded), OR the rule's own next
+    /// real verdict is delivered with a strictly-newer admission-time seq than
+    /// the loss it covers, whichever happens first (#4783 follow-up: SEQ-GUARDED
+    /// CLEARING — see guardian_legacy_sink_executor.hpp's class doc comment and
+    /// legacy_sink_kick() above). Surfaced as `yuzu.guardian_legacy_sink_gap_rules`
+    /// (sparse). Production accessor, same rationale as legacy_sink_events_lost()
+    /// above.
+    [[nodiscard]] std::uint64_t legacy_sink_gap_rules() const;
+
+    /// #4783 governance follow-up: cumulative count of emit_guard_event() calls that
+    /// bailed because no sink was wired yet (see legacy_sink_dropped_unwired_'s own
+    /// doc comment near its declaration below - the pre-network-arm A3 drop, a
+    /// routine window on every agent boot before agent.cpp's post-Subscribe
+    /// set_event_sink call). Surfaced as `yuzu.guardian_legacy_sink_dropped_unwired`
+    /// (sparse). Production accessor, same rationale as legacy_sink_events_lost()
+    /// above.
+    [[nodiscard]] std::uint64_t legacy_sink_dropped_unwired() const;
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
+    ///
+    /// #4783 Gate 4 UP-3/UP-4: also takes one final, UNCONDITIONAL (not
+    /// change_gen-gated, unlike legacy_sink_kick()'s own persist) snapshot of
+    /// legacy_sink_executor_'s loss ledger and writes it to KvStore - a
+    /// bounded, synchronous write, same reasoning as the pre-existing
+    /// lifecycle-journal final flush right after it in the .cpp. Covers the
+    /// case where the agent shuts down before its next heartbeat ever runs
+    /// (an open gap with zero prior legacy_sink_kick() calls still needs to
+    /// survive the restart it is about to undergo).
     void stop();
 
     /// Sink for outbound Guardian events (drift, etc.). Wired by agent.cpp once
     /// the Subscribe stream is open and BEFORE any push arrives, so a guard started
     /// by apply_rules captures a live sink. The sink writes a
     /// CommandResponse{plugin:"__guard__", action:"event", payload:<event>} on the
-    /// stream. Guards capture a copy at start, so this is set-once-then-read.
-    using EventSink = std::function<void(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
+    /// stream and reports the delivery outcome (#4783: Sent / LinkDown / WriteFailed)
+    /// so a failed Write() is countable instead of silently swallowed. Guards capture
+    /// a copy at start, so this is set-once-then-read. Called ONLY from
+    /// legacy_sink_executor_'s own detached worker, never from a guard's own thread
+    /// or from emit_guard_event() directly - see guardian_legacy_sink_executor.hpp.
+    using EventSink =
+        std::function<LegacySendOutcome(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
     void set_event_sink(EventSink sink);
 
     /// Replace (full_sync=true) or merge (full_sync=false) the active
@@ -336,6 +450,16 @@ public:
     /// KV namespace used for all Guardian persistent state. Exposed for
     /// tests — do not read from this namespace in production code.
     static std::string_view kv_namespace();
+
+    /// #4783 Gate 4 UP-3/UP-4: the single fixed KvStore key (under
+    /// kv_namespace()) the legacy-sink loss ledger (counters + open-gap
+    /// snapshots) persists under — see legacy_sink_kick()/start_local()/
+    /// stop() in guardian_engine.cpp. Exposed for tests — same "do not read
+    /// from this namespace in production code" rule as kv_namespace() above;
+    /// lets a test write a deliberately malformed/absent record directly
+    /// (the self-heal / boot-degrade regression) without needing a second
+    /// GuardianEngine instance to have produced one first.
+    static std::string_view legacy_sink_loss_ledger_key_for_test();
 
     /// Wire the spark detection path, once, before start_local() (agent.cpp,
     /// rung 7.7): builds the reader, the SparkEngine backend adapter, the
@@ -480,6 +604,18 @@ public:
         rearm_fault_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
+    /// see that member's own doc comment for the exact firing point and its
+    /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that
+    /// will construct/own the kicker thread, strictly before starting it, so
+    /// the write establishing the std::function is visible to the thread that
+    /// will read it (std::thread's own launch is itself a synchronizes-with
+    /// edge - no additional synchronization needed for the ARMING itself).
+    /// No production caller.
+    void set_legacy_sink_persist_race_hook_for_test(std::function<void()> hook) {
+        legacy_sink_persist_race_hook_for_test_ = std::move(hook);
+    }
+
     /// TEST-ONLY: the exact message logged for the most recent start_local() re-arm
     /// degrade (empty if none occurred this run). Recorded directly at the point of
     /// emission rather than observed via spdlog - a test binary's process-wide
@@ -526,6 +662,45 @@ public:
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
+
+    /// TEST-ONLY (#4783): direct access to the legacy-sink executor itself, for its
+    /// own test seams (pending_count_for_test/pending_bytes_for_test/stats()/
+    /// active_worker_count()/etc - see guardian_legacy_sink_executor.hpp). No
+    /// production caller; production code funnels through emit_guard_event()/stop()/
+    /// active_io_workers() only, never this accessor. A test using this must
+    /// `#include "guardian_legacy_sink_executor.hpp"` itself for the complete type -
+    /// this header only forward-declares it.
+    [[nodiscard]] GuardianLegacySinkExecutor& legacy_sink_executor_for_test() const;
+
+    /// TEST-ONLY (#4783): true once the legacy-sink executor's queue is IDLE (empty
+    /// && nothing in flight) within `timeout` - see
+    /// GuardianLegacySinkExecutor::wait_idle_for_test's own doc comment for why this
+    /// is NOT the same as physical worker retirement (retire_legacy_sink_workers_for_test
+    /// below is that seam). Use this to make a delivery assertion deterministic
+    /// instead of racing the detached worker.
+    [[nodiscard]] bool flush_legacy_sink_for_test(std::chrono::milliseconds timeout) const;
+
+    /// TEST-ONLY (#4783): true once every legacy-sink executor worker has PHYSICALLY
+    /// retired (active_worker_count()==0) within `timeout`. Call this - not just
+    /// flush_legacy_sink_for_test above - before any fixture/capture a sink's SendFn
+    /// still references destructs (plan hygiene rule 6): a worker can remain
+    /// momentarily alive even after the queue reports idle.
+    [[nodiscard]] bool retire_legacy_sink_workers_for_test(std::chrono::milliseconds timeout) const;
+
+    /// TEST-ONLY (#4783 commit 4): replaces legacy_sink_executor_ with a freshly
+    /// constructed instance whose Config::max_events is `max_events` — lets a test
+    /// force a deterministic RefusedCapacity (and the sticky gap it records)
+    /// without pushing thousands of events. GuardianLegacySinkExecutor::Config is
+    /// not usable as a parameter type here directly (this header only
+    /// forward-declares GuardianLegacySinkExecutor, the same ABI-boundary reason
+    /// set_spark_backend_op_deadline_for_test above threads only the one field
+    /// tests need instead of the runtime's own Config type) — so, like that seam,
+    /// only the single field a test needs is threaded through. MUST be called
+    /// BEFORE start_local() (asserted, same pre-start_local() convention as
+    /// set_rearm_fault_hook_for_test above): the fresh executor replaces one that
+    /// may otherwise already have live queued/in-flight state once guards can run.
+    /// No production caller.
+    void set_legacy_sink_max_events_for_test(std::size_t max_events);
 
 private:
     KvStore* kv_;
@@ -690,11 +865,49 @@ private:
     void rollback_spark_wiring_locked(SparkEngine* engine, bool registered,
                                       std::uint64_t consumer_id);
 
-    /// Build a GuaranteedStateEvent from a guard's drift report and ship it to
-    /// the current event sink. Called from guard worker threads, so it takes
-    /// ONLY sink_mtx_ (never mtx_): guards may fire during apply_rules / stop
-    /// which hold mtx_, and taking mtx_ here would deadlock the stop-join.
-    void emit_guard_event(const GuardDrift& drift);
+    /// Build a GuaranteedStateEvent from a guard's drift report and ENQUEUE it on
+    /// legacy_sink_executor_ for delivery on a detached worker (#4783) - the
+    /// hand-off itself (offer()) never blocks on network I/O and never throws;
+    /// everything BEFORE that hand-off (the event_id string build, the
+    /// health-detail JSON encode, the EventSink copy) keeps whatever throw surface
+    /// it already had - this function is not newly noexcept overall, only the
+    /// final hand-off is. Called from guard worker threads, so it takes ONLY
+    /// sink_mtx_ (never mtx_): guards may fire during apply_rules / stop which
+    /// hold mtx_, and taking mtx_ here would deadlock the stop-join.
+    ///
+    /// `is_gap_repair` (#4783 commit 4): threaded straight through to offer()'s own
+    /// parameter of the same name — set ONLY by legacy_sink_kick() when building a
+    /// synthesized guard.unhealthy report for a sticky integrity gap; every real
+    /// guard callsite (and the guardian_emit_drift_for_test friend helper) uses the
+    /// default. This flag is what lets the executor stamp GapRecord::repair_seq /
+    /// clear the gap on a strictly-newer Sent without the executor having to
+    /// reconstruct "is this drift report actually a repair" from the event's own
+    /// content (see guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING).
+    ///
+    /// `timestamp_override` (#4783 follow-up review, part (c)): when present,
+    /// stamps the built event's `timestamp` field from THIS time point instead of
+    /// `std::chrono::system_clock::now()` — `event_id` still mints from `now_ms`
+    /// regardless, only the wire `timestamp` field changes. ONLY
+    /// legacy_sink_kick() ever passes this, with the gap's `last_lost` (never
+    /// `first_lost` — a real verdict delivered between two losses is legitimately
+    /// older than the SECOND loss and should still be overwritten by a repair
+    /// covering that second loss); every real guard callsite leaves it at
+    /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
+    /// executor's own seq-guarded clearing and dequeue-time supersession check —
+    /// it lets the server's existing `updated_at >=` upsert guard independently
+    /// reject a stale repair, even if it somehow still reached the wire.
+    ///
+    /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded
+    /// straight through to offer()'s own parameter of the same name — see
+    /// guardian_legacy_sink_executor.hpp's ADMISSION-TIME EPISODE BINDING
+    /// section. ONLY legacy_sink_kick() ever passes this, with the
+    /// `GapRecord::lost_seq` it captured from the SAME gapped_rules_needing_repair()
+    /// call that produced `drift`/`timestamp_override` — every real guard
+    /// callsite leaves it at nullopt.
+    void emit_guard_event(const GuardDrift& drift, bool is_gap_repair = false,
+                          std::optional<std::chrono::system_clock::time_point>
+                              timestamp_override = std::nullopt,
+                          std::optional<std::uint64_t> expected_gap_lost_seq = std::nullopt);
 
     // Test seam: drift emission is otherwise reachable only through an armed
     // guard, and guards are Windows-only / no-op elsewhere — so the event_id
@@ -711,6 +924,85 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// #4783: count of emit_guard_event() calls that bailed because no sink was wired
+    /// yet (event_sink_ null - the pre-network-arm A3 drop, unchanged semantics).
+    /// Previously a silent, uncounted return; now countable so "the sink was never
+    /// wired" is distinguishable from "wired and delivered". Governance follow-up:
+    /// now wired to a production consumer too - legacy_sink_dropped_unwired() above
+    /// reads it (no lock needed, plain atomic), and agent.cpp's heartbeat surfaces it
+    /// fleet-wide as yuzu_fleet_guardian_legacy_sink_dropped_unwired.
+    std::atomic<std::uint64_t> legacy_sink_dropped_unwired_{0};
+    /// #4783 Gate 8 re-review: serializes the ENTIRE snapshot/decide/persist/
+    /// record-gen sequence in both legacy_sink_kick() and stop()'s final
+    /// persist (see each method's own doc comment) against each other. Fixes
+    /// a lost-update race: legacy_sink_kick() runs off mtx_ on the agent's
+    /// heartbeat thread (by design - it must never contend with a guard
+    /// thread's own reporting or an apply_rules reconcile), while stop() holds
+    /// mtx_ but that guards nothing here - and agent.cpp's own shutdown
+    /// ScopeExit calls guardian_->stop() BEFORE joining the heartbeat thread
+    /// (quiesce_run_workers() - a late in-flight heartbeat tick can still call
+    /// legacy_sink_kick() while stop() is already running). Before this lock
+    /// existed, a CAS on legacy_sink_last_persisted_gen_ alone was NOT
+    /// sufficient: kick() could take a snapshot at generation G1, decide to
+    /// write, then be preempted while stop() runs entirely - taking its own
+    /// later snapshot at G2, writing G2 to KV, and recording G2 - after which
+    /// kick() resumes and unconditionally writes its STALE G1 snapshot,
+    /// physically overwriting the newer KV record with older, less-complete
+    /// data (the two writes are each individually mutex-serialized inside
+    /// KvStore::set(), but nothing fenced kick()'s call to that function
+    /// against running after stop()'s on the OS scheduler's own timing).
+    /// Taking the snapshot itself under this lock (not just gating the write)
+    /// is what closes it: whichever call acquires the lock second always
+    /// takes a FRESH snapshot that already reflects everything the first call
+    /// did, so the second write can never regress the first.
+    ///
+    /// Deliberately NOT mtx_ - reusing that would block a guard thread's own
+    /// reporting or an apply_rules reconcile on a KvStore write, exactly the
+    /// hazard legacy_sink_kick() exists to stay off of (see that method's own
+    /// doc comment); this lock is taken ONLY around the orchestration
+    /// (snapshot + persist + record-gen), never around anything guard-thread-
+    /// reachable.
+    ///
+    /// Lock order: mtx_ -> legacy_sink_persist_mu_ -> {executor's own
+    /// internal `mu`, KvStore's own mutex}. stop() enters at the first level
+    /// (it holds mtx_ for its ENTIRE body, including this persist block - see
+    /// stop()'s own doc comment); legacy_sink_kick() enters at the second
+    /// level directly, never taking mtx_ at all. What keeps this acyclic:
+    /// nothing acquires legacy_sink_persist_mu_ while already holding the
+    /// executor's `mu` or KvStore's own mutex (both are taken NESTED inside
+    /// it, by snapshot()/persist_legacy_sink_loss_ledger() respectively,
+    /// never the reverse), and nothing acquires mtx_ while already holding
+    /// legacy_sink_persist_mu_.
+    std::mutex legacy_sink_persist_mu_;
+    /// #4783 Gate 4 UP-3/UP-4: the change_gen (GuardianLegacySinkExecutor::
+    /// Snapshot::change_gen) of the loss ledger this engine last successfully
+    /// persisted to KvStore - see legacy_sink_kick()'s own doc comment for the
+    /// gate this guards. A PLAIN uint64_t, not atomic: every read and write of
+    /// this field happens under legacy_sink_persist_mu_ above (both call
+    /// sites), which is what actually serializes the two threads that can
+    /// touch it - the atomic this used to be only protected the field itself,
+    /// never the read-modify-decide-write sequence around it (see
+    /// legacy_sink_persist_mu_'s own doc comment for the race that left open).
+    /// Default 0 matches a freshly-constructed (or freshly-restore()'d -
+    /// restore() never touches change_gen) executor's own change_gen default,
+    /// so the first post-boot kick()/stop() does not treat "nothing changed
+    /// since restore()" as something worth a redundant write.
+    std::uint64_t legacy_sink_last_persisted_gen_{0};
+    /// TEST-ONLY (#4783 Gate 8 re-review): if set, invoked from
+    /// legacy_sink_kick()'s persist block AFTER it has taken its snapshot and
+    /// decided a write is needed, but BEFORE it actually calls
+    /// persist_legacy_sink_loss_ledger() - reproducing the exact window the
+    /// lost-update race occupied. CONTRACT: fires with legacy_sink_persist_mu_
+    /// HELD on the calling thread - observe/park only; calling back into
+    /// legacy_sink_kick() or stop() from the hook (directly, or via a
+    /// same-thread call) self-deadlocks (a genuine same-thread std::mutex
+    /// relock - same posture as set_rearm_fault_hook_for_test's CONTRACT
+    /// above). The regression test below instead runs stop() on a SECOND
+    /// thread, which the lock legitimately blocks until the hook releases -
+    /// see test_guardian_engine_legacy_sink.cpp for the full orchestration.
+    /// Set-then-use (arm before starting the kicker thread that will observe
+    /// it); null = no-op, the production default. No production caller.
+    std::function<void()> legacy_sink_persist_race_hook_for_test_;
     /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
     /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
@@ -736,6 +1028,18 @@ private:
     /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
     /// file-hash-equals arm attempt has run yet.
     bool last_file_on_baseline_wired_for_test_{false};
+
+    /// #4783: the detached, bounded, FIFO, gap-accounting sender legacy guard
+    /// producers' events are enqueued on (emit_guard_event() -> offer()). Constructed
+    /// UNCONDITIONALLY in the constructor (always live, regardless of prefer_spark_ -
+    /// the legacy IGuard path is the one this executor exists for). Declared BEFORE
+    /// guards_ deliberately: a guard's own worker thread may still call
+    /// emit_guard_event() -> offer() during its OWN stop() (stop_all_guards_locked()
+    /// joins guards_ one at a time, and an in-flight report on guard N+1 can still be
+    /// racing that join while guard N's teardown is offer()-ing its own final event),
+    /// so this executor must outlive every guards_ entry - reverse-declaration-order
+    /// destruction means a member declared here is destroyed AFTER guards_.
+    std::unique_ptr<GuardianLegacySinkExecutor> legacy_sink_executor_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported

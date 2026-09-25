@@ -364,7 +364,7 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     };
     auto fleet = []() { return DexFleet{}; };
     std::string requested_key;
-    DexRoutes::PerfFn perf = [&](const std::string& key) {
+    DexPerfFn perf = [&](const std::string& key) {
         requested_key = key;
         return two_cohorts(12, 4);
     };
@@ -372,7 +372,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("permitted: tab + devices drill render through the provider") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf");
         REQUIRE(tab);
         CHECK(tab->status == 200);
@@ -399,7 +402,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("an invalid ?key= falls back to the default, never reaches the provider") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf?key=not%20a%20valid%20key%21");
         REQUIRE(tab);
         CHECK(tab->status == 200);
@@ -409,7 +415,10 @@ TEST_CASE("perf routes: perm gating + provider degradation", "[dex][perf][routes
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto tab = sink.Get("/fragments/dex/perf");
         REQUIRE(tab);
         CHECK(tab->status == 403);
@@ -721,15 +730,14 @@ struct RestPerfHarness {
         std::shared_ptr<const yuzu::server::DexPerfApi> dex_perf_api_local;
         if (perf)
             dex_perf_api_local = std::make_shared<yuzu::server::test::FnDexPerfApi>(
-                perf, yuzu::server::AppPerfProviders{});
+                perf, yuzu::server::test::FnDexPerfApi::Providers{});
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
                             nullptr, nullptr, {}, {}, {}, std::move(perf),
                             /*network_api=*/nullptr, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
-                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
-                            /*app_perf_providers=*/{}, /*engine_principal_store=*/nullptr,
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{}, /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
                             /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
                             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, /*fleet_read_fn=*/{},
@@ -1079,14 +1087,16 @@ TEST_CASE("the route's valid_tag_key copy AGREES with TagStore::validate_key (C-
     auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
                      const std::string&) { return true; };
     std::string requested_key;
-    DexRoutes::PerfFn perf = [&](const std::string& key) {
+    DexPerfFn perf = [&](const std::string& key) {
         requested_key = key;
         return DexPerfSnapshot{};
     };
     yuzu::server::test::TestRouteSink sink;
     DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf, yuzu::server::test::FnDexPerfApi::Providers{});
     routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, {}, {},
-                           {}, perf);
+                           {}, {}, {}, dex_perf_api);
 
     struct Case {
         const char* raw;     // urlencoded query value
@@ -1275,12 +1285,15 @@ TEST_CASE("cohort_diff route: served comparison + perm gate + degraded provider"
         return false;
     };
     auto fleet = []() { return DexFleet{}; };
-    DexRoutes::PerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
+    DexPerfFn perf = [](const std::string&) { return diff_snap(12, 12); };
 
     SECTION("permitted: serves the A-vs-B comparison with a populated delta") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -1289,7 +1302,10 @@ TEST_CASE("cohort_diff route: served comparison + perm gate + degraded provider"
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, perf);
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, noPerm, nullptr, fleet, {}, {}, {}, {}, {},
+                               dex_perf_api);
         auto r = sink.Get("/fragments/dex/perf/cohort-diff?key=model&a=a&b=b");
         REQUIRE(r);
         CHECK(r->status == 403);

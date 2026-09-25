@@ -194,6 +194,18 @@ struct ApprovalQuery {
     std::string submitted_by;
 };
 
+/// `query_checked()`'s result: the matched rows plus whether the fixed LIST
+/// cap (approval_manager.cpp's `kApprovalListCap`, currently 100 — MUST stay
+/// equal to `query()`'s own hardcoded `LIMIT 100`, kept unmodified per this
+/// method's introducing PR's scope) actually dropped rows. Mirrors
+/// `ScheduleEngine::ScheduleListResult` (schedule_engine.hpp) — same #4030-
+/// programme rationale: a fleet with more matching approvals than the cap
+/// must not have its truncated response mistaken for the complete set.
+struct ApprovalListResult {
+    std::vector<Approval> approvals;
+    bool truncated{false};
+};
+
 /// Why a precondition-guarded consume did not consume (#2443). The caller needs
 /// these apart: a precondition denial must be reported to the operator as
 /// "state moved, mint a fresh ticket" with the ticket still recallable, whereas
@@ -414,6 +426,35 @@ public:
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
+    /// unhappy-path governance finding (#2146 A2-R4): neither GET
+    /// /api/v1/approvals nor MCP list_pending_approvals validated `status`
+    /// against this closed set before this fix -- an unrecognized value
+    /// (a typo, a case mismatch, or MCP's explicit `""`) flowed straight
+    /// into a SQL equality filter and silently produced a false-empty (or,
+    /// for `""`, a false-ALL-statuses) result instead of rejecting the
+    /// caller's malformed input. Mirrors ResponseStore::allowed_op_column()
+    /// and ScheduleEngine's group_by allow-list convention.
+    static const std::vector<std::string>& allowed_status();
+
+    /// query() with the store failure kept apart from a genuinely empty
+    /// result — the same rationale as get_checked (see its doc comment):
+    /// query() collapses "not open" / "pool exhausted" / "query failed"
+    /// into the SAME empty vector a real zero-match result returns, so a
+    /// caller polling "are there any approvals needing attention" (REST v1
+    /// `GET /api/v1/approvals`, MCP `list_pending_approvals`) cannot tell
+    /// "all clear" from "blind to a backlog because the store is down" — a
+    /// silent false-negative on exactly the signal a maker-checker workflow
+    /// depends on. Returns `StoreReadError` (not a bare optional/string) so
+    /// the caller can classify permanent-vs-transient via `sqlstate`, the
+    /// same shape `get_checked` already established in this class.
+    ///
+    /// `ApprovalListResult::truncated` is detected by querying one row PAST
+    /// the fixed cap (matches `ScheduleEngine::query_schedules_checked`'s
+    /// technique, schedule_engine.cpp) so a match count of EXACTLY the cap
+    /// is never misreported as truncated — the simpler "returned == limit"
+    /// heuristic false-positives at that boundary.
+    std::expected<ApprovalListResult, StoreReadError> query_checked(const ApprovalQuery& q = {}) const;
+
     /// Single-approval lookup by id (read-only). Two callers: the versioned
     /// GET /api/v1/approvals/{id} status_url target (query()'s LIMIT 100 would
     /// false-404 an id that has aged past the top window), and the MCP
@@ -445,6 +486,12 @@ public:
                                          const std::string& scope_expression) const;
 
     int pending_count() const;
+
+    /// pending_count() with the same store-failure/genuinely-empty
+    /// distinction as query_checked (see its doc comment) — pending_count()
+    /// returns 0 for "not open" / "pool exhausted" / "query failed",
+    /// identical to a real "zero pending approvals" state.
+    std::expected<int, StoreReadError> pending_count_checked() const;
 
     /// Count of PENDING approvals submitted by one principal. Backs the MCP
     /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does

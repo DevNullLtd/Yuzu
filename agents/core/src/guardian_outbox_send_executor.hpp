@@ -56,7 +56,8 @@
 #include "guardian_io_executor.hpp" // io_detail::spawn_detached
 #include "guardian_outbox.hpp"      // OutboxEntry, SendResult
 
-#include <yuzu/plugin.h> // YUZU_EXPORT
+#include <yuzu/log_token.hpp> // log_id_token
+#include <yuzu/plugin.h>      // YUZU_EXPORT
 
 #include <spdlog/spdlog.h> // #3953 items 1+2 - firewalled stall/orphan-exception logging
 
@@ -477,7 +478,7 @@ private:
         try {
             spdlog::warn("Guardian outbox send stalled past its threshold (event_id {}); "
                          "drain continues, the send stays running detached.",
-                         event_id);
+                         ::yuzu::log_id_token(event_id));
         } catch (...) {
         }
     }
@@ -485,7 +486,7 @@ private:
         try {
             spdlog::info("Guardian outbox send (event_id {}) completed after having "
                          "stalled past its threshold.",
-                         event_id);
+                         ::yuzu::log_id_token(event_id));
         } catch (...) {
         }
     }

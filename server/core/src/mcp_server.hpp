@@ -25,7 +25,6 @@
 // reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
@@ -58,10 +57,13 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
-#include "schedule_engine.hpp"
+#include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
+#include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
-#include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
+#include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
 // #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
 // TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -678,8 +680,8 @@ public:
     /// (never null) — each backing store pointer is checked individually
     /// inside the impl, matching the old per-lambda null-checks; the tools'
     /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
-    /// fire. Additive alongside `app_perf_providers` (still wired, still used
-    /// by the dashboard fragments) until every consumer migrates.
+    /// fire. `AppPerfProviders` (the pre-seam bundle) is retired (#4626) — the
+    /// dashboard fragments now route through this same seam too.
     void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
@@ -697,6 +699,59 @@ public:
     using DexVisibleFn =
         std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+
+    /// ADR-0031 WS-A4 (seventh family): the SAME in-process schedule-read API
+    /// seam the REST `GET /api/v1/schedules` handler and the dashboard
+    /// fragment (`GET /fragments/schedules`) use — server.cpp wires the
+    /// IDENTICAL instance so `list_schedules` can never disagree with either.
+    /// A SETTER, not a `build_handler` parameter (unlike `network_api`) —
+    /// mirrors `set_dex_perf_api` above: `build_handler`'s own
+    /// `ScheduleEngine* schedule_engine` parameter is now unused inside the
+    /// `list_schedules` handler body (superseded by this seam) but is kept,
+    /// unremoved, for constructor-signature stability — a bounded, two-site
+    /// ripple (the two `ScheduleEngine* schedule_engine` forwarding-overload
+    /// parameters in mcp_server.cpp that construct `build_handler`'s caller),
+    /// not an open-ended one; a disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `schedule` family row). Unset (default-constructed
+    /// null) ⇒ the tool's own `!schedule_api_`
+    /// readiness guard answers "Schedule engine unavailable", matching the
+    /// pre-seam `!schedule_engine` guard's behaviour exactly.
+    void set_schedule_api(std::shared_ptr<const ScheduleApi> a) { schedule_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
+    /// seam the REST `GET /api/v1/workflows[/{id}]` and
+    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
+    /// `get_workflow_execution` can never disagree with REST v1.
+    /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
+    /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
+    /// parameter is now unused inside these three tool bodies (superseded by
+    /// this seam) but is kept, unremoved, for constructor-signature
+    /// stability — a bounded, disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `workflow` family row). Unset (default-
+    /// constructed null) ⇒ the tools' own `!workflow_api_` readiness guard
+    /// answers "Workflow engine unavailable", matching the pre-seam
+    /// `!workflow_engine` guard's behaviour exactly.
+    void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
+    /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
+    /// server.cpp wires the IDENTICAL instance so the eight Guardian read
+    /// tools can never disagree with REST v1 (`get_guardian_schemas` stays
+    /// outside the seam, store-free — see guardian_api.hpp). `build_handler`'s
+    /// own `GuaranteedStateStore* guaranteed_state_store` parameter stays
+    /// wired too — the eight Guardian tool bodies below now call
+    /// `guardian_api_` exclusively for their reads, but the rule/baseline
+    /// MUTATOR tools (`create_guardian_rule` etc., no public seam of their
+    /// own) still need the raw store. server.cpp constructs this
+    /// UNCONDITIONALLY (never null) — each of the two backing store
+    /// pointers is checked INDIVIDUALLY inside the impl (guardian_api.cpp),
+    /// mirroring dex_perf_api's own multi-dependency posture: a null
+    /// `guaranteed_state_store_` degrades every method, a null
+    /// `baseline_store_` degrades ONLY device_compliance. The tools' own
+    /// `!guardian_api_` guard is therefore defense-in-depth only, matching
+    /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
+    void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -750,7 +805,6 @@ public:
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             yuzu::MetricsRegistry* metrics = nullptr,
-                            AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
                             TagPushFn tag_push_fn = {},
                             // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
@@ -956,7 +1010,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1048,7 +1101,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1151,6 +1203,12 @@ private:
     std::shared_ptr<const DexPerfApi> dex_perf_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
+    // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
+    std::shared_ptr<const ScheduleApi> schedule_api_;
+    // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
+    std::shared_ptr<const WorkflowApi> workflow_api_;
+    // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
+    std::shared_ptr<const GuardianApi> guardian_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "puppeteer": "^25.10.0"
+    "puppeteer": "^25.11.0"
   },
   "overrides": {
     "ws": "^8.20.1"

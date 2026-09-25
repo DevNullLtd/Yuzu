@@ -1743,3 +1743,130 @@ TEST_CASE("approval_store_error_body: a genuinely transient sqlstate still gets 
     CHECK(seen_message.find("temporarily") != std::string::npos);
     CHECK(seen_retry == 5000);
 }
+
+// ── query_checked / pending_count_checked (#2146 A2-R4) ────────────────────
+// query()/pending_count() collapse three degraded conditions -- store not
+// open, pool-lease timeout, query failure -- into the SAME empty vector / 0
+// a genuinely empty store returns. These checked twins must distinguish
+// them, mirroring get_checked's own established shape in this class.
+
+TEST_CASE("ApprovalManager: query_checked and pending_count_checked fail closed "
+          "when the store never opened",
+          "[pg][approval_manager][approval]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+
+    // Force a migration failure the same way test_schedule_engine.cpp's
+    // sibling "not open" test does: pre-seed the store's schema with a
+    // conflicting table so PgMigrationRunner cannot apply approval_manager's
+    // v1 DDL, leaving is_open() false.
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult s{PQexec(conn.get(), "CREATE SCHEMA approval_manager")};
+        REQUIRE(s.ok());
+        pg::PgResult t{PQexec(conn.get(), "CREATE TABLE approval_manager.bogus (x int)")};
+        REQUIRE(t.ok());
+    }
+
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApprovalManager mgr{pool};
+    CHECK_FALSE(mgr.is_open());
+
+    // The pre-existing unchecked methods collapse this into empty/0 -- pinned
+    // here only as the CONTRAST the checked twins below exist to fix.
+    CHECK(mgr.query().empty());
+    CHECK(mgr.pending_count() == 0);
+
+    auto list_checked = mgr.query_checked();
+    REQUIRE_FALSE(list_checked.has_value());
+    CHECK(list_checked.error().message.find("not open") != std::string::npos);
+
+    auto count_checked = mgr.pending_count_checked();
+    REQUIRE_FALSE(count_checked.has_value());
+    CHECK(count_checked.error().message.find("not open") != std::string::npos);
+}
+
+TEST_CASE("ApprovalManager: query_checked and pending_count_checked report a genuine "
+          "query failure, not a false empty result",
+          "[pg][approval_manager][approval]") {
+    // Same technique as "a store failure during the recheck is not reported
+    // as spent" above: drop the table out from under an OPEN store so the
+    // next query genuinely fails (PGRES_TUPLES_OK check fails), distinct
+    // from the "never migrated" (!open_) case pinned above.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    REQUIRE(mgr.is_open());
+
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto list_checked = mgr.query_checked();
+    REQUIRE_FALSE(list_checked.has_value());
+    CHECK(list_checked.error().message.find("read failed") != std::string::npos);
+    CHECK(!list_checked.error().sqlstate.empty());
+
+    auto count_checked = mgr.pending_count_checked();
+    REQUIRE_FALSE(count_checked.has_value());
+    CHECK(count_checked.error().message.find("read failed") != std::string::npos);
+    CHECK(!count_checked.error().sqlstate.empty());
+}
+
+TEST_CASE("ApprovalManager: query_checked happy path matches query()'s fields",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("def-checked", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    auto list_checked = mgr.query_checked();
+    REQUIRE(list_checked.has_value());
+    REQUIRE(list_checked->approvals.size() == 1);
+    CHECK(list_checked->approvals[0].id == *id);
+    CHECK(list_checked->approvals[0].definition_id == "def-checked");
+    CHECK_FALSE(list_checked->truncated);
+
+    auto count_checked = mgr.pending_count_checked();
+    REQUIRE(count_checked.has_value());
+    CHECK(*count_checked == 1);
+}
+
+TEST_CASE("ApprovalManager: query_checked at exactly the list cap is not misreported "
+          "as truncated (#2146 A2-R4 boundary)",
+          "[pg][approval_manager][approval]") {
+    // Mirrors ScheduleEngine::query_schedules_checked's identical boundary
+    // test (test_schedule_engine.cpp) -- the query-one-past-the-cap
+    // technique must not false-positive when the true count is EXACTLY the
+    // cap. seed_pending bypasses submit()'s own 1000-row cap so this stays a
+    // fast bulk INSERT.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    seed_pending(mgr_bundle.pool(), "cap-", 100, /*age_seconds=*/60);
+
+    auto list_checked = mgr.query_checked();
+    REQUIRE(list_checked.has_value());
+    CHECK(list_checked->approvals.size() == 100);
+    CHECK_FALSE(list_checked->truncated);
+}
+
+TEST_CASE("ApprovalManager: query_checked truncates and flags a queue one over "
+          "the list cap (#2146 A2-R4 boundary)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    seed_pending(mgr_bundle.pool(), "cap-", 101, /*age_seconds=*/60);
+
+    auto list_checked = mgr.query_checked();
+    REQUIRE(list_checked.has_value());
+    CHECK(list_checked->approvals.size() == 100);
+    CHECK(list_checked->truncated);
+}

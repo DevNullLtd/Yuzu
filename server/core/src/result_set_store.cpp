@@ -414,19 +414,17 @@ std::expected<std::optional<ResultSet>, ResultSetError> ResultSetStore::get(cons
     return std::optional<ResultSet>(read_row(res.get(), 0));
 }
 
-std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
-                                                     const std::string& cursor, int limit,
-                                                     std::string& out_next_cursor) {
-    out_next_cursor.clear();
-    std::vector<ResultSet> result;
+std::expected<ResultSetStore::ListPage, ResultSetError> ResultSetStore::list_by_owner_checked(
+    const std::string& owner, const std::string& cursor, int limit) {
     if (!open_)
-        return result;
+        return std::unexpected(ResultSetError::DbError);
     if (limit <= 0)
         limit = 50;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::list_by_owner: no connection ({})", pool_.last_error());
-        return result;
+        spdlog::error("ResultSetStore::list_by_owner_checked: no connection ({})",
+                      pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
 
     int64_t cur_lu = 0, cur_ca = 0;
@@ -451,34 +449,45 @@ std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::list_by_owner: query failed: {}",
+        spdlog::error("ResultSetStore::list_by_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));
-        return result;
+        return std::unexpected(ResultSetError::DbError);
     }
+    ListPage page;
     const int rows = PQntuples(res.get());
-    result.reserve(static_cast<std::size_t>(rows));
+    page.sets.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
-        result.push_back(read_row(res.get(), i));
+        page.sets.push_back(read_row(res.get(), i));
 
-    if (static_cast<int>(result.size()) > limit) {
-        result.resize(limit);
-        out_next_cursor = make_cursor(result.back());
+    if (static_cast<int>(page.sets.size()) > limit) {
+        page.sets.resize(limit);
+        page.next_cursor = make_cursor(page.sets.back());
     }
-    return result;
+    return page;
 }
 
-std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,
-                                                 int limit, std::string& out_next_cursor) {
-    out_next_cursor.clear();
-    std::vector<std::string> result;
+std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
+                                                     const std::string& cursor, int limit,
+                                                     std::string& out_next_cursor) {
+    auto r = list_by_owner_checked(owner, cursor, limit);
+    if (!r) {
+        out_next_cursor.clear();
+        return {};
+    }
+    out_next_cursor = r->next_cursor;
+    return std::move(r->sets);
+}
+
+std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
+    const std::string& id, const std::string& cursor, int limit) {
     if (!open_)
-        return result;
+        return std::unexpected(ResultSetError::DbError);
     if (limit <= 0)
         limit = 1000;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::members: no connection ({})", pool_.last_error());
-        return result;
+        spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
 
     // Keyset over device_id ASC.
@@ -495,35 +504,50 @@ std::vector<std::string> ResultSetStore::members(const std::string& id, const st
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::members: query failed: {}", PQerrorMessage(lease.get()));
-        return result;
+        spdlog::error("ResultSetStore::members_checked: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
     }
+    MembersPage page;
     const int rows = PQntuples(res.get());
-    result.reserve(static_cast<std::size_t>(rows));
+    page.device_ids.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
-        result.emplace_back(PQgetvalue(res.get(), i, 0));
+        page.device_ids.emplace_back(PQgetvalue(res.get(), i, 0));
 
-    if (static_cast<int>(result.size()) > limit) {
-        result.resize(limit);
-        out_next_cursor = result.back();
+    if (static_cast<int>(page.device_ids.size()) > limit) {
+        page.device_ids.resize(limit);
+        page.next_cursor = page.device_ids.back();
     }
-    return result;
+    return page;
 }
 
-std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const std::string& owner) {
-    std::vector<LineageNode> chain;
+std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,
+                                                 int limit, std::string& out_next_cursor) {
+    auto r = members_checked(id, cursor, limit);
+    if (!r) {
+        out_next_cursor.clear();
+        return {};
+    }
+    out_next_cursor = r->next_cursor;
+    return std::move(r->device_ids);
+}
+
+std::expected<std::vector<LineageNode>, ResultSetError> ResultSetStore::lineage_checked(
+    const std::string& id, const std::string& owner) {
     if (!open_)
-        return chain;
+        return std::unexpected(ResultSetError::DbError);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::lineage: no connection ({})", pool_.last_error());
-        return chain;
+        spdlog::error("ResultSetStore::lineage_checked: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
 
     // One logical operation, one lease (ADR-0012 §2(c)) — up to kLineageDepthCap
     // sequential hops on the same connection.
+    std::vector<LineageNode> chain;
     std::optional<std::string> cur = id;
     int depth = 0;
+    bool db_error = false;
     std::unordered_set<std::string> visited; // cycle guard (review finding J)
     while (cur && depth < kLineageDepthCap) {
         if (!visited.insert(*cur).second)
@@ -534,14 +558,22 @@ std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const st
             "FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
             std::vector<std::string>{*cur});
         if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ResultSetStore::lineage: query failed: {}", PQerrorMessage(lease.get()));
+            spdlog::error("ResultSetStore::lineage_checked: query failed: {}",
+                          PQerrorMessage(lease.get()));
+            // #4306 finding 3: a genuine mid-walk query failure is a DbError
+            // for the WHOLE call, not the partial chain accumulated so far —
+            // the pre-#4306 plain lineage() returned that partial chain,
+            // indistinguishable from a genuinely-short breadcrumb; see the
+            // header posture note on lineage()'s semantic shift.
+            db_error = true;
             break;
         }
         std::optional<std::string> next;
         if (PQntuples(res.get()) > 0) {
             // Owner-filter (review finding B2): stop at the first node not
             // owned by `owner` so a cross-operator ancestor's name/
-            // source_kind/device_count never reaches the caller.
+            // source_kind/device_count never reaches the caller. Normal
+            // termination, not a DbError — same as the cycle guard above.
             std::string node_owner = PQgetvalue(res.get(), 0, 5);
             if (node_owner != owner)
                 break;
@@ -557,9 +589,15 @@ std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const st
         cur = next;
         ++depth;
     }
+    if (db_error)
+        return std::unexpected(ResultSetError::DbError);
     // chain is leaf→root; reverse to root→leaf for breadcrumb display.
     std::reverse(chain.begin(), chain.end());
     return chain;
+}
+
+std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const std::string& owner) {
+    return lineage_checked(id, owner).value_or(std::vector<LineageNode>{});
 }
 
 std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& id,
@@ -646,23 +684,39 @@ ResultSetStore::resolve_alias(const std::string& owner, const std::string& name)
     return std::optional<std::string>(std::string(PQgetvalue(res.get(), 0, 0)));
 }
 
-int ResultSetStore::count_for_owner(const std::string& owner) {
+std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
+    const std::string& owner) {
     if (!open_)
-        return 0;
+        return std::unexpected(ResultSetError::DbError);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::count_for_owner: no connection ({})", pool_.last_error());
-        return 0;
+        spdlog::error("ResultSetStore::count_for_owner_checked: no connection ({})",
+                      pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
+    // #4306 fold-in A: predicate aligned with insert_row_impl's authoritative
+    // in-txn recheck (Gate 4 UP-6) -- expired-but-unswept rows do NOT count
+    // against the quota there, so a pre-check without this filter
+    // OVER-counts relative to the authoritative check and could reject a
+    // dispatch the authoritative check would have allowed (a stalled GC
+    // sweep converting GC debt into a spurious operator quota failure).
+    // Keeping the two predicates identical means this pre-check predicts the
+    // authoritative check exactly.
     pg::PgResult res = pg::exec_params(
-        lease.get(), "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1",
+        lease.get(),
+        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+        "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
         std::vector<std::string>{owner});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::count_for_owner: query failed: {}",
+        spdlog::error("ResultSetStore::count_for_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));
-        return 0;
+        return std::unexpected(ResultSetError::DbError);
     }
     return to_int(PQgetvalue(res.get(), 0, 0));
+}
+
+int ResultSetStore::count_for_owner(const std::string& owner) {
+    return count_for_owner_checked(owner).value_or(0);
 }
 
 int ResultSetStore::count_pinned_for_owner(const std::string& owner) {

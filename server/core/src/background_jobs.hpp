@@ -21,7 +21,8 @@
 ///                            event-outbox poll, ADR-2002 §5) are ReplicaSafe and
 ///                            must NEVER be leader-gated.
 ///   - FencedLeaderOnly     — side-effecting singleton work that double-fires
-///                            across replicas (agent dispatch, CRL numbering).
+///                            across replicas (agent dispatch, redundant CRL
+///                            re-publishes).
 ///                            Runs only on the WS-3 fenced leader; ENFORCEMENT is
 ///                            slice 10.3 (rides WS-3 3.2), not this file. ADDING a
 ///                            FencedLeaderOnly pass REQUIRES wrapping its dispatch
@@ -45,7 +46,8 @@
 /// the event-outbox poll, the three retention prunes, the app_perf rollup upsert,
 /// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-/// projector, MCP bridge sweep + session gc, store-worker delivery pools). This
+/// projector, MCP bridge sweep + session gc, store-worker delivery pools, the
+/// HA WS-8 Postgres reachability probe). This
 /// proves named⇒classified for those sites. It does NOT yet prove pass⇒named for
 /// every dispatch site — a consteval sweep visiting ALL of them is a tracked
 /// follow-up (#4094) — so completeness rests on THIS array plus the recorded
@@ -90,9 +92,10 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (43 passes). Verified against the source sweep
+/// The exhaustive inventory (44 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
-/// `gateway_route_store.reap_stale_routes`, 2026-09-11); keep the count
+/// `gateway_route_store.reap_stale_routes`, 2026-09-11, and the HA WS-8 addition
+/// of `pg_reachability_probe.tick`, 2026-09-24); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -180,7 +183,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,
-     "DB-WRITE: CRL row + crlNumber bump must be single-writer or numbering diverges (WS-6)"},
+     "DB-WRITE: freshness re-publish; numbering is safe on any replica (WS-6 6.1 table lock), gated only to avoid N redundant CRLs per stale tick"},
     {"registry.teardown_revoked_streams", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica: tears down only the Subscribe streams connected to THIS replica"},
     {"mcp_stream_bridge.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
@@ -225,6 +228,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "per-replica in-process: projects ExecutionEventBus progress/terminal frames to the MCP SSE listeners connected to THIS replica; MUST run per-replica; no shared state (terminals are durably re-fetchable)"},
     {"store_worker_pool.worker_loop", "StoreWorkerPool::workers_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-process delivery-queue drain (WebhookStore + OffloadTargetStore delivery_pool_): POSTs the events THIS replica enqueued via submit(); MUST run per-replica. CAVEAT/tracked: the pass itself is replica-local, but whether a given logical event is enqueued once-per-fleet or once-per-replica is an EMIT-SITE concern (verify webhook/offload emit sites are per-replica-origin before a 2nd replica, or a fleet-triggered emit double-delivers; tracked #4098)"},
+    {"pg_reachability_probe.tick", "PgReachabilityProbe::thread_", BackgroundJobClass::ReplicaSafe,
+     "HA WS-8 per-replica read-only probe (pg_is_in_recovery() / transaction_read_only on its own dedicated connection) feeding THIS replica's /readyz pg_reachable row; MUST run per-replica — each replica measures its OWN path to Postgres; never leader-gate (a follower would then report stale/unready and be evicted from the LB)"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site

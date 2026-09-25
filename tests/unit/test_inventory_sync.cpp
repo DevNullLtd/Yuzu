@@ -312,7 +312,7 @@ TEST_CASE("collect skips an empty inventory rather than wiping stored rows (UP-I
     // inventory and the server would record the wipe as a successful store. The
     // collector returns nullopt on an empty parse; here we assert the parse itself is
     // empty for the sentinel so the guard upstream fires.
-    auto e = parse_installed_apps_output("app|No applications found|-|-|-\n");
+    auto e = parse_installed_apps_output("app|No applications found|-|-|-|-|-\n");
     CHECK(e.empty());
 }
 
@@ -342,7 +342,8 @@ TEST_CASE("empty inventory parses to no entries and a stable empty hash",
           "[sync][parse]") {
     // A host with zero machine-scope apps must still hash-skip cleanly, not look
     // broken: empty list → empty canonical blob → the well-known SHA-256 of "".
-    auto e = parse_installed_apps_output("user_app|x|y|1|p|d\napp|No applications found|-|-|-\n");
+    auto e = parse_installed_apps_output(
+        "user_app|x|y|1|p|d\napp|No applications found|-|-|-|-|-\n");
     CHECK(e.empty());
     CHECK(installed_software_canonical_blob({}) == "");
     CHECK(sha256_hex("") ==

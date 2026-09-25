@@ -6,9 +6,12 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
+#include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
+#include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
 #include "scim_routes.hpp"
@@ -18,6 +21,7 @@
 #include <CLI/CLI.hpp>
 
 #include "server_ota_options.hpp"
+#include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -27,6 +31,7 @@
 #ifndef _WIN32
 #include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (#3007, mirrors the agent)
 #endif
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
 #include <atomic>
 #include <chrono>
@@ -283,6 +288,18 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // #4722: gRPC's ConfigVars snapshots GRPC_SSL_CIPHER_SUITES on first use;
+    // pin it before any gRPC symbol can run (unconditional overwrite — see
+    // tls_policy.hpp). ORDERING IS THE CONTRACT: no automated test observes
+    // this line (the test executable pins from its own static initialiser);
+    // moving it below the first gRPC call silently restores gRPC's default
+    // TLS 1.2 cipher list.
+    if (!yuzu::tls::pin_grpc_cipher_env()) {
+        std::cerr << "Failed to pin " << yuzu::tls::kGrpcCipherSuitesEnvVar
+                  << " in the process environment; refusing to start\n";
+        return EXIT_FAILURE;
+    }
+
     CLI::App app{"Yuzu Server", "yuzu-server"};
     app.set_version_flag("--version",
                          std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
@@ -313,6 +330,14 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
+                   "On shutdown, keep serving for at least this many seconds after /readyz "
+                   "starts answering 503, so a load balancer stops routing here before the "
+                   "listener closes (default 0; 0-60). Set it to at least the load balancer's "
+                   "health-check interval x unhealthy threshold, plus one interval.")
+        ->default_val(0)
+        ->check(CLI::Range(0, yuzu::server::shutdown_drain::kMaxShutdownDrainSeconds))
+        ->envname("YUZU_SHUTDOWN_DRAIN_SECONDS");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
@@ -397,6 +422,21 @@ int main(int argc, char* argv[]) {
     app.add_option("--gateway-command-addr", cfg.gateway_command_address,
                    "Gateway ManagementService address for command forwarding (host:port)")
         ->envname("YUZU_GATEWAY_COMMAND_ADDR");
+    // HA WS-4 4.3: raw entries, parsed+validated into cfg.gateway_cluster_addresses
+    // after CLI11_PARSE below (parse_gateway_cluster_addrs needs to reject a
+    // malformed entry with a CLI exit, not a lenient warning — see that
+    // function's doc comment, gateway_mgmt_stub_pool.hpp).
+    std::vector<std::string> gateway_cluster_addr_entries;
+    app.add_option("--gateway-cluster-addr", gateway_cluster_addr_entries,
+                   "Per-cluster gateway ManagementService address(es) for cross-cluster command "
+                   "fan-out, cluster_id=host:port (e.g. us-east=10.0.1.5:50063). Repeatable or "
+                   "comma-separated. Unset (default) = single-cluster mode: "
+                   "--gateway-command-addr alone is used for every cluster_id. Per-cluster "
+                   "routing only -- trust-zone isolation between clusters is not yet provided "
+                   "(#4669); do not rely on this to keep one cluster's gateway from being able "
+                   "to answer for an agent on another cluster.")
+        ->delimiter(',')
+        ->envname("YUZU_GATEWAY_CLUSTER_ADDR");
     app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
                    "Multi-egress NAT/proxy CIDR(s) (e.g. 203.0.113.0/24,2001:db8::/32). A direct "
                    "agent whose Register and Subscribe source IPs both fall in one range is "
@@ -1053,13 +1093,19 @@ int main(int argc, char* argv[]) {
     // through without re-prompting. The helper itself doesn't log on
     // every skip (too noisy), so we surface it once at startup so the
     // operator sees the disabled state in journald and an auditor
-    // reading the boot log can spot a misconfigured deployment.
+    // reading the boot log can spot a misconfigured deployment. The JIT
+    // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
+    // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
+    // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
-            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
-            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
-            "(default 300) to re-enable.",
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
+            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
+            "and the elevation-eligibility routes), which still require an MFA-enrolled "
+            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
+            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
+            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
+            "to re-enable.",
             cfg.mfa_step_up_window_secs);
     }
 
@@ -1087,6 +1133,20 @@ int main(int argc, char* argv[]) {
         cfg.csp_extra_sources = std::move(*validated);
     } else {
         std::cerr << "Invalid --csp-extra-sources: " << validated.error() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    // ── Validate --gateway-cluster-addr (HA WS-4 4.3) ──
+    // A malformed/duplicate entry here is a routing-correctness defect, not
+    // an advisory allowlist like --trusted-nat-cidr's own lenient parse —
+    // fail the CLI outright rather than silently dropping or half-applying
+    // an entry (Fable pre-implementation review, 4.3 plan).
+    if (auto parsed = yuzu::server::parse_gateway_cluster_addrs(
+            gateway_cluster_addr_entries, yuzu::server::detail::kMaxClusterIdLen);
+        parsed.has_value()) {
+        cfg.gateway_cluster_addresses = std::move(*parsed);
+    } else {
+        std::cerr << "Invalid --gateway-cluster-addr: " << parsed.error() << "\n";
         return EXIT_FAILURE;
     }
 
@@ -1176,6 +1236,42 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── Multi-host Postgres DSN guard (HA WS-8) ──
+    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
+    // pool's connections on a standby, and /readyz cannot see them all. Add
+    // read-write when the attribute is absent; refuse a weaker explicit value, and
+    // refuse load_balance_hosts. Done after logging is configured (so the line
+    // reaches --log-file and --log-format json) and before the auth bootstrap
+    // pool and Server::create, so every connection — both pools, the leader
+    // elector and the readiness probe — uses the same normalised DSN. See
+    // pg/multi_host_dsn.hpp.
+    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
+        guarded.has_value()) {
+        if (guarded->appended)
+            spdlog::warn("Postgres connection names {} hosts{} without target_session_attrs; "
+                         "using target_session_attrs=read-write so the server only connects to "
+                         "a writable primary (set it explicitly to silence this)",
+                         guarded->hosts,
+                         guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "");
+        cfg.postgres_dsn = std::move(guarded->dsn);
+    } else {
+        spdlog::critical("Invalid --postgres-dsn: {}", guarded.error());
+        return EXIT_FAILURE;
+    }
+
+    // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
+    // Refuse to start rather than silently serve on an OpenSSL build where our
+    // allow-list resolves to zero usable TLS 1.2 ciphers.
+    {
+        const auto tls_policy = yuzu::tls::resolve_cipher_policy();
+        if (!tls_policy) {
+            spdlog::critical("{}", yuzu::tls::describe_cipher_policy_error(tls_policy.error()));
+            return EXIT_FAILURE;
+        }
+        for (const auto& line : yuzu::tls::tls_policy_report_lines(*tls_policy))
+            spdlog::info("{}", line);
+    }
 
     // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
     // Disabling client certificate verification requires BOTH a CLI flag AND
@@ -1302,6 +1398,25 @@ int main(int argc, char* argv[]) {
             spdlog::error("Cannot connect to PostgreSQL for auth store bootstrap: {}",
                           auth_pg_pool->last_error());
             return EXIT_FAILURE;
+        }
+        // HA WS-8: the multi-host guard above sees only the DSN and PG* env; a
+        // service file (service= / PGSERVICE) is applied by libpq at connect time.
+        // Check what libpq actually resolved on a live connection, and refuse to
+        // start on load_balance_hosts or a host list without read-write (Gate 8
+        // round 7). libpq re-reads a service file on every connect; the readiness
+        // probe repeats this check on each connection IT makes, so a later edit
+        // shows on /readyz only at the probe's next reconnect (contract residual
+        // (2), pg_reachability_probe.hpp) — restart the server after editing it.
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot connect to PostgreSQL to check the connection settings");
+                return EXIT_FAILURE;
+            }
+            if (auto ok = yuzu::server::pg::check_effective_connection(lease.get()); !ok) {
+                spdlog::critical("Invalid Postgres connection settings: {}", ok.error());
+                return EXIT_FAILURE;
+            }
         }
         const std::filesystem::path key_dir =
             cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;

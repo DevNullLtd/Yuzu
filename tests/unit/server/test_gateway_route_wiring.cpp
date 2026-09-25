@@ -36,6 +36,7 @@
 
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "gateway_route_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -45,6 +46,8 @@
 #include <yuzu/server/auto_approve.hpp>
 
 #include "../test_helpers.hpp"
+
+#include <algorithm>
 
 #include <libpq-fe.h>
 
@@ -445,6 +448,127 @@ TEST_CASE("ProxyRegister: presenting a TOMBSTONED session (the agent disconnecte
     REQUIRE((*row)->lease_until_ms.has_value()); // re-armed with a fresh lease
 }
 
+TEST_CASE("#4669: a CLEAN-DEREGISTER tombstone's home_cluster_id survives reclaim, and a "
+          "reclaimed session presenting a DIFFERENT cluster is still refused — the priority "
+          "item Gate 2 security-guardian asked to convert from code-reading to a test",
+          "[pg][gateway_route_wiring][affinity]") {
+    // security-guardian's Gate 2 review verified BY READING CODE that
+    // reclaim_tombstoned_session never touches home_cluster_id, so the SAME
+    // affinity guard covers a reclaimed session too — but flagged that no
+    // test chained deregister -> reclaim -> mismatched-cluster-announce
+    // end-to-end. This test is that chain.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string session_id = "gw-session-4669-reclaim-clean";
+    REQUIRE(store.register_fresh("agent-4669-reclaim-clean", session_id).has_value());
+    auto bind = store.announce_connected("agent-4669-reclaim-clean", session_id, "cluster-real",
+                                         "node-real", 90);
+    REQUIRE(bind.has_value());
+    CHECK(bind->matched);
+    CHECK_FALSE(bind->cluster_affinity_violation);
+
+    // Clean deregister — a real DISCONNECTED, not a reap sweep.
+    REQUIRE(store.deregister("agent-4669-reclaim-clean", session_id).has_value());
+    auto tombstoned = store.lookup_route("agent-4669-reclaim-clean");
+    REQUIRE(tombstoned.has_value());
+    REQUIRE(tombstoned->has_value());
+    CHECK_FALSE((*tombstoned)->session_id.has_value()); // confirmed tombstoned
+    REQUIRE((*tombstoned)->home_cluster_id.has_value()); // #4669: survives a CLEAN deregister
+    CHECK(*(*tombstoned)->home_cluster_id == "cluster-real");
+
+    // Reclaim via a fresh replica's ProxyRegister replay presenting the SAME
+    // (now-tombstoned) session — the pre-existing, already-tested reclaim
+    // mechanism. This does NOT touch home_cluster_id (verified by reading
+    // gateway_route_store.cpp's reclaim SQL — it sets only session_id/
+    // lease_until/updated_at/connection_epoch).
+    LiveGatewayWiringHarness h(store);
+    auto resp = h.register_agent("agent-4669-reclaim-clean", session_id);
+    REQUIRE(resp.accepted());
+    CHECK(resp.session_id() == session_id);
+
+    auto reclaimed = store.lookup_route("agent-4669-reclaim-clean");
+    REQUIRE(reclaimed.has_value());
+    REQUIRE(reclaimed->has_value());
+    REQUIRE((*reclaimed)->home_cluster_id.has_value()); // survived the reclaim too
+    CHECK(*(*reclaimed)->home_cluster_id == "cluster-real");
+
+    // The reclaimed session now announces from a DIFFERENT cluster — a
+    // rogue that won the session-identity race (the pre-existing, accepted
+    // register_fresh/reclaim weakness) still cannot move this agent's
+    // affinity, because home_cluster_id survived intact through the whole
+    // deregister->reclaim chain.
+    auto rogue = store.announce_connected("agent-4669-reclaim-clean", session_id, "cluster-rogue",
+                                          "node-rogue", 90);
+    REQUIRE(rogue.has_value());
+    CHECK_FALSE(rogue->matched);
+    CHECK(rogue->cluster_affinity_violation);
+
+    auto final_row = store.lookup_route("agent-4669-reclaim-clean");
+    REQUIRE(final_row.has_value());
+    REQUIRE(final_row->has_value());
+    CHECK(*(*final_row)->home_cluster_id == "cluster-real"); // untouched by the rogue's attempt
+}
+
+TEST_CASE("#4669: a REAP-SWEEP-origin tombstone clears home_cluster_id, so a reclaimed session "
+          "correctly TOFU-rebinds to whatever cluster next announces — the same 'genuine "
+          "staleness' re-home path the design accepts, reached via reclaim rather than a fresh "
+          "register_fresh, distinguishing it from the clean-deregister case above",
+          "[pg][gateway_route_wiring][affinity]") {
+    // Unhappy-path UP-3 (Gate 4): reclaim_tombstoned_session's protection is
+    // ORIGIN-DEPENDENT — a clean deregister leaves home_cluster_id intact
+    // (test above), but a reap-sweep tombstone clears it (reap_stale_routes'
+    // sweep (a) NULLs home_cluster_id alongside the rest, per its own
+    // header comment). This is INTENDED: a reap-origin tombstone requires
+    // genuine unreachability for the full grace window, matching the
+    // design's own accepted "genuine staleness" re-home trigger — this test
+    // documents that the SAME acceptance applies whether the next binder
+    // arrives via a fresh register_fresh OR a reclaim of the (now
+    // unprotected) tombstoned session_id.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string session_id = "gw-session-4669-reclaim-reap";
+    REQUIRE(store.register_fresh("agent-4669-reclaim-reap", session_id).has_value());
+    REQUIRE(store.announce_connected("agent-4669-reclaim-reap", session_id, "cluster-real",
+                                     "node-real", 90)
+                .has_value());
+
+    // Simulate the reaper's expired-lease sweep tombstoning the row
+    // out-of-band (mirroring the existing "mem-vs-store-tombstone" test's
+    // pattern of calling deregister directly to simulate the reaper —
+    // reap_stale_routes' sweep (a) UPDATE and deregister's tombstone SET
+    // clause differ only in that (a) ALSO NULLs home_cluster_id).
+    REQUIRE(store.deregister("agent-4669-reclaim-reap", session_id).has_value());
+    REQUIRE(store.clear_cluster_affinity("agent-4669-reclaim-reap").has_value());
+    auto tombstoned = store.lookup_route("agent-4669-reclaim-reap");
+    REQUIRE(tombstoned.has_value());
+    REQUIRE(tombstoned->has_value());
+    CHECK_FALSE((*tombstoned)->home_cluster_id.has_value()); // reap-origin: cleared
+
+    LiveGatewayWiringHarness h(store);
+    auto resp = h.register_agent("agent-4669-reclaim-reap", session_id);
+    REQUIRE(resp.accepted());
+
+    // Whichever cluster next legitimately announces for this reclaimed
+    // session TOFU-rebinds — by design, matching the accepted re-home path.
+    auto rebind = store.announce_connected("agent-4669-reclaim-reap", session_id, "cluster-new",
+                                           "node-new", 90);
+    REQUIRE(rebind.has_value());
+    CHECK(rebind->matched);
+    CHECK_FALSE(rebind->cluster_affinity_violation);
+
+    auto final_row = store.lookup_route("agent-4669-reclaim-reap");
+    REQUIRE(final_row.has_value());
+    REQUIRE(final_row->has_value());
+    REQUIRE((*final_row)->home_cluster_id.has_value());
+    CHECK(*(*final_row)->home_cluster_id == "cluster-new"); // TOFU-bound to the new claimant
+}
+
 TEST_CASE("ProxyRegister: the STORE governs even when the session is KNOWN IN MEMORY — a "
           "tombstoned-out-from-under-it row still gets reclaimed (HA WS-4 4.4 round-2 review "
           "fix F1: a >270s gateway-uplink partition, core itself never restarted)",
@@ -830,6 +954,476 @@ TEST_CASE("NotifyStreamStatus: CONNECTED fills cluster_id/gateway_node for the m
     CHECK((*row)->lease_until_ms.has_value()); // announce_connected sets the lease
 }
 
+// ── #4669: agent<->cluster affinity (WS-9-style scenario) ──────────────────
+
+TEST_CASE("NotifyStreamStatus: a CONNECTED claiming a DIFFERENT cluster than the agent's "
+          "durably-bound home affinity is REFUSED outright — #4669, closes the "
+          "'rogue cluster claims an agent already live elsewhere' shape (the issue's own "
+          "acceptance-criteria scenario)",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // The agent is live on the REAL cluster ("cluster-x") — a normal
+    // ProxyRegister + CONNECTED, binding the agent's home affinity.
+    auto req1 = make_gw_register(auth_mgr, "agent-hijack-1");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string real_session = resp1.session_id();
+
+    gw::StreamStatusNotification real_notif;
+    real_notif.set_agent_id("agent-hijack-1");
+    real_notif.set_session_id(real_session);
+    real_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    real_notif.set_cluster_id("cluster-x");
+    real_notif.set_gateway_node("node-real");
+    gw::StreamStatusAck real_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &real_notif, &real_ack).ok());
+    REQUIRE(real_ack.acknowledged());
+
+    // A SECOND gateway process calls ProxyRegister for the SAME
+    // already-approved agent_id — no per-agent secret required (the issue's
+    // finding), and no presented x-yuzu-session-id (context=nullptr means
+    // the "fresh" register_fresh branch, which unconditionally wins the
+    // epoch race — a pre-existing, accepted weakness #4669 does not attempt
+    // to close by itself). It then tries to CONFIRM its own, different
+    // cluster.
+    auto req2 = make_gw_register(auth_mgr, "agent-hijack-1");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string rogue_session = resp2.session_id();
+    REQUIRE(rogue_session != real_session);
+
+    gw::StreamStatusNotification rogue_notif;
+    rogue_notif.set_agent_id("agent-hijack-1");
+    rogue_notif.set_session_id(rogue_session);
+    rogue_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    rogue_notif.set_cluster_id("cluster-rogue");
+    rogue_notif.set_gateway_node("node-rogue");
+    rogue_notif.add_wire_capabilities("rogue-cap");
+    rogue_notif.set_stream_home_id("home-rogue");
+    gw::StreamStatusAck rogue_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &rogue_notif, &rogue_ack).ok());
+
+    // THE MITIGATION: refused outright, not silently re-homed.
+    CHECK_FALSE(rogue_ack.acknowledged());
+
+    // The durable row: session_id reflects register_fresh's own
+    // unconditional epoch win (pre-existing, undisputed by this fix) but
+    // cluster_id was NEVER confirmed for the rogue (still NULL — register_
+    // fresh nulled it, and the refused announce_connected never wrote it),
+    // and home_cluster_id is UNCHANGED.
+    auto row = store.lookup_route("agent-hijack-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == rogue_session);
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x");
+
+    // The PRIMARY dispatch path (AgentRegistry::set_gateway_route ->
+    // AgentSession::cluster_id, read by send_to/send_to_all) was ALSO never
+    // published for the rogue session — proven via the stream_home_id/
+    // wire-capability accessors (the only publicly-observable fields
+    // set_gateway_route writes): if set_gateway_route had been called with
+    // the rogue's payload, gateway_stream_home_id would read back
+    // "home-rogue" and the wire capability "rogue-cap" would be present.
+    // Neither happened — the #4669 reorder (announce_connected gates
+    // set_gateway_route) closed the split this fix exists to prevent.
+    auto rogue_home = registry.gateway_stream_home_id("agent-hijack-1", rogue_session);
+    REQUIRE(rogue_home.has_value()); // the session IS installed (register_fresh always wins)
+    CHECK(rogue_home->empty());      // but set_gateway_route was never called for it
+    CHECK_FALSE(registry.gateway_has_wire_capability("agent-hijack-1", "rogue-cap"));
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}})
+              .value() == 1);
+
+    // The REAL agent's own later reconnect self-heals: a fresh
+    // register_fresh always wins the epoch race, and its CONNECTED presents
+    // the matching cluster.
+    auto req3 = make_gw_register(auth_mgr, "agent-hijack-1");
+    apb::RegisterResponse resp3;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req3, &resp3).ok());
+    const std::string real_session2 = resp3.session_id();
+
+    gw::StreamStatusNotification real_notif2;
+    real_notif2.set_agent_id("agent-hijack-1");
+    real_notif2.set_session_id(real_session2);
+    real_notif2.set_event(gw::StreamStatusNotification::CONNECTED);
+    real_notif2.set_cluster_id("cluster-x");
+    real_notif2.set_gateway_node("node-real-2");
+    gw::StreamStatusAck real_ack2;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &real_notif2, &real_ack2).ok());
+    CHECK(real_ack2.acknowledged());
+
+    auto row2 = store.lookup_route("agent-hijack-1");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    REQUIRE((*row2)->cluster_id.has_value());
+    CHECK(*(*row2)->cluster_id == "cluster-x");
+}
+
+TEST_CASE("a rogue's ORIGINAL still-live session resending CONNECTED after the round-1 "
+          "soft-tombstone sweep orphans its session_id is STILL refused — #4669 pr-rev round 2 "
+          "(FortitudeEtc/Codex+Kimi, CRITICAL, empirically reproduced twice independently)",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // 1. The real agent binds cluster-x — an ordinary ProxyRegister + CONNECTED.
+    auto req1 = make_gw_register(auth_mgr, "agent-orv2-1");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string real_session = resp1.session_id();
+
+    gw::StreamStatusNotification real_notif;
+    real_notif.set_agent_id("agent-orv2-1");
+    real_notif.set_session_id(real_session);
+    real_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    real_notif.set_cluster_id("cluster-x");
+    real_notif.set_gateway_node("node-real");
+    gw::StreamStatusAck real_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &real_notif, &real_ack).ok());
+    REQUIRE(real_ack.acknowledged());
+
+    // 2. A rogue's ProxyRegister unconditionally wins the epoch race (pre-existing,
+    // accepted weakness), installing its OWN session in gateway_sessions_. Its
+    // first CONNECTED, claiming a different cluster, is correctly refused
+    // (the round-1 mechanism this test does not re-litigate) — but the rogue's
+    // session stays live: nothing invalidates a gateway_sessions_ entry merely
+    // because a CONNECTED for it was refused.
+    auto req2 = make_gw_register(auth_mgr, "agent-orv2-1");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string rogue_session = resp2.session_id();
+    REQUIRE(rogue_session != real_session);
+
+    gw::StreamStatusNotification rogue_notif1;
+    rogue_notif1.set_agent_id("agent-orv2-1");
+    rogue_notif1.set_session_id(rogue_session);
+    rogue_notif1.set_event(gw::StreamStatusNotification::CONNECTED);
+    rogue_notif1.set_cluster_id("cluster-y");
+    rogue_notif1.set_gateway_node("node-rogue");
+    gw::StreamStatusAck rogue_ack1;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &rogue_notif1, &rogue_ack1).ok());
+    REQUIRE_FALSE(rogue_ack1.acknowledged());
+
+    auto row_before_reap = store.lookup_route("agent-orv2-1");
+    REQUIRE(row_before_reap.has_value());
+    REQUIRE(row_before_reap->has_value());
+    CHECK((*row_before_reap)->session_id == rogue_session);
+    REQUIRE((*row_before_reap)->home_cluster_id.has_value());
+    CHECK(*(*row_before_reap)->home_cluster_id == "cluster-x");
+
+    // 3. Age the row past the tombstone-purge age and reap. The round-1 fix's
+    // soft-tombstone sweep (b') fires: session_id/cluster_id/gateway_node/
+    // stream_home_id -> NULL, but home_cluster_id is PRESERVED (this is the
+    // round-1 fix working exactly as designed).
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* p1 = "agent-orv2-1";
+        const char* params[1] = {p1};
+        pg::PgResult r{PQexecParams(conn.get(),
+                                    "UPDATE gateway_route_store.agent_routes SET "
+                                    "  updated_at = now() - interval '400 seconds' "
+                                    "WHERE agent_id=$1",
+                                    1, nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    auto reap_out = store.reap_stale_routes();
+    REQUIRE(reap_out.has_value());
+    CHECK(reap_out->tombstones_reaped == 0); // NOT hard-deleted (round-1 fix)
+    CHECK(reap_out->affinity_preserved_soft_tombstones == 1);
+
+    auto row_after_reap = store.lookup_route("agent-orv2-1");
+    REQUIRE(row_after_reap.has_value());
+    REQUIRE(row_after_reap->has_value());
+    CHECK_FALSE((*row_after_reap)->session_id.has_value());
+    REQUIRE((*row_after_reap)->home_cluster_id.has_value());
+    CHECK(*(*row_after_reap)->home_cluster_id == "cluster-x"); // preserved, as designed
+
+    // 4. THE ATTACK: the rogue's ORIGINAL session (still live in this
+    // replica's gateway_sessions_ — never invalidated by the earlier refusal)
+    // resends CONNECTED, still claiming cluster-y. Before the round-2 fix,
+    // both affinity probes matched only `session_id=$2` exactly, which the
+    // now-NULL durable session_id could never satisfy, so this fell through
+    // to an ordinary, unaudited session_mismatch and the rogue's cluster was
+    // published to the in-memory dispatch route regardless.
+    gw::StreamStatusNotification rogue_notif2;
+    rogue_notif2.set_agent_id("agent-orv2-1");
+    rogue_notif2.set_session_id(rogue_session);
+    rogue_notif2.set_event(gw::StreamStatusNotification::CONNECTED);
+    rogue_notif2.set_cluster_id("cluster-y");
+    rogue_notif2.set_gateway_node("node-rogue-2");
+    rogue_notif2.add_wire_capabilities("rogue-cap-2");
+    rogue_notif2.set_stream_home_id("home-rogue-2");
+    gw::StreamStatusAck rogue_ack2;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &rogue_notif2, &rogue_ack2).ok());
+
+    // THE FIX: still refused, not silently re-homed.
+    CHECK_FALSE(rogue_ack2.acknowledged());
+
+    // The in-memory dispatch route was never published for the rogue's resend.
+    auto rogue_home = registry.gateway_stream_home_id("agent-orv2-1", rogue_session);
+    REQUIRE(rogue_home.has_value()); // the session IS still installed
+    CHECK(rogue_home->empty());      // but set_gateway_route was never called for this resend
+    CHECK_FALSE(registry.gateway_has_wire_capability("agent-orv2-1", "rogue-cap-2"));
+
+    // The durable row's affinity is untouched.
+    auto row_final = store.lookup_route("agent-orv2-1");
+    REQUIRE(row_final.has_value());
+    REQUIRE(row_final->has_value());
+    REQUIRE((*row_final)->home_cluster_id.has_value());
+    CHECK(*(*row_final)->home_cluster_id == "cluster-x");
+
+    // Classified as a real affinity violation (caught by the PRE-CHECK this
+    // time, not the write-time branch — same op/outcome label either way,
+    // per gateway_service_impl.cpp's own comment on why they share one
+    // label), not folded into the benign session_mismatch bucket. Two
+    // increments total across this test: the rogue's FIRST CONNECTED
+    // (session-matched violation) and this resend (session-orphaned
+    // violation, the fix this test exists for).
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}})
+              .value() == 2);
+
+    // The real cluster can still reconnect successfully afterwards.
+    auto req3 = make_gw_register(auth_mgr, "agent-orv2-1");
+    apb::RegisterResponse resp3;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req3, &resp3).ok());
+    const std::string real_session2 = resp3.session_id();
+
+    gw::StreamStatusNotification real_notif2;
+    real_notif2.set_agent_id("agent-orv2-1");
+    real_notif2.set_session_id(real_session2);
+    real_notif2.set_event(gw::StreamStatusNotification::CONNECTED);
+    real_notif2.set_cluster_id("cluster-x");
+    real_notif2.set_gateway_node("node-real-2");
+    gw::StreamStatusAck real_ack2;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &real_notif2, &real_ack2).ok());
+    CHECK(real_ack2.acknowledged());
+}
+
+TEST_CASE("AgentRegistry::unpublish_gateway_route reverts exactly what set_gateway_route just "
+          "published for a matching session (#4669 pr-rev Blocker 2, the write-time-violation "
+          "revert this method exists for)",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-unpublish-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session = resp.session_id();
+
+    // A legitimate CONNECTED publishes gateway_node/wire_capabilities/
+    // stream_home_id/cluster_id in-memory via set_gateway_route — the exact
+    // publish unpublish_gateway_route must be able to revert.
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-unpublish-1");
+    notif.set_session_id(session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-x");
+    notif.set_gateway_node("node-x");
+    notif.add_wire_capabilities("cap-x");
+    notif.set_stream_home_id("home-x");
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    REQUIRE(ack.acknowledged());
+
+    // Sanity: the publish actually landed before we revert it.
+    auto home_before = registry.gateway_stream_home_id("agent-unpublish-1", session);
+    REQUIRE(home_before.has_value());
+    CHECK(*home_before == "home-x");
+    CHECK(registry.gateway_has_wire_capability("agent-unpublish-1", "cap-x"));
+
+    // THE METHOD UNDER TEST: revert it, simulating what NotifyStreamStatus's
+    // write-time cluster_affinity_violation branch does after
+    // set_gateway_route already ran but announce_connected's own guarded
+    // write definitively refused the claim.
+    CHECK(registry.unpublish_gateway_route("agent-unpublish-1", session));
+
+    auto home_after = registry.gateway_stream_home_id("agent-unpublish-1", session);
+    REQUIRE(home_after.has_value()); // session still matches — just unstamped
+    CHECK(home_after->empty());
+    CHECK_FALSE(registry.gateway_has_wire_capability("agent-unpublish-1", "cap-x"));
+
+    // A SECOND call for the SAME still-installed session is a harmless,
+    // idempotent no-op — still `true` (the session_id match is what the
+    // return value reports, not whether there was anything left to clear),
+    // not an error, not a crash.
+    CHECK(registry.unpublish_gateway_route("agent-unpublish-1", session));
+
+    // A session_id that does not match the currently-installed one (a
+    // superseded/foreign session) is refused — reverting it would silently
+    // tear down a DIFFERENT, possibly newer, live publish.
+    CHECK_FALSE(registry.unpublish_gateway_route("agent-unpublish-1", "some-other-session"));
+
+    // An unknown agent_id is refused the same way — nothing to revert.
+    CHECK_FALSE(registry.unpublish_gateway_route("agent-never-registered", session));
+}
+
+TEST_CASE("#4669: a refused cross-cluster claim emits an audited gateway.cluster_affinity_"
+          "violation row with the correct principal/target/detail — Gate 4 consistency-auditor "
+          "SHOULD: the new AuditEvent construction was previously exercised by no test at all "
+          "(audit_store_ stayed nullptr in the hijack-scenario test)",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+    gateway_svc.set_audit_store(&audit);
+
+    auto req1 = make_gw_register(auth_mgr, "agent-audit-1");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string real_session = resp1.session_id();
+
+    gw::StreamStatusNotification real_notif;
+    real_notif.set_agent_id("agent-audit-1");
+    real_notif.set_session_id(real_session);
+    real_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    real_notif.set_cluster_id("cluster-audit-real");
+    real_notif.set_gateway_node("node-real");
+    gw::StreamStatusAck real_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &real_notif, &real_ack).ok());
+    REQUIRE(real_ack.acknowledged());
+
+    // The pre-check catches this (the common case): a same-session CONNECTED
+    // claiming a different cluster, refused BEFORE set_gateway_route.
+    gw::StreamStatusNotification rogue_notif;
+    rogue_notif.set_agent_id("agent-audit-1");
+    rogue_notif.set_session_id(real_session);
+    rogue_notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    rogue_notif.set_cluster_id("cluster-audit-rogue");
+    rogue_notif.set_gateway_node("node-rogue");
+    gw::StreamStatusAck rogue_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &rogue_notif, &rogue_ack).ok());
+    CHECK_FALSE(rogue_ack.acknowledged());
+
+    auto rows = audit.query({});
+    REQUIRE(rows.has_value());
+    auto matching = std::ranges::count_if(*rows, [](const auto& r) {
+        return r.action == "gateway.cluster_affinity_violation";
+    });
+    REQUIRE(matching == 1); // exactly one violation audited for this one refusal
+
+    auto it = std::ranges::find_if(*rows, [](const auto& r) {
+        return r.action == "gateway.cluster_affinity_violation";
+    });
+    REQUIRE(it != rows->end());
+    CHECK(it->principal == "gateway_cluster:cluster-audit-rogue");
+    CHECK(it->principal_role == "gateway");
+    CHECK(it->target_type == "agent");
+    CHECK(it->target_id == "agent-audit-1");
+    CHECK(it->result == "failure");
+    CHECK(it->detail.find("session=" + real_session) != std::string::npos);
+    CHECK(it->detail.find("claimed_cluster_id=cluster-audit-rogue") != std::string::npos);
+    CHECK(it->detail.find("detected_at=pre_check") != std::string::npos);
+}
+
+TEST_CASE("NotifyStreamStatus: single-gateway/non-multi-cluster deployments are unaffected by "
+          "the #4669 affinity guard — the SAME stable cluster_id across repeated reconnects "
+          "keeps succeeding",
+          "[pg][gateway_route_wiring][affinity]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // A single-cluster-mode gateway build announces the SAME literal
+    // cluster_id ("default", per YUZU_GW_CLUSTER_ID's own default) on every
+    // connection — ADR-2002 §7d.
+    for (int i = 0; i < 3; ++i) {
+        auto req = make_gw_register(auth_mgr, "agent-single-gw-1");
+        apb::RegisterResponse resp;
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        const std::string session_id = resp.session_id();
+
+        gw::StreamStatusNotification notif;
+        notif.set_agent_id("agent-single-gw-1");
+        notif.set_session_id(session_id);
+        notif.set_event(gw::StreamStatusNotification::CONNECTED);
+        notif.set_cluster_id("default");
+        notif.set_gateway_node("node-" + std::to_string(i));
+        gw::StreamStatusAck ack;
+        REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+        CHECK(ack.acknowledged());
+
+        auto row = store.lookup_route("agent-single-gw-1");
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        REQUIRE((*row)->cluster_id.has_value());
+        CHECK(*(*row)->cluster_id == "default");
+
+        // A clean DISCONNECTED between reconnects, mirroring an ordinary
+        // agent restart cycle.
+        gw::StreamStatusNotification dnotif;
+        dnotif.set_agent_id("agent-single-gw-1");
+        dnotif.set_session_id(session_id);
+        dnotif.set_event(gw::StreamStatusNotification::DISCONNECTED);
+        gw::StreamStatusAck dack;
+        REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &dnotif, &dack).ok());
+    }
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}})
+              .value() == 0);
+}
+
 TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the matching "
           "session — a stale/superseded session does not tear it down",
           "[pg][gateway_route_wiring]") {
@@ -1049,12 +1643,17 @@ TEST_CASE("NotifyStreamStatus #4324: a stale DISCONNECTED from a torn-down home 
     REQUIRE(resp2.session_id() == session1); // reused, not a fresh mint
 
     // 4. CONNECTED under home2 — the SAME session_id, a NEW home. This is the
-    // real re-home: same session, new stream_home_id.
+    // real re-home: same session, new stream_home_id. cluster_id stays
+    // "cluster-a" (the SAME cluster as step 2) — a live circuit-recovery
+    // reconnect is agent-pinned to its zone's cluster (ADR-2002 §7) and
+    // never legitimately crosses clusters under a REUSED session_id; #4669's
+    // affinity guard would (correctly) refuse a same-session cluster CHANGE,
+    // which is not what THIS scenario (the stream_home_id fence) is testing.
     gw::StreamStatusNotification connected2;
     connected2.set_agent_id(agent_id);
     connected2.set_session_id(session1);
     connected2.set_event(gw::StreamStatusNotification::CONNECTED);
-    connected2.set_cluster_id("cluster-b");
+    connected2.set_cluster_id("cluster-a");
     connected2.set_gateway_node("node-b");
     connected2.set_stream_home_id("home-2");
     gw::StreamStatusAck ack2;

@@ -17,8 +17,9 @@
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
-#include "schedule_engine.hpp"
+#include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): ScheduleApi — replaces a direct ScheduleEngine reach
 #include "tag_store.hpp"
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the read triad
 #include "workflow_engine.hpp"
 
 #include <httplib.h>
@@ -145,9 +146,44 @@ public:
         AuditFn audit_fn;
         EmitEventFn emit_fn;
         ScopeEstimateFn scope_fn;
+        /// Kept for the legacy unversioned GET/mutator routes above (`GET
+        /// /api/workflows[/{id}]`, `GET /api/workflow-executions/{id}`,
+        /// `POST /api/workflows`, `DELETE /api/workflows/{id}`,
+        /// `POST /api/workflows/{id}/execute`) and the ProductPackStore
+        /// install/uninstall fan-out (`make_item_delete_fn`) — none of these
+        /// has a public REST v1/MCP twin of its own, so they are deliberately
+        /// OUTSIDE the `WorkflowApi` seam below (mirrors the `schedule`
+        /// family's own legacy-mutator carve-out). The three READ routes that
+        /// DO have a public twin (`GET /api/v1/workflows[/{id}]`,
+        /// `GET /api/v1/workflow-executions/{id}`) route through
+        /// `workflow_api` instead, below.
         WorkflowEngine* workflow_engine{nullptr};
         ExecutionTracker* execution_tracker{nullptr};
-        ScheduleEngine* schedule_engine{nullptr};
+        /// ADR-0031 WS-A4 (eighth family): the workflow-read seam — replaces
+        /// a direct `WorkflowEngine*` reach for `GET /api/v1/workflows`,
+        /// `GET /api/v1/workflows/{id}` and `GET /api/v1/workflow-executions/
+        /// {id}` (the seamed read triad; the legacy unversioned GET routes
+        /// and every mutator above keep their own `WorkflowEngine*` wiring,
+        /// unaffected by this seam). Unwired (default-constructed null
+        /// `shared_ptr`) ⇒ each of the three v1 routes answers its own
+        /// pre-seam "workflow engine not available" 503 exactly, since
+        /// `workflow_api` is constructed if-and-only-if `workflow_engine_`
+        /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for
+        /// the full carve-out list.
+        std::shared_ptr<const WorkflowApi> workflow_api;
+        /// ADR-0031 WS-A4 (seventh family): the schedule-read seam — replaces
+        /// a direct `ScheduleEngine*` reach for `GET /fragments/schedules` /
+        /// `GET /api/v1/schedules` (the seamed read triad; the unversioned
+        /// legacy `/api/schedules` mutators in `schedule_routes.cpp` are a
+        /// separate, untouched capability and keep their own `ScheduleEngine*`
+        /// wiring, unaffected by this seam). Unwired (default-constructed
+        /// null `shared_ptr`) ⇒ each route answers its OWN pre-seam
+        /// `!schedule_engine` behaviour exactly, and the two differ: the
+        /// fragment answers 200 with `<div class="empty-state">Not
+        /// available</div>`, while REST v1 answers 503 (adversarial-review-kimi
+        /// round: this comment previously said "both routes answer 503",
+        /// which was never true of the fragment).
+        std::shared_ptr<const ScheduleApi> schedule_api;
         ProductPackStore* product_pack_store{nullptr};
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};

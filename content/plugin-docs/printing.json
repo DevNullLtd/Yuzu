@@ -1,6 +1,32 @@
 {
   "actions": [
     {
+      "action": "clear_queue",
+      "definition_ids": [
+        "crossplatform.printing.clear_queue"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "measured in a Debian/Ubuntu cupsd container: container root/@SYSTEM (SystemGroup root lpadmin) cancelling another user's job succeeds (status 0x0000, I93-7) — but the production Linux agent runs unprivileged (docs/agent-privilege-model.md), never root or @SYSTEM, so an ordinary non-owning cancel is correctly refused (403) before Cancel-Job is ever reached; reliable only for a job the agent's own identity owns",
+          "mechanism": "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "PROVISIONAL — cupsd.conf Cancel-Job policy requires @OWNER/@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by cupsd, authorisation outcome for a non-owned job UNMEASURED",
+          "mechanism": "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see docs/agent-privilege-model.md",
+          "mechanism": "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
       "action": "jobs",
       "definition_ids": [
         "crossplatform.printing.jobs"
@@ -58,11 +84,31 @@
   ],
   "definitions": [
     {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Cancels EXACTLY ONE queued print job, identified by printer and job id (both required). This is a state-changing, Destructive+Irreversible action requiring role-gated approval — there is no purge-all/cancel-all path. On Windows, uses SetJobW(JOB_CONTROL_CANCEL); the spooler itself looks the job up on the named printer. On macOS/Linux, over the CUPS Unix domain socket with Authorization: PeerCred (it refuses, and never falls back to TCP, when no socket is found), the agent first lists the named printer's not-completed jobs and only then sends an IPP Cancel-Job request (cupsd's Cancel-Job ignores the printer, so the job must be proven to be on it first).",
+      "display_name": "Cancel Print Job",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "crossplatform.printing.clear_queue",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
       "approval_mode": "auto",
       "author_roles": [
         "content-author"
       ],
-      "description": "Lists queued print jobs, optionally filtered to one printer: printer, job id, owner, document name, status, submission time (ISO-8601 UTC), and size in bytes. The document field is the job's user-supplied title/filename — it is treated as instruction-result user content (server instruction-result retention only; never forwarded to daily-sync, TAR, or DEX). It exists so an operator can identify individual jobs — a focused follow-up PR adds a clear_queue action that targets one job by this id.",
+      "description": "Lists queued print jobs, optionally filtered to one printer: printer, job id, owner, document name, status, submission time (ISO-8601 UTC), and size in bytes. The document field is the job's user-supplied title/filename — it is treated as instruction-result user content (server instruction-result retention only; never forwarded to daily-sync, TAR, or DEX). It exists so an operator can identify which job a subsequent clear_queue call should target.",
       "display_name": "List Print Jobs",
       "execute_roles": [
         "endpoint-admin",
@@ -100,9 +146,32 @@
       ]
     }
   ],
-  "description": "Printer and print-job inventory",
-  "how_it_works": "`printers` and `jobs` are plain IPP reads: encode a request (RFC 8010, no libcups — `printing_ipp.hpp` is a from-scratch minimal codec), send it over the CUPS Unix domain socket (falling back to `localhost:631` over TCP when no socket is found), decode the response, and format the rows. On Windows the same two actions go through winspool (`EnumPrintersW`/`EnumJobsW`) instead of IPP; there is no libcups dependency on any platform. The plugin keeps no history: `jobs` only ever reports not-completed jobs, and nothing here retains a record of a job once it leaves the queue. A focused follow-up PR on top of this one adds `clear_queue`, the plugin's only mutation.",
+  "description": "Printer/job inventory plus a single narrowly-scoped clear_queue cancellation",
+  "how_it_works": "`printers` and `jobs` are plain IPP reads: encode a request (RFC 8010, no libcups — `printing_ipp.hpp` is a from-scratch minimal codec), send it over the CUPS Unix domain socket (falling back to `localhost:631` over TCP when no socket is found), decode the response, and format the rows. On Windows the same two actions go through winspool (`EnumPrintersW`/`EnumJobsW`) instead of IPP; there is no libcups dependency on any platform. The plugin keeps no history: `jobs` only ever reports not-completed jobs, and nothing here retains a record of a job once it leaves the queue. `clear_queue` is the plugin's only mutation — it cancels exactly one job id (`SetJobW(JOB_CONTROL_CANCEL)` on Windows, IPP `Cancel-Job` over the same CUPS Unix socket on macOS/Linux), never a purge-all; a human resubmitting the document from their own application is the real-world path back, not a Yuzu dispatch. The named `printer` must hold the job, on every OS. Windows: the spooler itself looks the job up on that printer. macOS/Linux: cupsd's own `Cancel-Job` looks a job up by id alone and ignores the printer, so a nonexistent printer name with a valid id would otherwise cancel that job and report success; the agent therefore first lists the named printer's not-completed jobs and sends `Cancel-Job` only for an id that is on that list and whose own printer URI names that printer (compared case-insensitively, as cupsd resolves names); a job that is listed with no printer URI to confirm its printer is reported as an `error` and never cancelled. The check and the cancel are two requests, so a job that its owner or an administrator moves to another queue in between is still cancelled by id.",
   "inputs": [
+    {
+      "constraints": {
+        "maxLength": 256,
+        "minLength": 1
+      },
+      "default": null,
+      "definition_id": "crossplatform.printing.clear_queue",
+      "description": "The printer's name, as shown by `printers`. The job must be on this printer: a job id that belongs to a different printer, or a printer that does not exist, is reported as not_found and nothing is cancelled. On macOS/Linux the destination URI that `jobs` prints (`ipp://localhost:631/printers/NAME`) is also accepted, a job submitted to a printer class is addressed by the class name, and a name over 127 bytes, containing control characters, or not valid UTF-8 (for example a pasted `%FF`) is refused (invalid_printer), as is, on Windows, a name containing a comma, a control character or invalid UTF-8. macOS/Linux match the name case-insensitively, as cupsd does.",
+      "name": "printer",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[1-9][0-9]{0,8}$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.printing.clear_queue",
+      "description": "The job identifier to cancel, from the jobs action's job_id column.",
+      "name": "job_id",
+      "required": true,
+      "type": "string"
+    },
     {
       "constraints": {
         "maxLength": 256
@@ -116,14 +185,67 @@
     }
   ],
   "kind": {
-    "collector": true,
+    "collector": false,
     "gathered": true,
-    "mutating": false
+    "mutating": true
   },
-  "leg_hash": "8aea1a515344",
+  "leg_hash": "a6ac30dd4945",
   "manifest_version": 1,
   "name": "printing",
   "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The printer the target job was on (its name; on macOS/Linux a pasted destination URI is reduced to the name), or \"-\" when the param itself was missing or invalid.",
+          "example": "Office-LaserJet",
+          "name": "printer",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The job id targeted, or 0 when the param itself was missing/invalid.",
+          "example": "42",
+          "name": "job_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Values: canceled, not_found, refused, error. `canceled` means the spooler/cupsd ACCEPTED the cancel request, not that the job has already left the queue: an actively printing job can take a moment to clear, so confirm with `jobs`.",
+          "example": "canceled",
+          "name": "outcome",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "\"-\" on a successful cancel; otherwise a <os>:<source>:<detail> failure token, or missing_printer/invalid_job_id/invalid_printer for a parameter validation failure.",
+          "example": "-",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.printing.clear_queue"
+    },
     {
       "columns": [
         {
@@ -139,7 +261,7 @@
           "values": null
         },
         {
-          "description": "Job identifier. Values: 1 or greater.",
+          "description": "Job identifier — the value clear_queue's job_id parameter targets. Values: 1 or greater.",
           "example": "42",
           "name": "job_id",
           "platforms": [
@@ -303,7 +425,7 @@
       "definition_id": "crossplatform.printing.printers"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `<kind>|none` when the read succeeded but nothing was found (an honest empty result, never conflated with a read failure). A field the platform mechanism did not report is `-` for a string field or `-1` for a count/size the mechanism could not determine.",
+  "outputs_note": "Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `<kind>|none` when the read succeeded but nothing was found (an honest empty result, never conflated with a read failure); a read that could not be made at all is a `<kind>|unavailable|<token>` row, with the token as in the status table below. A field the platform mechanism did not report is `-` for a string field or `-1` for a count/size the mechanism could not determine.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -311,9 +433,9 @@
   },
   "privileges": [
     {
-      "grant": "None — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
-      "if_refused": "n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error",
-      "measured": "the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`)",
+      "grant": "None for reads — `EnumPrintersW`/`EnumJobsW`/`OpenPrinterW` need no elevated right (measured under admin and `SYSTEM` only). `clear_queue` opens the printer with `PRINTER_ACCESS_USE`; cancel was measured only under Administrators and `SYSTEM` (both already elevated), and a least-privileged identity cancelling any job (its own or another user's) is **not** measured — see `docs/agent-privilege-model.md`. `EnumPrintersW` (the only call at risk of blocking against an unreachable network print server — `PRINTER_ENUM_CONNECTIONS`) is bounded (`yuzu::shared::bounded_call`, 5s); the per-printer `OpenPrinterW`/`EnumJobsW` pair is deliberately NOT — bounding a call holding a live `HANDLE` the caller closes on return would race a timed-out detached thread against that close (see `enum_jobs_raw`'s own comment) — `EnumJobsW` instead caps at 5000 rows, not wall-clock time; a genuinely unreachable per-printer RPC can still hang (tracked as a follow-up, not closed here)",
+      "if_refused": "n/a — reads do not fail closed; a win32 failure or bounded-call timeout on `EnumPrintersW` reports `CONSTRAINED`, never a permission error. `clear_queue` is different: `ERROR_ACCESS_DENIED` from `OpenPrinterW` or `SetJobW` reports `PERMISSION_DENIED` (`refused`)",
+      "measured": "the-rig, `SYSTEM`, 2026-09-08 (`docs/samples/windows.txt`); `SYSTEM` and the admin SSH identity (reads and `clear_queue` cancel)",
       "os": "Windows",
       "runs_as": "agent service account"
     },
@@ -338,13 +460,31 @@
       "completeness": "full",
       "provenance": "(empty)",
       "status": "`OK`",
-      "when": "every platform: a successful read, populated or genuinely empty"
+      "when": "every platform: a successful read, or `clear_queue` cancelling the job"
     },
     {
       "completeness": "partial",
-      "provenance": "`windows:winspool:enum_printers_failed` / `windows:winspool:open_printer_failed` / `windows:winspool:enum_jobs_failed` — `\"CUPS-Get-Printers: transport failed\"` / `linux:cups:connect_failed` / `macos:cups:connect_failed` — `\"CUPS-Get-Printers: response did not decode\"` / `linux:cups:decode_failed` / `macos:cups:decode_failed` — `\"Get-Jobs: transport failed\"` / `\"Get-Jobs: response did not decode\"` — `\"CUPS-Get-Printers: unexpected status 0x⟨hex⟩\"` / `\"Get-Jobs: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
+      "provenance": "`windows:winspool:enum_printers_failed` / `windows:winspool:open_printer_failed` / `windows:winspool:enum_jobs_failed` — `\"CUPS-Get-Printers: transport failed\"` / `linux:cups:connect_failed` / `macos:cups:connect_failed` — `\"CUPS-Get-Printers: response did not decode\"` / `linux:cups:decode_failed` / `macos:cups:decode_failed` — `\"Get-Jobs: transport failed\"` / `\"Get-Jobs: response did not decode\"` — `\"CUPS-Get-Printers: unexpected status 0x⟨hex⟩\"` / `\"Get-Jobs: unexpected status 0x⟨hex⟩\"` / `\"Get-Jobs: printer name too long\"` (`invalid_printer`) / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
       "status": "`CONSTRAINED`",
-      "when": "Windows `printers`: `EnumPrintersW` failed or timed out (a bounded call — see Privileges and prerequisites). Windows `jobs`: the same `EnumPrintersW` failure, OR a specific printer's queue could not be opened (`OpenPrinterW` denied — NOT a bounded call), or its `EnumJobsW` read failed or was truncated at the row cap (also NOT a bounded call — see Privileges and prerequisites for why) — each is a per-printer skip, surfaced as `CONSTRAINED`/`PARTIAL` alongside whatever rows did succeed, never silently. macOS/Linux `printers`/`jobs`: the IPP round trip failed at the transport/decode step, or cupsd returned a status outside the successful range (RFC 8010 `0x0000`–`0x00FF`) — e.g. an unrecognised printer-uri, never silently read as zero rows"
+      "when": "Windows `printers`: `EnumPrintersW` failed or timed out (a bounded call — see Privileges and prerequisites). Windows `jobs`: the same `EnumPrintersW` failure, OR a specific printer's queue could not be opened (`OpenPrinterW` denied — NOT a bounded call), or its `EnumJobsW` read failed or was truncated at the row cap (also NOT a bounded call — see Privileges and prerequisites for why) — each is a per-printer skip, surfaced as `CONSTRAINED`/`PARTIAL` alongside whatever rows did succeed, never silently. macOS/Linux `printers`/`jobs`: the IPP round trip failed at the transport/decode step, or cupsd returned a status outside the successful range (RFC 8010 `0x0000`–`0x00FF`) — e.g. an unrecognised printer-uri, never silently read as zero rows. macOS/Linux `jobs` given a `printer` too long to encode into a request (the definition caps it at 256 bytes; only a dispatch that skipped that validation can exceed the IPP length limit of about 64 KiB) sends nothing and reports `job|unavailable|invalid_printer`"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`missing_printer` / `invalid_job_id` / `invalid_printer` — `windows:winspool:open_printer_failed` / `windows:winspool:printer_not_found` (names with a path separator or colon) / `windows:winspool:job_not_found` / `windows:winspool:set_job_failed` — `linux:cups:connect_failed` / `macos:cups:connect_failed` — `linux:cups:decode_failed` / `macos:cups:decode_failed` — `linux:cups:no_identity` / `macos:cups:no_identity` — `\"Get-Jobs: unexpected status 0x⟨hex⟩\"` / `\"Cancel-Job: unexpected status 0x⟨hex⟩\"` / `linux:cups:unexpected_status` / `macos:cups:unexpected_status`",
+      "status": "`UNAVAILABLE`",
+      "when": "`clear_queue` parameter validation failed (`printer` empty — `missing_printer`; `job_id` unparseable — `invalid_job_id`; or `printer` not usable — `invalid_printer`, shown as `-`: on macOS/Linux over 127 bytes, containing a control character, or not valid UTF-8 (for example a pasted `%FF`); on Windows containing a comma, a control character or invalid UTF-8 — a fully-refused request: nothing is sent to cupsd or the spooler), or the cancel itself could not complete: Windows `OpenPrinterW` failed for a reason other than not-found or access-denied (spooler stopped, RPC unavailable — the Win32 error is in the status detail, which the agent records in its log rather than sending on the wire); Windows reported a nonexistent job (`GetJobW`, or `SetJobW` if the job finished in between — `ERROR_INVALID_PARAMETER`), which is `PARTIAL` rather than `FULL` because that code was measured only under elevated identities; Windows `OpenPrinterW` returned `ERROR_INVALID_PRINTER_NAME` for a name containing a path separator or colon (`\\\\server\\queue`, the `//server/queue` form the `printers`/`jobs` rows render, `http://…`), which the OS also returns for an unreachable server, so it is reported as `printer_not_found` but not as definitive; macOS/Linux could not resolve the agent's effective-user identity (an `error`, not a denial: the request is not sent and cupsd is never asked); or `SetJobW` failed for a reason other than access-denied or a vanished job (the Win32 error is in the status detail, which the agent records in its log rather than sending on the wire); macOS/Linux the pre-cancel `Get-Jobs` or the `Cancel-Job` round trip failed at the transport/decode step, or cupsd returned a status this plugin doesn't otherwise classify for either request, or the pre-cancel `Get-Jobs` lists the job without a printer URI that confirms which printer it is on (reported with `unexpected_status`; nothing is cancelled)"
+    },
+    {
+      "completeness": "full",
+      "provenance": "`windows:winspool:printer_not_found` (plain local names) — `linux:cups:not_found` / `macos:cups:not_found`",
+      "status": "`UNAVAILABLE`",
+      "when": "`clear_queue`: the target printer does not exist, or the job is not on it — Windows `OpenPrinterW` (`ERROR_INVALID_PRINTER_NAME`) for a plain local printer name (no path separator or colon); macOS/Linux: the named printer does not exist (cupsd answers the pre-cancel `Get-Jobs` with `client-error-not-found`, IPP `0x0406`), or the job is not on that printer's not-completed queue (including a job that was already cancelled or completed), or cupsd's own `0x0406` from `Cancel-Job`"
+    },
+    {
+      "completeness": "full",
+      "provenance": "`linux:cups:socket_unavailable` / `macos:cups:socket_unavailable` — `windows:winspool:access_denied` — `linux:cups:access_denied` / `macos:cups:access_denied`",
+      "status": "`PERMISSION_DENIED`",
+      "when": "`clear_queue` refused before or after attempting the cancel: macOS/Linux found no CUPS Unix socket at all (refuses outright rather than falling back to the `localhost:631` TCP path `printers`/`jobs` use for reads — a mutating action never takes that fallback); or the cancel (or, on macOS/Linux, the pre-cancel `Get-Jobs`) was refused for lack of authorization — Windows `OpenPrinterW` or `SetJobW` returned `ERROR_ACCESS_DENIED`, macOS/Linux cupsd's HTTP layer (401/403) or IPP response (`client-error-forbidden`/`not-authenticated`/`not-authorized`, `0x0401`/`0x0402`/`0x0403`) refused the caller. A `client-error-bad-request` (`0x0400`) is a protocol fault, not an authorization decision, and surfaces as `unexpected_status` — see Privileges and prerequisites for who is actually authorized to cancel whose job on each platform"
     }
   ],
   "samples": {
@@ -381,12 +521,22 @@
             "job|ipp://localhost:631/printers/yuzu_test|1|-|-|pending|2026-09-14T17:27:40Z|1024"
           ],
           "truncated": false
+        },
+        {
+          "action": "clear_queue",
+          "not_captured": "Destructive/Irreversible: mutating action, not executed in a docs capture",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-14",
         "host_class": "container",
-        "leg_hash": "8aea1a515344",
+        "leg_hash": "a6ac30dd4945",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -425,12 +575,22 @@
             "job|none"
           ],
           "truncated": false
+        },
+        {
+          "action": "clear_queue",
+          "not_captured": "Destructive/Irreversible: mutating action, not executed in a docs capture",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-14",
         "host_class": "bare-metal",
-        "leg_hash": "8aea1a515344",
+        "leg_hash": "a6ac30dd4945",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -472,12 +632,22 @@
             "job|none"
           ],
           "truncated": false
+        },
+        {
+          "action": "clear_queue",
+          "not_captured": "Destructive/Irreversible: mutating action, not executed in a docs capture",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-08",
         "host_class": "bare-metal",
-        "leg_hash": "8aea1a515344",
+        "leg_hash": "a6ac30dd4945",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
@@ -502,6 +672,15 @@
       "operation": "Read",
       "risk_tier": "Low",
       "securable": "Inventory"
+    },
+    {
+      "action": "clear_queue",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
     }
   ],
   "source": {
@@ -509,7 +688,8 @@
       "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp"
     ],
     "changelog": [
-      "changelog.d/wave9-pr91b-printing.added.md"
+      "changelog.d/wave9-pr91b-printing.added.md",
+      "changelog.d/wave9-pr91b2-printing-clear-queue.added.md"
     ],
     "definitions": [
       "content/definitions/printing.yaml"
@@ -521,6 +701,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/unit/server/test_printing_clear_queue_gate.cpp",
       "tests/unit/test_printing_local_dispatcher.cpp",
       "tests/unit/test_printing_parsers.cpp"
     ]

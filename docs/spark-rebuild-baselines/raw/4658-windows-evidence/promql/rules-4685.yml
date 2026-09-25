@@ -1,0 +1,16 @@
+groups:
+- name: g9-4685
+  rules:
+  # Expressions exactly as published in the docs/spark-flip-gate.md section 5 entry for #4685.
+  - alert: StuckUnsupportedFile
+    expr: |
+      yuzu_fleet_spark_unsupported{os="windows",mechanism="file"} > 0
+        and on(os, instance)
+      (yuzu_fleet_spark_reporting{os="windows"}
+        - on(os, instance) yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} == 0)
+  - alert: StuckUnsupportedRegistry
+    expr: |
+      yuzu_fleet_spark_unsupported{os="windows",mechanism="registry"} > 0
+        and on(os, instance)
+      (yuzu_fleet_spark_reporting{os="windows"}
+        - on(os, instance) yuzu_fleet_spark_mechanisms{os="windows",mechanism="registry"} == 0)

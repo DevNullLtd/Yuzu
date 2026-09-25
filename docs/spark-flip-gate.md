@@ -1552,11 +1552,150 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Compensating control: the server-authored `Guardian T_server` line (neutralised on the server) is
   the authoritative half of the join; no shipped consumer reads agent-log lines; the operator manual
   (`docs/user-manual/server-admin.md`, Upgrade Notes) states which lines print ids as authored.
-- Owner: the author of the PR-5 (F14 flip) change.
-- Milestone: #4665 itself; it blocks criterion-10 sign-off and the F14 flip, whichever comes first.
-- Revisit trigger: the earlier of #4606 closing or the F14 flip PR opening, with a backstop review
-  date of 2026-10-31. **Not risk-accepted** - #4665 is a real, filed, open decision and remains a gating
-  item for the flip; this entry records the exposure and the compensating control only.
+- **CONFIRMED and FIXED, branch `feat/4665-log-injection-neutralisation` (starting `2ef5b8d3c`;
+  not yet merged to `dev` as of this entry).** The fix went through three further rounds after
+  its initial 10 commits (`2ef5b8d3c`..`ebb6600db`) landed: doc corrections (`a3388bf1a`), an
+  `/adversarial-review` (Kimi + Codex) fix round (`1ecfa6899`) that found and closed a real,
+  previously-unwrapped forgery sink in `guard_registry.cpp`'s registry assertion values
+  (`cfg_.expected`/`detected`, CDX-01/K5), and a full `/governance` 8-gate run afterward that
+  found and closed two more sibling-field misses (`guard_registry.cpp`'s `cfg_.value_type`,
+  `guaranteed_state_store.cpp`'s `agent_id`) plus a server-side push-builder gap: a legacy
+  non-conforming `rule_id` was excluded from `apply_rules()`'s validation reach but NOT from
+  `guardian_push_builder.cpp::build_agent_push`, so a single such row could wedge whole-push
+  delivery to every agent in its scope with no server-side signal — now filtered out at the
+  builder (`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), matching the
+  existing depth-guard exclusion pattern. `common/include/yuzu/log_token.hpp`
+  gained `log_key_token()` (a path/service-name/
+  registry-key/free-text neutraliser for a `'...'`-quoted log fragment - preserves spaces and
+  non-ASCII bytes, unlike the pre-existing `log_id_token()`) and `is_valid_rule_id()` (the shared
+  REST/MCP/agent-ingest validation predicate: non-empty, `[A-Za-z0-9._-]+`, <= 256 bytes). Every raw
+  rule_id/key/path/hive/service-name/unit-name print site across the Guardian/Spark subsystem is now
+  wrapped - the legacy file, registry and service guards; `SparkEngine`; the Guardian engine's arm,
+  baseline and rule-parsing messages; the Spark runtime's own watched-key lines; the server's
+  Guardian push enforce-downgrade warning; and the event store's own error lines - closing every
+  category the operator manual referenced by the Compensating control field above used to list as
+  still printing raw (`docs/user-manual/server-admin.md`'s Upgrade Notes, updated in the same
+  series). `GuardianEngine::apply_rules()` now pre-validates every `rule_id` in a push and rejects the WHOLE push on the first
+  invalid id, rather than silently dropping just that one rule while still advancing the generation.
+  REST `POST /api/v1/guaranteed-state/rules` and MCP `create_guardian_rule` now enforce
+  `is_valid_rule_id()` at create (400/error + an audit row on reject, previously empty-only and
+  REST didn't audit the reject at all), with real JSON-Schema `pattern`/`maxLength` constraints, not
+  prose alone. A separate, more subtle vulnerability the same review surfaced was closed alongside
+  it: the R5.7 driver's (`fullsync_blackout_diag.py`) six evidence regexes used unanchored
+  `.search()`, so a forged benchmark line embedded inside an unrelated log statement's free-text
+  field (no newline needed) could be extracted as real evidence - all anchored to `.match()` now. A
+  new regression-net tripwire (`tests/test_guardian_spark_log_injection_tripwire.py`) fails the
+  build on any future unwrapped `spdlog::` call in this subsystem; it found 7 real sites the manual
+  sweep missed on its first run, now also fixed. Windows-only code verified on real MSVC 19.44. No
+  stored-data migration needed (fresh-build-only fleet; confirmed no production fleet exists yet).
+  **A fourth round followed PR #4979's collaborator adversarial review (fjarvis, Codex+Kimi-K3
+  panel, 2026-09-25):** a real BLOCKING finding — the push-builder exclusion fix from the third
+  round, combined with `full_sync`'s unconditional teardown-and-rebuild-from-the-push semantics,
+  meant a previously-armed legacy non-conforming rule was silently and permanently DISARMED on the
+  next `full_sync`, not "frozen at its last-applied state" as that round's own doc text claimed
+  (Codex empirically observed `full_sync cleared N prior rule(s)` on this exact path). Operator
+  decision (Dave, mid-review): accept this as a deliberate **hard cutover**, not a migration — no
+  preserve-and-re-arm mechanism was built. `docs/user-manual/upgrading.md` and
+  `docs/user-manual/guaranteed-state.md` rewritten to state the true disarm behaviour and its
+  pre-upgrade detection query honestly, and `apply_rules()`'s full_sync sweep now logs the
+  disarm-in-progress explicitly (`Guardian: full_sync is disarming N rule(s)...`) rather than
+  silently. Two further non-blocking findings from the same review also fixed: `guardian_routes.cpp`'s
+  `note_platform_matrix_stale` used the weaker `log_safe()` helper (control-bytes-only) on a
+  `k=v`-shaped line, missing the same same-line field-forgery threat this whole issue exists to
+  close — switched to `audit_token()` (folds space/`=`/`,` too); and `guardian_engine.cpp`'s "failed
+  spark validation" diagnostic printed `rule.spark().type()` (and, via `assertion.error()`, three
+  more operator-authored fields from `guardian_spark_bridge.hpp`'s own error strings) raw — now
+  wrapped at the sink with one `log_key_token()` call covering all four producers.
+- Owner: fixed ahead of PR-5 by the author of the #4665 fix series, not deferred to the PR-5 (F14
+  flip) author as this entry originally assumed.
+- Milestone: #4665 itself - fix landed on `feat/4665-log-injection-neutralisation`; merge to `dev`
+  still pending as of this entry.
+- Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer blocked
+  by this entry once the branch above merges.
+
+**#4685** (Guardian: Unsupported rules not re-reconciled after a File/Registry episode, #4658)
+- Detection signal: none dedicated. The fleet query and the agent log below are hints, not proof,
+  and no alert ships (last bullet).
+  - Fleet (aggregate: the gauges are server-side sums and cannot name a host). The query below
+    returns a series while `yuzu_fleet_spark_unsupported` for the mechanism is above zero and
+    that mechanism's `yuzu_fleet_spark_mechanisms` series equals `yuzu_fleet_spark_reporting`
+    (same `os` and `instance`), that is, rules stay unsupported although every reporting agent
+    counts the mechanism as functional again:
+
+    ```promql
+    yuzu_fleet_spark_unsupported{os="windows",mechanism="file"} > 0
+      and on(os, instance)
+    (yuzu_fleet_spark_reporting{os="windows"}
+      - on(os, instance) yuzu_fleet_spark_mechanisms{os="windows",mechanism="file"} == 0)
+    ```
+
+    The Registry form is a separate query with `mechanism="registry"` in both selectors. Both
+    were checked with promtool against synthetic series only (the rules, the test and a
+    flipped-expectation negative control are committed under
+    `docs/spark-rebuild-baselines/raw/4658-windows-evidence/promql/`). Unlike the mechanism-gap recipe in
+    `docs/user-manual/metrics.md`, this query is deliberately silent when the mechanism series is
+    absent (an absent mechanism is not functional, so there is nothing recovered to be stuck).
+    Blind spot: the query needs the two counts to be EQUAL, so a single agent that lacks the mechanism (a permanently boot-inert
+    agent, or an unrelated concurrent episode) silences it fleet-wide; silence proves nothing
+    while any agent lacks the mechanism. Only a sustained hold is a hint: the gauges trail the
+    agent by up to about 45 s (`docs/user-manual/guaranteed-state.md`, "Fleet lag").
+  - Agent log. The line
+    `Guardian: rule '<id>' classified unsupported (<type> has no mechanism on this host) ...`
+    (`guardian_engine.cpp`, logged only on a new or changed classification), between
+    `spark_file: worker failing persistently` and
+    `spark_file: worker pass recovered after N failure(s)` (Registry:
+    `spark_registry: sweeper failing persistently` and
+    `spark_registry: sweeper pass recovered after N failure(s)`), shows a rule was classified
+    during the episode; it does not show the rule is still unsupported afterwards. Two limits:
+    an empty search proves nothing because the agent log is not flushed per line (#4608), and
+    the Guardian line and the `recovered` lines are logged at info level, so `--log-level warn`
+    hides them (the `failing persistently` lines are error level).
+  - Alerts. None ships: `docs/prometheus/yuzu-alerts.yml` deliberately has no
+    `YuzuSparkUnsupported` rule and none on `yuzu_fleet_spark_mechanisms`. The per-mechanism
+    alert is tracked in #2084 and must ship before the flip. An alert on the query above also
+    wants the `for:` hold `docs/user-manual/metrics.md` gives for the mechanism series (at least
+    two heartbeats, 60 s at the default 30 s heartbeat; a paging alert at least 10 minutes,
+    tuned on fleet data).
+- Operator action: none today (see the compensating control). Once Spark is live the gap does
+  not announce itself: an Unsupported placement returns `ReconcileOutcome::Inert`, which by
+  design does not hold `policy_generation` (`guardian_engine.cpp`, `apply_rules()`), so the
+  agent reports itself converged and the server's heartbeat reconcile does not re-push
+  (`agent_gen >= current`, `server.cpp`; see the recovery-path note in the
+  `#2815 + #2818 + #2833 + #2839` entry above), and the Unsupported branch's own comment says
+  `get_status()` is deliberately untouched; `get_status()` itself (`guardian_engine.cpp`) reports
+  every stored rule as `errored` unconditionally, so it cannot tell this state from any other.
+  After the mechanism has recovered, re-run the reconcile on the affected host, narrowest
+  first: restart that agent (`start_local()` re-arms its cached rules through
+  `reconcile_rule_locked`), or send the scoped push in `docs/user-manual/guaranteed-state.md`
+  section 4 (`POST /api/v1/guaranteed-state/push` with a `scope` that selects only the affected
+  hosts and `"full_sync": true`; requires `GuaranteedState:Push`). The fleet gauges cannot name a
+  host and the agent log is the only per-host evidence, so an operator who cannot identify the
+  affected hosts is left with the same push over a wider scope, at the cost below. Avoid the
+  fleet-wide route (a
+  Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` tears
+  down and re-arms every rule on every in-scope agent (R5.7 (g)(1); its cost is the #3990
+  blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`) and re-classifies any
+  host still in an episode. No further runbook exists: R5.7 (g)(1) and the operator manual say
+  only that the rules stay disarmed until the next reconcile or an agent restart.
+- Compensating control: `prefer_spark_` is false in production, so the Unsupported placement
+  cannot occur today. `agent.cpp` constructs `GuardianEngine` with the two-argument form, so
+  `prefer_spark` takes its default `false` (`guardian_engine.hpp`), and
+  `GuardianEngine::reconcile_rule_locked` classifies only when
+  `try_spark = prefer_spark_ && spark_availability_ == Available`. The gap is disclosed in R5.7
+  (g)(1) of `docs/spark-stage2-guardian-consumer-design.md` and in the operator manual. `inert`
+  is reached about 150 ms of backoff after the first failure at the default cadence (R5.7 (g)(4)),
+  so once Spark is live an episode does not need to be long to open the window.
+- Owner: unassigned; until #4685 is picked up, the author of the PR-5 (F14 flip) change, as for
+  #4665.
+- Milestone: #4685 itself; no PR slot assigned yet.
+- Revisit trigger: before the F14 flip. **Not risk-accepted** - #4685 is a real, filed, open
+  defect and remains a gating item for the flip until it is fixed or closed; this entry records
+  the disclosure and the compensating control only. Severity as the #4658 governance ledger
+  records it (`gap-a-guardian-no-rereconcile`): LOW for the #4658 merge, because while
+  `prefer_spark_` is false the wrong outcome (rules enforced by neither backend) cannot occur in
+  a shipped build; HIGH and blocking at the F14 flip, when that protection lapses. The ledger's
+  impact, exposure and severity codes are defined under "Severity - DERIVE it, do not choose it"
+  in `.claude/skills/governance/SKILL.md`.
 
 **Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
@@ -1714,22 +1853,45 @@ adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING. This precondition is tracked in #4666.
 
-**NEW precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
-governance review of the rule-id neutralisation): agent-side `Guardian T_detect` and `T_wire` lines may
-be used as latency evidence only if either every operator-authored identifier the agent logs is
-neutralised or rejected at one ingest chokepoint, or the correlator takes its join set from the
-server-authored `T_server` line and drops any agent line whose id is outside a benchmark-authored,
-charset-checked rule set.** Rule ids and Spark keys (which embed an operator-authored path) are
-unvalidated, and many agent log lines still print them as authored (the legacy file, registry and
-service guards, which are the live detection path today; SparkEngine; the Guardian engine; nine Spark
-key sites in the runtime), so a newline in an id lets one forged physical line pose as a benchmark
-record; the R5.7 driver already reads agent-log lines. Until one of the two holds, an agent-only latency
-figure must not be presented as criterion-10 evidence. The Spark runtime's own rule-id lines are already
-neutralised (PR #4657). The adjudication of this exposure was made by subagents of the authoring session
-(independence asserted, not verified) and awaits the PR reviewer's confirmation; it derives HIGH at the
-consumer that treats agent-log lines as evidence, not for the #4606 diff. Tracked in #4665, which also
-covers the documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for
-the driver.
+**Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
+governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on
+`feat/4665-log-injection-neutralisation`, merge to `dev` still pending as of this entry): agent-side
+`Guardian T_detect` and `T_wire` lines may be used as latency evidence only if either every
+operator-authored identifier the agent logs is neutralised or rejected at one ingest chokepoint, or
+the correlator takes its join set from the server-authored `T_server` line and drops any agent line
+whose id is outside a benchmark-authored, charset-checked rule set.** Rule ids and Spark keys (which
+embed an operator-authored path) were unvalidated, and many agent log lines still printed them as
+authored, so a newline in an id let one forged physical line pose as a benchmark record; the R5.7
+driver already reads agent-log lines. **#4665's own final scope turned out broader than this
+paragraph originally named** - not just "the legacy file, registry and service guards ... SparkEngine;
+the Guardian engine; nine Spark key sites in the runtime" (the Spark runtime's own rule-id lines
+were already neutralised ahead of this, PR #4657), but every rule_id/key/path/hive/service-name/
+unit-name print site across `guardian_engine.cpp`, `guardian_arm_ack.cpp`, `guardian_spark_bridge.hpp`,
+`spark_engine.cpp`, `guardian_spark_runtime.cpp`, `spark_registry.cpp`, `spark_file.cpp`,
+`spark_service.cpp`, `guard_file.cpp`, `guard_service.cpp`, `guard_systemd.cpp`, `guard_registry.cpp`
+and `guardian_outbox_send_executor.hpp` on the agent, plus `guardian_push_builder.cpp` and
+`guaranteed_state_store.cpp` on the server - closing the first branch of this precondition directly
+(every operator-authored identifier is now neutralised at print time, and `rule_id` is additionally
+rejected at REST/MCP create via `is_valid_rule_id()`). A separate, later-discovered vulnerability in
+the SAME family was closed in the same series and was never part of this precondition's original
+acceptance criteria: the R5.7 driver's own evidence regexes (`fullsync_blackout_diag.py`) were
+unanchored (`.search()` not `.match()`), letting a forged benchmark line hide inside an unrelated log
+statement's free-text field with no newline at all - now anchored. An agent-only latency figure may
+now be presented as criterion-10 evidence; a regression-net tripwire
+(`tests/test_guardian_spark_log_injection_tripwire.py`) guards against a future unwrapped call site
+reopening the first branch. Tracked in #4665, which also covered the
+documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for the
+driver.
+
+**NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
+#4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
+not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry. The
+per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
+detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
+the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
+on the section 5 query. #4704 (a blocked log sink stalls the File worker or, worse, the Registry
+sweeper's `mu_`) must be fixed or accepted as a limit before the flip as well, since the flip is
+what makes these mechanism workers live.**
 
 Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
 slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`

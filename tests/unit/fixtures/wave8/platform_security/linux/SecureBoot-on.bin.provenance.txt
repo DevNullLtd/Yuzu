@@ -1,0 +1,1 @@
+status: RECONSTRUCTION from the UEFI 2.x global-variable layout, not a capture: 4-byte attributes 0x00000006 (BS|RT) + data byte 0x01. WSL2 and the Docker VM expose no UEFI variables, so no real capture host exists on the-rig or this Mac; a real UEFI Linux capture is a follow-up. Also serves as SetupMode=1 (same layout).

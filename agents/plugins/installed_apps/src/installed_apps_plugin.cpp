@@ -11,13 +11,18 @@
  *             (no "-" placeholders, no sentinel row on an empty result).
  *
  * Output is pipe-delimited, one record per line via write_output():
- *   app|name|version|publisher|install_date                       (list/query)
+ *   app|name|version|publisher|install_date|install_location|bundle_id  (list, every field escape-aware)
+ *   app|name|version|publisher                                (query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
  *       signature_status|distro_id|distro_version                 (list_inventory)
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
- * (content/definitions/installed_apps.yaml et al.) — extend `list_inventory`,
- * never those.
+ * (content/definitions/installed_apps.yaml et al.). `list`'s two trailing
+ * columns were added under ADR-0028's binding condition; its `app` tag, name,
+ * version, publisher and install_date keep their position and value for every
+ * real value (format_app_row now escapes every field) and `list` rows are never
+ * hashed; never widen `query`/`list_per_user` — extend `list_inventory` for
+ * anything the daily sync needs.
  */
 
 #include <yuzu/plugin.hpp>
@@ -26,6 +31,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 // Pure parse/format helpers for the list_inventory action (v2 rows). In a
@@ -209,12 +215,14 @@ ToolOutcome run_tool(std::vector<std::string> argv,
 
 // ── App record ────────────────────────────────────────────────────────────
 
-struct AppInfo {
-    std::string name;
-    std::string version;
-    std::string publisher;
-    std::string install_date;
-};
+// One installed application as the three collectors produce it -- the same
+// record type the pure `list` formatter and the Windows dedupe take
+// (installed_apps_parsers.hpp), so the header templates run in the plugin with
+// the plugin's own instantiation. install_location/bundle_id are the `list`
+// action's trailing columns (ADR-0028 binding condition); NOT part of the
+// ADR-0016 InvRecord; empty renders "-" (designed for Linux, which has no
+// single install prefix / no bundle id).
+using AppInfo = parsers::AppRowFields;
 
 // Acquisition result + its health, returned together. `docs/cpp-conventions.md`
 // lists output parameters as forbidden in new code, and the health flag has to
@@ -342,23 +350,18 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
         HKEY app_key{};
         if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
             HKeyCloser app_guard{app_key};
-            auto read_str = [&](const char* value_name) -> std::string {
-                wchar_t buf[512]{};
-                DWORD size = sizeof(buf); // size in BYTES
-                DWORD type = 0;
-                if (RegQueryValueExW(app_key, to_wide(value_name).c_str(), nullptr, &type,
-                                     reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
-                    if (type == REG_SZ && size >= sizeof(wchar_t)) {
-                        return reg_sz_to_utf8(buf, size);
-                    }
-                }
-                return {};
+            // Policy per value: see read_reg_string. Only InstallLocation accepts
+            // REG_EXPAND_SZ; the four hashed fields and SystemComponent stay REG_SZ-only.
+            auto read_str = [&](const char* value_name, bool accept_expand_sz) {
+                return read_reg_string(app_key, value_name, accept_expand_sz);
             };
 
-            auto display_name = read_str("DisplayName");
+            auto display_name = read_str("DisplayName", false);
             if (!display_name.empty()) {
-                // Skip system components and updates without meaningful names
-                auto sys_component = read_str("SystemComponent");
+                // Meant to skip system components, but SystemComponent is a
+                // REG_DWORD and read_reg_string accepts strings only, so this test
+                // never matches today (tracked separately).
+                auto sys_component = read_str("SystemComponent", false);
                 if (sys_component == "1") {
                     name_len = kNameBufLen;
                     continue; // app_guard closes app_key
@@ -366,9 +369,10 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
 
                 AppInfo app;
                 app.name = std::move(display_name);
-                app.version = read_str("DisplayVersion");
-                app.publisher = read_str("Publisher");
-                app.install_date = read_str("InstallDate");
+                app.version = read_str("DisplayVersion", false);
+                app.publisher = read_str("Publisher", false);
+                app.install_date = read_str("InstallDate", false);
+                app.install_location = read_str("InstallLocation", /*accept_expand_sz=*/true);
                 apps.push_back(std::move(app));
             }
         }
@@ -391,15 +395,12 @@ AppCollection get_installed_apps_windows() {
     // Current user
     enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
 
-    // Deduplicate by name+version
-    std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
-        return a.name < b.name || (a.name == b.name && a.version < b.version);
-    });
-    apps.erase(std::unique(apps.begin(), apps.end(),
-                           [](const AppInfo& a, const AppInfo& b) {
-                               return a.name == b.name && a.version == b.version;
-                           }),
-               apps.end());
+    // Sort, `list`-only location layer, unique(): one pure pass shared with the
+    // tests (installed_apps_parsers.hpp). The comparator and survivor are the
+    // pre-ADR-0028 code byte-for-byte, so the ADR-0016 `inv|` rows and `query`
+    // cannot move; only the survivor's install_location changes (it becomes the
+    // lexicographically smallest populated one in its run).
+    parsers::dedupe_uninstall_records(apps);
 
     return AppCollection{std::move(apps), degraded};
 }
@@ -426,7 +427,7 @@ AppCollection get_installed_apps_linux() {
         for (auto& rec : parsers::parse_dpkg_list(out)) {
             // parse_dpkg_list already filters to "install ok installed" rows.
             apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), "-"});
+                            std::move(rec.publisher), "-", {}, {}});
         }
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
               !path.empty()) {
@@ -438,7 +439,7 @@ AppCollection get_installed_apps_linux() {
         auto out = std::move(res.output);
         for (auto& rec : parsers::parse_rpm_list(out)) {
             apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), std::move(rec.install_date)});
+                            std::move(rec.publisher), std::move(rec.install_date), {}, {}});
         }
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {
@@ -448,7 +449,7 @@ AppCollection get_installed_apps_linux() {
         degraded = degraded || res.degraded;
         auto out = std::move(res.output);
         for (auto& rec : parsers::parse_pacman_list(out))
-            apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-"});
+            apps.push_back({std::move(rec.name), std::move(rec.version), "-", "-", {}, {}});
     }
 
     std::sort(apps.begin(), apps.end(),
@@ -483,13 +484,19 @@ AppCollection get_installed_apps_macos() {
         if (res.ran && parsed.empty())
             degraded = true;
         for (auto& rec : parsed) {
-            apps.push_back(
-                {std::move(rec.name), std::move(rec.version), "-", std::move(rec.install_date)});
+            // rec.location (normally the .app bundle path) is now the `list` action's
+            // install_location column (ADR-0028 binding condition). bundle_id is
+            // filled separately, and only on the `list` path (with_bundle_ids).
+            apps.push_back({std::move(rec.name), std::move(rec.version), "-",
+                            std::move(rec.install_date), std::move(rec.location), {}});
         }
     }
 
-    std::sort(apps.begin(), apps.end(),
-              [](const AppInfo& a, const AppInfo& b) { return a.name < b.name; });
+    // Tie-break on install_location so same-named apps keep a deterministic order
+    // across captures (a name-only sort leaves their relative order arbitrary).
+    std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
+        return std::tie(a.name, a.install_location) < std::tie(b.name, b.install_location);
+    });
     return AppCollection{std::move(apps), degraded};
 }
 #endif
@@ -620,6 +627,51 @@ InvCollection get_inventory_linux() {
 // wrong, which is exactly when degrading is right.
 constexpr std::size_t kMaxEnrichApps = 5000;
 constexpr std::size_t kMaxPkgutilPackages = 5000;
+
+// Fills AppInfo::bundle_id (CFBundle only, no SecStaticCode) for the `list`
+// action. Called from do_list ONLY: do_query and do_list_per_user also use
+// get_installed_apps_macos() but never emit bundle_id, so filling it inside the
+// acquisition would waste up to kMaxEnrichApps CFBundleCreate calls there.
+// YUZU_HAVE_SECURITY_FRAMEWORK: meson.build resolves ['Security',
+// 'CoreFoundation'] as ONE dependency() call that never partially resolves, so
+// CFBundle is available exactly when the enrichment header's guard is.
+// Same kMaxEnrichApps / over_budget shape as get_inventory_macos_uncached, but
+// `list` is interactive and the column is informational: on exhaustion the
+// remaining rows keep an empty bundle_id (rendered "-") and the run is NOT
+// reported degraded -- unlike the daily-sync leg, where a silently hollowed-out
+// security-posture field must not publish as authoritative.
+// Budget semantics: kCollectionBudget is checked BETWEEN apps, so it bounds how
+// many CFBundle reads start, not how long one takes -- a single wedged read (a
+// stale network mount under a listed location) holds this dispatch worker until
+// it returns, the accepted residual recorded at kCollectionBudget's declaration.
+// A complete `list` (system_profiler + parse + this pass) measured 1.4-2.3 s wall
+// for 323 apps on the reference Mac (2026-09-21); the pass is inside the run-to-run noise
+// of the one system_profiler call, so the budget is a runaway guard, not the
+// expected cost.
+[[nodiscard]] std::vector<AppInfo> with_bundle_ids(std::vector<AppInfo> apps) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto over_budget = [start]() {
+        return std::chrono::steady_clock::now() - start > kCollectionBudget;
+    };
+    std::size_t located = 0, filled = 0;
+    for (const auto& app : apps)
+        located += !app.install_location.empty();
+    for (auto& app : apps) {
+        if (app.install_location.empty())
+            continue;
+        if (filled >= kMaxEnrichApps || over_budget()) {
+            // The alphabetical tail loses bundle_id ("-", indistinguishable from
+            // a bundle without one); the log line is the only signal.
+            spdlog::warn("installed_apps: list bundle_id enrichment stopped after {} of {} "
+                         "located apps (cap {} apps / {} s); remaining rows carry '-'",
+                         filled, located, kMaxEnrichApps, kCollectionBudget.count());
+            break;
+        }
+        ++filled;
+        app.bundle_id = yuzu::installed_apps::macos_enrich::bundle_id_for(app.install_location);
+    }
+    return apps;
+}
 
 InvCollection get_inventory_macos_uncached() {
     bool degraded = false;
@@ -1079,17 +1131,18 @@ int do_list(yuzu::CommandContext& ctx) {
     if (!report_if_degraded(ctx, apps.degraded, "list"))
         return 1;
 
+#if defined(__APPLE__)
+    // After the degraded guard: a withheld result must not pay the CFBundle pass.
+    apps.apps = with_bundle_ids(std::move(apps.apps));
+#endif
+
     if (apps.apps.empty()) {
-        ctx.write_output("app|No applications found|-|-|-");
+        ctx.write_output(parsers::format_app_row({.name = "No applications found"}));
         return 0;
     }
 
-    for (const auto& app : apps.apps) {
-        ctx.write_output(sanitize_utf8(
-            std::format("app|{}|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                        app.publisher.empty() ? "-" : app.publisher,
-                        app.install_date.empty() ? "-" : app.install_date)));
-    }
+    for (const auto& app : apps.apps)
+        ctx.write_output(sanitize_utf8(parsers::format_app_row(app)));
     return 0;
 }
 
@@ -1142,16 +1195,18 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 // Linux and macOS now collect through the shared bounded argv runner
 // (yuzu::agent::run_bounded_subprocess, ADR-3002 rung 2) — dpkg-query/rpm/
 // pacman/apk on Linux, system_profiler(+brew for list_per_user)(+pkgutil +
-// native SecCode/CFBundle enrichment for list_inventory) on macOS — Wave 4
-// PR4.3a's de-shell migration off the prior ungoverned rung-3 popen()/
-// system() acquisition.
+// native SecCode/CFBundle enrichment for list_inventory, + CFBundle for `list`'s
+// bundle_id) on macOS — Wave 4 PR4.3a's de-shell migration off the prior
+// ungoverned rung-3 popen()/system() acquisition.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "system_profiler via bounded argv runner + native CFBundle enrichment",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
     },
@@ -1195,7 +1250,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class InstalledAppsPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "installed_apps"; }
-    std::string_view version() const noexcept override { return "1.1.0"; }
+    std::string_view version() const noexcept override { return "1.2.0"; }
     std::string_view description() const noexcept override {
         return "Inventories installed applications and queries by name";
     }

@@ -21,47 +21,32 @@
 
 #include <yuzu/plugin.hpp>
 
-#include <nlohmann/json.hpp>
+#include "asset_tags_parsers.hpp"
+#include "asset_tags_store.hpp"
+
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace {
 
 namespace fs = std::filesystem;
-
-// The 4 fixed structured tag categories
-constexpr std::string_view kCategoryKeys[] = {"role", "environment", "location", "service"};
-
-struct ChangeRecord {
-    std::string key;
-    std::string old_value;
-    std::string new_value;
-    int64_t timestamp{0}; // epoch seconds
-};
-
-struct AssetTagState {
-    std::unordered_map<std::string, std::string> tags;
-    int64_t last_sync_epoch{0};
-    bool stale{true};
-    std::vector<ChangeRecord> change_log;
-};
+using namespace yuzu::asset_tags;
 
 std::mutex g_mu;
 AssetTagState g_state;
 fs::path g_store_path;
 std::atomic<bool> g_shutdown{false};
 std::thread g_check_thread;
-int g_check_interval_s{300}; // default 5 minutes
+std::atomic<int> g_check_interval_s{300}; // default 5 minutes
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -69,6 +54,9 @@ int64_t now_epoch() {
         .count();
 }
 
+// Load the persisted snapshot. A missing file is a normal first run; an
+// unreadable or schema-violating file is rejected whole (defaults kept, one
+// warning naming the reason) and replaced by the next sync's atomic write.
 void load_state() {
     std::lock_guard lock(g_mu);
     g_state = {};
@@ -76,77 +64,27 @@ void load_state() {
     if (g_store_path.empty())
         return;
 
-    std::error_code ec;
-    if (!fs::exists(g_store_path, ec))
+    auto text = read_state_file(g_store_path);
+    if (!text) {
+        spdlog::warn("asset_tags: cannot read state file: {}", text.error().message);
         return;
-
-    std::ifstream f(g_store_path);
-    if (!f)
-        return;
-
-    try {
-        auto j = nlohmann::json::parse(f);
-        if (j.contains("tags") && j["tags"].is_object()) {
-            for (auto& [key, val] : j["tags"].items()) {
-                if (val.is_string())
-                    g_state.tags[key] = val.get<std::string>();
-            }
-        }
-        if (j.contains("last_sync_epoch"))
-            g_state.last_sync_epoch = j["last_sync_epoch"].get<int64_t>();
-        if (j.contains("stale"))
-            g_state.stale = j["stale"].get<bool>();
-        if (j.contains("change_log") && j["change_log"].is_array()) {
-            for (const auto& entry : j["change_log"]) {
-                ChangeRecord cr;
-                cr.key = entry.value("key", "");
-                cr.old_value = entry.value("old_value", "");
-                cr.new_value = entry.value("new_value", "");
-                cr.timestamp = entry.value("timestamp", int64_t{0});
-                g_state.change_log.push_back(std::move(cr));
-            }
-        }
-    } catch (...) {}
-}
-
-void save_state() {
-    if (g_store_path.empty())
-        return;
-
-    std::error_code ec;
-    auto parent = g_store_path.parent_path();
-    if (!parent.empty())
-        fs::create_directories(parent, ec);
-
-    nlohmann::json j;
-    {
-        std::lock_guard lock(g_mu);
-        j["tags"] = g_state.tags;
-        j["last_sync_epoch"] = g_state.last_sync_epoch;
-        j["stale"] = g_state.stale;
-
-        nlohmann::json log_arr = nlohmann::json::array();
-        // Keep only last 50 changes
-        size_t start = g_state.change_log.size() > 50 ? g_state.change_log.size() - 50 : 0;
-        for (size_t i = start; i < g_state.change_log.size(); ++i) {
-            const auto& cr = g_state.change_log[i];
-            log_arr.push_back({{"key", cr.key},
-                               {"old_value", cr.old_value},
-                               {"new_value", cr.new_value},
-                               {"timestamp", cr.timestamp}});
-        }
-        j["change_log"] = log_arr;
     }
+    if (!*text)
+        return; // first run
 
-    std::ofstream f(g_store_path);
-    if (f)
-        f << j.dump(2);
+    auto parsed = parse_state(**text);
+    if (!parsed) {
+        spdlog::warn("asset_tags: ignoring corrupt state file {}: {}", g_store_path.string(),
+                     parsed.error().message);
+        return;
+    }
+    g_state = std::move(*parsed);
 }
 
 void check_thread_fn() {
     while (!g_shutdown.load(std::memory_order_acquire)) {
         // Sleep in small increments for responsive shutdown
-        auto remaining = std::chrono::seconds{g_check_interval_s};
+        auto remaining = std::chrono::seconds{g_check_interval_s.load(std::memory_order_relaxed)};
         while (remaining.count() > 0 && !g_shutdown.load(std::memory_order_acquire)) {
             auto sleep_time = std::min(remaining, std::chrono::seconds{5});
             std::this_thread::sleep_for(sleep_time);
@@ -159,10 +97,13 @@ void check_thread_fn() {
         std::lock_guard lock(g_mu);
         auto now = now_epoch();
         if (g_state.last_sync_epoch > 0 &&
-            (now - g_state.last_sync_epoch) > g_check_interval_s) {
+            (now - g_state.last_sync_epoch) > g_check_interval_s.load(std::memory_order_relaxed)) {
             if (!g_state.stale) {
                 g_state.stale = true;
-                // Save updated stale flag
+                // In-memory only, deliberately not persisted: `status` reports
+                // it live, the next `sync` writes `stale=false` to disk, and
+                // after a restart the flag re-derives from `last_sync_epoch`
+                // on the next check tick.
             }
         }
     }
@@ -220,11 +161,11 @@ public:
         // Read optional check interval from config (default 300s)
         auto interval_str = pctx.get_config("asset_tags.check_interval");
         if (!interval_str.empty()) {
-            try {
-                g_check_interval_s = std::stoi(std::string{interval_str});
-                if (g_check_interval_s < 30)
-                    g_check_interval_s = 30; // floor at 30s
-            } catch (...) {}
+            if (auto v = parse_check_interval(interval_str))
+                g_check_interval_s.store(*v, std::memory_order_relaxed);
+            else
+                spdlog::warn("asset_tags: ignoring malformed asset_tags.check_interval '{}'",
+                             std::string{interval_str});
         }
 
         load_state();
@@ -252,91 +193,88 @@ public:
         if (action == "changes")
             return do_changes(ctx);
 
-        ctx.write_output(std::format("unknown action: {}", action));
+        ctx.write_output(format_error_row("unknown action", action));
         return 1;
     }
 
 private:
+    // Caller holds g_mu.
+    static std::string tag_value_locked(std::string_view key) {
+        auto it = g_state.tags.find(std::string{key});
+        return it != g_state.tags.end() ? it->second : std::string{};
+    }
+
     int do_sync(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto now = now_epoch();
+        const auto now = now_epoch();
+
+        CategoryValues values;
+        for (std::size_t i = 0; i < kCategoryKeys.size(); ++i)
+            values[i] = cap_value(params.get(kCategoryKeys[i]));
+
         std::vector<ChangeRecord> new_changes;
-
+        CategoryValues current;
+        int64_t last_sync = 0;
+        bool persisted = true;
         {
+            // One critical section: mutate, snapshot, and persist under the
+            // same lock so the file is always one consistent state and
+            // successive syncs' writes are ordered (S21). Readers
+            // (do_status/do_get/do_changes) and the staleness check thread
+            // take the same lock, so a stalled data_dir filesystem stalls
+            // every action of this plugin, not just sync -- accepted: a
+            // small local file, and the alternative serialises the same I/O
+            // behind more code (M3).
             std::lock_guard lock(g_mu);
+            new_changes = apply_sync(g_state, values, now);
 
-            for (auto cat_key : kCategoryKeys) {
-                std::string key_str{cat_key};
-                auto new_value = std::string{params.get(cat_key)};
-
-                auto it = g_state.tags.find(key_str);
-                std::string old_value = (it != g_state.tags.end()) ? it->second : "";
-
-                if (new_value != old_value) {
-                    ChangeRecord cr;
-                    cr.key = key_str;
-                    cr.old_value = old_value;
-                    cr.new_value = new_value;
-                    cr.timestamp = now;
-                    new_changes.push_back(cr);
-                    g_state.change_log.push_back(cr);
-                }
-
-                if (new_value.empty()) {
-                    g_state.tags.erase(key_str);
-                } else {
-                    g_state.tags[key_str] = new_value;
+            if (!g_store_path.empty()) {
+                auto written = write_state_file_atomic(g_store_path, serialize_state(g_state));
+                if (!written) {
+                    persisted = false;
+                    spdlog::warn("asset_tags: state not persisted: {}", written.error().message);
+                } else if (*written) {
+                    spdlog::warn("asset_tags: {}", (*written)->message);
                 }
             }
 
-            g_state.last_sync_epoch = now;
-            g_state.stale = false;
+            for (std::size_t i = 0; i < kCategoryKeys.size(); ++i)
+                current[i] = tag_value_locked(kCategoryKeys[i]);
+            last_sync = g_state.last_sync_epoch;
         }
-
-        save_state();
 
         // Report results
         if (new_changes.empty()) {
             ctx.write_output("sync|no_changes");
         } else {
-            for (const auto& cr : new_changes) {
-                if (cr.old_value.empty()) {
-                    ctx.write_output(
-                        std::format("sync|tag_added|{}|{}", cr.key, cr.new_value));
-                } else if (cr.new_value.empty()) {
-                    ctx.write_output(
-                        std::format("sync|tag_removed|{}|{}", cr.key, cr.old_value));
-                } else {
-                    ctx.write_output(std::format("sync|tag_changed|{}|{}|{}", cr.key,
-                                                 cr.old_value, cr.new_value));
-                }
-            }
+            for (const auto& cr : new_changes)
+                ctx.write_output(format_sync_event(cr));
         }
 
         // Report current state
-        std::lock_guard lock(g_mu);
-        for (auto cat_key : kCategoryKeys) {
-            std::string key_str{cat_key};
-            auto it = g_state.tags.find(key_str);
-            auto val = (it != g_state.tags.end()) ? it->second : "";
-            ctx.write_output(std::format("tag|{}|{}", key_str, val));
-        }
-        ctx.write_output(std::format("last_sync|{}", g_state.last_sync_epoch));
+        for (std::size_t i = 0; i < kCategoryKeys.size(); ++i)
+            ctx.write_output(format_tag_row(kCategoryKeys[i], current[i]));
+        ctx.write_output(std::format("last_sync|{}", last_sync));
+
+        // The in-memory state advanced and the rows above are truthful either
+        // way; the status tells the caller whether the write reached disk.
+        if (persisted)
+            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL);
+        else
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "asset_tags:persist_failed");
         return 0;
     }
 
     int do_status(yuzu::CommandContext& ctx) {
         std::lock_guard lock(g_mu);
 
-        for (auto cat_key : kCategoryKeys) {
-            std::string key_str{cat_key};
-            auto it = g_state.tags.find(key_str);
-            auto val = (it != g_state.tags.end()) ? it->second : "";
-            ctx.write_output(std::format("tag|{}|{}", key_str, val));
-        }
+        for (auto cat_key : kCategoryKeys)
+            ctx.write_output(format_tag_row(cat_key, tag_value_locked(cat_key)));
 
         ctx.write_output(std::format("last_sync|{}", g_state.last_sync_epoch));
         ctx.write_output(std::format("stale|{}", g_state.stale ? "true" : "false"));
-        ctx.write_output(std::format("check_interval|{}", g_check_interval_s));
+        ctx.write_output(std::format("check_interval|{}",
+                                     g_check_interval_s.load(std::memory_order_relaxed)));
         ctx.write_output(std::format("change_count|{}", g_state.change_log.size()));
         return 0;
     }
@@ -348,25 +286,13 @@ private:
             return 1;
         }
 
-        std::string key_str{key};
-
-        // Validate it's a known category
-        bool valid = false;
-        for (auto cat_key : kCategoryKeys) {
-            if (cat_key == key_str) {
-                valid = true;
-                break;
-            }
-        }
-        if (!valid) {
-            ctx.write_output(std::format("error|unknown category: {}", key_str));
+        if (!is_category_key(key)) {
+            ctx.write_output(format_error_row("error|unknown category", key));
             return 1;
         }
 
         std::lock_guard lock(g_mu);
-        auto it = g_state.tags.find(key_str);
-        auto val = (it != g_state.tags.end()) ? it->second : "";
-        ctx.write_output(std::format("tag|{}|{}", key_str, val));
+        ctx.write_output(format_tag_row(key, tag_value_locked(key)));
         return 0;
     }
 
@@ -378,10 +304,8 @@ private:
             return 0;
         }
 
-        for (const auto& cr : g_state.change_log) {
-            ctx.write_output(std::format("change|{}|{}|{}|{}", cr.key, cr.old_value,
-                                         cr.new_value, cr.timestamp));
-        }
+        for (const auto& cr : g_state.change_log)
+            ctx.write_output(format_change_row(cr));
         ctx.write_output(std::format("total_changes|{}", g_state.change_log.size()));
         return 0;
     }

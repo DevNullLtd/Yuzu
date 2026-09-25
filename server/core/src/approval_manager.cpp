@@ -19,6 +19,13 @@ namespace {
 
 constexpr const char* kStoreName = "approval_manager";
 
+// query()/query_checked() row cap. No creation-side check enforces this on
+// submit() — a legitimately busy queue can exceed it — query_checked()
+// detects and reports the overflow via ApprovalListResult::truncated. Both
+// query() and query_checked() build their SQL from this constant (review
+// finding, PR #4656) — see ApprovalListResult's doc comment.
+constexpr int kApprovalListCap = 100;
+
 // Bounded acquires (ADR-0012 §2). No hot-path caller here — every runtime
 // acquire uses the ordinary CRUD budget (matches PatchManager/
 // ScheduleEngine).
@@ -470,6 +477,11 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 // Query
 // ---------------------------------------------------------------------------
 
+const std::vector<std::string>& ApprovalManager::allowed_status() {
+    static const std::vector<std::string> v = {"pending", "approved", "rejected", "expired"};
+    return v;
+}
+
 std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     std::vector<Approval> results;
     if (!open_)
@@ -491,7 +503,12 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
         sql += " AND submitted_by = $" + std::to_string(idx++);
         params.push_back(q.submitted_by);
     }
-    sql += " ORDER BY submitted_at DESC LIMIT 100";
+    // `id DESC` tiebreaker (unhappy-path governance finding, #2146 A2-R4):
+    // submitted_at has no uniqueness constraint, so a tie straddling the
+    // LIMIT boundary was non-deterministic across identical calls -- id is
+    // TEXT PRIMARY KEY, always unique, so appending it makes the result
+    // order fully deterministic.
+    sql += " ORDER BY submitted_at DESC, id DESC LIMIT " + std::to_string(kApprovalListCap);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK)
@@ -502,6 +519,74 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     for (int i = 0; i < rows; ++i)
         results.push_back(row_to_approval(res.get(), i));
     return results;
+}
+
+// Checked twin of query() above (#2146 A2-R4): the same three degraded
+// conditions that method silently folds into an empty vector -- store not
+// open, pool-lease timeout, and a failed SQL query -- are reported as
+// std::unexpected here instead, mirroring get_checked's shape (this class's
+// own established checked-read convention) so REST v1 `GET /api/v1/approvals`
+// and MCP `list_pending_approvals` can emit an honest 503/retry_after_ms
+// rather than serializing a false empty-list response.
+//
+// Resource Ledger (gov cpp-safety, #2146 A2-R4 fix round): this function and
+// pending_count_checked() below each acquire one pg::PgPool::Lease (owner
+// move-only/non-copyable, `pool_.try_acquire_for`) and one pg::PgResult
+// (owner RAII, PQclear on scope exit, via pg::exec_params). Both are
+// stack-local and released by destructor on every path, including every
+// early std::unexpected return -- no manual cleanup, no borrow escapes past
+// either object's scope (row_to_approval copies every column into owned
+// std::string/int64_t fields before the PgResult goes out of scope).
+std::expected<ApprovalListResult, StoreReadError>
+ApprovalManager::query_checked(const ApprovalQuery& q) const {
+    if (!open_) {
+        spdlog::warn("ApprovalManager::query_checked degraded: store not open");
+        return std::unexpected(StoreReadError{"database not open"});
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("ApprovalManager::query_checked degraded: pool exhausted");
+        return std::unexpected(
+            StoreReadError{"approval store temporarily unavailable (pool exhausted)"});
+    }
+
+    std::string sql =
+        std::string("SELECT ") + kSelectAllCols + " FROM approval_manager.approvals WHERE 1=1";
+    std::vector<std::string> params;
+    int idx = 1;
+
+    if (!q.status.empty()) {
+        sql += " AND status = $" + std::to_string(idx++);
+        params.push_back(q.status);
+    }
+    if (!q.submitted_by.empty()) {
+        sql += " AND submitted_by = $" + std::to_string(idx++);
+        params.push_back(q.submitted_by);
+    }
+    // Query one row PAST the cap so a match count of EXACTLY kApprovalListCap
+    // is never misreported as truncated -- the simpler "returned == limit"
+    // heuristic false-positives on that boundary (matches
+    // ScheduleEngine::query_schedules_checked's identical technique,
+    // schedule_engine.cpp). The sentinel row is trimmed back off below, never
+    // returned to the caller. `id DESC` tiebreaker: see query() above.
+    sql += " ORDER BY submitted_at DESC, id DESC LIMIT " + std::to_string(kApprovalListCap + 1);
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ApprovalManager::query_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
+    }
+
+    ApprovalListResult out;
+    const int rows = PQntuples(res.get());
+    out.truncated = rows > kApprovalListCap;
+    const int take = out.truncated ? kApprovalListCap : rows;
+    out.approvals.reserve(static_cast<std::size_t>(take));
+    for (int i = 0; i < take; ++i)
+        out.approvals.push_back(row_to_approval(res.get(), i));
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +605,36 @@ int ApprovalManager::pending_count() const {
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK)
         return 0;
+    return static_cast<int>(to_i64(col(res.get(), 0, 0)));
+}
+
+// Checked twin of pending_count() above (#2146 A2-R4): the same three
+// degraded conditions that method silently folds into 0 -- store not open,
+// pool-lease timeout, and a failed SQL query -- are reported as
+// std::unexpected here instead, identical to a real "zero pending approvals"
+// count otherwise. Feeds REST v1 `GET /api/v1/approvals/pending/count` and
+// MCP `get_pending_approval_count`.
+std::expected<int, StoreReadError> ApprovalManager::pending_count_checked() const {
+    if (!open_) {
+        spdlog::warn("ApprovalManager::pending_count_checked degraded: store not open");
+        return std::unexpected(StoreReadError{"database not open"});
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("ApprovalManager::pending_count_checked degraded: pool exhausted");
+        return std::unexpected(
+            StoreReadError{"approval store temporarily unavailable (pool exhausted)"});
+    }
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ApprovalManager::pending_count_checked degraded: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
+    }
     return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 

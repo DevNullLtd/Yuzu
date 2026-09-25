@@ -18,17 +18,23 @@ namespace yuzu::server {
 SoftwareCatalogRollup::SoftwareCatalogRollup(SoftwareInventoryStore& store,
                                              std::chrono::seconds interval,
                                              yuzu::MetricsRegistry* metrics)
-    : store_(store), interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600}
-                                                                   : interval),
+    : store_(store),
+      interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
       metrics_(metrics) {}
 
-SoftwareCatalogRollup::~SoftwareCatalogRollup() { stop(); }
+SoftwareCatalogRollup::~SoftwareCatalogRollup() {
+    stop();
+}
 
 void SoftwareCatalogRollup::start() {
     if (thread_.joinable())
         return; // already started
     stop_.store(false, std::memory_order_release);
     thread_ = std::thread([this] { run(); });
+}
+
+void SoftwareCatalogRollup::request_stop() noexcept {
+    stop_.store(true, std::memory_order_release);
 }
 
 void SoftwareCatalogRollup::stop() {
@@ -63,7 +69,8 @@ void SoftwareCatalogRollup::run() {
         // calls std::terminate — catch, log, keep ticking.
         try {
             const auto t0 = std::chrono::steady_clock::now();
-            YUZU_ASSERT_BACKGROUND_JOB("software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
+            YUZU_ASSERT_BACKGROUND_JOB(
+                "software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
             const bool ok = store_.refresh_catalog_rollup();
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

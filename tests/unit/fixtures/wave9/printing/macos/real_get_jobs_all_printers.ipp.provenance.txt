@@ -1,0 +1,30 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
+date: 2026-09-21 (UTC)
+identity: id -u = 501 (alex, non-root). Scratch queues created with `lpadmin`
+and removed afterwards; same setup as real_get_jobs_binding_check.ipp (jobs 16
+and 17 on yuzu4616a, job 18 on yuzu4616b).
+
+request: Get-Jobs (0x000A), request-id 1, with the printer-uri written RAW as
+ipp://localhost/printers/%00 (not encoded): which-jobs=not-completed,
+requested-attributes=job-id + job-printer-uri. A throwaway program built it with
+`ipp::encode_request`, passing the three attributes of `job_binding_check_attrs`
+but with the printer-uri VALUE set to the raw string instead of the encoded one.
+
+exact command:
+  curl -s --unix-socket /private/var/run/cupsd \
+      -H 'Content-Type: application/ipp' --data-binary @req_raw.bin \
+      http://localhost/ -o real_get_jobs_all_printers.ipp
+
+decoded result: 294 bytes; status-code 0x0000 (successful-ok); THREE job
+groups across BOTH queues: job-id 16 and 17 (yuzu4616a) and job-id 18
+(yuzu4616b), each with its own job-printer-uri.
+
+why it exists: cupsd percent-decodes the resource, so a printer name of `%00`
+put raw into the URI truncates at the NUL and becomes the all-printers
+collection. Before the printer name was percent-encoded, that made the
+binding check list every queue's jobs, so any job id passed, and Cancel-Job
+(which ignores the printer) then cancelled a job on another queue; observed
+end to end on this cupsd. The test that loads this file proves the second guard:
+a job is accepted only when its own job-printer-uri names the named printer.

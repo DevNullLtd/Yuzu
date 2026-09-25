@@ -535,7 +535,14 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // exec_visible — that derivation runs an RBAC/tag-store lookup
         // that is wasted work on the (common, cheap-to-detect) no-agent
         // path, which never reaches a dispatch decision anyway.
-        if (!deps.registry->has_any()) {
+        //
+        // HA WS-5 governance hardening (external review finding, 2026-09-22):
+        // has_any() alone is LOCAL-ONLY — on a replica holding zero local
+        // sessions but a healthy presence-visible fleet (the ordinary HA
+        // topology this slice exists to support), the plain check rejected
+        // EVERY dispatch here before all_ids()/evaluate_scope() or any
+        // presence lookup ever ran. has_any_reachable() checks presence too.
+        if (!deps.registry->has_any_reachable()) {
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",

@@ -4,7 +4,7 @@ How to decide **where a rule belongs** — and why the answer is usually "not in
 
 ## Why this exists
 
-Four files load into every agent session before any work starts:
+Six files load into every agent session before any work starts:
 
 | File | Read by | Budget | Hard cap |
 |---|---|---|---|
@@ -12,14 +12,23 @@ Four files load into every agent session before any work starts:
 | `AGENTS.md` | Codex, Kimi | 40,000 | 48,000 |
 | `.claude/routed-concerns.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 | `.claude/routed-concerns-access-control.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
+| `.claude/routed-concerns-security-posture.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
+| `.claude/routed-concerns-software-estate.md` | Claude (`@`-imported by CLAUDE.md) | 40,000 | 48,000 |
 
 Every character in them is paid on every session, whether or not the work touches that subject. A
 `docs/` file costs nothing until something reads it.
 
-This ceiling has been hit three times. #2147 closed the first (44.6k → 23.1k, by moving the
+This ceiling has been hit four times. #2147 closed the first (44.6k → 23.1k, by moving the
 routed-concerns table into an `@`-imported file). The second was found at **39,996 of 40,000 bytes —
-four bytes free** — and split the table again. Both fixes were splits. **Splitting is now exhausted:
-there is no fifth file to split into, and the total context cost is unchanged by splitting anyway.**
+four bytes free** — and split the table again. **Splitting is now exhausted: another file adds no
+capacity, and the total context cost is unchanged by splitting anyway.** Two more splits landed
+regardless, independently and around the same time: Wave 8 added `routed-concerns-security-posture.md`
+(a third table file, so the security-posture plugin rows land there and `routed-concerns.md` gains
+none) and Wave 10 P2a-3 added `routed-concerns-software-estate.md` (a fourth, for a Forensics/
+per-user-software-data row that would not fit the remaining headroom either) — both stopgaps, not
+new capacity. **A further split needs its own justification: each split buys headroom but leaves
+the total context cost across all always-loaded files unchanged, so it is a deferral, not a fix,
+and each new file is itself a fixed cost paid by every session.**
 
 The failure was never a single bad commit. It was ~235 characters a day of individually reasonable
 additions, each one cheaper to put in CLAUDE.md than to route properly.
@@ -122,9 +131,9 @@ resolved even on the author's own machine.
 
 `tests/test_issue_docs.py`, run by `.github/workflows/docs-lint.yml` and the `docs` Meson suite:
 
-1. **Budget** — each of the four files under 40,000 characters, and the 48,000 hard cap.
+1. **Budget** — each of the five files under 40,000 characters, and the 48,000 hard cap.
 2. **Expiry** — no `EXPIRES:` date in the past.
-3. **Dead pointers** — every backticked citation in the four files resolves: a path-shaped one
+3. **Dead pointers** — every backticked citation in the five files resolves: a path-shaped one
    (with a directory component) must exist exactly, and a bare filename must match some tracked
    file's name. `STREAM.md` was cited for months and existed nowhere.
 4. **Routed-concern table structure** — every row has three populated columns, and no row's

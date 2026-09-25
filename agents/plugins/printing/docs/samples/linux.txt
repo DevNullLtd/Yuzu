@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash 8aea1a515344
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash a6ac30dd4945
 == action=printers
 printer|yuzu_test|stopped|paused|0|Local Raw Printer|ipp://localhost:631/printers/yuzu_test|1
 [result_status] OK / FULL / 
@@ -6,3 +6,7 @@ printer|yuzu_test|stopped|paused|0|Local Raw Printer|ipp://localhost:631/printer
 == action=jobs
 job|ipp://localhost:631/printers/yuzu_test|1|-|-|pending|2026-09-14T17:27:40Z|1024
 [result_status] OK / FULL /
+
+== action=clear_queue
+[not captured] Destructive/Irreversible: mutating action, not executed in a docs capture
+

@@ -1108,6 +1108,14 @@ curl -s -b cookies.txt http://localhost:8080/api/schedules
 curl -s -b cookies.txt "http://localhost:8080/api/schedules?enabled_only=true"
 ```
 
+The dashboard's Schedules tab (see [Dashboard UI](#13-dashboard-ui) below) is backed by the
+versioned `GET /api/v1/schedules` twin, not the legacy endpoint above. If the schedule store is
+temporarily unreachable, the tab shows "Schedule list temporarily unavailable — retry shortly"
+instead of an empty list. Schedule reads (dashboard, REST v1, and MCP `list_schedules` alike) are
+capped at 100 rows; if a fleet has more schedules than that, the tab shows a partial-list notice
+above the table, and `GET /api/v1/schedules`'s JSON response carries `result_truncated_by_cap: true`
+(see [REST API](rest-api.md#get-apiv1schedules)) — the two are the same underlying signal.
+
 #### Create a schedule
 
 ```

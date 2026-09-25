@@ -16,22 +16,48 @@
 /// **Every authorization/targeting-relevant read is type-distinguishable
 /// (2026-07-25, program policy — see `docs/postgres-store-playbook.md`
 /// "Authoritative reads must be type-distinguishable").** `get`, `contains`,
-/// `resolve_alias`, and `member_set_owned` return `std::expected<T,
-/// ResultSetError>` — a runtime DB error is `std::unexpected(DbError)`,
-/// NEVER an empty/false/nullopt value indistinguishable from a genuine
-/// "not found" or "not a member". This is load-bearing: `member_set_owned`
-/// backs `AgentRegistry::evaluate_scope`'s `from_result_set:` membership
-/// check, and under a `NOT from_result_set:<id>` scope a silently-empty
-/// membership (the pre-2026-07-25 behavior) INVERTS to "matches every
-/// device" — a concrete command-dispatch fleet-wide fail-open, not a
-/// theoretical one. Every caller of these four methods MUST apply the
-/// reviewer test: "if this value were silently empty/false, could any
-/// downstream branch grant/target/enforce/skip/invert(NOT)/report success?
-/// If yes, fail closed (abort/503) on `DbError` — never treat it as
-/// empty-container." `list_by_owner`, `members`, `lineage`,
-/// `count_for_owner`, `counts`, and `list_pending` remain plain-optional/
-/// container reads (deny-or-benign failure modes; not yet widened — tracked
-/// as a follow-up, see ADR-0036).
+/// `resolve_alias`, `member_set_owned`, `count_for_owner_checked`,
+/// `members_checked`, `list_by_owner_checked`, and `lineage_checked` return
+/// `std::expected<T, ResultSetError>` — a runtime DB error is
+/// `std::unexpected(DbError)`, NEVER an empty/false/nullopt value
+/// indistinguishable from a genuine "not found" or "not a member". This is
+/// load-bearing: `member_set_owned` backs `AgentRegistry::evaluate_scope`'s
+/// `from_result_set:` membership check, and under a `NOT from_result_set:<id>`
+/// scope a silently-empty membership (the pre-2026-07-25 behavior) INVERTS to
+/// "matches every device" — a concrete command-dispatch fleet-wide fail-open,
+/// not a theoretical one. `count_for_owner_checked` backs the pre-dispatch
+/// per-owner quota check on the three async result-set producers (#4306
+/// finding 1): a silently-empty/zero count there would let an over-quota
+/// dispatch fire for real before the authoritative in-txn recheck ever runs.
+/// `members_checked`/`list_by_owner_checked`/`lineage_checked` back every
+/// REST/MCP consumer that materialises or reports membership (#4306 finding 3
+/// / #4307 finding 2): a silently-truncated page there is indistinguishable
+/// from a genuine last page or an empty fleet. Every caller of these eight
+/// methods MUST apply the reviewer test: "if this value were silently
+/// empty/false, could any downstream branch grant/target/enforce/skip/
+/// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
+/// — never treat it as empty-container."
+///
+/// `list_by_owner`, `members`, `lineage`, and `count_for_owner` are thin
+/// `.value_or(...)` wrappers over their `_checked` twins above, kept for API
+/// continuity. `list_by_owner` and `lineage` still have real production
+/// callers — the render-only dashboard fragments in `result_set_routes.cpp`
+/// (`docs/postgres-store-playbook.md` rule 4's render-only carve-out: no
+/// decision downstream of a dashboard render, so a degraded read just
+/// re-renders an empty fragment rather than needing a 503). `members` and
+/// `count_for_owner` have NO production caller left after this widening —
+/// every call site that could grant/target/dispatch on their result now goes
+/// through the `_checked` twin; the plain forms exist only for
+/// `test_result_set_store.cpp`'s own healthy-path assertions. **`lineage`'s
+/// wrapper is NOT behaviourally identical to the pre-#4306 plain
+/// implementation**: the old `lineage()` returned a PARTIAL chain on a
+/// mid-walk query failure (whatever had been accumulated before the failing
+/// hop); `lineage_checked` treats a mid-walk failure as `DbError` for the
+/// whole call, so the wrapper now returns EMPTY instead — more honest (no
+/// silent partial breadcrumb), but a real behavior change for the dashboard's
+/// still-plain `lineage()` callers. `counts`, `count_pinned_for_owner`, and
+/// `list_pending` remain plain-container reads too (deny-or-benign failure
+/// modes; not yet widened — tracked as a follow-up, see ADR-0036).
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -176,19 +202,59 @@ public:
     /// collapsing the two would let a transient DB blip read as a clean
     /// not-found on an authorization-relevant lookup.
     std::expected<std::optional<ResultSet>, ResultSetError> get(const std::string& id);
-    /// Owner-scoped list, sorted last_used_at then created_at DESC. `cursor` is
-    /// an opaque created_at|id token ("" for first page). Returns up to `limit`
-    /// rows; `out_next_cursor` is set empty when the last page is reached.
-    /// NOT YET widened to a typed error (deny-or-benign failure mode — an
-    /// empty page just re-renders the sidebar empty, no grant/target/enforce
-    /// downstream); tracked as a follow-up alongside `members`/`lineage`.
+
+    /// One page of an owner-scoped list, sorted last_used_at then created_at
+    /// DESC. `std::unexpected(DbError)` on a runtime error — see the type-
+    /// distinguishable-reads note above; NEVER an empty page indistinguishable
+    /// from a genuine last/only page. `list_by_owner()` below is the deny-or-
+    /// benign plain wrapper (dashboard-only).
+    struct ListPage {
+        std::vector<ResultSet> sets;
+        std::string next_cursor; // empty once the last page is reached
+    };
+    std::expected<ListPage, ResultSetError> list_by_owner_checked(const std::string& owner,
+                                                                   const std::string& cursor,
+                                                                   int limit);
+    /// Deny-or-benign plain wrapper over `list_by_owner_checked` — see the
+    /// file-header posture note. `out_next_cursor` is set empty on a `DbError`
+    /// (same shape as a genuine last page), matching this method's pre-#4306
+    /// behavior exactly.
     std::vector<ResultSet> list_by_owner(const std::string& owner, const std::string& cursor,
                                          int limit, std::string& out_next_cursor);
+
+    /// One page of `id`'s member device ids. `std::unexpected(DbError)` on a
+    /// runtime error — see the type-distinguishable-reads note above; NEVER an
+    /// empty page indistinguishable from a genuine last page. THE read this
+    /// producer/report chain materialises or displays as membership (#4306
+    /// finding 3 / #4307 finding 2) — a caller that lets `DbError` fall
+    /// through as an empty page silently truncates or empties the result.
+    /// `members()` below is the deny-or-benign plain wrapper (dashboard-only).
+    struct MembersPage {
+        std::vector<std::string> device_ids;
+        std::string next_cursor; // empty once the last page is reached
+    };
+    std::expected<MembersPage, ResultSetError> members_checked(const std::string& id,
+                                                                const std::string& cursor,
+                                                                int limit);
+    /// Deny-or-benign plain wrapper over `members_checked` — see the
+    /// file-header posture note. `out_next_cursor` is cleared on a `DbError`
+    /// (same shape as a genuine last page), matching this method's pre-#4306
+    /// behavior exactly.
     std::vector<std::string> members(const std::string& id, const std::string& cursor, int limit,
                                      std::string& out_next_cursor);
+
     /// Lineage chain root→leaf, walking parent_id. Owner-filtered: the walk
     /// stops at the first ancestor not owned by `owner`, so a child parented
-    /// onto another operator's set cannot leak that set's metadata (review B2).
+    /// onto another operator's set cannot leak that set's metadata (review B2)
+    /// — stopping there is NORMAL termination, not a `DbError`, same as the
+    /// cycle guard. `std::unexpected(DbError)` is reserved for a genuine
+    /// store/query failure encountered mid-walk — see the type-
+    /// distinguishable-reads note above. `lineage()` below is the deny-or-
+    /// benign plain wrapper (dashboard-only) and is NOT behaviourally
+    /// identical to the pre-#4306 plain implementation on a mid-walk failure
+    /// — see the file-header posture note.
+    std::expected<std::vector<LineageNode>, ResultSetError>
+    lineage_checked(const std::string& id, const std::string& owner);
     std::vector<LineageNode> lineage(const std::string& id, const std::string& owner);
     /// `std::unexpected(DbError)` on a runtime error — see the type-
     /// distinguishable-reads note above the `get()` declaration. (No current
@@ -226,6 +292,18 @@ public:
     /// inverts to match-all, same class of fail-open as `member_set_owned`.
     std::expected<std::optional<std::string>, ResultSetError>
     resolve_alias(const std::string& owner, const std::string& name);
+    /// `std::unexpected(DbError)` on a runtime error — NEVER `0`,
+    /// indistinguishable from a genuinely-empty owner. See the type-
+    /// distinguishable-reads note above. THE pre-dispatch per-owner quota
+    /// check on the three async result-set producers (#4306 finding 1): a
+    /// caller that lets `DbError` fall through as `0` reads a degraded
+    /// backend as "well under quota" and dispatches a real command before
+    /// `create_pending`'s atomic in-txn recheck ever runs — by which point
+    /// the command has already reached agents. Callers MUST refuse to
+    /// dispatch (not substitute 0) on `DbError`. `count_for_owner()` below is
+    /// the deny-or-benign plain wrapper, kept for the one caller
+    /// (`test_result_set_store.cpp`) that doesn't need the distinction.
+    std::expected<int, ResultSetError> count_for_owner_checked(const std::string& owner);
     int count_for_owner(const std::string& owner);
     int count_pinned_for_owner(const std::string& owner);
 

@@ -68,10 +68,15 @@ public:
         // Resolve members (one bounded read, lease released), THEN aggregate B1
         // (a second bounded read) — never a lease held across the other
         // (ADR-0012 §1), matching the pre-seam AppPerfProviders.group closure.
-        const auto members = mgmt_group_store_->get_members(group_id);
+        // get_members_checked (not the plain get_members()) so a member-read
+        // degrade fails closed to nullopt instead of rendering as an empty
+        // cohort (#1762) — same contract tag_trend already has via TagStore.
+        auto members = mgmt_group_store_->get_members_checked(group_id);
+        if (!members)
+            return std::nullopt; // AUTHORITATIVE degrade — the member read failed
         std::vector<std::string> agent_ids;
-        agent_ids.reserve(members.size());
-        for (const auto& m : members)
+        agent_ids.reserve(members->size());
+        for (const auto& m : *members)
             agent_ids.push_back(m.agent_id);
         auto rows = group_reader_->get_group_trend(agent_ids, app, version);
         if (!rows)
@@ -96,15 +101,34 @@ public:
     std::optional<std::string> device_app_perf_json(const std::string& agent_id,
                                                      const std::string& app_filter,
                                                      bool audit_persisted) const override {
-        if (!daily_store_)
-            return std::nullopt;
-        auto rows = daily_store_->get_agent_app_perf(agent_id);
+        auto rows = device_rows(agent_id);
         if (!rows)
             return std::nullopt;
         return dex_device_app_perf_json(agent_id, app_filter, *rows, audit_persisted);
     }
 
+    // Note (#4626): derives from the SAME device_rows() helper as
+    // device_app_perf_json above — neither method derives from the other,
+    // both read the store exactly once and reduce independently.
+    std::optional<std::vector<AppPerfDeviceApp>>
+    device_app_summaries(const std::string& agent_id) const override {
+        auto rows = device_rows(agent_id);
+        if (!rows)
+            return std::nullopt;
+        return app_perf_device_summaries(*rows);
+    }
+
 private:
+    /// Shared raw-row read backing BOTH device_app_perf_json and
+    /// device_app_summaries (the single daily_store_->get_agent_app_perf
+    /// call each of them needs) — see this class's two callers' own doc
+    /// comments for why neither derives from the other.
+    std::optional<std::vector<AppPerfDailyRow>> device_rows(const std::string& agent_id) const {
+        if (!daily_store_)
+            return std::nullopt;
+        return daily_store_->get_agent_app_perf(agent_id);
+    }
+
     DexPerfFn dex_perf_fn_;
     AppPerfFleetStore* fleet_store_;
     AppPerfDailyStore* daily_store_;

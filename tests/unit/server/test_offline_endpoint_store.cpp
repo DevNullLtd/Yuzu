@@ -18,6 +18,7 @@
 
 using yuzu::server::OfflineEndpoint;
 using yuzu::server::OfflineEndpointStore;
+using yuzu::server::PresenceIdentity;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -41,6 +42,14 @@ std::int64_t now_ms() {
 }
 
 const OfflineEndpoint* find(const std::vector<OfflineEndpoint>& v, const std::string& id) {
+    for (const auto& e : v)
+        if (e.agent_id == id)
+            return &e;
+    return nullptr;
+}
+
+const PresenceIdentity* find_presence(const std::vector<PresenceIdentity>& v,
+                                      const std::string& id) {
     for (const auto& e : v)
         if (e.agent_id == id)
             return &e;
@@ -137,6 +146,83 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         REQUIRE(v != nullptr);
         CHECK(v->agent_version.empty());
         CHECK(v->arch.empty());
+    }
+}
+
+// HA WS-5 (ADR-2002 §7a): cross-replica presence — query_live_ids's identity
+// projection and remove_if_session's session-guarded delete.
+TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+
+    SECTION("query_live_ids returns identity fields for a recent row") {
+        REQUIRE(store.upsert("agent-p1", "host-p1", "linux", t, 0, "1.0.0", "x86_64",
+                             "sess-1"));
+        auto rows = store.query_live_ids(std::chrono::hours(1));
+        const auto* p = find_presence(rows, "agent-p1");
+        REQUIRE(p != nullptr);
+        CHECK(p->hostname == "host-p1");
+        CHECK(p->os == "linux");
+        CHECK(p->agent_version == "1.0.0");
+        CHECK(p->arch == "x86_64");
+    }
+
+    SECTION("query_live_ids's TTL is the DATABASE clock, not last_heartbeat_ms") {
+        // A row whose last_heartbeat_ms is old (client-supplied, potentially
+        // skewed) but whose last_seen_at was JUST authored by upsert() (PG
+        // now()) is live — last_seen_at is the sole liveness authority,
+        // exactly the #3715 precedent (never the replica's own clock, and
+        // here not even the client-supplied last_heartbeat_ms).
+        REQUIRE(store.upsert("agent-freshseen", "h", "linux", t - 86'400'000, 0, "", "", ""));
+        auto rows = store.query_live_ids(std::chrono::seconds(60));
+        CHECK(find_presence(rows, "agent-freshseen") != nullptr);
+    }
+
+    SECTION("query_live_ids excludes a row outside the TTL window") {
+        // A ttl of 0 means "nothing is live" (last_seen_at is authored at
+        // upsert time, strictly before the read's now()).
+        REQUIRE(store.upsert("agent-stale", "h", "linux", t, 0, "", "", "sess-x"));
+        auto rows = store.query_live_ids(std::chrono::seconds(0));
+        CHECK(find_presence(rows, "agent-stale") == nullptr);
+    }
+
+    SECTION("remove_if_session no-ops on a session mismatch") {
+        REQUIRE(store.upsert("agent-guard", "h", "linux", t, 0, "", "", "sess-real"));
+        CHECK_FALSE(store.remove_if_session("agent-guard", "sess-stale"));
+        auto rows = store.query_live_ids(std::chrono::hours(1));
+        CHECK(find_presence(rows, "agent-guard") != nullptr); // row survives
+    }
+
+    SECTION("remove_if_session deletes on a session match") {
+        REQUIRE(store.upsert("agent-guard2", "h", "linux", t, 0, "", "", "sess-real2"));
+        CHECK(store.remove_if_session("agent-guard2", "sess-real2"));
+        auto rows = store.query_live_ids(std::chrono::hours(1));
+        CHECK(find_presence(rows, "agent-guard2") == nullptr);
+    }
+
+    SECTION("remove_if_session rejects an empty session_id — never a bare agent_id delete") {
+        REQUIRE(store.upsert("agent-guard3", "h", "linux", t, 0, "", "", "sess-real3"));
+        CHECK_FALSE(store.remove_if_session("agent-guard3", ""));
+        auto rows = store.query_live_ids(std::chrono::hours(1));
+        CHECK(find_presence(rows, "agent-guard3") != nullptr);
+    }
+
+    SECTION("a blank session_id on upsert never matches a later remove_if_session") {
+        // The blank-session upsert path (a heartbeat that raced session
+        // lookup — see upsert()'s doc comment): the row's session_id column
+        // is blanked, and remove_if_session always requires a NON-empty
+        // caller-supplied value, so it can never match — the row simply
+        // waits out the TTL instead, which is always safe.
+        REQUIRE(store.upsert("agent-raced", "h", "linux", t, 0, "", "", ""));
+        CHECK_FALSE(store.remove_if_session("agent-raced", ""));
+        auto rows = store.query_live_ids(std::chrono::hours(1));
+        CHECK(find_presence(rows, "agent-raced") != nullptr);
     }
 }
 

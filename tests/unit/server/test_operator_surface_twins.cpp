@@ -565,6 +565,12 @@ constexpr TwinRow kExpectedTwins[] = {
     // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
     // app-usage), same (securable, operation) the MCP twin enforces.
     {"get_agent_app_usage", "Forensics", "Read", true},
+    // #2146 A2-R4 (review finding, PR #4656) — approval-review read twins.
+    // Pinned against rest_api_v1.cpp's GET /api/v1/approvals and GET
+    // /api/v1/approvals/pending/count, same Approval:Read gate the MCP
+    // twins' tier_allows/perm_fn calls enforce.
+    {"list_pending_approvals", "Approval", "Read", true},
+    {"get_pending_approval_count", "Approval", "Read", true},
 };
 
 } // namespace
@@ -633,6 +639,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_pending_approval_count",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");

@@ -51,17 +51,23 @@
     "method": "GET",
     "path": "/api/approvals",
     "capability_id": "get.api-approvals",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/approvals"
+    },
+    "mcp_twin": "list_pending_approvals",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/approvals/pending/count",
     "capability_id": "get.api-approvals-pending-count",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/approvals/pending/count"
+    },
+    "mcp_twin": "get_pending_approval_count",
+    "status": "twinned"
   },
   {
     "method": "POST",

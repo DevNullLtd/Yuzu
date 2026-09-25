@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <string>
 
 namespace yuzu::server::approval {
@@ -27,8 +28,22 @@ void register_approval_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         ApprovalQuery q;
-        if (req.has_param("status"))
+        if (req.has_param("status")) {
             q.status = req.get_param_value("status");
+            // Gate 8 governance finding (#2146 A2-R4, same defect class just
+            // fixed on GET /api/v1/approvals and MCP list_pending_approvals):
+            // an unrecognized status silently produced a false-empty result
+            // rather than a 400.
+            if (std::find(ApprovalManager::allowed_status().begin(),
+                          ApprovalManager::allowed_status().end(),
+                          q.status) == ApprovalManager::allowed_status().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid status"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+        }
         if (req.has_param("submitted_by"))
             q.submitted_by = req.get_param_value("submitted_by");
 

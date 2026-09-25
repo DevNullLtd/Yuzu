@@ -50,6 +50,25 @@ namespace yuzu::server::detail {
 namespace gw = ::yuzu::gateway::v1;
 namespace pb = ::yuzu::agent::v1;
 
+// HA WS-4 4.3: `StreamStatusNotification.cluster_id` is gateway-asserted,
+// untrusted input — see gateway_service_impl.cpp's ingest-clamp comment at
+// its NotifyStreamStatus CONNECTED use for the full rationale. Declared here
+// (not TU-local) because `main.cpp`'s `--gateway-cluster-addr` CLI parser
+// (`parse_gateway_cluster_addrs`, gateway_mgmt_stub_pool.hpp) validates a
+// configured cluster_id key against this SAME bound — one constant, two
+// call sites, never a duplicated magic number.
+inline constexpr std::size_t kMaxClusterIdLen = 64;
+
+// HA WS-4 4.3 (sre Gate 3): caps GatewayUpstreamServiceImpl::
+// unmapped_clusters_warned_'s ENTRY COUNT — each entry is already
+// per-entry-bounded by kMaxClusterIdLen, but the set itself had no cap on
+// how many distinct unmapped cluster_id values it could accumulate over
+// process lifetime. 256 is generous headroom over any real deployment's
+// cluster count (a handful to low tens) while still bounding worst-case
+// memory from a session cycling through many distinct malformed/
+// misconfigured values.
+inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
+
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
     GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus, auth::AuthManager& auth_mgr,
@@ -64,6 +83,19 @@ public:
     /// disables the writes — every write site below is fail-OPEN and tolerates
     /// a null store the same way it tolerates a degraded write.
     void set_gateway_route_store(GatewayRouteStore* store) { gateway_route_store_ = store; }
+    /// HA WS-4 4.3: the set of `cluster_id` keys `--gateway-cluster-addr`
+    /// configured (plus the auto-aliased `"default"`), for a CONNECTED-time
+    /// early warning when a session announces an unmapped cluster_id — see
+    /// the NotifyStreamStatus CONNECTED branch. nullptr (the default, and
+    /// what server.cpp wires when the flag is unset) means single-cluster
+    /// mode: skip the check entirely, since every cluster_id resolves to the
+    /// legacy stub regardless of its value in that mode. The pointee is
+    /// immutable, boot-time-built config (`GatewayMgmtStubPool`'s key set,
+    /// server.cpp) — no lifetime/mutation concerns beyond outliving this
+    /// object, same contract as every other raw store pointer here.
+    void set_known_gateway_clusters(const std::unordered_set<std::string>* clusters) {
+        known_gateway_clusters_ = clusters;
+    }
     /// Test-only, see ProxyRegister's `proxy_register_interleave_hook_for_test_`
     /// firing-point comment in gateway_service_impl.cpp.
     void set_proxy_register_interleave_hook_for_test(std::function<void()> hook) {
@@ -172,6 +204,14 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     GatewayRouteStore* gateway_route_store_{nullptr};
+    const std::unordered_set<std::string>* known_gateway_clusters_{nullptr};
+    // HA WS-4 4.3: which unmapped cluster_ids have already logged the
+    // CONNECTED-time warning — once per id, not once per connect, so a
+    // flapping/reconnecting agent on a permanently-misconfigured cluster
+    // doesn't spam the log. The metric counter emitted alongside it (same
+    // NotifyStreamStatus branch) increments on every occurrence regardless.
+    mutable std::mutex unmapped_clusters_warned_mu_;
+    std::unordered_set<std::string> unmapped_clusters_warned_;
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};

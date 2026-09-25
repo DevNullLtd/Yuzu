@@ -19,11 +19,13 @@
 ///     (blocking) — the one route in this cluster that actually gates.
 
 #include "health_routes.hpp"
+#include "pg_reachability_probe.hpp"
 #include "test_route_sink.hpp"
 
 #include "agent_registry.hpp"
 #include "default_certs.hpp"
 #include "event_bus.hpp"
+#include "nvd_db.hpp"
 #include "process_health.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -67,6 +69,8 @@ struct Harness {
     auth::AuthManager auth_mgr{};
     DefaultCertSet default_cert_set{};
     std::atomic<bool> draining{false};
+    PgReachabilityProbe* pg_probe{nullptr}; // HA WS-8: null = fail-closed
+    NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -129,8 +133,10 @@ struct Harness {
         deps.auth_mgr = &auth_mgr;
         deps.default_cert_set = &default_cert_set;
         deps.draining = &draining;
+        deps.pg_reachability_probe = pg_probe;
         deps.server_start_time = std::chrono::steady_clock::now();
-        // Every store pointer stays null — see file header comment.
+        deps.nvd_db = nvd_db;
+        // Every other store pointer stays null — see file header comment.
         health::register_health_routes(sink, deps);
     }
 
@@ -314,6 +320,42 @@ TEST_CASE("health_routes: GET /readyz with every store pointer null reports "
     // scim_store above.
     CHECK(std::find(failed.begin(), failed.end(), "ca_store") == failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "ca_root") == failed.end());
+}
+
+TEST_CASE("health_routes: GET /readyz reports a dead nvd_db as degraded, never "
+          "as a failed store",
+          "[server][routes][health_routes]") {
+    // nvd_db is fail-open by design: a broken CVE cache must be visible to
+    // on-call without pulling the node out of rotation.
+    Harness h;
+    h.wire(); // nvd_db left null == not open
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    REQUIRE(body.contains("degraded"));
+    auto degraded = body["degraded"].get<std::vector<std::string>>();
+    CHECK(std::find(degraded.begin(), degraded.end(), "nvd_db") != degraded.end());
+    REQUIRE(body.contains("failed_stores"));
+    auto failed = body["failed_stores"].get<std::vector<std::string>>();
+    CHECK(std::find(failed.begin(), failed.end(), "nvd_db") == failed.end());
+}
+
+TEST_CASE("health_routes: GET /readyz does not report an open nvd_db as degraded",
+          "[server][routes][health_routes]") {
+    // The other arm of the nvd_db notice: pins the predicate to is_open(), so a
+    // regression to a constant false (always degraded) fails here.
+    NvdDatabase db(":memory:");
+    REQUIRE(db.is_open());
+    Harness h;
+    h.nvd_db = &db;
+    h.wire();
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    if (body.contains("degraded")) {
+        auto degraded = body["degraded"].get<std::vector<std::string>>();
+        CHECK(std::find(degraded.begin(), degraded.end(), "nvd_db") == degraded.end());
+    }
 }
 
 TEST_CASE("health_routes: GET /readyz reports draining when deps.draining is "
@@ -531,4 +573,103 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_health_routes(") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// HA WS-8 (ADR-2002 §12): the runtime pg_reachable row
+// ---------------------------------------------------------------------------
+
+namespace {
+bool has(const std::vector<std::string>& v, const std::string& x) {
+    return std::find(v.begin(), v.end(), x) != v.end();
+}
+PgReachabilityProbe::PingFn fixed_ping(PgReachabilityProbe::PingResult::Kind k) {
+    return [k](const std::atomic<bool>&) {
+        return PgReachabilityProbe::PingResult{k, "t"};
+    };
+}
+} // namespace
+
+TEST_CASE("health_routes: /readyz fails closed on pg_reachable when no probe is wired",
+          "[server][routes][health_routes][readyz]") {
+    Harness h;
+    h.wire();
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    auto body = json::parse(r->body);
+    CHECK(has(body["failed_stores"].get<std::vector<std::string>>(), "pg_reachable"));
+    CHECK(body["pg"] == "not_yet_probed");
+}
+
+TEST_CASE("health_routes: /readyz reports pg_reachable ok when the probe is Ready — and the "
+          "body carries no pg reason",
+          "[server][routes][health_routes][readyz]") {
+    PgReachabilityProbe probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    probe.probe_once();
+    Harness h;
+    h.pg_probe = &probe;
+    h.wire();
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    // Still 503 — every store pointer in this harness is null — but NOT for
+    // Postgres reachability.
+    auto body = json::parse(r->body);
+    CHECK_FALSE(has(body["failed_stores"].get<std::vector<std::string>>(), "pg_reachable"));
+    CHECK_FALSE(body.contains("pg"));
+}
+
+TEST_CASE("health_routes: /readyz names the pg reason when reachability fails, and no detail",
+          "[server][routes][health_routes][readyz]") {
+    PgReachabilityProbe probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::ReadOnly));
+    probe.probe_once();
+    Harness h;
+    h.pg_probe = &probe;
+    h.wire();
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    auto body = json::parse(r->body);
+    CHECK(has(body["failed_stores"].get<std::vector<std::string>>(), "pg_reachable"));
+    CHECK(body["pg"] == "read_only");
+    // The ping's operator detail ("t") must never reach the unauthenticated body.
+    CHECK(r->body.find("\"t\"") == std::string::npos);
+}
+
+TEST_CASE("health_routes: draining still wins over pg_reachable",
+          "[server][routes][health_routes][readyz]") {
+    Harness h;
+    h.wire();
+    h.draining.store(true, std::memory_order_release);
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(json::parse(r->body)["status"] == "draining");
+}
+
+TEST_CASE("health_routes: /health mirrors pg_reachable",
+          "[server][routes][health_routes][readyz]") {
+    PgReachabilityProbe probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Failed));
+    probe.probe_once();
+    probe.probe_once();
+    Harness h;
+    h.pg_probe = &probe;
+    h.wire();
+    auto r = h.sink.Get("/health");
+    REQUIRE(r);
+    CHECK(json::parse(r->body)["stores"]["pg_reachable"] == "error");
+}
+
+TEST_CASE("health_routes: /metrics exports the reachability gauges on scrape",
+          "[server][routes][health_routes][readyz]") {
+    PgReachabilityProbe probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    probe.probe_once();
+    Harness h;
+    h.pg_probe = &probe;
+    h.wire();
+    auto r = h.sink.Get("/metrics");
+    REQUIRE(r);
+    CHECK(r->body.find("yuzu_server_pg_reachable 1") != std::string::npos);
+    CHECK(r->body.find("yuzu_server_pg_reachability_last_success_age_seconds") !=
+          std::string::npos);
 }

@@ -473,20 +473,27 @@ wait_for(exec_id)
 responses = get_responses("crossplatform.software.inventory", exec_id)
 
 # Find machines with outdated Java
+# `output` holds many newline-joined rows, each app|name|version|publisher|install_date|
+# install_location|bundle_id (seven escape-aware tokens on plugin >= 1.2.0; an older
+# agent emits five and does not escape `|`, so only 5- or 7-token lines are accepted).
+import re
+def split_row(line):
+    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", line)]
 for row in responses:
-    name = row["output"].get("name", "")
-    version = row["output"].get("version", "")
-    if "java" in name.lower() and version < "21.0":
-        print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
+    for line in row["output"].splitlines():
+        if not line:
+            continue
+        tokens = split_row(line)
+        if tokens[0] != "app" or len(tokens) not in (5, 7):
+            continue
+        name, version = tokens[1], tokens[2]
+        if "java" in name.lower() and version < "21.0":
+            print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
 ```
 
 #### CEL Compliance Expression
 
-Policy: Java Runtime must be version 21+:
-
-```cel
-result.name.contains('Java') && result.version.startsWith('21.')
-```
+CEL sees this definition's result as one raw `output` string (no `name`/`version` fields), so a version comparison is not expressible there; use the Python route above, or a substring test on `output` with the caveat that it also matches the publisher, install path and bundle identifier.
 
 ---
 
@@ -867,7 +874,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
-| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string |
+| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string, install_location:string, bundle_id:string |
 | `crossplatform.software.query` | query | Q | WLM | name:string (req) | found:bool, name:string, version:string, publisher:string |
 | `device.software_actions.list_upgradable` | upgradable | Q | WLM | *(none)* | package_name:string, current_version:string, available_version:string |
 | `device.software_actions.installed_count` | count | Q | WLM | *(none)* | count:int32 |

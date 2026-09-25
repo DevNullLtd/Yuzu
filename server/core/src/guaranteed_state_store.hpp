@@ -70,6 +70,18 @@
 ///    empty is at least visible on `/metrics` even though the return type
 ///    does not yet distinguish it. None of these reads feeds an
 ///    enforce/target decision (playbook's deny-or-benign class).
+///    **Named exception (#4855):** `dex_device_signal_summary` now ALSO has a
+///    type-distinguishable `dex_device_signal_summary_checked` twin
+///    (`std::optional`, `dex_read_checked<>`) — the per-device DEX
+///    experience-score surfaces (dashboard lens, REST
+///    `GET /api/v1/dex/devices/{id}`, MCP `get_dex_device_score`, and the pure
+///    per-device `dex_device_score()` helper they all route through) fail
+///    closed on a degrade instead of rendering it as a healthy, signal-free
+///    100. The plain `dex_device_signal_summary` above stays on the store as
+///    a documented, still-empty-on-degrade form (unchanged signature/
+///    behaviour, kept for any caller that only wants the #2659 posture) —
+///    this widens ONE read for ONE consumer class, not the #2659 fleet-wide
+///    set; every other `dex_*` read above is still deferred.
 
 #include <atomic>
 #include <cstdint>
@@ -81,6 +93,9 @@
 #include <vector>
 
 #include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types relocated here (pure, store-free)
+#include "guardian_types.hpp" // ADR-0031 WS-A4 (ninth family): GuaranteedStateRuleRow/EventRow/
+                              // EventQuery/ReadError relocated here (pure, store-free) — see that
+                              // header's own comment for the ODR-safe relocation shape
 
 namespace yuzu {
 class MetricsRegistry;
@@ -101,64 +116,11 @@ namespace yuzu::server {
 // shared wire convention.
 inline constexpr const char* kObservationRuleId = "__observation__";
 
-struct GuaranteedStateRuleRow {
-    std::string rule_id;           // UUID
-    std::string name;              // unique, human-authored
-    std::string yaml_source;       // human-readable rendering (generated; see spec_json)
-    // Canonical structured JSON of the Guard (spark/assertion/remediation) —
-    // the AUTHORITATIVE form the agent enforces from and that the push proto is
-    // built from. yaml_source is rendered one-way from this.
-    std::string spec_json;
-    // RESERVED (stored, not yet evaluated): the Guard's Prerequisites — a Scope
-    // expression over device facts that must hold for the Guard to apply on a
-    // device, finer than a Baseline's management-group assignment.
-    std::string prerequisites;
-    int64_t version{1};
-    bool enabled{true};
-    std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
-    std::string severity;          // "critical" | "high" | "medium" | "low"
-    std::string os_target;         // "windows" | "linux" | "macos" | ""=all
-    std::string scope_expr;        // server-side scope expression
-    std::vector<uint8_t> signature;// HMAC-SHA256 over yaml_source
-    std::string created_at;        // ISO-8601
-    std::string updated_at;        // ISO-8601
-    // Principal who authored the rule (created_by) and who last modified it
-    // (updated_by). Required for SOC 2 audit-chain reconstruction alongside
-    // audit_events — the REST handler populates both from the session
-    // principal; the store is a plain passthrough.
-    std::string created_by;
-    std::string updated_by;
-};
-
-struct GuaranteedStateEventRow {
-    std::string event_id;          // UUID
-    std::string rule_id;
-    std::string agent_id;
-    std::string event_type;        // "drift.detected" | "drift.remediated" | ...
-    std::string severity;
-    std::string guard_type;        // "registry" | "etw" | ...
-    std::string guard_category;    // "event" | "condition"
-    std::string detected_value;
-    std::string expected_value;
-    // Structured, machine-readable detail (JSON, keyed by event_type). Companion
-    // to the human `detected_value`, not a replacement. For DEX observations
-    // (process.crashed) it carries the projectable crash facts; "" for plain
-    // drift. The DEX read model projects this into indexed columns.
-    std::string detail_json;
-    std::string remediation_action;
-    bool remediation_success{false};
-    int64_t detection_latency_us{0};
-    int64_t remediation_latency_us{0};
-    std::string timestamp;         // ISO-8601
-};
-
-struct GuaranteedStateEventQuery {
-    std::string rule_id;           // filter by rule, optional
-    std::string agent_id;          // filter by agent, optional
-    std::string severity;          // "critical" ... optional
-    int limit{100};                // clamped to [1, kMaxEventsLimit] by the store
-    int offset{0};
-};
+// GuaranteedStateRuleRow / GuaranteedStateEventRow / GuaranteedStateEventQuery
+// / GuaranteedStateReadError were relocated VERBATIM to the pure
+// "guardian_types.hpp" (included above) for the ADR-0031 WS-A4 GuardianApi
+// seam (ninth family); they remain in namespace yuzu::server and every
+// includer keeps seeing them transitively.
 
 // ── Overview aggregation result types (Slice A dashboard overview) ───────────
 struct GuardianRuleActivity {
@@ -218,13 +180,9 @@ struct EventInsertResult {
                                         ///< only (#4606 criterion-10 T_server). Never persisted.
 };
 
-// Error surface for the type-distinguishable single-object read (`get_rule`).
-// The success type is `std::optional<GuaranteedStateRuleRow>`: a value ==
-// found, `std::nullopt` == genuinely no row for this rule_id.
-// `std::unexpected(kDegraded)` == store/pool/query failure — the caller shows
-// a degrade banner/503, never treats it as absent (mirrors
-// `DeviceInventoryStore::CiReadError` / `InventoryReadError` exactly).
-enum class GuaranteedStateReadError { kDegraded };
+// GuaranteedStateReadError (the type-distinguishable single-object read
+// error surface for `get_rule`) was relocated to "guardian_types.hpp" too —
+// see that header's comment.
 
 class GuaranteedStateStore {
 public:
@@ -358,6 +316,15 @@ public:
     std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
                                                           const std::string& since = "") const;
+    /// Type-distinguishable twin of the above (#4855): `std::nullopt` on a
+    /// degraded read (store-not-open / pool-timeout / query-error), never
+    /// collapsed into an empty vector — the device-score builders need this to
+    /// avoid rendering a degraded read as a healthy, signal-free device. Still
+    /// bumps `yuzu_server_guardian_read_degrade_total{reason}` on a degrade,
+    /// same as the plain form (which is now a thin `.value_or({})` over this).
+    std::optional<std::vector<DexSignalCount>>
+    dex_device_signal_summary_checked(const std::string& agent_id,
+                                      const std::string& since = "") const;
 
     std::vector<GuardianRuleActivity> rule_activity(const std::string& since = "") const;
     std::vector<GuardianDayCount> daily_remediations(const std::string& since = "") const;

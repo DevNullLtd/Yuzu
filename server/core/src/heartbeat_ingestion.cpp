@@ -41,11 +41,16 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os;
         std::string agent_version;
         std::string arch;
+        std::string session_id;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
             agent_version = sess->agent_version;
             arch = sess->arch;
+            // HA WS-5: threaded through so a later graceful disconnect can
+            // session-guard its presence-row delete (remove_if_session) —
+            // see agent_service_impl.cpp / gateway_service_impl.cpp.
+            session_id = sess->session_id;
         }
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
@@ -61,7 +66,7 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // which upsert() treats as "preserve the last-known value" (round-3 v2
         // columns) rather than blanking a value this store already learned.
         offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0, agent_version,
-                               arch);
+                               arch, session_id);
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

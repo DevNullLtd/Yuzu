@@ -45,6 +45,7 @@
 #include <yuzu/agent/guard_systemd.hpp> // parse_active_state, systemd_error_name_is_absence,
                                         // systemd_state_is_transitional, normalize_unit_name,
                                         // valid_unit_name — pure, all-platform, shared with the guard
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -420,7 +421,7 @@ private:
         } else {
             spdlog::warn("spark_service: LoadUnit '{}' transient error (name='{}', {}) — "
                          "reopening, no false Stopped",
-                         uw.unit, err.name ? err.name : "(none)",
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)",
                          err.message ? err.message : err_str(r < 0 ? -r : 0));
             res = ResolveResult::BusError;
         }
@@ -447,7 +448,7 @@ private:
         } else {
             spdlog::warn("spark_service: ActiveState read transient error for '{}' (name='{}') — "
                          "reopening, no false drift",
-                         uw.unit, err.name ? err.name : "(none)");
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)");
         }
         if (s)
             free(s);
@@ -515,7 +516,8 @@ private:
         int r = sd_bus_match_signal(bus, &slot, kDest, uw.path.c_str(), kPropsIface,
                                     "PropertiesChanged", &on_props_changed, &uw);
         if (r < 0) {
-            spdlog::warn("spark_service: match arm failed for '{}': {}", uw.unit, err_str(-r));
+            spdlog::warn("spark_service: match arm failed for '{}': {}",
+                         ::yuzu::log_key_token(uw.unit), err_str(-r));
             if (auto st = read_state(bus, uw)) {
                 set_terminal_from_systemd(uw, *st, emits);
                 stage_coverage(uw, SparkCoverage::Poll, established);

@@ -410,7 +410,7 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim
             spdlog::error("Guardian spark: building the disarm submission for key '{}' threw ({}) - "
                          "the disarm attempt itself failed, not just the backend call; the claim "
                          "is retained for the next same-key event",
-                         key, e.what());
+                         ::yuzu::log_key_token(key), e.what());
         } catch (...) {
         }
     }
@@ -478,7 +478,7 @@ void GuardianSparkRuntime::on_disarm_complete(const std::string& key,
                 spdlog::error("Guardian spark: backend_->disarm() itself threw for key '{}' - "
                              "the disarm attempt failed on the worker, not at admission; the "
                              "claim is retained for the next same-key event",
-                             key);
+                             ::yuzu::log_key_token(key));
             } catch (...) {
             }
             claim->dispatch = ClaimDispatch::Queued;
@@ -631,7 +631,7 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
         try {
             spdlog::error("Guardian spark: building the arm submission for key '{}' threw ({}) - "
                           "the arm was never dispatched",
-                          key, e.what());
+                          ::yuzu::log_key_token(key), e.what());
         } catch (...) {
         }
     }
@@ -795,7 +795,7 @@ void GuardianSparkRuntime::direct_disarm_fallback(const std::string& key, std::u
         try {
             spdlog::error("Guardian spark: compensating-disarm direct fallback for key '{}' "
                          "threw ({}) - best-effort teardown only, not retried again",
-                         key, e.what());
+                         ::yuzu::log_key_token(key), e.what());
         } catch (...) {
         }
     } catch (...) {
@@ -1346,7 +1346,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             try {
                 spdlog::error("Guardian spark: building the compensating-disarm continuation "
                              "for key '{}' threw - falling back to a direct disarm on this "
-                             "worker", key);
+                             "worker", ::yuzu::log_key_token(key));
             } catch (...) {
             }
             direct_disarm_fallback(key, sub);
@@ -1378,7 +1378,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                             try {
                                 spdlog::error("Guardian spark: compensating disarm's own worker "
                                              "threw for key '{}' - retrying once, best-effort",
-                                             cont->key);
+                                             ::yuzu::log_key_token(cont->key));
                             } catch (...) {
                             }
                             self->direct_disarm_fallback(cont->key, cont->sub);
@@ -1389,7 +1389,7 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 try {
                     spdlog::error("Guardian spark: building the compensating-disarm submission for "
                                  "key '{}' threw ({}) - falling back to a direct call on this worker",
-                                 key, e.what());
+                                 ::yuzu::log_key_token(key), e.what());
                 } catch (...) {
                 }
             }
@@ -2798,7 +2798,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                                      "last-resort fallback, but this leftover fifo residue "
                                      "is left for the next same-key event to sweep (see "
                                      "detach_sweep_left_residue())",
-                                     *key_opt, eit->second.fifo.size(),
+                                     ::yuzu::log_key_token(*key_opt), eit->second.fifo.size(),
                                      ::yuzu::log_id_token(rule_id));
                     } catch (...) {
                     }
@@ -2941,7 +2941,8 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
         try {
             spdlog::warn("Guardian spark: key '{}' subscription {} lost ({}) - detaching {} "
                          "rule(s) as errored",
-                         key, subscription_id, detail.empty() ? "no reason given" : detail,
+                         ::yuzu::log_key_token(key), subscription_id,
+                         detail.empty() ? "no reason given" : ::yuzu::log_key_token(detail),
                          rule_ids.size());
         } catch (...) {
         }

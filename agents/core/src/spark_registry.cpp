@@ -113,6 +113,7 @@
 
 #include "guard_win_handle.hpp" // detail::EventHandle
 #include "spark_detached_call.hpp"
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -1174,7 +1175,7 @@ public:
                 try {
                     spdlog::warn("spark_registry: emit for '{}' threw from the fire callback - "
                                  "the re-arm's synthetic fire covers it",
-                                 w.spark_key);
+                                 ::yuzu::log_key_token(w.spark_key));
                 } catch (...) {
                 }
             }
@@ -1289,7 +1290,7 @@ private:
         // branch) - mark unconditionally.
         mark_coverage_locked(w, SparkCoverage::None);
         spdlog::warn("spark_registry: establishing '{}' failed ({}) - watch is deaf until the retry",
-                     w.spark_key, reason);
+                     ::yuzu::log_key_token(w.spark_key), reason);
     }
 
     /// A probe result for a LIVE watch, matched by generation. Under mu_; every
@@ -1366,8 +1367,8 @@ private:
                          : "registry probe result could not be boxed";
         } else {
             reason = w.wait ? "registry re-arm failed" : "registry establishment failed";
-            spdlog::warn("spark_registry: probe for '{}' failed at {} (err={})", w.spark_key,
-                         r->stage, r->err);
+            spdlog::warn("spark_registry: probe for '{}' failed at {} (err={})",
+                         ::yuzu::log_key_token(w.spark_key), r->stage, r->err);
             work.dead_results.push_back(std::move(*r));
         }
         fail_backend_locked(w, reason);
@@ -1634,7 +1635,7 @@ private:
                         try {
                             spdlog::warn("spark_registry: an establishment report for '{}' was "
                                          "dropped (sink threw); further drops are not logged",
-                                         e.key);
+                                         ::yuzu::log_key_token(e.key));
                         } catch (...) {
                         }
                     }
@@ -1793,7 +1794,7 @@ private:
             w.resync_retry_at = Clock::now() + delay;
             spdlog::warn("spark_registry: synthetic fire for '{}' threw on submit (attempt {}) - "
                          "retrying in {} ms",
-                         w.spark_key, w.resync_attempts,
+                         ::yuzu::log_key_token(w.spark_key), w.resync_attempts,
                          std::chrono::duration_cast<std::chrono::milliseconds>(delay).count());
         }
         work.failed_emits.clear();
@@ -1969,7 +1970,7 @@ private:
         if ((drain_refusals_ & (drain_refusals_ - 1)) == 0) {
             spdlog::warn("spark_registry: drain worker for '{}' {} ({} retirement(s) backlogged, "
                          "refusal #{}) - relaunching on a backoff",
-                         w->spark_key,
+                         ::yuzu::log_key_token(w->spark_key),
                          why == DetachedLaunch::Rejected ? "refused by the lane cap"
                                                           : "could not be started",
                          lost_count_, drain_refusals_);

@@ -147,7 +147,7 @@ struct ChromeIrHarness {
                             /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,

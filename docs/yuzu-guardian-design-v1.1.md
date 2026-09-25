@@ -2494,6 +2494,28 @@ Guardian ladder must check these.
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
   mechanism.
+  **Fourth additive source since #4783:** `GuardianLegacySinkExecutor::
+  active_worker_count()` (`guardian_legacy_sink_executor.hpp`) is summed into
+  `GuardianEngine::active_io_workers()` itself - the same `GuardianEngine`-level
+  chokepoint the paragraph above describes, not a separate `AgentImpl`-level sum
+  like the Spark extension below. This executor is the detached, bounded, FIFO
+  sender every legacy `IGuard` producer (`FileGuard`/`RegistryGuard`/
+  `ServiceGuard`/`SystemdServiceGuard`) now enqueues onto via
+  `GuardianEngine::emit_guard_event()`, instead of writing to the Subscribe
+  stream synchronously on its own detection thread; it is constructed
+  unconditionally at `GuardianEngine` construction and stays live regardless of
+  `prefer_spark_`. Its worker wears `GuardianDetachedWorkerRole` and retires -
+  decrementing the count - only at its `AliveTicket`'s destruction, the same
+  physical-alive-count binding described above for `GuardianIoExecutor`. The
+  hazard is the same shape as the outbox executor's: a stalled-but-not-dead gRPC
+  `Write()` (gateway up, not draining) wedges the worker in a blocking syscall
+  that can be neither joined nor force-cancelled. If its count were left out of
+  the sum, `main.cpp`/`service_win.cpp` could tear down the `AgentImpl` state its
+  send callback captures (`stream_write_mu_`/`guardian_sink_stream_`) while that
+  send is still running - reinstating the exact use-after-free the joined-thread
+  rule and the outbox executor's own accounting both exist to prevent. See
+  `guardian_legacy_sink_executor.hpp`'s own ORPHAN-EXIT CONTRACT note and
+  `GuardianEngine::active_io_workers()`'s doc comment (`guardian_engine.cpp`).
   **Second role since rung 9c PR-1:** every `GuardianIoExecutor` worker body - `run()` and
   `submit()` alike, their `on_abandoned`/`on_complete` callbacks included - wears
   `GuardianDetachedWorkerRole` (`guardian_detached_worker_role.hpp`), and the same
@@ -2597,6 +2619,23 @@ Guardian ladder must check these.
   (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
   rule never armed via legacy still relaunders on full_sync/restart exactly as
   before this fix.
+- **A guard whose own detection has permanently degraded must never publish
+  itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
+  (rename-detection) watch permanently disables after repeated teardown
+  failures (`kParentIoAbandonLimit`, `guard_file.cpp`); `report_compliant()`
+  gates on that state and substitutes a `guard.unhealthy` health report
+  (`GuardDrift::Health`, `guard.hpp`) for any would-be compliant publication,
+  re-sent on a `parent_unhealthy_refresh_ms` cadence (default 5 minutes) as a
+  lost-edge backstop, for as long as the rule stays disabled — ordinary drift
+  reporting for the guard's own detection is unaffected. `GuardianEngine::
+  emit_guard_event`'s health arm runs BEFORE `apply_drift_to_event` and
+  ignores every compliance field on the report unconditionally, so a future
+  producer that sets both `health` and a compliance field cannot leak a false
+  compliant/drift verdict through it. A future `Health` enumerator or a new
+  degraded-detection state on ANY guard type (Registry, Service) must route
+  through this same gate-and-substitute shape — never append a second,
+  parallel "also emit compliant" event alongside a health report, which
+  reopens the exact false-green window this PR closed.
 
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 

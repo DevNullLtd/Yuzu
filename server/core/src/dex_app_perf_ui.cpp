@@ -363,6 +363,27 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                  "</option>";
         }
         h += "</select></div>";
+    } else {
+        // #4857 D1: `fleet_snapshot` has no degrade channel, so a genuine
+        // zero-cohort-population read never claims a "degraded" state.
+        // Reaching THIS branch does NOT mean `dex_perf_api_` is unwired —
+        // the caller (dex_routes.cpp's route handler) already returned an
+        // "unavailable" placeholder earlier in that case, before this
+        // model-selector code runs at all; an unwired API never reaches
+        // here. Governance round-2 (G8-2, cpp-expert): the empty
+        // `model_values` this branch renders for is NOT uniformly "devices
+        // reporting with no model tag" — it is equally reached when ZERO
+        // devices report anything this cycle at all (a genuinely empty
+        // fleet snapshot, e.g. `DexPerfFn` returning no devices), which is
+        // not "reporting devices, just untagged". The wording below is
+        // deliberately neutral over both causes rather than presupposing
+        // reporting devices exist (the untagged residual is deliberately
+        // excluded from `model_values` either way, see the caller's
+        // comment) — disclose the absence honestly rather than silently
+        // omitting the selector (the pre-#4857 `TagValuesFn` convention this
+        // replaces).
+        h += "<div class=\"gp-note\">Model: no device-model values in the current fleet "
+             "snapshot.</div>";
     }
 
     if (versions.empty()) {

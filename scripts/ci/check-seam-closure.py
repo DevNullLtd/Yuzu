@@ -6,7 +6,12 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers five families — `network`, `verify`, `compliance`, `device`, `dex` (see FAMILIES below).
+covers nine families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule`, `workflow`, `guardian` (see FAMILIES below; this
+docstring previously read "five", already stale by `dex_perf` before the
+`schedule` family was added, then stale again at "seven" once `workflow`
+landed, then again at "eight" once `guardian` landed — corrected here each
+time, not merely for the family that caught it).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -77,8 +82,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks five families — `network`, `verify`, `compliance`,
-`device` and `dex` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks nine families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf`, `schedule`, `workflow` and `guardian` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -159,6 +164,16 @@ FORBIDDEN_HEADER_PATTERNS = [
     "agent_registry.hpp",
     "pg/*.hpp",
     "*_api_local.hpp",
+    # `schedule` (seventh family) / a future `workflow` seam, Fable review:
+    # `ScheduleEngine`/`WorkflowEngine` are Postgres-backed stores
+    # (`pg::PgPool&` constructor dependency) but are named `*_engine.hpp`,
+    # not `*_store.hpp` — the first pattern above does not catch them, and
+    # neither is named `agent_registry.hpp`. Without this pair, an abstract
+    # seam header could `#include`/forward-declare either and CI would stay
+    # green — the same blindness class `agent_registry.hpp` above was added
+    # to close, just for a different store header naming convention.
+    "schedule_engine.hpp",
+    "workflow_engine.hpp",
 ]
 
 # ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
@@ -186,6 +201,8 @@ IMPL_TUS = [
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
     "server/core/src/dex_perf_api.cpp",
+    "server/core/src/schedule_api.cpp",
+    "server/core/src/workflow_api.cpp",
     # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
     # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
@@ -201,6 +218,15 @@ IMPL_TUS = [
     # httplib/routes-free from its first commit (unlike dex_read_model.cpp, it
     # never had the DEX-signals-seam's presentation include to drop).
     "server/core/src/dex_app_perf_model.cpp",
+    "server/core/src/guardian_api.cpp",
+    # guardian_model.cpp backs the same LocalGuardianApi (it defines
+    # guardian_status_rollup/guardian_agent_status_rollup/
+    # guardian_rule_agent_status_rows/guardian_device_all_guards/
+    # guardian_device_compliance_rollup, ADR-0031 WS-A4 GuardianApi seam,
+    # ninth family) and was already httplib/routes-free — the dashboard
+    # fragments that also call it (`guardian_routes.cpp`) reach it as a
+    # SIBLING include, not the other way around.
+    "server/core/src/guardian_model.cpp",
 ]
 # ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
 # The store-HEADER patterns above do NOT catch an abstract seam header that
@@ -219,6 +245,9 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/device_api.hpp",
     "server/core/src/dex_api.hpp",
     "server/core/src/dex_perf_api.hpp",
+    "server/core/src/schedule_api.hpp",
+    "server/core/src/workflow_api.hpp",
+    "server/core/src/guardian_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -250,8 +279,16 @@ ABSTRACT_API_HEADERS = [
 # (the verify seam's own pure model) that legitimately appears in verify_api.hpp's
 # closure — it is NOT a store type, so listing it would be a false positive.
 STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
+# `ScheduleEngine`/`WorkflowEngine`: `schedule` (seventh family) / a future
+# `workflow` seam, Fable review — the same naming-convention gap
+# `FORBIDDEN_HEADER_PATTERNS`' `schedule_engine.hpp`/`workflow_engine.hpp`
+# entries close for the HEADER-include probe, closed here for the
+# TYPE-NAME-in-code probe (a forward-declared `class ScheduleEngine;` plus a
+# `list_schedules(ScheduleEngine*, …)` signature names the type without
+# including its header).
 EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
-                           "AgentRegistry", "ExecutionTracker", "PgPool"]
+                           "AgentRegistry", "ExecutionTracker", "PgPool",
+                           "ScheduleEngine", "WorkflowEngine"]
 
 # `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
 # `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
@@ -268,10 +305,11 @@ EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
 IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
-# (the FOURTH, #4484) and `dex` (the FIFTH — the DEX signals seam). Each set
-# covers the
+# (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
+# (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
+# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -297,6 +335,16 @@ FAMILIES = {
             "server/core/src/device_ui.cpp",
             "server/core/src/device_api.hpp",
             "server/core/src/device_api_local.hpp",
+            # device_lens_routes.{cpp,hpp} — the DEX/Guardian device-page lens
+            # fragments, split out of device_routes.cpp in the SAME wave but
+            # left outside this enforced set until their own rewire (issue
+            # #4576 + the guardian-lens deferral). Now onto the DexApi/
+            # GuardianApi abstract seams (see device_lens_routes.hpp's own
+            # banner) — enrolled here alongside device_routes.cpp/device_ui.cpp
+            # rather than as a standalone family, since it is this family's
+            # own presentation surface, just a second TU.
+            "server/core/src/device_lens_routes.cpp",
+            "server/core/src/device_lens_routes.hpp",
         ],
     },
     "network": {
@@ -348,11 +396,14 @@ FAMILIES = {
     # `dex_read_builders.hpp`'s other includers are OUTSIDE this set: they
     # legitimately reach the store (core side of the seam), like every other
     # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
-    # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
-    # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
-    # other families' twin-registration files. REST and MCP both route through
-    # `DexApi`; the dashboard fragments and the /fragments/device/dex lens are
-    # deferred (follow-up).
+    # `dex_routes.cpp` are multi-family / mixed TUs and stay
+    # INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the other
+    # families' twin-registration files. REST and MCP both route through
+    # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
+    # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
+    # `device` family's TU set above (it is that family's own second
+    # presentation TU), not this one, since `dex`'s enforced set here is
+    # header-only.
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",
@@ -364,11 +415,17 @@ FAMILIES = {
     # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
     # sequel to `dex` (DEX signals). REST and MCP ARE rewired through this
     # seam (zero remaining direct AppPerfProviders/DexPerfFn calls in
-    # rest_api_v1.cpp/mcp_server.cpp) — same header-only posture as `dex` for
-    # a DIFFERENT reason: those two consumer TUs are multi-family and stay
-    # inspected-not-enforced (same as every family), not because the rewire is
-    # outstanding. Only the dashboard (dex_app_perf_ui.*, dex_perf_ui.cpp) is
-    # unrewired, tracked #4626 (mirroring `dex`'s #4576).
+    # rest_api_v1.cpp/mcp_server.cpp). #4626 additionally rewired and ENROLLED
+    # the dashboard consumer TUs (`dex_perf_ui.cpp`, `dex_app_perf_ui.hpp`,
+    # `dex_app_perf_ui.cpp`) — the retired `AppPerfProviders` bundle's last
+    # production consumer — so this family now enforces its UI TUs too,
+    # narrowing the gap to `network`'s five-consumer-enforced posture.
+    # `dex_routes.cpp`/`.hpp` (the ROUTE-registration half) stay OUTSIDE this
+    # set, same as `dex`'s own `dex_routes.cpp` — that TU also registers the
+    # still-store-coupled DEX-SIGNALS fragments (GuaranteedStateStore-backed,
+    # out of scope for both `dex` and `dex_perf`'s own seam builds), so
+    # enforcing it would require splitting the DEX-signals dashboard rewire
+    # (tracked #4576) into this family's scope, which it is not.
     "dex_perf": {
         "tus": [
             "server/core/src/app_perf_types.hpp",
@@ -376,6 +433,107 @@ FAMILIES = {
             "server/core/src/dex_perf_model.hpp",
             "server/core/src/dex_perf_api.hpp",
             "server/core/src/dex_perf_api_local.hpp",
+            "server/core/src/dex_perf_ui.cpp",
+            "server/core/src/dex_app_perf_ui.hpp",
+            "server/core/src/dex_app_perf_ui.cpp",
+        ],
+    },
+    # `schedule` (ADR-0031 WS-A4, the SEVENTH family through the seam) — the
+    # recurring-schedule READ surface (GET /fragments/schedules, GET
+    # /api/v1/schedules, MCP list_schedules — all three share ONE
+    # ScheduleApi::list_schedules call). Header-only posture, same reason as
+    # `dex`/`dex_perf`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the unseamed `workflow` family's routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and the dashboard fragment ARE rewired (server.cpp / mcp_server.cpp
+    # both call the seam). `schedule_types.hpp` was relocated out of
+    # `schedule_engine.hpp`; `schedule_model.hpp`/`.cpp` (schedule_row_json)
+    # was split out of the entangled `workflow_model.hpp`, which previously
+    # bundled it with the (unseamed) workflow builders and `#include`d BOTH
+    # `schedule_engine.hpp` AND `workflow_engine.hpp` despite claiming
+    # "pure, I/O-free" — the exact anti-pattern the `dex_perf` seam's own
+    # design note (PR #4582) warns against. The unversioned legacy
+    # `/api/schedules` POST/DELETE/enable mutators (`schedule_routes.cpp`)
+    # are a SEPARATE, deliberately untouched capability with no public
+    # REST v1/MCP twin — nothing to carve out of this family's enforced set,
+    # unlike `compliance`'s WS-A3 mutator gap.
+    "schedule": {
+        "tus": [
+            "server/core/src/schedule_types.hpp",
+            "server/core/src/schedule_model.hpp",
+            "server/core/src/schedule_model.cpp",
+            "server/core/src/schedule_api.hpp",
+            "server/core/src/schedule_api_local.hpp",
+        ],
+    },
+    # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
+    # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
+    # /api/v1/workflow-executions/{id}, MCP list_workflows/get_workflow/
+    # get_workflow_execution). Header-only posture, same reason as
+    # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the legacy unversioned GET routes and
+    # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and MCP ARE rewired (server.cpp / mcp_server.cpp both call the
+    # seam). `workflow_types.hpp` was relocated out of `workflow_engine.hpp`;
+    # `workflow_model.hpp` was made genuinely pure by pointing it at
+    # `workflow_types.hpp` instead of the store-coupled `workflow_engine.
+    # hpp` (it needed no FURTHER split by this eighth family — it DID
+    # originally bundle another family's builder, `schedule_row_json`, but
+    # the seventh family's own PR already split that out into
+    # `schedule_model.hpp`, so by the time `workflow` landed there was
+    # nothing left to carve out). The legacy unversioned GET
+    # routes and every `POST`/`DELETE`/`.../execute` mutator
+    # (`workflow_routes.cpp`) are a SEPARATE, deliberately untouched
+    # capability with no public REST v1/MCP twin of their own (the
+    # mutators) or sharing the SAME store call as their v1 twin without
+    # themselves being the versioned resource (the legacy GETs) — nothing
+    # to carve out of this family's enforced set, unlike `compliance`'s
+    # WS-A3 mutator gap.
+    "workflow": {
+        "tus": [
+            "server/core/src/workflow_types.hpp",
+            "server/core/src/workflow_model.hpp",
+            "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_api.hpp",
+            "server/core/src/workflow_api_local.hpp",
+        ],
+    },
+    # `guardian` (ADR-0031 WS-A4, the NINTH family) — the Guardian /
+    # Guaranteed State READ surface: `GuaranteedStateStore`-backed
+    # `GET /api/v1/guaranteed-state/{rules,rules/{id},status,
+    # status/{agent_id},rules/{id}/status,agents/{id}/rules,events}` +
+    # `BaselineStore`-backed `device-compliance` — eight of the family's
+    # nine public resources, each with a live MCP twin. The ninth,
+    # `schemas`/MCP `get_guardian_schemas`, is deliberately outside the
+    # seam (a compiled-in, store-free catalog — see guardian_api.hpp).
+    # Enforced at the HEADER level only, same posture as
+    # `dex`/`dex_perf`/`schedule`/`workflow` and for the SAME reason:
+    # `rest_api_v1.cpp`/`mcp_server.cpp` are multi-family TUs, and
+    # `guardian_routes.cpp` — UNLIKE those four siblings — has no
+    # single-family enforced TU of its own to add here either, because it
+    # interleaves the seamed READ fragments with the rule/baseline
+    # MUTATORS (no public REST/MCP twin — `compliance`'s own WS-A3 gap
+    # shape, #4334) in one translation unit; carving the mutators out into
+    # a `policy_admin_routes.hpp`-style sibling file is a disclosed,
+    # separate follow-up, not done by this seam. `guardian_types.hpp` holds
+    # both the relocated `GuaranteedState*` row/query/error types (out of
+    # `guaranteed_state_store.hpp`) AND the five pre-existing pure result
+    # structs relocated out of `guardian_model.hpp` (that header itself
+    # forward-declares `GuaranteedStateStore`/`BaselineStore` and so cannot
+    # sit in this family's enforced set — see its own file banner).
+    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment IS now
+    # rewired onto this seam (`GuardianApi::device_guards`, mirroring the
+    # `dex` family's own ISSUE #4576 rewire) and enforced — but via the
+    # `device` family's TU set, not this one, since `guardian`'s own enforced
+    # set here is header-only (see the `device` family entry above).
+    "guardian": {
+        "tus": [
+            "server/core/src/guardian_types.hpp",
+            "server/core/src/guardian_api.hpp",
+            "server/core/src/guardian_api_local.hpp",
         ],
     },
 }

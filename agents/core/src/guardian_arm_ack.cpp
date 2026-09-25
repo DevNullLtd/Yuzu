@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include "guaranteed_state.pb.h"
 #include "sync_canonical.hpp" // sha256_hex
@@ -335,7 +336,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             try {
                 spdlog::warn("Guardian: spark arm failed for rule '{}' (accepted, resolved "
                              "asynchronously, status={})",
-                             it->first, receipt_status_name(status));
+                             log_id_token(it->first), receipt_status_name(status));
             } catch (...) {
             }
             // Governance follow-up (Gate 3, cpp-safety + cpp-expert; Gate 4,

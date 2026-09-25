@@ -1,0 +1,41 @@
+status: REAL CAPTURE
+
+host: ubuntu:26.04 (linux/arm64) Docker container on this Mac, cupsd 2.4.16
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 0 (root, real container root — no header at all, so this
+          is the un-augmented request identity, not an impersonation claim)
+
+request: Cancel-Job (0x0008), printer `yuzu_test`, job-id 3, requesting-
+user-name=root, request-id 1 — NO `Authorization` header of any kind. Job
+3 was submitted as `nobody` (`su -s /bin/sh nobody -c 'lp -d yuzu_test
+/etc/hosts'`) — a FRESH job, distinct from job 1 (already cancelled by
+cancel_job_root_vs_nobody.ipp's capture), so this is not a repeat cancel
+of an already-gone job.
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/linux
+  python3 build_request.py cancel-job yuzu_test 3 root > /tmp/req3.ipp
+  curl --unix-socket /run/cups/cups.sock -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      --data-binary @/tmp/req3.ipp \
+      http://localhost/ -o cancel_job_root_no_peercred.ipp
+
+decoded result: 72 bytes; HTTP 200; status-code 0x0000 (successful-ok) —
+IDENTICAL outcome to cancel_job_root_vs_nobody.ipp's WITH-header capture.
+Verified afterward: `lpstat -o yuzu_test` no longer lists job 3.
+
+WHAT THIS PROVES: on this Debian/Ubuntu cupsd, over the Unix domain
+socket, cupsd resolves the connecting principal from the kernel's real
+peer credentials (SO_PEERCRED) on the socket itself — the process really
+was uid 0 — not from the `Authorization: PeerCred <user>` header
+printing_plugin.cpp sends. The header is accepted (no framing/parse
+error either way) but is NOT load-bearing for this outcome: root
+cancelling another user's job succeeds whether or not the header is
+present, because root's REAL socket-peer identity already satisfies
+`Require user @OWNER @SYSTEM` (SystemGroup root lpadmin). This narrows
+what the earlier PROVISIONAL note could only speculate about: the plugin
+code's `Authorization: PeerCred` header is harmless but its necessity for
+the measured @SYSTEM-membership success path is UNPROVEN by this
+container — cupsd's real authorization signal on Linux is the kernel
+peer-credential, matching upstream CUPS's documented `PeerCred` scheme
+auth behaviour over local sockets.

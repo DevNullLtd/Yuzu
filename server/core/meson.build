@@ -421,6 +421,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
+    'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
@@ -428,9 +429,12 @@ yuzu_server_core_lib = static_library(
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
+    'src/approval_model.cpp',
     'src/schedule_engine.cpp',
     'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',
+    'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
+    'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
@@ -477,6 +481,7 @@ yuzu_server_core_lib = static_library(
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
     'src/guardian_model.cpp',
+    'src/guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
@@ -570,6 +575,7 @@ yuzu_server_core_lib = static_library(
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -625,6 +631,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
@@ -632,6 +639,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_transfer_watchdog.cpp',
     'src/principal_quota.cpp',
     'src/cert_reloader.cpp',
+    'src/grpc_tls_credentials.cpp',
     'src/x509_ca.cpp',
     # key_provider.cpp lives in the yuzu_key_provider leaf target above
     # (ADR-0010 arch-S3); the dep below carries it.

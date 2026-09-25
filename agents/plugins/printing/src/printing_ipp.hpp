@@ -127,8 +127,23 @@ inline void put_attr(std::string& out, uint8_t tag, std::string_view name, std::
 /// `operation_attrs` in the order given, then end-of-attributes (0x03).
 /// This plugin never sends a job-attributes or printer-attributes group on
 /// a request, so no group-selection parameter is needed.
+///
+/// Returns an EMPTY string (a request that must not be sent) when any
+/// attribute name or value exceeds the 16-bit IPP length prefix. Writing the
+/// truncated length and then appending the whole value would let the peer
+/// parse the excess bytes as further attributes -- a caller-controlled value
+/// could inject attributes into the request.
 [[nodiscard]] inline std::string encode_request(uint16_t op, uint32_t request_id,
                                                  const std::vector<OperationAttr>& operation_attrs) {
+    constexpr std::size_t kMaxIppLength = 0xFFFF;
+    for (const auto& a : operation_attrs) {
+        if (a.name.size() > kMaxIppLength || a.value.size() > kMaxIppLength)
+            return {};
+        for (const auto& extra : a.additional_values) {
+            if (extra.size() > kMaxIppLength)
+                return {};
+        }
+    }
     std::string out;
     detail::put_u16(out, kVersion);
     detail::put_u16(out, op);

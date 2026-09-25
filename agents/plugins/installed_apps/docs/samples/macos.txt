@@ -1,327 +1,328 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 47e1dd9008d0
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 (account redacted to jsmith; user-profile paths redacted) · leg-hash 3690edc65cda
 == action=list
-app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51
-app|ABAssistantService|14.0|-|13/08/2026, 03:51
-app|AMSEngagementViewService|1.0|-|13/08/2026, 03:51
-app|AOSAlertManager|1.07|-|13/08/2026, 03:51
-app|AOSHeartbeat|1.07|-|13/08/2026, 03:51
-app|AOSPushRelay|1.07|-|13/08/2026, 03:51
-app|AOSUIPrefPaneLauncher|1.0|-|13/08/2026, 03:51
-app|ARDAgent|3.9.8|-|13/08/2026, 03:51
-app|AVB Configuration|1440.7|-|13/08/2026, 03:51
-app|AXVisualSupportAgent|1.0|-|13/08/2026, 03:51
-app|About This Mac|1.0|-|13/08/2026, 03:51
-app|Accessibility Reader|1.0|-|13/08/2026, 03:51
-app|Accessibility Tutorial|1.0|-|13/08/2026, 03:51
-app|AccessibilityUIServer|1.0|-|13/08/2026, 03:51
-app|AccessibilityVisualsAgent|1.0|-|13/08/2026, 03:51
-app|Activity Monitor|10.14|-|13/08/2026, 03:51
-app|AddPrinter|607|-|13/08/2026, 03:51
-app|AddressBookManager|14.0|-|13/08/2026, 03:51
-app|AddressBookSourceSync|14.0|-|13/08/2026, 03:51
-app|AddressBookSync|14.0|-|13/08/2026, 03:51
-app|AddressBookUrlForwarder|14.0|-|13/08/2026, 03:51
-app|AinuIM|1.0|-|13/08/2026, 03:51
-app|AirDrop|26.4|-|13/08/2026, 03:51
-app|AirPlayUIAgent|2.0|-|13/08/2026, 03:51
-app|AirPort Base Station Agent|2.2.1|-|13/08/2026, 03:51
-app|AirPort Utility|6.3.9|-|13/08/2026, 03:51
-app|AirScanLegacyDiscovery|607|-|13/08/2026, 03:51
-app|AirScanScanner|18|-|13/08/2026, 03:51
-app|App Store|3.0|-|13/08/2026, 03:51
-app|AppSSOAgent|1.0|-|13/08/2026, 03:51
-app|Apple Diagnostics|1.0|-|13/08/2026, 03:51
-app|AppleMobileDeviceHelper|5.0|-|13/08/2026, 03:51
-app|AppleMobileSync|5.0|-|13/08/2026, 03:51
-app|AppleScript Utility|1.1.2|-|13/08/2026, 03:51
-app|AppleSpell|2.4|-|13/08/2026, 03:51
-app|Apps|1.0|-|13/08/2026, 03:51
-app|AquaAppearanceHelper|1.0|-|13/08/2026, 03:51
-app|Archive Utility|10.15|-|13/08/2026, 03:51
-app|AskPermissionUI|129.6.2|-|13/08/2026, 03:51
-app|Assistive Control|2.0|-|13/08/2026, 03:51
-app|Audio MIDI Setup|3.8|-|13/08/2026, 03:51
-app|AutoFillPanelService|1.0|-|13/08/2026, 03:51
-app|AutomationModeUI|1.0|-|13/08/2026, 03:51
-app|Automator|2.10|-|13/08/2026, 03:51
-app|Automator Application Stub|1.3|-|13/08/2026, 03:51
-app|Automator Installer|2.10|-|13/08/2026, 03:51
-app|BackgroundTaskManagementAgent|1.0|-|13/08/2026, 03:51
-app|Batteries|1.0|-|13/08/2026, 03:51
-app|Bluetooth File Exchange|9.0|-|13/08/2026, 03:51
-app|Bluetooth Setup Assistant|9.0|-|13/08/2026, 03:51
-app|BluetoothUIServer|9.0|-|13/08/2026, 03:51
-app|BluetoothUIService|1.0|-|13/08/2026, 03:51
-app|Books|8.5|-|13/08/2026, 03:51
-app|Boot Camp Assistant|6.1.0|-|13/08/2026, 03:51
-app|Build Web Page|10.1|-|13/08/2026, 03:51
-app|CIMFindInputCodeTool|104|-|13/08/2026, 03:51
-app|Calculator|12.0|-|13/08/2026, 03:51
-app|Calendar|16.0|-|13/08/2026, 03:51
-app|CalendarFileHandler|8.0|-|13/08/2026, 03:51
-app|Calibration Assistant|1.0|-|13/08/2026, 03:51
-app|Captive Network Assistant|5.0|-|13/08/2026, 03:51
-app|Certificate Assistant|5.0|-|13/08/2026, 03:51
-app|CharacterPalette|2.0.1|-|13/08/2026, 03:51
-app|Chess|3.18|-|13/08/2026, 03:51
-app|ChineseTextConverterService|2.1|-|13/08/2026, 03:51
-app|CinematicFramingOnboardingUI|1.0|-|13/08/2026, 03:51
-app|ClassroomStudentMenuExtra|1.0|-|13/08/2026, 03:51
-app|Clock|1.1|-|13/08/2026, 03:51
-app|Cocoa-AppleScript Applet|1.0|-|13/08/2026, 03:51
-app|ColorSync Utility|12.2.0|-|13/08/2026, 03:51
-app|Computer|26.4|-|13/08/2026, 03:51
-app|Conflict Resolver|8.1|-|13/08/2026, 03:51
-app|Console|1.1|-|13/08/2026, 03:51
-app|Contacts|14.0|-|13/08/2026, 03:51
-app|Contacts|1.0|-|13/08/2026, 03:51
-app|ContinuityCaptureOnboardingUI|1.0|-|13/08/2026, 03:51
-app|Control Centre|1.0|-|13/08/2026, 03:51
-app|ControlStrip|1.0|-|13/08/2026, 03:51
-app|CoreLocationAgent|3077.0.4|-|13/08/2026, 03:51
-app|CoreServicesUIAgent|369|-|13/08/2026, 03:51
-app|Coverage Details|1.0|-|13/08/2026, 03:51
-app|DFRHUD|1.0|-|13/08/2026, 03:51
-app|DVD Player|6.0|-|13/08/2026, 03:51
-app|Database Events|1.0.6|-|13/08/2026, 03:51
-app|Desk View|2.0|-|13/08/2026, 03:51
-app|Diagnostics Reporter|1.0|-|13/08/2026, 03:51
-app|Dictation|6.2.47|-|13/08/2026, 03:51
-app|Dictionary|2.3.0|-|13/08/2026, 03:51
-app|Digital Colour Meter|6.11|-|13/08/2026, 03:51
-app|Directory Utility|7.0|-|13/08/2026, 03:51
-app|DiscHelper|1.0|-|13/08/2026, 03:51
-app|Disk Utility|22.7|-|13/08/2026, 03:51
-app|DiskImageMounter|1.0|-|13/08/2026, 03:51
-app|DiskImages UI Agent|683.160.3|-|13/08/2026, 03:51
-app|Display Calibrator|4.19|-|13/08/2026, 03:51
-app|Dock|1.8|-|13/08/2026, 03:51
-app|Docker|4.89.0|-|13/08/2026, 16:18
-app|Droplet with Settable Properties|1.0|-|13/08/2026, 03:51
-app|Dwell Control|1.0|-|13/08/2026, 03:51
-app|EmojiFunctionRowIM|1.0|-|13/08/2026, 03:51
-app|Enhanced Logging|1.0|-|13/08/2026, 03:51
-app|Erase Assistant|1.0|-|13/08/2026, 03:51
-app|EscrowSecurityAlert|1.0|-|13/08/2026, 03:51
-app|Expansion Slot Utility|2.0|-|13/08/2026, 03:51
-app|FaceTime|36|-|13/08/2026, 03:51
-app|Family|1.0|-|13/08/2026, 03:51
-app|FamilyExtensionHost|1.0|-|13/08/2026, 03:51
-app|Feedback Assistant|5.1|-|13/08/2026, 03:51
-app|FeedbackRemoteView|1.0|-|13/08/2026, 03:51
-app|FileProvider-Feedback|1.0|-|13/08/2026, 03:51
-app|Find My|4.0|-|13/08/2026, 03:51
-app|FindMyMacMessenger|4.1|-|13/08/2026, 03:51
-app|Finder|26.4|-|13/08/2026, 03:51
-app|Folder Actions Setup|1.2|-|13/08/2026, 03:51
-app|FolderActionsDispatcher|1.0|-|13/08/2026, 03:51
-app|FollowUpUI|1.0|-|13/08/2026, 03:51
-app|Font Book|11.0|-|13/08/2026, 03:51
-app|FontRegistryUIAgent|81.0|-|13/08/2026, 03:51
-app|Freeform|4.5|-|13/08/2026, 03:51
-app|Game Center|1.0|-|13/08/2026, 03:51
-app|GameOverlayUI|1.0|-|13/08/2026, 03:51
-app|Games|1.0|-|13/08/2026, 03:51
-app|Games|820.6.10.1.1|-|13/08/2026, 03:51
-app|GarageBand|10.4.13|-|18/07/2026, 01:47
-app|Grapher|2.8|-|13/08/2026, 03:51
-app|Home|10.0|-|13/08/2026, 03:51
-app|Hush|1.0.19|-|24/08/2026, 12:32
-app|IDSRemoteURLConnectionAgent|10.0|-|13/08/2026, 03:51
-app|IMAutomaticHistoryDeletionAgent|10.0|-|13/08/2026, 03:51
-app|IMTransferAgent|10.0|-|13/08/2026, 03:51
-app|IOUIAgent|1.0|-|13/08/2026, 03:51
-app|Image Capture|8.0|-|13/08/2026, 03:51
-app|Image Events|1.1.6|-|13/08/2026, 03:51
-app|Image Playground|1.0|-|13/08/2026, 03:51
-app|Install Command Line Developer Tools|2416|-|13/08/2026, 03:51
-app|Install Spotify|1.2.96.518|-|31/12/1979, 23:00
-app|Install in Progress|3.0|-|13/08/2026, 03:51
-app|Installer|6.2.0|-|13/08/2026, 03:51
-app|Installer Progress|1.0|-|13/08/2026, 03:51
-app|JapaneseIM-KanaTyping|6.3|-|13/08/2026, 03:51
-app|JapaneseIM-RomajiTyping|6.3|-|13/08/2026, 03:51
-app|JavaLauncher|326|-|13/08/2026, 03:51
-app|Journal|2.0|-|13/08/2026, 03:51
-app|KerberosMenuExtra|1.0|-|13/08/2026, 03:51
-app|KeyboardAccessAgent|10|-|13/08/2026, 03:51
-app|KeyboardSetupAssistant|1.0|-|13/08/2026, 03:51
-app|Keychain Access|11.0|-|13/08/2026, 03:51
-app|Keychain Circle Notification|1.0|-|13/08/2026, 03:51
-app|Keynote|15.1.1|-|18/07/2026, 01:45
-app|KoreanIM|1.0|-|13/08/2026, 03:51
-app|Language Chooser|1.0|-|13/08/2026, 03:51
-app|LinkedNotesUIService|1.0|-|13/08/2026, 03:51
-app|Live Captions|1.0|-|13/08/2026, 03:51
-app|LiveSpeech|1.0|-|13/08/2026, 03:51
-app|MDMMigrationTrampoline|1.0|-|13/08/2026, 03:51
-app|MRT|1.93|-|19/08/2026, 15:56
-app|MTLReplayer|314.14|-|13/08/2026, 03:51
-app|Magnifier|1.0|-|13/08/2026, 03:51
-app|Mail|16.0|-|13/08/2026, 03:51
-app|MakePDF|10.1|-|13/08/2026, 03:51
-app|ManagedClient|18.0|-|13/08/2026, 03:51
-app|Maps|3.0|-|13/08/2026, 03:51
-app|Medical Imaging Calibrator|1.0|-|13/08/2026, 03:51
-app|Memory Slot Utility|1.5.3|-|13/08/2026, 03:51
-app|Messages|26.0|-|13/08/2026, 03:51
-app|Migration Assistant|26.6|-|13/08/2026, 03:51
-app|Mission Control|1.2|-|13/08/2026, 03:51
-app|MobileDeviceUpdater|1.0|-|13/08/2026, 03:51
-app|Music|1.6.6|-|13/08/2026, 03:51
-app|Music Recognition|1.0|-|13/08/2026, 03:51
-app|NetAuthAgent|6.2|-|13/08/2026, 03:51
-app|Network|26.4|-|13/08/2026, 03:51
-app|News|11.5|-|13/08/2026, 03:51
-app|NordVPN|10.9.0|-|06/09/2026, 14:56
-app|Notes|4.13|-|13/08/2026, 03:51
-app|Notification Centre|1.0|-|13/08/2026, 03:51
-app|NowPlayingTouchUI|1.0|-|13/08/2026, 03:51
-app|Numbers|15.1|-|18/07/2026, 01:46
-app|OBEXAgent|9.0|-|13/08/2026, 03:51
-app|OSDUIHelper|1.0|-|13/08/2026, 03:51
-app|OpenSpell|1.0|-|13/08/2026, 03:51
-app|PIPAgent|2.0|-|13/08/2026, 03:51
-app|Pages|15.1.1|-|18/07/2026, 01:46
-app|Paired Devices|7.1|-|13/08/2026, 03:51
-app|ParentalControls|4.1|-|13/08/2026, 03:51
-app|Pass Viewer|1.0|-|13/08/2026, 03:51
-app|PassViewer|-|-|13/08/2026, 03:51
-app|Passwords|2.6.2|-|13/08/2026, 03:51
-app|PeopleMessageService|1.0|-|13/08/2026, 03:51
-app|Phone|1.0|-|13/08/2026, 03:51
-app|Photo Booth|13.1|-|13/08/2026, 03:51
-app|Photos|11.0|-|13/08/2026, 03:51
-app|PluginIM|26.200|-|13/08/2026, 03:51
-app|Podcasts|1.1.0|-|13/08/2026, 03:51
-app|PowerChime|1.0|-|13/08/2026, 03:51
-app|PressAndHold|1.0|-|13/08/2026, 03:51
-app|Preview|11.0|-|13/08/2026, 03:51
-app|PreviewShell|16.0|-|13/08/2026, 03:51
-app|PreviewShellMac|16.0|-|13/08/2026, 03:51
-app|Print Centre|1.0|-|13/08/2026, 03:51
-app|Pro Display Calibrator|212.35|-|13/08/2026, 03:51
-app|Problem Reporter|10.13|-|13/08/2026, 03:51
-app|Profile Installer|1.0|-|13/08/2026, 03:51
-app|Python|3.9.6|-|19/08/2026, 16:37
-app|Quick Look Simulator|1.0|-|13/08/2026, 03:51
-app|QuickLookUIHelper|5.0|-|13/08/2026, 03:51
-app|QuickTime Player|10.5|-|13/08/2026, 03:51
-app|RapportUIAgent|7.1|-|13/08/2026, 03:51
-app|Recents|26.4|-|13/08/2026, 03:51
-app|Recursive File Processing Droplet|1.0|-|13/08/2026, 03:51
-app|Recursive Image File Processing Droplet|1.0|-|13/08/2026, 03:51
-app|RegisterPluginIMApp|26.200|-|13/08/2026, 03:51
-app|Reminders|7.0|-|13/08/2026, 03:51
-app|Remote Desktop Message|3.9.8|-|13/08/2026, 03:51
-app|Rosetta 2 Updater|1.0|-|13/08/2026, 03:51
-app|SCIM|104|-|13/08/2026, 03:51
-app|SSMenuAgent|3.9.8|-|13/08/2026, 03:51
-app|STMUIHelper|1.0|-|13/08/2026, 03:51
-app|Screen Sharing|6.1|-|13/08/2026, 03:51
-app|Screen Time|3.0|-|13/08/2026, 03:51
-app|ScreenReaderUIServer|10|-|13/08/2026, 03:51
-app|ScreenSaverEngine|5.0|-|13/08/2026, 03:51
-app|Screenshot|1.0|-|13/08/2026, 03:51
-app|Script Editor|2.11|-|13/08/2026, 03:51
-app|Script Menu|1|-|13/08/2026, 03:51
-app|ScriptMonitor|1.0.1|-|13/08/2026, 03:51
-app|Setup Assistant|10.10|-|13/08/2026, 03:51
-app|ShortcutDroplet|1.0|-|13/08/2026, 03:51
-app|Shortcuts|7.0|-|13/08/2026, 03:51
-app|Shortcuts Events|1.0|-|13/08/2026, 03:51
-app|ShortcutsActions|-|-|13/08/2026, 03:51
-app|Signal|8.26.0|-|04/09/2026, 22:19
-app|Siri|3525.5.2|-|13/08/2026, 03:51
-app|Siri|1.0|-|13/08/2026, 03:51
-app|SmartCard Pairing|1.0|-|13/08/2026, 03:51
-app|Software Update|6|-|13/08/2026, 03:51
-app|SoftwareUpdateNotificationManager|1.0|-|13/08/2026, 03:51
-app|SpacesTouchBarAgent|1.0|-|13/08/2026, 03:51
-app|Speech Downloader|10|-|13/08/2026, 03:51
-app|SpeechRecognitionServer|10|-|13/08/2026, 03:51
-app|SpeechService|9.2.22|-|13/08/2026, 03:51
-app|Spotify|1.2.98.301|-|31/08/2026, 10:43
-app|Spotlight|1.0|-|13/08/2026, 03:51
-app|Spotlight|3.0|-|13/08/2026, 03:51
-app|StageManagerOnboarding|1.0|-|13/08/2026, 03:51
-app|Stickies|10.3|-|13/08/2026, 03:51
-app|Stocks|8.5|-|13/08/2026, 03:51
-app|Summary Service|2.0|-|13/08/2026, 03:51
-app|SyncServer|8.1|-|13/08/2026, 03:51
-app|System Events|1.3.6|-|13/08/2026, 03:51
-app|System Information|11.0|-|13/08/2026, 03:51
-app|System Settings|15.0|-|13/08/2026, 03:51
-app|System Speech|9.2.22|-|13/08/2026, 03:51
-app|SystemIntents|1.0|-|13/08/2026, 03:51
-app|SystemUIServer|1.7|-|13/08/2026, 03:51
-app|TCIM|104|-|13/08/2026, 03:51
-app|TMHelperAgent|13|-|13/08/2026, 03:51
-app|TV|1.6.6|-|13/08/2026, 03:51
-app|TYIM|104|-|13/08/2026, 03:51
-app|Tailscale|1.102.2|-|19/08/2026, 16:04
-app|TamilIM|1.6|-|13/08/2026, 03:51
-app|Terminal|2.15|-|13/08/2026, 03:51
-app|TextEdit|1.20|-|13/08/2026, 03:51
-app|TextInputMenuAgent|1.0|-|13/08/2026, 03:51
-app|TextInputSwitcher|1.1|-|13/08/2026, 03:51
-app|ThermalTrap|1.0|-|13/08/2026, 03:51
-app|Ticket Viewer|4.1|-|13/08/2026, 03:51
-app|Time Machine|1.3|-|13/08/2026, 03:51
-app|Tips|1.0|-|13/08/2026, 03:51
-app|Tips|26.6|-|13/08/2026, 03:51
-app|TrackpadIM|1.0|-|13/08/2026, 03:51
-app|TransliterationIM|1.0|-|13/08/2026, 03:51
-app|UASharedPasteboardProgressUI|54.1|-|13/08/2026, 03:51
-app|UIKitSystem|1.0|-|13/08/2026, 03:51
-app|Universal Control|1.0|-|13/08/2026, 03:51
-app|UniversalAccessControl|7.0|-|13/08/2026, 03:51
-app|UnmountAssistantAgent|5.0|-|13/08/2026, 03:51
-app|UserNotificationCenter|82|-|13/08/2026, 03:51
-app|VietnameseIM|1.0|-|13/08/2026, 03:51
-app|Visual Studio Code|1.136.1|-|26/08/2026, 21:13
-app|Voice Memos|3.2|-|13/08/2026, 03:51
-app|VoiceOver|10|-|13/08/2026, 03:51
-app|VoiceOver Quickstart|10|-|13/08/2026, 03:51
-app|VoiceOver Utility|10|-|13/08/2026, 03:51
-app|Wallpaper|1.0|-|13/08/2026, 03:51
-app|Watch Face Help|1.0|-|13/08/2026, 03:51
-app|Weather|6.0|-|13/08/2026, 03:51
-app|WhatsApp|26.34.24|-|06/09/2026, 21:14
-app|WiFiAgent|1.0|-|13/08/2026, 03:51
-app|WidgetKit Simulator|1.0|-|13/08/2026, 03:51
-app|WindowManager|341.6.1|-|13/08/2026, 03:51
-app|WindowManagerShowDesktopEducation|1.0|-|13/08/2026, 03:51
-app|Wireless Diagnostics|11.0|-|13/08/2026, 03:51
-app|Wish|8.5.9|-|13/08/2026, 03:51
-app|WorkoutAlert-Mac|1.0|-|13/08/2026, 03:51
-app|XProtect|157|-|19/08/2026, 15:56
-app|com.apple.ctcategories|-|-|20/08/2026, 14:51
-app|eaptlstrust|13.0|-|13/08/2026, 03:51
-app|group.is.workflow|-|-|19/08/2026, 15:55
-app|iCloud|1.0|-|13/08/2026, 03:51
-app|iCloud Drive|26.4|-|13/08/2026, 03:51
-app|iCloud Drive|1.0|-|13/08/2026, 03:51
-app|iCloud+|1.0|-|13/08/2026, 03:51
-app|iCloudUserNotificationsd|1.0|-|13/08/2026, 03:51
-app|iMovie|10.4.4|-|18/07/2026, 01:47
-app|iOS App Installer|1.0|-|13/08/2026, 03:51
-app|iPhone Mirroring|1.6|-|13/08/2026, 03:51
-app|identityservicesd|10.0|-|13/08/2026, 03:51
-app|imagent|10.0|-|13/08/2026, 03:51
-app|liquiddetectiond|-|-|13/08/2026, 03:51
-app|loginwindow|9.0|-|13/08/2026, 03:51
-app|nbagent|1.0|-|13/08/2026, 03:51
-app|privatecloudcomputed|1.0|-|13/08/2026, 03:51
-app|qlmanage|1.0|-|13/08/2026, 03:51
-app|quicklookd|5.0|-|13/08/2026, 03:51
-app|rcd|362|-|13/08/2026, 03:51
-app|screencaptureui|1.0|-|13/08/2026, 03:51
-app|sociallayerd|1.0|-|13/08/2026, 03:51
-app|storeuid|1.0|-|13/08/2026, 03:51
-app|syncuid|8.1|-|13/08/2026, 03:51
-app|uBlock Origin Lite|2026.901.1442|-|03/09/2026, 01:30
-app|universalAccessAuthWarn|1.0|-|13/08/2026, 03:51
+app|50onPaletteServer|1.1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/50onPaletteServer.app|com.apple.50onPaletteIM
+app|ABAssistantService|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/ABAssistantService.app|com.apple.ABAssistantService
+app|AMSEngagementViewService|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AppleMediaServicesUI.framework/Versions/A/Resources/AMSEngagementViewService.app|com.apple.AMSEngagementViewService
+app|AOSAlertManager|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSAlertManager.app|com.apple.AOSAlertManager
+app|AOSHeartbeat|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSHeartbeat.app|com.apple.AOSHeartbeat
+app|AOSPushRelay|1.07|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSKit.framework/Versions/A/Helpers/AOSPushRelay.app|com.apple.AOSPushRelay
+app|AOSUIPrefPaneLauncher|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/AOSUIPrefPaneLauncher.app|com.apple.AOSUIPrefPaneLauncher
+app|ARDAgent|3.9.8|-|13/08/2026, 03:51|/System/Library/CoreServices/RemoteManagement/ARDAgent.app|com.apple.RemoteDesktopAgent
+app|AVB Configuration|1440.7|-|13/08/2026, 03:51|/System/Library/CoreServices/AVB Configuration.app|com.apple.AVB-Audio-Configuration
+app|AXVisualSupportAgent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UniversalAccess.framework/Versions/A/Resources/AXVisualSupportAgent.app|com.apple.accessibility.AXVisualSupportAgent
+app|About This Mac|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/About This Mac.app|com.apple.AboutThisMacLauncher
+app|Accessibility Reader|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Accessibility Reader.app|com.apple.accessibility.AccessibilityReader
+app|Accessibility Tutorial|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UniversalAccess.framework/Versions/A/Resources/Accessibility Tutorial.app|com.apple.AccessibilityOnboarding
+app|AccessibilityUIServer|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/AccessibilityUIServer.app|com.apple.AccessibilityUIServer
+app|AccessibilityVisualsAgent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AccessibilitySupport.framework/Versions/A/Resources/AccessibilityVisualsAgent.app|com.apple.AccessibilityVisualsAgent
+app|Activity Monitor|10.14|-|13/08/2026, 03:51|/System/Applications/Utilities/Activity Monitor.app|com.apple.ActivityMonitor
+app|AddPrinter|607|-|13/08/2026, 03:51|/System/Library/CoreServices/AddPrinter.app|com.apple.print.add
+app|AddressBookManager|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/AddressBookManager.app|com.apple.AddressBook.abd
+app|AddressBookSourceSync|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/AddressBookSourceSync.app|com.apple.AddressBookSourceSync
+app|AddressBookSync|14.0|-|13/08/2026, 03:51|/System/Library/Frameworks/AddressBook.framework/Helpers/AddressBookSync.app|com.apple.AddressBook.sync
+app|AddressBookUrlForwarder|14.0|-|13/08/2026, 03:51|/System/Library/CoreServices/AddressBookUrlForwarder.app|com.apple.AddressBook.UrlForwarder
+app|AinuIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/AinuIM.app|com.apple.inputmethod.Ainu
+app|AirDrop|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app|com.apple.finder.Open-AirDrop
+app|AirPlayUIAgent|2.0|-|13/08/2026, 03:51|/System/Library/CoreServices/AirPlayUIAgent.app|com.apple.AirPlayUIAgent
+app|AirPort Base Station Agent|2.2.1|-|13/08/2026, 03:51|/System/Library/CoreServices/AirPort Base Station Agent.app|com.apple.AirPortBaseStationAgent
+app|AirPort Utility|6.3.9|-|13/08/2026, 03:51|/System/Applications/Utilities/AirPort Utility.app|com.apple.airport.airportutility
+app|AirScanLegacyDiscovery|607|-|13/08/2026, 03:51|/Library/Image Capture/Support/LegacyDeviceDiscoveryHelpers/AirScanLegacyDiscovery.app|com.apple.print.AirScanLegacyDiscovery
+app|AirScanScanner|18|-|13/08/2026, 03:51|/System/Library/Image Capture/Devices/AirScanScanner.app|com.apple.AirScanScanner
+app|App Store|3.0|-|13/08/2026, 03:51|/System/Applications/App Store.app|com.apple.AppStore
+app|AppSSOAgent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AppSSO.framework/Support/AppSSOAgent.app|com.apple.AppSSOAgent
+app|Apple Diagnostics|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Apple Diagnostics.app|com.apple.DiagnosticsModeAssistant
+app|AppleMobileDeviceHelper|5.0|-|13/08/2026, 03:51|/Library/Apple/System/Library/PrivateFrameworks/MobileDevice.framework/Versions/A/AppleMobileDeviceHelper.app|com.apple.SyncServices.AppleMobileDeviceHelper
+app|AppleMobileSync|5.0|-|13/08/2026, 03:51|/Library/Apple/System/Library/PrivateFrameworks/MobileDevice.framework/Versions/A/AppleMobileSync.app|com.apple.SyncServices.AppleMobileSync
+app|AppleScript Utility|1.1.2|-|13/08/2026, 03:51|/System/Library/CoreServices/AppleScript Utility.app|com.apple.AppleScriptUtility
+app|AppleSpell|2.4|-|13/08/2026, 03:51|/System/Library/Services/AppleSpell.service|com.apple.AppleSpell
+app|Apps|1.0|-|13/08/2026, 03:51|/System/Applications/Apps.app|com.apple.apps.launcher
+app|AquaAppearanceHelper|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/AquaAppearanceHelper.app|com.apple.AquaAppearanceHelper
+app|Archive Utility|10.15|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Archive Utility.app|com.apple.archiveutility
+app|AskPermissionUI|129.6.2|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AskPermission.framework/Versions/A/Resources/AskPermissionUI.app|com.apple.AskPermissionUI
+app|Assistive Control|2.0|-|13/08/2026, 03:51|/System/Library/Input Methods/Assistive Control.app|com.apple.inputmethod.AssistiveControl
+app|Audio MIDI Setup|3.8|-|13/08/2026, 03:51|/System/Applications/Utilities/Audio MIDI Setup.app|com.apple.audio.AudioMIDISetup
+app|AutoFillPanelService|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AutoFillUI.framework/Contents/AutoFillPanelService.app|com.apple.AutoFillPanelService
+app|AutomationModeUI|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationModeUI.app|com.apple.dt.AutomationModeUI
+app|Automator|2.10|-|13/08/2026, 03:51|/System/Applications/Automator.app|com.apple.Automator
+app|Automator Application Stub|1.3|-|13/08/2026, 03:51|/System/Library/CoreServices/Automator Application Stub.app|com.apple.Automator.Automator-Application-Stub
+app|Automator Installer|2.10|-|13/08/2026, 03:51|/System/Library/CoreServices/Automator Installer.app|com.apple.AutomatorInstaller
+app|BackgroundTaskManagementAgent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Support/BackgroundTaskManagementAgent.app|com.apple.backgroundtaskmanagement.agent
+app|Batteries|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Batteries.app|com.apple.Batteries
+app|Bluetooth File Exchange|9.0|-|13/08/2026, 03:51|/System/Applications/Utilities/Bluetooth File Exchange.app|com.apple.BluetoothFileExchange
+app|Bluetooth Setup Assistant|9.0|-|13/08/2026, 03:51|/System/Library/CoreServices/BluetoothSetupAssistant.app|com.apple.BluetoothSetupAssistant
+app|BluetoothUIServer|9.0|-|13/08/2026, 03:51|/System/Library/CoreServices/BluetoothUIServer.app|com.apple.BluetoothUIServer
+app|BluetoothUIService|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/BluetoothUIService.app|com.apple.BluetoothUIService
+app|Books|8.5|-|13/08/2026, 03:51|/System/Applications/Books.app|com.apple.iBooksX
+app|Boot Camp Assistant|6.1.0|-|13/08/2026, 03:51|/System/Applications/Utilities/Boot Camp Assistant.app|com.apple.bootcampassistant
+app|Build Web Page|10.1|-|13/08/2026, 03:51|/System/Library/Image Capture/Automatic Tasks/Build Web Page.app|com.apple.BuildWebPage
+app|CIMFindInputCodeTool|104|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/CoreChineseEngine.framework/Versions/A/SharedSupport/CIMFindInputCodeTool.app|com.apple.CCE.CIMFindInputCode
+app|Calculator|12.0|-|13/08/2026, 03:51|/System/Applications/Calculator.app|com.apple.calculator
+app|Calendar|16.0|-|13/08/2026, 03:51|/System/Applications/Calendar.app|com.apple.iCal
+app|CalendarFileHandler|8.0|-|13/08/2026, 03:51|/System/Library/CoreServices/CalendarFileHandler.app|com.apple.CalendarFileHandler
+app|Calibration Assistant|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AmbientDisplay.framework/Versions/A/Resources/Calibration Assistant.app|com.apple.Calibration-Assistant
+app|Captive Network Assistant|5.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Captive Network Assistant.app|com.apple.CaptiveNetworkAssistant
+app|Certificate Assistant|5.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Certificate Assistant.app|com.apple.CertificateAssistant
+app|CharacterPalette|2.0.1|-|13/08/2026, 03:51|/System/Library/Input Methods/CharacterPalette.app|com.apple.CharacterPaletteIM
+app|Chess|3.18|-|13/08/2026, 03:51|/System/Applications/Chess.app|com.apple.Chess
+app|ChineseTextConverterService|2.1|-|13/08/2026, 03:51|/System/Library/Services/ChineseTextConverterService.app|com.apple.ChineseTextConverterService
+app|CinematicFramingOnboardingUI|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/CinematicFramingOnboardingUI.app|com.apple.CMViewSrvc
+app|ClassroomStudentMenuExtra|1.0|-|13/08/2026, 03:51|/System/Library/Classroom/ClassroomStudentMenuExtra.app|com.apple.ClassroomStudentMenuExtra
+app|Claude Code URL Handler|1.0|-|08/09/2026, 17:55|/Users/jsmith/Applications/Claude Code URL Handler.app|com.anthropic.claude-code-url-handler
+app|Clock|1.1|-|13/08/2026, 03:51|/System/Applications/Clock.app|com.apple.clock
+app|Cocoa-AppleScript Applet|1.0|-|13/08/2026, 03:51|/Library/Application Support/Script Editor/Templates/Cocoa-AppleScript Applet.app|com.apple.ScriptEditor.id.cocoa-applet-template
+app|ColorSync Utility|12.2.0|-|13/08/2026, 03:51|/System/Applications/Utilities/ColorSync Utility.app|com.apple.ColorSyncUtility
+app|Computer|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/Computer.app|com.apple.finder.Open-Computer
+app|Conflict Resolver|8.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SyncServicesUI.framework/Versions/A/Resources/Conflict Resolver.app|com.apple.syncservices.ConflictResolver
+app|Console|1.1|-|13/08/2026, 03:51|/System/Applications/Utilities/Console.app|com.apple.Console
+app|Contacts|14.0|-|13/08/2026, 03:51|/System/Applications/Contacts.app|com.apple.AddressBook
+app|Contacts|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PeopleViewService.app|com.apple.PeopleViewService
+app|ContinuityCaptureOnboardingUI|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/ContinuityCaptureOnboardingUI.app|com.apple.ContinuityCaptureOnboardingUI
+app|Control Centre|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ControlCenter.app|com.apple.controlcenter
+app|ControlStrip|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ControlStrip.app|com.apple.controlstrip
+app|CoreLocationAgent|3077.0.4|-|13/08/2026, 03:51|/System/Library/CoreServices/CoreLocationAgent.app|com.apple.CoreLocationAgent
+app|CoreServicesUIAgent|369|-|13/08/2026, 03:51|/System/Library/CoreServices/CoreServicesUIAgent.app|com.apple.coreservices.uiagent
+app|Coverage Details|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Coverage Details.app|com.apple.NewDeviceOutreachApp
+app|DFRHUD|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UniversalAccess.framework/Versions/A/Resources/DFRHUD.app|com.apple.accessibility.DFRHUD
+app|DVD Player|6.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/DVD Player.app|com.apple.DVDPlayer
+app|Database Events|1.0.6|-|13/08/2026, 03:51|/System/Library/CoreServices/Database Events.app|com.apple.databaseevents
+app|Desk View|2.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Desk View.app|com.apple.DeskCam
+app|Diagnostics Reporter|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Diagnostics Reporter.app|com.apple.DiagnosticsReporter
+app|Dictation|6.2.47|-|13/08/2026, 03:51|/System/Library/Input Methods/DictationIM.app|com.apple.inputmethod.ironwood
+app|Dictionary|2.3.0|-|13/08/2026, 03:51|/System/Applications/Dictionary.app|com.apple.Dictionary
+app|Digital Colour Meter|6.11|-|13/08/2026, 03:51|/System/Applications/Utilities/Digital Color Meter.app|com.apple.DigitalColorMeter
+app|Directory Utility|7.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Directory Utility.app|com.apple.DirectoryUtility
+app|DiscHelper|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/DiscHelper.app|com.apple.DiscHelper
+app|Disk Utility|22.7|-|13/08/2026, 03:51|/System/Applications/Utilities/Disk Utility.app|com.apple.DiskUtility
+app|DiskImageMounter|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/DiskImageMounter.app|com.apple.DiskImageMounter
+app|DiskImages UI Agent|683.160.3|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/DiskImages UI Agent.app|com.apple.frameworks.diskimages.diuiagent
+app|Display Calibrator|4.19|-|13/08/2026, 03:51|/System/Library/ColorSync/Calibrators/Display Calibrator.app|com.apple.ColorSyncCalibrator
+app|Dock|1.8|-|13/08/2026, 03:51|/System/Library/CoreServices/Dock.app|com.apple.dock
+app|Docker|4.89.0|-|13/08/2026, 16:18|/Applications/Docker.app|com.docker.docker
+app|Docker|4.92.0|-|13/08/2026, 16:18|/Users/jsmith/Library/Application Support/com.docker.install/in_progress/Docker.app|com.docker.docker
+app|Droplet with Settable Properties|1.0|-|13/08/2026, 03:51|/Library/Application Support/Script Editor/Templates/Droplets/Droplet with Settable Properties.app|com.apple.ScriptEditor.id.droplet-with-settable-properties-template
+app|Dwell Control|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Dwell Control.app|com.apple.DwellControl
+app|EmojiFunctionRowIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/EmojiFunctionRowIM.app|com.apple.EmojiFunctionRowItem-Container
+app|Enhanced Logging|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Enhanced Logging.app|com.apple.EnhancedLogging
+app|Erase Assistant|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Erase Assistant.app|com.apple.EraseAssistant
+app|EscrowSecurityAlert|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/EscrowSecurityAlert.app|com.apple.EscrowSecurityAlert
+app|Expansion Slot Utility|2.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Expansion Slot Utility.app|com.apple.ExpansionSlotUtility
+app|FaceTime|36|-|13/08/2026, 03:51|/System/Applications/FaceTime.app|com.apple.FaceTime
+app|Family|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Family.app|com.apple.Family
+app|FamilyExtensionHost|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/FamilyExtensionHost.app|com.apple.FamilyExtensionHost
+app|Feedback Assistant|5.1|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Feedback Assistant.app|com.apple.appleseed.FeedbackAssistant
+app|FeedbackRemoteView|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/FeedbackService.framework/Versions/A/Support/FeedbackRemoteView.app|com.apple.FeedbackRemoteView
+app|FileProvider-Feedback|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/FileProvider-Feedback.app|com.apple.FileProvider-Feedback
+app|Find My|4.0|-|13/08/2026, 03:51|/System/Applications/FindMy.app|com.apple.findmy
+app|FindMyMacMessenger|4.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/FindMyMac.framework/Versions/A/Resources/FindMyMacMessenger.app|com.apple.FindMyMacMessenger
+app|Finder|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app|com.apple.finder
+app|Folder Actions Setup|1.2|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Folder Actions Setup.app|com.apple.FolderActionsSetup
+app|FolderActionsDispatcher|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/FolderActionsDispatcher.app|com.apple.FolderActionsDispatcher
+app|FollowUpUI|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/CoreFollowUp.framework/Versions/A/Resources/FollowUpUI.app|com.apple.FollowUpUI
+app|Font Book|11.0|-|13/08/2026, 03:51|/System/Applications/Font Book.app|com.apple.FontBook
+app|FontRegistryUIAgent|81.0|-|13/08/2026, 03:51|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/ATS.framework/Versions/A/Support/FontRegistryUIAgent.app|com.apple.FontRegistryUIAgent
+app|Freeform|4.5|-|13/08/2026, 03:51|/System/Applications/Freeform.app|com.apple.freeform
+app|Game Center|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Game Center.app|com.apple.gamecenter
+app|GameOverlayUI|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/GameOverlayUI.app|com.apple.GameOverlayUI
+app|Games|1.0|-|13/08/2026, 03:51|/System/Applications/Games.app|com.apple.games
+app|Games|820.6.10.1.1|-|13/08/2026, 03:51|/System/Library/CoreServices/GameTrampoline.app|com.apple.GameTrampoline
+app|GarageBand|10.4.13|-|18/07/2026, 01:47|/Applications/GarageBand.app|com.apple.garageband10
+app|Grapher|2.8|-|13/08/2026, 03:51|/System/Applications/Utilities/Grapher.app|com.apple.grapher
+app|Home|10.0|-|13/08/2026, 03:51|/System/Applications/Home.app|com.apple.Home
+app|Hush|1.0.19|-|24/08/2026, 12:32|/Applications/Hush.app|se.oblador.Hush
+app|IDSRemoteURLConnectionAgent|10.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/IDSFoundation.framework/IDSRemoteURLConnectionAgent.app|com.apple.idsfoundation.IDSRemoteURLConnectionAgent
+app|IMAutomaticHistoryDeletionAgent|10.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/IMDPersistence.framework/IMAutomaticHistoryDeletionAgent.app|com.apple.IMAutomaticHistoryDeletionAgent
+app|IMTransferAgent|10.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/IMTransferServices.framework/IMTransferAgent.app|com.apple.imtransferservices.IMTransferAgent
+app|IOUIAgent|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/IOUIAgent.app|com.apple.IOUIAgent
+app|Image Capture|8.0|-|13/08/2026, 03:51|/System/Applications/Image Capture.app|com.apple.Image_Capture
+app|Image Events|1.1.6|-|13/08/2026, 03:51|/System/Library/CoreServices/Image Events.app|com.apple.imageevents
+app|Image Playground|1.0|-|13/08/2026, 03:51|/System/Applications/Image Playground.app|com.apple.GenerativePlaygroundApp
+app|Install Command Line Developer Tools|2416|-|13/08/2026, 03:51|/System/Library/CoreServices/Install Command Line Developer Tools.app|com.apple.dt.CommandLineTools.installondemand
+app|Install in Progress|3.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Install in Progress.app|com.apple.PackageUIKit.Install-in-Progress
+app|Installer|6.2.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Installer.app|com.apple.installer
+app|Installer Progress|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Installer Progress.app|com.apple.Installer-Progress
+app|JapaneseIM-KanaTyping|6.3|-|13/08/2026, 03:51|/System/Library/Input Methods/JapaneseIM-KanaTyping.app|com.apple.JapaneseIM.KanaTyping
+app|JapaneseIM-RomajiTyping|6.3|-|13/08/2026, 03:51|/System/Library/Input Methods/JapaneseIM-RomajiTyping.app|com.apple.JapaneseIM.RomajiTyping
+app|JavaLauncher|326|-|13/08/2026, 03:51|/System/Library/CoreServices/JavaLauncher.app|com.apple.JavaLauncher
+app|Journal|2.0|-|13/08/2026, 03:51|/System/Applications/Journal.app|com.apple.journal
+app|KerberosMenuExtra|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AppSSOKerberos.framework/Support/KerberosMenuExtra.app|com.apple.KerberosMenuExtra
+app|KeyboardAccessAgent|10|-|13/08/2026, 03:51|/System/Library/CoreServices/KeyboardAccessAgent.app|com.apple.KeyboardAccessAgent
+app|KeyboardSetupAssistant|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/KeyboardSetupAssistant.app|com.apple.KeyboardSetupAssistant
+app|Keychain Access|11.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Keychain Access.app|com.apple.keychainaccess
+app|Keychain Circle Notification|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Keychain Circle Notification.app|com.apple.security.Keychain-Circle-Notification
+app|Keynote|15.1.1|-|18/07/2026, 01:45|/Applications/Keynote Creator Studio.app|com.apple.Keynote
+app|KoreanIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/KoreanIM.app|com.apple.KIM-Container
+app|Language Chooser|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Language Chooser.app|com.apple.Language-Chooser
+app|LinkedNotesUIService|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/PaperKit.framework/Contents/LinkedNotesUIService.app|com.apple.LinkedNotesUIService
+app|Live Captions|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AccessibilitySharedSupport.framework/Versions/A/Resources/Live Captions.app|com.apple.accessibility.LiveTranscriptionAgent
+app|LiveSpeech|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AccessibilitySharedSupport.framework/Versions/A/Resources/LiveSpeech.app|com.apple.accessibility.LiveSpeech
+app|MDMMigrationTrampoline|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/MDMMigrationTrampoline.app|com.apple.MDMMigrationTrampoline
+app|MRT|1.93|-|19/08/2026, 15:56|/Library/Apple/System/Library/CoreServices/MRT.app|com.apple.MRT
+app|MTLReplayer|314.14|-|13/08/2026, 03:51|/System/Library/CoreServices/MTLReplayer.app|com.apple.MTLReplayer
+app|Magnifier|1.0|-|13/08/2026, 03:51|/System/Applications/Utilities/Magnifier.app|com.apple.Magnifier
+app|Mail|16.0|-|13/08/2026, 03:51|/System/Applications/Mail.app|com.apple.mail
+app|MakePDF|10.1|-|13/08/2026, 03:51|/System/Library/Image Capture/Automatic Tasks/MakePDF.app|com.apple.MakePDF
+app|ManagedClient|18.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ManagedClient.app|com.apple.ManagedClient
+app|Maps|3.0|-|13/08/2026, 03:51|/System/Applications/Maps.app|com.apple.Maps
+app|Medical Imaging Calibrator|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Medical Imaging Calibrator.app|com.apple.MedicalImagingCalibrator
+app|Memory Slot Utility|1.5.3|-|13/08/2026, 03:51|/System/Library/CoreServices/Memory Slot Utility.app|com.apple.MemorySlotUtility
+app|Messages|26.0|-|13/08/2026, 03:51|/System/Applications/Messages.app|com.apple.MobileSMS
+app|Migration Assistant|26.6|-|13/08/2026, 03:51|/System/Applications/Utilities/Migration Assistant.app|com.apple.MigrateAssistant
+app|Mission Control|1.2|-|13/08/2026, 03:51|/System/Applications/Mission Control.app|com.apple.exposelauncher
+app|MobileDeviceUpdater|1.0|-|13/08/2026, 03:51|/Library/Apple/System/Library/PrivateFrameworks/MobileDevice.framework/Versions/A/Resources/MobileDeviceUpdater.app|com.apple.MobileDeviceUpdater
+app|Music|1.6.6|-|13/08/2026, 03:51|/System/Applications/Music.app|com.apple.Music
+app|Music Recognition|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/MusicRecognitionMac.app|com.apple.musicrecognition.mac
+app|NetAuthAgent|6.2|-|13/08/2026, 03:51|/System/Library/CoreServices/NetAuthAgent.app|com.apple.NetAuthAgent
+app|Network|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/Network.app|com.apple.finder.Open-Network
+app|News|11.5|-|13/08/2026, 03:51|/System/Applications/News.app|com.apple.news
+app|NordVPN|10.11.0|-|21/09/2026, 09:36|/Applications/NordVPN.app|com.nordvpn.macos
+app|Notes|4.13|-|13/08/2026, 03:51|/System/Applications/Notes.app|com.apple.Notes
+app|Notification Centre|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/NotificationCenter.app|com.apple.notificationcenterui
+app|NowPlayingTouchUI|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/NowPlayingTouchUI.app|com.apple.NowPlayingTouchUI
+app|Numbers|15.1|-|18/07/2026, 01:46|/Applications/Numbers Creator Studio.app|com.apple.Numbers
+app|OBEXAgent|9.0|-|13/08/2026, 03:51|/System/Library/CoreServices/OBEXAgent.app|com.apple.OBEXAgent
+app|OSDUIHelper|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/OSDUIHelper.app|com.apple.OSDUIHelper
+app|OpenSpell|1.0|-|13/08/2026, 03:51|/System/Library/Services/OpenSpell.service|com.apple.OpenSpell
+app|PIPAgent|2.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PIPAgent.app|com.apple.PIPAgent
+app|Pages|15.1.1|-|18/07/2026, 01:46|/Applications/Pages Creator Studio.app|com.apple.Pages
+app|Paired Devices|7.1|-|13/08/2026, 03:51|/System/Library/CoreServices/Paired Devices.app|com.apple.PairedDevices
+app|ParentalControls|4.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/FamilyControls.framework/Versions/A/Resources/ParentalControls.app|com.apple.familycontrols.useragent
+app|Pass Viewer|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Pass Viewer.app|com.apple.Pass-Viewer
+app|PassViewer|-|-|13/08/2026, 03:51|/System/Library/CoreServices/PassViewer.app|com.apple.PassViewer
+app|Passwords|2.6.2|-|13/08/2026, 03:51|/System/Applications/Passwords.app|com.apple.Passwords
+app|PeopleMessageService|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PeopleMessageService.app|com.apple.PeopleMessageService
+app|Phone|1.0|-|13/08/2026, 03:51|/System/Applications/Phone.app|com.apple.mobilephone
+app|Photo Booth|13.1|-|13/08/2026, 03:51|/System/Applications/Photo Booth.app|com.apple.PhotoBooth
+app|Photos|11.0|-|13/08/2026, 03:51|/System/Applications/Photos.app|com.apple.Photos
+app|PluginIM|26.200|-|13/08/2026, 03:51|/System/Library/Input Methods/PluginIM.app|com.apple.inputmethod.PluginIM
+app|Podcasts|1.1.0|-|13/08/2026, 03:51|/System/Applications/Podcasts.app|com.apple.podcasts
+app|PowerChime|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PowerChime.app|com.apple.PowerChime
+app|PressAndHold|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/PressAndHold.app|com.apple.PAH-Container
+app|Preview|11.0|-|13/08/2026, 03:51|/System/Applications/Preview.app|com.apple.Preview
+app|PreviewShell|16.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PreviewShell.app|com.apple.PreviewShell
+app|PreviewShellMac|16.0|-|13/08/2026, 03:51|/System/Library/CoreServices/PreviewShellMac.app|com.apple.PreviewShellMac
+app|Print Centre|1.0|-|13/08/2026, 03:51|/System/Applications/Utilities/Print Center.app|com.apple.printcenter
+app|Pro Display Calibrator|212.35|-|13/08/2026, 03:51|/System/Library/CoreServices/Pro Display Calibrator.app|com.apple.displaycalibrator
+app|Problem Reporter|10.13|-|13/08/2026, 03:51|/System/Library/CoreServices/Problem Reporter.app|com.apple.ProblemReporter
+app|Profile Installer|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ProfileHelper.app|com.apple.mcx.ProfileHelper
+app|Python|3.9.6|-|19/08/2026, 16:37|/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app|com.apple.python3
+app|Quick Look Simulator|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/QuickLookUI.framework/Versions/A/Resources/Quick Look Simulator.app|com.apple.quicklook.QuickLookSimulator
+app|QuickLookUIHelper|5.0|-|13/08/2026, 03:51|/System/Library/Frameworks/QuickLookUI.framework/Versions/A/Resources/QuickLookUIHelper.app|com.apple.quicklook.ui.helper
+app|QuickTime Player|10.5|-|13/08/2026, 03:51|/System/Applications/QuickTime Player.app|com.apple.QuickTimePlayerX
+app|RapportUIAgent|7.1|-|13/08/2026, 03:51|/System/Library/CoreServices/RapportUIAgent.app|com.apple.RapportUIAgent
+app|Recents|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/Recents.app|com.apple.finder.Open-Recents
+app|Recursive File Processing Droplet|1.0|-|13/08/2026, 03:51|/Library/Application Support/Script Editor/Templates/Droplets/Recursive File Processing Droplet.app|com.apple.ScriptEditor.id.file-processing-droplet-template
+app|Recursive Image File Processing Droplet|1.0|-|13/08/2026, 03:51|/Library/Application Support/Script Editor/Templates/Droplets/Recursive Image File Processing Droplet.app|com.apple.ScriptEditor.id.image-file-processing-droplet-template
+app|RegisterPluginIMApp|26.200|-|13/08/2026, 03:51|/System/Library/CoreServices/RegisterPluginIMApp.app|com.apple.pluginIM.pluginIMRegistrator
+app|Reminders|7.0|-|13/08/2026, 03:51|/System/Applications/Reminders.app|com.apple.reminders
+app|Remote Desktop Message|3.9.8|-|13/08/2026, 03:51|/System/Library/CoreServices/RemoteManagement/Remote Desktop Message.app|com.apple.RemoteDesktopMessageAgent
+app|Rosetta 2 Updater|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Rosetta 2 Updater.app|com.apple.OAHSoftwareUpdateApp
+app|SCIM|104|-|13/08/2026, 03:51|/System/Library/Input Methods/SCIM.app|com.apple.SCIM-Container
+app|SSMenuAgent|3.9.8|-|13/08/2026, 03:51|/System/Library/CoreServices/RemoteManagement/SSMenuAgent.app|com.apple.SSMenuAgent
+app|STMUIHelper|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/StorageManagement.framework/Versions/A/Resources/STMUIHelper.app|com.apple.STMFramework.UIHelper
+app|Screen Sharing|6.1|-|13/08/2026, 03:51|/System/Applications/Utilities/Screen Sharing.app|com.apple.ScreenSharing
+app|Screen Time|3.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Screen Time.app|com.apple.ScreenTimeWidgetApplication
+app|ScreenReaderUIServer|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/ScreenReader.framework/Versions/A/Resources/ScreenReaderUIServer.app|com.apple.ScreenReaderUIServer
+app|ScreenSaverEngine|5.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ScreenSaverEngine.app|com.apple.ScreenSaver.Engine
+app|Screenshot|1.0|-|13/08/2026, 03:51|/System/Applications/Utilities/Screenshot.app|com.apple.screenshot.launcher
+app|Script Editor|2.11|-|13/08/2026, 03:51|/System/Applications/Utilities/Script Editor.app|com.apple.ScriptEditor2
+app|Script Menu|1|-|13/08/2026, 03:51|/System/Library/CoreServices/Script Menu.app|com.apple.ScriptMenuApp
+app|ScriptMonitor|1.0.1|-|13/08/2026, 03:51|/System/Library/CoreServices/ScriptMonitor.app|com.apple.ScriptMonitor
+app|Setup Assistant|10.10|-|13/08/2026, 03:51|/System/Library/CoreServices/Setup Assistant.app|com.apple.SetupAssistant
+app|ShortcutDroplet|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ShortcutDroplet.app|com.apple.shortcuts.droplet
+app|Shortcuts|7.0|-|13/08/2026, 03:51|/System/Applications/Shortcuts.app|com.apple.shortcuts
+app|Shortcuts Events|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Shortcuts Events.app|com.apple.shortcuts.events
+app|ShortcutsActions|-|-|13/08/2026, 03:51|/System/Library/CoreServices/ShortcutsActions.app|com.apple.ShortcutsActions
+app|Signal|8.27.0|-|04/09/2026, 22:19|/Applications/Signal.app|org.whispersystems.signal-desktop
+app|Siri|1.0|-|13/08/2026, 03:51|/System/Applications/Siri.app|com.apple.siri.launcher
+app|Siri|3525.5.2|-|13/08/2026, 03:51|/System/Library/CoreServices/Siri.app|com.apple.Siri
+app|SmartCard Pairing|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/CryptoTokenKit.framework/ctkbind.app|com.apple.ctkbind
+app|Software Update|6|-|13/08/2026, 03:51|/System/Library/CoreServices/Software Update.app|com.apple.SoftwareUpdate
+app|SoftwareUpdateNotificationManager|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SoftwareUpdate.framework/Versions/A/Resources/SoftwareUpdateNotificationManager.app|com.apple.SoftwareUpdateNotificationManager
+app|SpacesTouchBarAgent|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/SpacesTouchBarAgent.app|com.apple.SpacesTouchBarAgent
+app|Speech Downloader|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SpeechObjects.framework/Versions/A/SpeechDataInstallerd.app|com.apple.speech.SpeechDataInstallerd
+app|SpeechRecognitionServer|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SpeechObjects.framework/Versions/A/SpeechRecognitionServer.app|com.apple.speech.SpeechRecognitionServer
+app|SpeechService|9.2.22|-|13/08/2026, 03:51|/System/Library/Services/SpeechService.service|com.apple.speech.SpeechService
+app|Spotify|1.3.0.277|-|14/09/2026, 11:13|/Applications/Spotify.app|com.spotify.client
+app|Spotlight|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Spotlight.app|com.apple.Spotlight
+app|Spotlight|3.0|-|13/08/2026, 03:51|/System/Library/Services/Spotlight.service|com.apple.SpotlightService
+app|StageManagerOnboarding|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/StageManagerOnboarding.app|com.apple.windowmanager.StageManagerOnboarding
+app|Stickies|10.3|-|13/08/2026, 03:51|/System/Applications/Stickies.app|com.apple.Stickies
+app|Stocks|8.5|-|13/08/2026, 03:51|/System/Applications/Stocks.app|com.apple.stocks
+app|Summary Service|2.0|-|13/08/2026, 03:51|/System/Library/Services/Summary Service.app|com.apple.SummaryService
+app|SyncServer|8.1|-|13/08/2026, 03:51|/System/Library/Frameworks/SyncServices.framework/Versions/A/Resources/SyncServer.app|com.apple.syncserver
+app|System Events|1.3.6|-|13/08/2026, 03:51|/System/Library/CoreServices/System Events.app|com.apple.systemevents
+app|System Information|11.0|-|13/08/2026, 03:51|/System/Applications/Utilities/System Information.app|com.apple.SystemProfiler
+app|System Settings|15.0|-|13/08/2026, 03:51|/System/Applications/System Settings.app|com.apple.systempreferences
+app|System Speech|9.2.22|-|13/08/2026, 03:51|/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/SpeechSynthesis.framework/Versions/A/System Speech.app|com.apple.speech.synthesis.SpeechSynthesisServer
+app|SystemIntents|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/SystemIntents.app|com.apple.SystemIntents
+app|SystemUIServer|1.7|-|13/08/2026, 03:51|/System/Library/CoreServices/SystemUIServer.app|com.apple.systemuiserver
+app|TCIM|104|-|13/08/2026, 03:51|/System/Library/Input Methods/TCIM.app|com.apple.TCIM-Container
+app|TMHelperAgent|13|-|13/08/2026, 03:51|/System/Library/CoreServices/TimeMachine/TMHelperAgent.app|com.apple.timemachine.HelperAgent
+app|TV|1.6.6|-|13/08/2026, 03:51|/System/Applications/TV.app|com.apple.TV
+app|TYIM|104|-|13/08/2026, 03:51|/System/Library/Input Methods/TYIM.app|com.apple.TYIM-Container
+app|Tailscale|1.102.2|-|19/08/2026, 16:04|/Applications/Tailscale.app|io.tailscale.ipn.macsys
+app|TamilIM|1.6|-|13/08/2026, 03:51|/System/Library/Input Methods/TamilIM.app|com.apple.inputmethod.Tamil
+app|Terminal|2.15|-|13/08/2026, 03:51|/System/Applications/Utilities/Terminal.app|com.apple.Terminal
+app|TextEdit|1.20|-|13/08/2026, 03:51|/System/Applications/TextEdit.app|com.apple.TextEdit
+app|TextInputMenuAgent|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/TextInputMenuAgent.app|com.apple.TextInputMenuAgent
+app|TextInputSwitcher|1.1|-|13/08/2026, 03:51|/System/Library/CoreServices/TextInputSwitcher.app|com.apple.TextInputSwitcher
+app|ThermalTrap|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/ThermalTrap.app|com.apple.ThermalTrap
+app|Ticket Viewer|4.1|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Ticket Viewer.app|com.apple.Ticket-Viewer
+app|Time Machine|1.3|-|13/08/2026, 03:51|/System/Applications/Time Machine.app|com.apple.backup.launcher
+app|Tips|26.6|-|13/08/2026, 03:51|/System/Applications/Tips.app|com.apple.helpviewer
+app|Tips|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/TipsSpotlightHandler.app|com.apple.tips
+app|TrackpadIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/TrackpadIM.app|com.apple.TrackpadIM-Container
+app|TransliterationIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/TransliterationIM.app|com.apple.TransliterationIM-Container
+app|UASharedPasteboardProgressUI|54.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UserActivity.framework/Agents/UASharedPasteboardProgressUI.app|com.apple.coreservices.UASharedPasteboardProgressUI
+app|UIKitSystem|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/UIKitSystem.app|com.apple.UIKitSystemApp
+app|Universal Control|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/UniversalControl.app|com.apple.universalcontrol
+app|UniversalAccessControl|7.0|-|13/08/2026, 03:51|/System/Library/CoreServices/UniversalAccessControl.app|com.apple.UniversalAccessControl
+app|UnmountAssistantAgent|5.0|-|13/08/2026, 03:51|/System/Library/CoreServices/UnmountAssistantAgent.app|com.apple.UnmountAssistantAgent
+app|UserNotificationCenter|82|-|13/08/2026, 03:51|/System/Library/CoreServices/UserNotificationCenter.app|com.apple.UserNotificationCenter
+app|VietnameseIM|1.0|-|13/08/2026, 03:51|/System/Library/Input Methods/VietnameseIM.app|com.apple.VIM-Container
+app|Visual Studio Code|1.137.0|-|26/08/2026, 21:13|/Applications/Visual Studio Code.app|com.microsoft.VSCode
+app|Voice Memos|3.2|-|13/08/2026, 03:51|/System/Applications/VoiceMemos.app|com.apple.VoiceMemos
+app|VoiceOver|10|-|13/08/2026, 03:51|/System/Library/CoreServices/VoiceOver.app|com.apple.VoiceOver
+app|VoiceOver Quickstart|10|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/ScreenReader.framework/Versions/A/Resources/VoiceOver Quickstart.app|com.apple.VoiceOverQuickstart
+app|VoiceOver Utility|10|-|13/08/2026, 03:51|/System/Applications/Utilities/VoiceOver Utility.app|com.apple.VoiceOverUtility
+app|Wallpaper|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WallpaperAgent.app|com.apple.wallpaper.agent
+app|Watch Face Help|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WatchFaceAlert.app|com.apple.WatchFaceAlert
+app|Weather|6.0|-|13/08/2026, 03:51|/System/Applications/Weather.app|com.apple.weather
+app|WhatsApp|26.37.22|-|21/09/2026, 10:33|/Applications/WhatsApp.app|net.whatsapp.WhatsApp
+app|WiFiAgent|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WiFiAgent.app|com.apple.wifi.WiFiAgent
+app|WidgetKit Simulator|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WidgetKit Simulator.app|com.apple.widgetkit.simulator
+app|WindowManager|341.6.1|-|13/08/2026, 03:51|/System/Library/CoreServices/WindowManager.app|com.apple.WindowManager
+app|WindowManagerShowDesktopEducation|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WindowManagerShowDesktopEducation.app|com.apple.windowmanager.ShowDesktopEducation
+app|Wireless Diagnostics|11.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/Wireless Diagnostics.app|com.apple.wifi.diagnostics
+app|Wish|8.5.9|-|13/08/2026, 03:51|/System/Library/Frameworks/Tk.framework/Versions/8.5/Resources/Wish.app|com.tcltk.wish
+app|WorkoutAlert-Mac|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/WorkoutAlert-Mac.app|com.apple.WorkoutAlert-Mac
+app|XProtect|163|-|19/09/2026, 06:21|/Library/Apple/System/Library/CoreServices/XProtect.app|com.apple.XProtectFramework.XProtect
+app|com.apple.ctcategories|-|-|20/08/2026, 14:51|/Users/jsmith/Library/HTTPStorages/com.apple.ctcategories.service|-
+app|eaptlstrust|13.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/EAP8021X.framework/Support/eaptlstrust.app|com.apple.eap8021x.eaptlstrust
+app|group.is.workflow|-|-|19/08/2026, 15:55|/Users/jsmith/Library/Application Scripts/group.is.workflow.my.app|-
+app|iCloud|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/iCloud.app|com.apple.CloudKit.ShareBear
+app|iCloud Drive|26.4|-|13/08/2026, 03:51|/System/Library/CoreServices/Finder.app/Contents/Applications/iCloud Drive.app|com.apple.finder.Open-iCloudDrive
+app|iCloud Drive|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Resources/iCloud Drive.app|com.apple.bird
+app|iCloud+|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/iCloud+.app|com.apple.icq
+app|iCloudUserNotificationsd|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/AOSAccounts.framework/Versions/A/Resources/iCloudUserNotificationsd.app|com.apple.iCloudUserNotificationsd
+app|iMovie|10.4.4|-|18/07/2026, 01:47|/Applications/iMovie.app|com.apple.iMovieApp
+app|iOS App Installer|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/Applications/iOS App Installer.app|com.apple.IPAInstaller
+app|iPhone Mirroring|1.6|-|13/08/2026, 03:51|/System/Applications/iPhone Mirroring.app|com.apple.ScreenContinuity
+app|identityservicesd|10.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app|com.apple.identityservicesd
+app|imagent|10.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/IMCore.framework/imagent.app|com.apple.imagent
+app|liquiddetectiond|-|-|13/08/2026, 03:51|/System/Library/CoreServices/liquiddetectiond.app|-
+app|loginwindow|9.0|-|13/08/2026, 03:51|/System/Library/CoreServices/loginwindow.app|com.apple.loginwindow
+app|nbagent|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/Noticeboard.framework/Versions/A/Resources/nbagent.app|com.apple.nbagent
+app|privatecloudcomputed|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/PrivateCloudCompute.framework/privatecloudcomputed.app|com.apple.privatecloudcomputed
+app|qlmanage|1.0|-|13/08/2026, 03:51|/System/Library/Frameworks/QuickLook.framework/Versions/A/Resources/qlmanage.app|com.apple.quicklook.qlmanage
+app|quicklookd|5.0|-|13/08/2026, 03:51|/System/Library/Frameworks/QuickLook.framework/Versions/A/Resources/quicklookd.app|com.apple.QuickLookDaemon
+app|rcd|362|-|13/08/2026, 03:51|/System/Library/CoreServices/rcd.app|com.apple.rcd
+app|screencaptureui|1.0|-|13/08/2026, 03:51|/System/Library/CoreServices/screencaptureui.app|com.apple.screencaptureui
+app|sociallayerd|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SocialLayer.framework/sociallayerd.app|com.apple.sociallayerd
+app|storeuid|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/storeuid.app|com.apple.storeuid
+app|syncuid|8.1|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/SyncServicesUI.framework/Versions/A/Resources/syncuid.app|com.apple.syncservices.syncuid
+app|uBlock Origin Lite|2026.914.1325|-|16/09/2026, 01:30|/Applications/uBlock Origin Lite.app|net.raymondhill.uBlock-Origin-Lite
+app|universalAccessAuthWarn|1.0|-|13/08/2026, 03:51|/System/Library/PrivateFrameworks/UniversalAccess.framework/Versions/A/Resources/universalAccessAuthWarn.app|com.apple.accessibility.universalAccessAuthWarn
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=query name=bash
@@ -396,6 +397,7 @@ user_app|system|Chess|3.18|-|13/08/2026, 03:51
 user_app|system|ChineseTextConverterService|2.1|-|13/08/2026, 03:51
 user_app|system|CinematicFramingOnboardingUI|1.0|-|13/08/2026, 03:51
 user_app|system|ClassroomStudentMenuExtra|1.0|-|13/08/2026, 03:51
+user_app|system|Claude Code URL Handler|1.0|-|08/09/2026, 17:55
 user_app|system|Clock|1.1|-|13/08/2026, 03:51
 user_app|system|Cocoa-AppleScript Applet|1.0|-|13/08/2026, 03:51
 user_app|system|ColorSync Utility|12.2.0|-|13/08/2026, 03:51
@@ -426,6 +428,7 @@ user_app|system|DiskImages UI Agent|683.160.3|-|13/08/2026, 03:51
 user_app|system|Display Calibrator|4.19|-|13/08/2026, 03:51
 user_app|system|Dock|1.8|-|13/08/2026, 03:51
 user_app|system|Docker|4.89.0|-|13/08/2026, 16:18
+user_app|system|Docker|4.92.0|-|13/08/2026, 16:18
 user_app|system|Droplet with Settable Properties|1.0|-|13/08/2026, 03:51
 user_app|system|Dwell Control|1.0|-|13/08/2026, 03:51
 user_app|system|EmojiFunctionRowIM|1.0|-|13/08/2026, 03:51
@@ -464,7 +467,6 @@ user_app|system|Image Capture|8.0|-|13/08/2026, 03:51
 user_app|system|Image Events|1.1.6|-|13/08/2026, 03:51
 user_app|system|Image Playground|1.0|-|13/08/2026, 03:51
 user_app|system|Install Command Line Developer Tools|2416|-|13/08/2026, 03:51
-user_app|system|Install Spotify|1.2.96.518|-|31/12/1979, 23:00
 user_app|system|Install in Progress|3.0|-|13/08/2026, 03:51
 user_app|system|Installer|6.2.0|-|13/08/2026, 03:51
 user_app|system|Installer Progress|1.0|-|13/08/2026, 03:51
@@ -502,7 +504,7 @@ user_app|system|Music Recognition|1.0|-|13/08/2026, 03:51
 user_app|system|NetAuthAgent|6.2|-|13/08/2026, 03:51
 user_app|system|Network|26.4|-|13/08/2026, 03:51
 user_app|system|News|11.5|-|13/08/2026, 03:51
-user_app|system|NordVPN|10.9.0|-|06/09/2026, 14:56
+user_app|system|NordVPN|10.11.0|-|21/09/2026, 09:36
 user_app|system|Notes|4.13|-|13/08/2026, 03:51
 user_app|system|Notification Centre|1.0|-|13/08/2026, 03:51
 user_app|system|NowPlayingTouchUI|1.0|-|13/08/2026, 03:51
@@ -560,9 +562,9 @@ user_app|system|ShortcutDroplet|1.0|-|13/08/2026, 03:51
 user_app|system|Shortcuts|7.0|-|13/08/2026, 03:51
 user_app|system|Shortcuts Events|1.0|-|13/08/2026, 03:51
 user_app|system|ShortcutsActions|-|-|13/08/2026, 03:51
-user_app|system|Signal|8.26.0|-|04/09/2026, 22:19
-user_app|system|Siri|3525.5.2|-|13/08/2026, 03:51
+user_app|system|Signal|8.27.0|-|04/09/2026, 22:19
 user_app|system|Siri|1.0|-|13/08/2026, 03:51
+user_app|system|Siri|3525.5.2|-|13/08/2026, 03:51
 user_app|system|SmartCard Pairing|1.0|-|13/08/2026, 03:51
 user_app|system|Software Update|6|-|13/08/2026, 03:51
 user_app|system|SoftwareUpdateNotificationManager|1.0|-|13/08/2026, 03:51
@@ -570,7 +572,7 @@ user_app|system|SpacesTouchBarAgent|1.0|-|13/08/2026, 03:51
 user_app|system|Speech Downloader|10|-|13/08/2026, 03:51
 user_app|system|SpeechRecognitionServer|10|-|13/08/2026, 03:51
 user_app|system|SpeechService|9.2.22|-|13/08/2026, 03:51
-user_app|system|Spotify|1.2.98.301|-|31/08/2026, 10:43
+user_app|system|Spotify|1.3.0.277|-|14/09/2026, 11:13
 user_app|system|Spotlight|1.0|-|13/08/2026, 03:51
 user_app|system|Spotlight|3.0|-|13/08/2026, 03:51
 user_app|system|StageManagerOnboarding|1.0|-|13/08/2026, 03:51
@@ -597,8 +599,8 @@ user_app|system|TextInputSwitcher|1.1|-|13/08/2026, 03:51
 user_app|system|ThermalTrap|1.0|-|13/08/2026, 03:51
 user_app|system|Ticket Viewer|4.1|-|13/08/2026, 03:51
 user_app|system|Time Machine|1.3|-|13/08/2026, 03:51
-user_app|system|Tips|1.0|-|13/08/2026, 03:51
 user_app|system|Tips|26.6|-|13/08/2026, 03:51
+user_app|system|Tips|1.0|-|13/08/2026, 03:51
 user_app|system|TrackpadIM|1.0|-|13/08/2026, 03:51
 user_app|system|TransliterationIM|1.0|-|13/08/2026, 03:51
 user_app|system|UASharedPasteboardProgressUI|54.1|-|13/08/2026, 03:51
@@ -608,7 +610,7 @@ user_app|system|UniversalAccessControl|7.0|-|13/08/2026, 03:51
 user_app|system|UnmountAssistantAgent|5.0|-|13/08/2026, 03:51
 user_app|system|UserNotificationCenter|82|-|13/08/2026, 03:51
 user_app|system|VietnameseIM|1.0|-|13/08/2026, 03:51
-user_app|system|Visual Studio Code|1.136.1|-|26/08/2026, 21:13
+user_app|system|Visual Studio Code|1.137.0|-|26/08/2026, 21:13
 user_app|system|Voice Memos|3.2|-|13/08/2026, 03:51
 user_app|system|VoiceOver|10|-|13/08/2026, 03:51
 user_app|system|VoiceOver Quickstart|10|-|13/08/2026, 03:51
@@ -616,7 +618,7 @@ user_app|system|VoiceOver Utility|10|-|13/08/2026, 03:51
 user_app|system|Wallpaper|1.0|-|13/08/2026, 03:51
 user_app|system|Watch Face Help|1.0|-|13/08/2026, 03:51
 user_app|system|Weather|6.0|-|13/08/2026, 03:51
-user_app|system|WhatsApp|26.34.24|-|06/09/2026, 21:14
+user_app|system|WhatsApp|26.37.22|-|21/09/2026, 10:33
 user_app|system|WiFiAgent|1.0|-|13/08/2026, 03:51
 user_app|system|WidgetKit Simulator|1.0|-|13/08/2026, 03:51
 user_app|system|WindowManager|341.6.1|-|13/08/2026, 03:51
@@ -624,7 +626,7 @@ user_app|system|WindowManagerShowDesktopEducation|1.0|-|13/08/2026, 03:51
 user_app|system|Wireless Diagnostics|11.0|-|13/08/2026, 03:51
 user_app|system|Wish|8.5.9|-|13/08/2026, 03:51
 user_app|system|WorkoutAlert-Mac|1.0|-|13/08/2026, 03:51
-user_app|system|XProtect|157|-|19/08/2026, 15:56
+user_app|system|XProtect|163|-|19/09/2026, 06:21
 user_app|system|com.apple.ctcategories|-|-|20/08/2026, 14:51
 user_app|system|eaptlstrust|13.0|-|13/08/2026, 03:51
 user_app|system|group.is.workflow|-|-|19/08/2026, 15:55
@@ -649,159 +651,13 @@ user_app|system|screencaptureui|1.0|-|13/08/2026, 03:51
 user_app|system|sociallayerd|1.0|-|13/08/2026, 03:51
 user_app|system|storeuid|1.0|-|13/08/2026, 03:51
 user_app|system|syncuid|8.1|-|13/08/2026, 03:51
-user_app|system|uBlock Origin Lite|2026.901.1442|-|03/09/2026, 01:30
+user_app|system|uBlock Origin Lite|2026.914.1325|-|16/09/2026, 01:30
 user_app|system|universalAccessAuthWarn|1.0|-|13/08/2026, 03:51
 error|installed_apps: acquisition degraded (tool timed out, was killed, failed to start, exited nonzero, or its output was truncated) -- result withheld rather than reported as complete
 [result_status] UNDECLARED / UNKNOWN / 
 [rc] 1
 
 == action=list_inventory
-inv|App Store|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Apps|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Automator|2.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Books|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Calculator|12.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Calendar|16.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Chess|3.18|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Clock|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Contacts|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Dictionary|2.3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FaceTime|36|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Find My|4.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Font Book|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Freeform|4.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Games|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Home|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Image Capture|8.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Image Playground|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Journal|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Mail|16.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Maps|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Messages|26.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Mission Control|1.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Music|1.6.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ShortcutsActions||macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Siri|3525.5.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Software Update|6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SpacesTouchBarAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Spotlight|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|StageManagerOnboarding|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|System Events|1.3.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SystemIntents|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SystemUIServer|1.7|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TextInputMenuAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TextInputSwitcher|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ThermalTrap|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TMHelperAgent|13|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Tips|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|UIKitSystem|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|UniversalAccessControl|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Universal Control|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|UnmountAssistantAgent|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|UserNotificationCenter|82|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|VoiceOver|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Wallpaper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Watch Face Help|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|WiFiAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|WidgetKit Simulator|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|WindowManager|341.6.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|WindowManagerShowDesktopEducation|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|WorkoutAlert-Mac|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|iCloud+|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|iCloud|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|liquiddetectiond||macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|loginwindow|9.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|rcd|362|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|screencaptureui|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AddressBookSync|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ABAssistantService|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AddressBookManager|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AddressBookSourceSync|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FontRegistryUIAgent|81.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|System Speech|9.2.22|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|CinematicFramingOnboardingUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ContinuityCaptureOnboardingUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SmartCard Pairing|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|LinkedNotesUIService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|qlmanage|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|quicklookd|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Quick Look Simulator|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|QuickLookUIHelper|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SyncServer|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Wish|8.5.9|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Build Web Page|10.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|MakePDF|10.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AirScanScanner|18|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|50onPaletteServer|1.1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AinuIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Assistive Control|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|CharacterPalette|2.0.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Dictation|6.2.47|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|EmojiFunctionRowIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|JapaneseIM-KanaTyping|6.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|JapaneseIM-RomajiTyping|6.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|KoreanIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|PluginIM|26.200|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|PressAndHold|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SCIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TCIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TYIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TamilIM|1.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TrackpadIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TransliterationIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|VietnameseIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|iCloudUserNotificationsd|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AOSAlertManager|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AOSHeartbeat|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AOSPushRelay|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Live Captions|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|LiveSpeech|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AccessibilityVisualsAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Calibration Assistant|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AppSSOAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|KerberosMenuExtra|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AMSEngagementViewService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AskPermissionUI|129.6.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AutoFillPanelService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AutomationModeUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|BackgroundTaskManagementAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|storeuid|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|CIMFindInputCodeTool|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FollowUpUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|DiskImages UI Agent|683.160.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|eaptlstrust|13.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ParentalControls|4.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FeedbackRemoteView|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|FindMyMacMessenger|4.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|identityservicesd|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|IDSRemoteURLConnectionAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|imagent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|IMAutomaticHistoryDeletionAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|IMTransferAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|nbagent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|privatecloudcomputed|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ScreenReaderUIServer|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|VoiceOver Quickstart|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AquaAppearanceHelper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|sociallayerd|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SoftwareUpdateNotificationManager|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Speech Downloader|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SpeechRecognitionServer|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|STMUIHelper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Conflict Resolver|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|syncuid|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AXVisualSupportAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Accessibility Tutorial|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|DFRHUD|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|universalAccessAuthWarn|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|UASharedPasteboardProgressUI|54.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|iCloud Drive|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AppleSpell|2.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ChineseTextConverterService|2.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|OpenSpell|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|SpeechService|9.2.22|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Spotlight|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Summary Service|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Time Machine|1.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Tips|26.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Activity Monitor|10.14|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
@@ -844,18 +700,72 @@ inv|Computer|26.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Network|26.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Recents|26.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|iCloud Drive|26.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|ClassroomStudentMenuExtra|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Display Calibrator|4.19|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AOSUIPrefPaneLauncher|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AVB Configuration|1440.7|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Accessibility Reader|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AccessibilityUIServer|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AddPrinter|607|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AddressBookUrlForwarder|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AirPlayUIAgent|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AirPort Base Station Agent|2.2.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Apple Diagnostics|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AppleScript Utility|1.1.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|News|11.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Notes|4.13|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Passwords|2.6.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Phone|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Photo Booth|13.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Photos|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Podcasts|1.1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Preview|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|QuickTime Player|10.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Reminders|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Shortcuts|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Siri|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Stickies|10.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Stocks|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|System Settings|15.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TV|1.6.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TextEdit|1.20|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|App Store|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Apps|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Automator|2.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Books|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Calculator|12.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Calendar|16.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Chess|3.18|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Clock|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Contacts|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Dictionary|2.3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|FaceTime|36|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Find My|4.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Font Book|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Freeform|4.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Games|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Home|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Image Capture|8.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Image Playground|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Journal|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Mail|16.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Maps|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Messages|26.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Mission Control|1.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Music|1.6.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SystemUIServer|1.7|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TextInputMenuAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TextInputSwitcher|1.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ThermalTrap|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TMHelperAgent|13|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Tips|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|UIKitSystem|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|UniversalAccessControl|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Universal Control|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|UnmountAssistantAgent|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|UserNotificationCenter|82|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|VoiceOver|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Wallpaper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Watch Face Help|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WiFiAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WidgetKit Simulator|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WindowManager|341.6.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WindowManagerShowDesktopEducation|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WorkoutAlert-Mac|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|iCloud+|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|iCloud|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|liquiddetectiond||macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|loginwindow|9.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|rcd|362|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|screencaptureui|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Automator Application Stub|1.3||13/08/2026, 03:51|app|macos||||signed||
 inv|Automator Installer|2.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Batteries|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
@@ -925,6 +835,9 @@ inv|RegisterPluginIMApp|26.200|macOS Software Signing|13/08/2026, 03:51|app|maco
 inv|ARDAgent|3.9.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Remote Desktop Message|3.9.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|SSMenuAgent|3.9.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|FeedbackRemoteView|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SyncServer|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SoftwareUpdateNotificationManager|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Rosetta 2 Updater|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Screen Time|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|ScreenSaverEngine|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
@@ -933,51 +846,141 @@ inv|ScriptMonitor|1.0.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||si
 inv|Setup Assistant|10.10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|ShortcutDroplet|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Shortcuts Events|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|News|11.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Notes|4.13|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Passwords|2.6.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Phone|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Photo Booth|13.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Photos|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Podcasts|1.1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Preview|11.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|QuickTime Player|10.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Reminders|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Shortcuts|7.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Siri|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Stickies|10.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Stocks|8.5|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|System Settings|15.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TV|1.6.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|TextEdit|1.20|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ShortcutsActions||macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Siri|3525.5.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Software Update|6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SpacesTouchBarAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Spotlight|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|StageManagerOnboarding|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|System Events|1.3.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SystemIntents|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AOSUIPrefPaneLauncher|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AVB Configuration|1440.7|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Accessibility Reader|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AccessibilityUIServer|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AddPrinter|607|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AddressBookUrlForwarder|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AirPlayUIAgent|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AirPort Base Station Agent|2.2.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Apple Diagnostics|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AppleScript Utility|1.1.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ClassroomStudentMenuExtra|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Display Calibrator|4.19|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|50onPaletteServer|1.1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AinuIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Assistive Control|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|CharacterPalette|2.0.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Dictation|6.2.47|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|EmojiFunctionRowIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|JapaneseIM-KanaTyping|6.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|JapaneseIM-RomajiTyping|6.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|KoreanIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|PluginIM|26.200|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|PressAndHold|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SCIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TCIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TYIM|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TamilIM|1.6|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TrackpadIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|TransliterationIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|VietnameseIM|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Calibration Assistant|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|KerberosMenuExtra|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AMSEngagementViewService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|iCloud Drive|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AXVisualSupportAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Accessibility Tutorial|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|DFRHUD|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|universalAccessAuthWarn|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Live Captions|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|LiveSpeech|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|imagent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|IMAutomaticHistoryDeletionAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|DiskImages UI Agent|683.160.3|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AutoFillPanelService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AutomationModeUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|CIMFindInputCodeTool|104|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|BackgroundTaskManagementAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|FindMyMacMessenger|4.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|iCloudUserNotificationsd|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AOSAlertManager|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AOSHeartbeat|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AOSPushRelay|1.07|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|identityservicesd|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|IDSRemoteURLConnectionAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|privatecloudcomputed|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|eaptlstrust|13.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|sociallayerd|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AquaAppearanceHelper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ScreenReaderUIServer|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|VoiceOver Quickstart|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Speech Downloader|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SpeechRecognitionServer|10|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|UASharedPasteboardProgressUI|54.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AppSSOAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ParentalControls|4.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|FollowUpUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AskPermissionUI|129.6.2|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|storeuid|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Conflict Resolver|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|syncuid|8.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|nbagent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|STMUIHelper|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|IMTransferAgent|10.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AccessibilityVisualsAgent|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|quicklookd|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Quick Look Simulator|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|QuickLookUIHelper|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|LinkedNotesUIService|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Build Web Page|10.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|MakePDF|10.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AirScanScanner|18|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|FontRegistryUIAgent|81.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|System Speech|9.2.22|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SmartCard Pairing|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Wish|8.5.9|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AddressBookSync|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ABAssistantService|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AddressBookManager|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AddressBookSourceSync|14.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|qlmanage|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|CinematicFramingOnboardingUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ContinuityCaptureOnboardingUI|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AppleSpell|2.4|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|ChineseTextConverterService|2.1|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|OpenSpell|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|SpeechService|9.2.22|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Spotlight|3.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|Summary Service|2.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 inv|Keynote|15.1.1|Apple Mac OS Application Signing|18/07/2026, 01:45|app|macos||||signed||
 inv|Pages|15.1.1|Apple Mac OS Application Signing|18/07/2026, 01:46|app|macos||||signed||
 inv|Numbers|15.1|Apple Mac OS Application Signing|18/07/2026, 01:46|app|macos||||signed||
 inv|iMovie|10.4.4|Apple Mac OS Application Signing|18/07/2026, 01:47|app|macos||||signed||
 inv|GarageBand|10.4.13|Apple Mac OS Application Signing|18/07/2026, 01:47|app|macos||||signed||
-inv|Tailscale|1.102.2|Developer ID Application: Tailscale Inc. (W5364U7YZB)|19/08/2026, 16:04|app|macos||||signed||
-inv|Hush|1.0.19|Apple Mac OS Application Signing|24/08/2026, 12:32|app|macos||||signed||
-inv|Visual Studio Code|1.136.1|Developer ID Application: Microsoft Corporation (UBF8T346G9)|26/08/2026, 21:13|app|macos||||signed||
-inv|group.is.workflow|||19/08/2026, 15:55|app|macos||||||
 inv|MRT|1.93|Software Signing|19/08/2026, 15:56|app|macos||||signed||
-inv|XProtect|157|Software Signing|19/08/2026, 15:56|app|macos||||signed||
-inv|Signal|8.26.0|Developer ID Application: Signal Messenger, LLC (U68MSDN6DR)|04/09/2026, 22:19|app|macos||||signed||
+inv|XProtect|163|Software Signing|19/09/2026, 06:21|app|macos||||signed||
+inv|Signal|8.27.0|Developer ID Application: Signal Messenger, LLC (U68MSDN6DR)|04/09/2026, 22:19|app|macos||||signed||
+inv|Docker|4.92.0|Developer ID Application: Docker Inc (9BNSXJN65R)|13/08/2026, 16:18|app|macos||||signed||
+inv|Hush|1.0.19|Apple Mac OS Application Signing|24/08/2026, 12:32|app|macos||||signed||
+inv|group.is.workflow|||19/08/2026, 15:55|app|macos||||||
+inv|Tailscale|1.102.2|Developer ID Application: Tailscale Inc. (W5364U7YZB)|19/08/2026, 16:04|app|macos||||signed||
 inv|Python|3.9.6|Software Signing|19/08/2026, 16:37|app|macos||||signed||
-inv|Install Spotify|1.2.96.518|Developer ID Application: Spotify (2FNC3A47ZF)|31/12/1979, 23:00|app|macos||||signed||
 inv|com.apple.ctcategories|||20/08/2026, 14:51|app|macos||||||
-inv|Spotify|1.2.98.301|Developer ID Application: Spotify (2FNC3A47ZF)|31/08/2026, 10:43|app|macos||||signed||
-inv|AppleMobileDeviceHelper|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|MobileDeviceUpdater|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AppleMobileSync|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|AirScanLegacyDiscovery|607|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
-inv|Docker|4.89.0|Developer ID Application: Docker Inc (9BNSXJN65R)|13/08/2026, 16:18|app|macos||||signed||
-inv|uBlock Origin Lite|2026.901.1442|Apple Mac OS Application Signing|03/09/2026, 01:30|app|macos||||signed||
-inv|NordVPN|10.9.0|Developer ID Application: Nordvpn S.A. (W5W395V82Y)|06/09/2026, 14:56|app|macos||||signed||
-inv|WhatsApp|26.34.24|Developer ID Application: WhatsApp Inc. (57T9237FN3)|06/09/2026, 21:14|app|macos||||signed||
 inv|Recursive File Processing Droplet|1.0||13/08/2026, 03:51|app|macos||||unsigned||
 inv|Droplet with Settable Properties|1.0||13/08/2026, 03:51|app|macos||||unsigned||
 inv|Recursive Image File Processing Droplet|1.0||13/08/2026, 03:51|app|macos||||unsigned||
 inv|Cocoa-AppleScript Applet|1.0||13/08/2026, 03:51|app|macos||||signed||
+inv|Claude Code URL Handler|1.0|Developer ID Application: Anthropic PBC (Q6L2SF6YDW)|08/09/2026, 17:55|app|macos||||signed||
+inv|AppleMobileDeviceHelper|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|MobileDeviceUpdater|1.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AppleMobileSync|5.0|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|AirScanLegacyDiscovery|607|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
+inv|WhatsApp|26.37.22|Developer ID Application: WhatsApp Inc. (57T9237FN3)|21/09/2026, 10:33|app|macos||||signed||
+inv|NordVPN|10.11.0|Developer ID Application: Nordvpn S.A. (W5W395V82Y)|21/09/2026, 09:36|app|macos||||signed||
+inv|Docker|4.89.0|Developer ID Application: Docker Inc (9BNSXJN65R)|13/08/2026, 16:18|app|macos||||signed||
+inv|Visual Studio Code|1.137.0|Developer ID Application: Microsoft Corporation (UBF8T346G9)|26/08/2026, 21:13|app|macos||||signed||
+inv|Spotify|1.3.0.277|Developer ID Application: Spotify (2FNC3A47ZF)|14/09/2026, 11:13|app|macos||||signed||
+inv|uBlock Origin Lite|2026.914.1325|Apple Mac OS Application Signing|16/09/2026, 01:30|app|macos||||signed||
 inv|com.apple.pkg.CLTools_SDK_macOS13|26.6.0.0.1781586384||1787153823|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.CLTools_SDK_macOS12|26.6.0.0.1781586378||1787153823|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0637_AppleLoopsDrummerKyle|3.1.0.0.1.1601920555||1784335515|pkg|macos_pkgutil||||||
@@ -996,6 +999,7 @@ inv|com.apple.pkg.CLTools_SDK_macOS110|26.6.0.0.1781586368||1787153823|pkg|macos
 inv|com.apple.pkg.XProtectPayloads_10_15.16U4413|157.1.1770928711||1787151411|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0048_AlchemyPadsDigitalHolyGhost|2.0.0.0.1.1601679620||1784335458|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0539_DrummerTambourine|2.0.0.0.1.1602002531||1784335499|pkg|macos_pkgutil||||||
+inv|com.apple.pkg.XProtectPayloads_10_15.16U4449|163.1789010093||1789795299|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0323_AppleLoopsVintageBreaks|2.1.0.0.1.1601920555||1784335476|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0487_EXS_OrchWoodwindFluteSolo|3.0.0.0.1.1602004766||1784335490|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0557_IRsSharedAUX|2.0.0.0.1.1602781381||1784335502|pkg|macos_pkgutil||||||
@@ -1010,6 +1014,7 @@ inv|com.apple.pkg.MAContent10_AssetPack_0560_LTPBasicPiano1|2.0.0.0.1.1602007057
 inv|com.apple.pkg.MAContent10_AssetPack_0315_AppleLoopsElectroHouse1|2.1.0.0.1.1601920555||1784335466|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0322_AppleLoopsDiscoFunk1|2.0.0.0.1.1601920555||1784335474|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0597_LTPChordTrainer|2.0.0.0.1.1602007057||1784335508|pkg|macos_pkgutil||||||
+inv|com.apple.pkg.XProtectPlistConfigData_10_15.16U4450|5360.1789102171||1789708837|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.XProtectPlistConfigData_10_15.16U4444|5356.1786690081||1787151408|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0540_PlugInSettingsGB|2.0.0.0.1.1602785573||1784335500|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.MAContent10_AssetPack_0375_EXS_GuitarsVintageStrat|2.0.0.0.1.1602004766||1784335486|pkg|macos_pkgutil||||||
@@ -1038,7 +1043,7 @@ inv|com.apple.cdm.pkg.Pages_MASReceipt|1.0||1784335575|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.Pages15|15.1.1.1.1770628492||1784335573|pkg|macos_pkgutil||||||
 inv|com.apple.cdm.pkg.Keynote_MASReceipt|1.0||1784335554|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.iMovie_AppStore|10.4.4.1.1768415391||1784335639|pkg|macos_pkgutil||||||
-inv|com.nordvpn.macos|10.9.0||1788702989|pkg|macos_pkgutil||||||
+inv|com.nordvpn.macos|10.11.0||1789979769|pkg|macos_pkgutil||||||
 inv|com.apple.pkg.GarageBand_AppStore|10.4.13.1.1765459979||1784335665|pkg|macos_pkgutil||||||
 inv|com.apple.cdm.pkg.Numbers_MASReceipt|1.0||1784335594|pkg|macos_pkgutil||||||
 inv|com.tailscale.ipn.macsys|1.102.2||1787151898|pkg|macos_pkgutil||||||

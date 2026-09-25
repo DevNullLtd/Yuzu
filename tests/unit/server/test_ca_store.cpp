@@ -11,7 +11,9 @@
  *    (fail-closed bool), list_revoked, a real-leaf revocation round-trip through pki::.
  *  - serial normalisation (pure function).
  *  - CRL numbering + record/latest roundtrip, publish_next_crl atomic allocation,
- *    record_crl's duplicate-version refusal.
+ *    record_crl_for_test's duplicate-version refusal, and the HA WS-6 6.1 cross-replica publish
+ *    contract (two stores on separate pools: distinct gap-free numbers, superset-on-wait,
+ *    clean lock timeout).
  *
  * No legacy-SQLite backfill test coverage: `CaStore::migrate_from_sqlite()` itself was retired
  * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0053 Update, 2026-09-03) -- no production
@@ -39,8 +41,14 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <set>
 #include <string>
 #include <string_view>
@@ -72,6 +80,61 @@ int64_t now_s() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+
+// Deterministic stand-in for a signed CRL: DER encodes the number, validity is derived from it.
+std::optional<CaStore::BuiltCrl> fake_crl(uint64_t n, const std::vector<IssuedCertRecord>&) {
+    const std::string s = "CRL#" + std::to_string(n);
+    return CaStore::BuiltCrl{std::vector<uint8_t>(s.begin(), s.end()),
+                             1000 + static_cast<int64_t>(n), 2000 + static_cast<int64_t>(n)};
+}
+
+// Joins every thread on scope exit, so a failing REQUIRE cannot leave a joinable std::thread
+// behind (std::terminate). std::jthread is not available on Apple Clang's libc++.
+struct JoinAll {
+    std::vector<std::thread>& threads;
+    ~JoinAll() {
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+};
+
+// Blocks until some session in THIS database is waiting for a lock on ca_crl_versions. The
+// database filter matters: template-cloned test databases share relation OIDs, and pg_locks is
+// cluster-wide, so without it another CI job's waiter could satisfy the probe.
+bool wait_for_crl_lock_waiter(const std::string& dsn) {
+    PgConn probe{PQconnectdb(dsn.c_str())};
+    if (PQstatus(probe.get()) != CONNECTION_OK)
+        return false;
+    // 2.5 s budget: a publisher gives up on the lock after CaStore::kCrlLockTimeout (5 s), so
+    // the probe must observe it well before that.
+    for (int i = 0; i < 100; ++i) {
+        PgResult w{PQexec(probe.get(),
+                          "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                          "WHERE c.relname = 'ca_crl_versions' AND NOT l.granted "
+                          "AND l.database = (SELECT oid FROM pg_database "
+                          "WHERE datname = current_database())")};
+        if (w.status() != PGRES_TUPLES_OK)
+            return false;
+        if (std::string(PQgetvalue(w.get(), 0, 0)) != "0")
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+}
+
+// A raw connection that holds the CRL table lock, standing in for another replica mid-publish.
+struct CrlLockHolder {
+    PgConn conn;
+    explicit CrlLockHolder(const std::string& dsn) : conn{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(conn.get(), "BEGIN")}.status() == PGRES_COMMAND_OK);
+        REQUIRE(PgResult{PQexec(conn.get(), "LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW "
+                                            "EXCLUSIVE MODE")}
+                    .status() == PGRES_COMMAND_OK);
+    }
+    void release() { REQUIRE(PgResult{PQexec(conn.get(), "COMMIT")}.status() == PGRES_COMMAND_OK); }
+};
 
 IssuedCertRecord sample_issued(const std::string& serial, const std::string& purpose = "agent") {
     IssuedCertRecord r;
@@ -115,7 +178,7 @@ TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
     REQUIRE_FALSE(store.is_open());
 }
 
-TEST_CASE("CaStore migration lands at v2 and drops sqlite_backfill_source (#3623)",
+TEST_CASE("CaStore migration lands at v4 and drops sqlite_backfill_source (#3623)",
           "[ca_store][pg][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
@@ -128,7 +191,18 @@ TEST_CASE("CaStore migration lands at v2 and drops sqlite_backfill_source (#3623
                                     "'ca_store'")};
     REQUIRE(ver.ok());
     REQUIRE(PQntuples(ver.get()) == 1);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
+    PgResult trg{PQexec(conn.get(), "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = "
+                                    "t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+                                    "WHERE n.nspname = 'ca_store' AND c.relname = 'ca_issued' "
+                                    "AND t.tgname = 'ca_issued_keep_revoked'")};
+    REQUIRE(trg.ok());
+    CHECK(std::string(PQgetvalue(trg.get(), 0, 0)) == "1");
+    PgResult col{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.columns WHERE "
+                                    "table_schema = 'ca_store' AND table_name = "
+                                    "'ca_crl_versions' AND column_name = 'revoked_count'")};
+    REQUIRE(col.ok());
+    CHECK(std::string(PQgetvalue(col.get(), 0, 0)) == "1");
     PgResult tbl{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
                                     "table_schema = 'ca_store' AND table_name = "
                                     "'sqlite_backfill_source'")};
@@ -558,7 +632,7 @@ TEST_CASE("CaStore: issuer_fingerprint provenance round-trips (issued + CRL)",
     crl.this_update = now_s();
     crl.next_update = now_s() + 86400;
     crl.issuer_fingerprint = "AA:BB:CC:DD";
-    REQUIRE(store.record_crl(crl));
+    REQUIRE(store.record_crl_for_test(crl));
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->issuer_fingerprint == "AA:BB:CC:DD");
@@ -607,7 +681,7 @@ TEST_CASE("CaStore: issuer_key_id round-trips and list_issued_by_key_id filters 
     crl.this_update = now_s();
     crl.next_update = now_s() + 86400;
     crl.issuer_key_id = kid_a;
-    REQUIRE(store.record_crl(crl));
+    REQUIRE(store.record_crl_for_test(crl));
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->issuer_key_id == kid_a);
@@ -724,7 +798,7 @@ TEST_CASE("CaStore: CRL numbering and roundtrip", "[ca_store][pg][crl]") {
     v1.der = {0x30, 0x82, 0x01, 0x02};
     v1.this_update = now_s();
     v1.next_update = now_s() + 7 * 86400;
-    REQUIRE(store.record_crl(v1));
+    REQUIRE(store.record_crl_for_test(v1));
 
     auto n2 = store.next_crl_number();
     REQUIRE(n2.has_value());
@@ -737,7 +811,7 @@ TEST_CASE("CaStore: CRL numbering and roundtrip", "[ca_store][pg][crl]") {
     CrlVersionRecord v2 = v1;
     v2.version = 2;
     v2.der = {0x30, 0x82, 0x02, 0x05};
-    REQUIRE(store.record_crl(v2));
+    REQUIRE(store.record_crl_for_test(v2));
     auto latest2 = store.latest_crl();
     REQUIRE(latest2);
     CHECK(latest2->version == 2);
@@ -748,26 +822,31 @@ TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically", "[
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     CaStore store{pool};
+    REQUIRE(store.set_root(sample_root("FP1")).has_value());
     REQUIRE(store.record_issued(sample_issued("DEAD")).has_value());
     REQUIRE(store.revoke("DEAD", "x").value_or(false));
 
     uint64_t seen_number = 0;
     std::size_t seen_revoked = 0;
-    auto build = [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked) {
+    auto build = [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked)
+        -> std::optional<CaStore::BuiltCrl> {
         seen_number = n;
         seen_revoked = revoked.size();
-        const std::string s = "CRL#" + std::to_string(n);
-        return std::vector<uint8_t>(s.begin(), s.end());
+        return fake_crl(n, revoked);
     };
 
-    auto v1 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    auto v1 = store.publish_next_crl(build, "FP1", "KID1");
     REQUIRE(v1);
     CHECK(v1->version == 1);
     CHECK(seen_number == 1);
     CHECK(seen_revoked == 1); // build saw the revoked DEAD cert
     CHECK(v1->issuer_fingerprint == "FP1");
+    CHECK(v1->issuer_key_id == "KID1");
+    CHECK(v1->this_update == 1000 + 1);
+    CHECK(v1->next_update == 2000 + 1);
+    CHECK(v1->revoked_count == 1);
 
-    auto v2 = store.publish_next_crl(build, now_s(), now_s() + 7 * 86400, "FP1");
+    auto v2 = store.publish_next_crl(build, "FP1");
     REQUIRE(v2);
     CHECK(v2->version == 2);
     CHECK(seen_number == 2);
@@ -776,16 +855,454 @@ TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically", "[
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->version == 2);
+    CHECK(latest->der == v2->der);
+    CHECK(latest->this_update == v2->this_update);
 
-    // A build that aborts (empty DER) inserts nothing and does NOT consume a number.
-    auto none = store.publish_next_crl(
-        [](uint64_t, const std::vector<IssuedCertRecord>&) { return std::vector<uint8_t>{}; },
-        now_s(), now_s() + 7 * 86400);
-    REQUIRE_FALSE(none);
+    // A build that aborts (nullopt or empty DER) rolls back and does NOT consume a number.
+    auto aborted = store.publish_next_crl(
+        [](uint64_t, const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
+            return std::nullopt;
+        });
+    REQUIRE_FALSE(aborted);
+    CHECK(aborted.error() == CaStore::PublishError::Failed);
+    CHECK_FALSE(store.publish_next_crl(
+        [](uint64_t, const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
+            return CaStore::BuiltCrl{};
+        }));
     CHECK(store.next_crl_number().value() == 3);
 }
 
-TEST_CASE("CaStore: record_crl rejects version < 1 and silent-clobber duplicates",
+// HA WS-6 6.1 (#4126): two CaStore instances on separate pools stand in for two server replicas
+// sharing one database. Every concurrent publish must succeed with a distinct number, and the
+// numbers must be exactly 1..N: no duplicate-key failure, no gap.
+TEST_CASE("CaStore: concurrent publishers across replicas get distinct gap-free CRL numbers",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 4}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 4}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.is_open());
+    REQUIRE(replica_b.is_open());
+    REQUIRE(replica_a.set_root(sample_root("FPX")).has_value());
+
+    constexpr int kThreadsPerReplica = 3;
+    constexpr int kPublishesPerThread = 8;
+    std::atomic<int> failures{0};
+    std::mutex seen_mu;
+    std::vector<int64_t> seen;
+    auto worker = [&](CaStore& store) {
+        for (int i = 0; i < kPublishesPerThread; ++i) {
+            auto rec = store.publish_next_crl(fake_crl, "FPX");
+            if (!rec) {
+                failures.fetch_add(1);
+                continue;
+            }
+            std::lock_guard lk(seen_mu);
+            seen.push_back(rec->version);
+        }
+    };
+    {
+        std::vector<std::thread> threads;
+        JoinAll join{threads};
+        for (int t = 0; t < kThreadsPerReplica; ++t) {
+            threads.emplace_back(worker, std::ref(replica_a));
+            threads.emplace_back(worker, std::ref(replica_b));
+        }
+    }
+    constexpr int kTotal = 2 * kThreadsPerReplica * kPublishesPerThread;
+    CHECK(failures.load() == 0);
+    REQUIRE(seen.size() == static_cast<std::size_t>(kTotal));
+    std::sort(seen.begin(), seen.end());
+    for (int i = 0; i < kTotal; ++i)
+        CHECK(seen[static_cast<std::size_t>(i)] == i + 1);
+    CHECK(replica_a.next_crl_number().value() == static_cast<uint64_t>(kTotal + 1));
+}
+
+// The superset property: a publish that is waiting on the CRL table lock must see a revocation
+// committed by another replica while it waited, because it reads the revoked set only after it
+// acquires the lock.
+TEST_CASE("CaStore: a publish queued on the lock includes revocations committed while it waited",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 2}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 2}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.record_issued(sample_issued("AAAA")).has_value());
+    REQUIRE(replica_a.record_issued(sample_issued("BBBB")).has_value());
+    REQUIRE(replica_a.revoke("AAAA", "x").value_or(false));
+
+    CrlLockHolder holder{db.dsn()};
+    std::vector<std::string> serials_in_crl;
+    std::optional<CrlVersionRecord> result;
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        auto rec = replica_b.publish_next_crl(
+            [&](uint64_t n, const std::vector<IssuedCertRecord>& revoked) {
+                for (const auto& r : revoked)
+                    serials_in_crl.push_back(r.serial_hex);
+                return fake_crl(n, revoked);
+            });
+        if (rec)
+            result = std::move(*rec);
+    });
+
+    REQUIRE(wait_for_crl_lock_waiter(db.dsn()));
+    REQUIRE(replica_a.revoke("BBBB", "x").value_or(false)); // commits while the publisher waits
+    holder.release();
+    threads[0].join();
+
+    REQUIRE(result);
+    CHECK(result->version == 1);
+    std::sort(serials_in_crl.begin(), serials_in_crl.end());
+    CHECK(serials_in_crl == std::vector<std::string>{"AAAA", "BBBB"});
+}
+
+// sec-1: the lock wait must stay bounded even when the pool sets no lock_timeout of its own (a
+// DSN carrying `options=`, or PGOPTIONS). Here the pool-level bounds are disabled outright, so
+// only the transaction-scoped set_config can end the wait.
+TEST_CASE("CaStore: a publish that cannot get the CRL lock times out without a pool-level bound",
+          "[ca_store][pg][crl][ha][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(),
+                 .size = 2,
+                 .statement_timeout_ms = 0,
+                 .lock_timeout_ms = 0}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    CrlLockHolder holder{db.dsn()};
+    std::atomic<bool> build_called{false};
+    std::optional<std::expected<CrlVersionRecord, CaStore::PublishError>> rec;
+    std::chrono::steady_clock::duration waited{};
+    std::atomic<bool> done{false};
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        const auto start = std::chrono::steady_clock::now();
+        rec = store.publish_next_crl([&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+            build_called = true;
+            return fake_crl(n, r);
+        });
+        waited = std::chrono::steady_clock::now() - start;
+        done = true;
+    });
+    // Watchdog: if the bound regresses, fail in 20 s instead of hanging until the shard timeout.
+    for (int i = 0; i < 2000 && !done; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool bounded = done.load();
+    if (!bounded)
+        holder.release(); // unblock the publisher so the thread can be joined
+    REQUIRE(bounded);
+    threads[0].join();
+    REQUIRE(rec);
+    REQUIRE_FALSE(*rec);
+    CHECK(rec->error() == CaStore::PublishError::Failed);
+    CHECK_FALSE(build_called); // never signed anything without holding the lock
+    CHECK(waited >= CaStore::kCrlLockTimeout - std::chrono::milliseconds(500));
+    // Generous upper bound: the timer also covers lease acquire and BEGIN on a loaded CI box.
+    CHECK(waited < CaStore::kCrlLockTimeout + std::chrono::seconds(10));
+
+    holder.release();
+    auto after = store.publish_next_crl(fake_crl);
+    REQUIRE(after);
+    CHECK(after->version == 1);
+}
+
+// UP-2: a subordinate import that swaps the root while a publish waits on the lock must not let
+// that publish record a CRL signed under the superseded root.
+TEST_CASE("CaStore: a publish whose root was replaced while it waited is refused",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 2}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 2}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.set_root(sample_root("FP:OLD")).has_value());
+
+    CrlLockHolder holder{db.dsn()};
+    bool build_called = false;
+    std::optional<CaStore::PublishError> error;
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        auto rec = replica_b.publish_next_crl(
+            [&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+                build_called = true;
+                return fake_crl(n, r);
+            },
+            "FP:OLD");
+        if (!rec)
+            error = rec.error();
+    });
+
+    REQUIRE(wait_for_crl_lock_waiter(db.dsn()));
+    REQUIRE(replica_a.set_root(sample_root("FP:NEW")).has_value()); // the "import"
+    holder.release();
+    threads[0].join();
+
+    REQUIRE(error);
+    CHECK(*error == CaStore::PublishError::RootChanged);
+    CHECK_FALSE(build_called);
+    CHECK_FALSE(replica_a.latest_crl());
+
+    auto retried = replica_b.publish_next_crl(fake_crl, "FP:NEW");
+    REQUIRE(retried);
+    CHECK(retried->version == 1);
+    CHECK(retried->issuer_fingerprint == "FP:NEW");
+}
+
+// safety-1: a second publish in the same process waits on the local mutex (bounded by
+// local_wait) instead of parking another pool connection on the table lock; past the bound it
+// reports Busy rather than queueing indefinitely.
+TEST_CASE("CaStore: a publish that cannot get the per-process lock reports Busy",
+          "[ca_store][pg][crl][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::atomic<bool> in_builder{false};
+    std::atomic<bool> release_builder{false};
+    std::optional<int64_t> first_version;
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        auto rec = store.publish_next_crl([&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+            in_builder = true;
+            for (int i = 0; i < 400 && !release_builder; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return fake_crl(n, r);
+        });
+        if (rec)
+            first_version = rec->version;
+    });
+    for (int i = 0; i < 400 && !in_builder; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(in_builder);
+
+    bool second_built = false;
+    auto second = store.publish_next_crl(
+        [&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+            second_built = true;
+            return fake_crl(n, r);
+        },
+        {}, {}, std::chrono::milliseconds{200});
+    release_builder = true;
+    threads[0].join();
+
+    REQUIRE_FALSE(second);
+    CHECK(second.error() == CaStore::PublishError::Busy);
+    CHECK_FALSE(second_built);
+    REQUIRE(first_version);
+    CHECK(*first_version == 1);
+}
+
+// UP2-2: purging stale default-cert inventory must never delete a revoked row — that would make
+// is_revoked() accept the cert again, drop it from every later CRL, and (by shrinking the revoked
+// count) let has_unpublished_revocations() miss a revocation elsewhere.
+TEST_CASE("CaStore: delete_issued_by keeps revoked rows", "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    auto leaf = [](const std::string& serial) {
+        auto r = sample_issued(serial, "server");
+        r.issued_by = "system:default-certs";
+        return r;
+    };
+    REQUIRE(store.record_issued(leaf("AAAA")).has_value());
+    REQUIRE(store.record_issued(leaf("BBBB")).has_value());
+    REQUIRE(store.revoke("AAAA", "key compromise").value_or(false));
+    REQUIRE(store.publish_next_crl(fake_crl));
+
+    REQUIRE(store.delete_issued_by("system:default-certs"));
+
+    CHECK(store.is_revoked("AAAA"));
+    auto a = store.get_issued("AAAA");
+    REQUIRE(a.has_value());
+    CHECK(a->has_value());
+    auto b = store.get_issued("BBBB");
+    REQUIRE(b.has_value());
+    CHECK_FALSE(b->has_value());
+    CHECK_FALSE(store.has_unpublished_revocations().value());
+}
+
+// Review (PR #4833): the root re-check must also FENCE the root row until the publish commits,
+// so a subordinate import cannot swap it between the check and the COMMIT.
+TEST_CASE("CaStore: a root swap waits for an in-flight publish to commit",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool_a{{.conninfo = db.dsn(), .size = 2}};
+    PgPool pool_b{{.conninfo = db.dsn(), .size = 2}};
+    CaStore replica_a{pool_a};
+    CaStore replica_b{pool_b};
+    REQUIRE(replica_a.set_root(sample_root("FP:OLD")).has_value());
+
+    std::atomic<bool> in_builder{false};
+    std::atomic<bool> release_builder{false};
+    std::atomic<bool> swap_done{false};
+    std::optional<std::string> published_fp;
+    std::vector<std::thread> threads;
+    JoinAll join{threads};
+    threads.emplace_back([&] {
+        auto rec = replica_b.publish_next_crl(
+            [&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+                in_builder = true;
+                for (int i = 0; i < 1000 && !release_builder; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                return fake_crl(n, r);
+            },
+            "FP:OLD");
+        if (rec)
+            published_fp = rec->issuer_fingerprint;
+    });
+    for (int i = 0; i < 500 && !in_builder; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(in_builder);
+
+    threads.emplace_back([&] {
+        (void)replica_a.set_root(sample_root("FP:NEW")); // the "import"
+        swap_done = true;
+    });
+    // Positive evidence that the swap is WAITING ON A LOCK (not merely slow): its backend shows a
+    // Lock wait in this database while the publish sits in its builder.
+    bool swap_waiting = false;
+    {
+        PgConn probe{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
+        for (int i = 0; i < 300 && !swap_waiting; ++i) {
+            PgResult w{PQexec(probe.get(),
+                              "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                              "current_database() AND wait_event_type = 'Lock' "
+                              "AND query ILIKE '%INSERT INTO ca_store.ca_root%'")};
+            REQUIRE(w.status() == PGRES_TUPLES_OK);
+            swap_waiting = std::string(PQgetvalue(w.get(), 0, 0)) != "0";
+            if (!swap_waiting)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    CHECK(swap_waiting);    // blocked by the publish's FOR SHARE on the root row
+    CHECK_FALSE(swap_done);
+    release_builder = true;
+    threads[0].join();
+    threads[1].join();
+
+    REQUIRE(published_fp);
+    CHECK(*published_fp == "FP:OLD"); // committed under the root it signed with
+    CHECK(swap_done);
+    auto root = replica_a.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    CHECK((*root)->fingerprint_sha256 == "FP:NEW");
+}
+
+// Review blocker (PR #4833): the append-only revoked set must hold in the DATABASE, not just in
+// delete_issued_by's WHERE clause — an older binary sharing the migrated schema runs the pre-6.1
+// unconditional DELETE. Row triggers must not block TRUNCATE (the documented clean re-root).
+TEST_CASE("CaStore: the database rejects deleting or changing a revoked ca_issued row",
+          "[ca_store][pg][crl][ha][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    auto leaf = [](const std::string& serial) {
+        auto r = sample_issued(serial, "server");
+        r.issued_by = "system:default-certs";
+        return r;
+    };
+    REQUIRE(store.record_issued(leaf("AAAA")).has_value());
+    REQUIRE(store.record_issued(leaf("BBBB")).has_value());
+    REQUIRE(store.revoke("AAAA", "key compromise").value_or(false));
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // The exact pre-6.1 delete_issued_by statement (no status predicate).
+    PgResult old_purge{PQexec(conn.get(), "DELETE FROM ca_store.ca_issued "
+                                          "WHERE issued_by = 'system:default-certs'")};
+    CHECK(old_purge.status() == PGRES_FATAL_ERROR);
+    CHECK(store.is_revoked("AAAA"));
+    auto b = store.get_issued("BBBB");
+    REQUIRE(b.has_value());
+    CHECK(b->has_value()); // the whole statement failed; nothing was deleted
+
+    PgResult unrevoke{PQexec(conn.get(), "UPDATE ca_store.ca_issued SET status = 'active' "
+                                         "WHERE serial_hex = 'AAAA'")};
+    CHECK(unrevoke.status() == PGRES_FATAL_ERROR);
+    CHECK(store.is_revoked("AAAA"));
+
+    // A non-revoked row can still be deleted; the current purge keeps the revoked one.
+    REQUIRE(store.delete_issued_by("system:default-certs"));
+    CHECK(store.is_revoked("AAAA"));
+
+    // TRUNCATE (clean re-root runbook) is not blocked by the row trigger.
+    PgResult trunc{PQexec(conn.get(), "TRUNCATE ca_store.ca_issued")};
+    CHECK(trunc.status() == PGRES_COMMAND_OK);
+}
+
+// qe-1: a COMMIT that fails after the row was built and inserted must not be reported as
+// published. A deferred constraint trigger raises at COMMIT time, after the callback returned.
+TEST_CASE("CaStore: a publish whose COMMIT fails is not reported as published",
+          "[ca_store][pg][crl][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(conn.get(),
+                                "CREATE FUNCTION ca_store.yuzu_test_fail_commit() RETURNS trigger "
+                                "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+                                "'yuzu_test forced commit failure'; END $$")}
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(PgResult{PQexec(conn.get(),
+                                "CREATE CONSTRAINT TRIGGER yuzu_test_fail_commit AFTER INSERT ON "
+                                "ca_store.ca_crl_versions DEFERRABLE INITIALLY DEFERRED FOR EACH "
+                                "ROW EXECUTE FUNCTION ca_store.yuzu_test_fail_commit()")}
+                    .status() == PGRES_COMMAND_OK);
+    }
+    bool build_called = false;
+    auto rec = store.publish_next_crl([&](uint64_t n, const std::vector<IssuedCertRecord>& r) {
+        build_called = true;
+        return fake_crl(n, r);
+    });
+    CHECK(build_called); // the row was built and inserted; only the COMMIT failed
+    REQUIRE_FALSE(rec);
+    CHECK(rec.error() == CaStore::PublishError::Failed);
+    CHECK_FALSE(store.latest_crl());
+}
+
+// UP-1: the freshness pass republishes when the latest CRL was not built from the current
+// revoked set. The check compares counts, never timestamps from different replicas' clocks.
+TEST_CASE("CaStore: has_unpublished_revocations tracks whether the latest CRL covers the set",
+          "[ca_store][pg][crl][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.record_issued(sample_issued("AAAA")).has_value());
+    REQUIRE(store.record_issued(sample_issued("BBBB")).has_value());
+
+    CHECK(store.has_unpublished_revocations().value()); // no CRL yet
+    REQUIRE(store.publish_next_crl(fake_crl));
+    CHECK_FALSE(store.has_unpublished_revocations().value());
+
+    // A revoke whose own publish never happened (e.g. it timed out on the lock).
+    REQUIRE(store.revoke("AAAA", "x").value_or(false));
+    CHECK(store.has_unpublished_revocations().value());
+    REQUIRE(store.publish_next_crl(fake_crl));
+    CHECK_FALSE(store.has_unpublished_revocations().value());
+
+    // A row without revoked_count (published before migration v3) reads as not covered.
+    CrlVersionRecord legacy;
+    legacy.version = 10;
+    legacy.der = {0x30, 0x00};
+    legacy.this_update = now_s();
+    legacy.next_update = now_s() + 86400;
+    REQUIRE(store.record_crl_for_test(legacy));
+    CHECK(store.has_unpublished_revocations().value());
+}
+
+TEST_CASE("CaStore: record_crl_for_test rejects version < 1 and silent-clobber duplicates",
           "[ca_store][pg][crl][negative]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -795,11 +1312,11 @@ TEST_CASE("CaStore: record_crl rejects version < 1 and silent-clobber duplicates
     r.der = {0x30, 0x00};
     r.this_update = now_s();
     r.next_update = now_s() + 86400;
-    REQUIRE_FALSE(store.record_crl(r));
+    REQUIRE_FALSE(store.record_crl_for_test(r));
     r.version = 1;
-    REQUIRE(store.record_crl(r));
+    REQUIRE(store.record_crl_for_test(r));
     r.der = {0x30, 0x01}; // a different CRL claiming the same number
-    REQUIRE_FALSE(store.record_crl(r));
+    REQUIRE_FALSE(store.record_crl_for_test(r));
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->der == std::vector<uint8_t>{0x30, 0x00}); // original preserved

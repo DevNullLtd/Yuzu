@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 8aea1a515344
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash a6ac30dd4945
 == action=printers
 printer|none
 [result_status] OK / FULL / 
@@ -6,3 +6,7 @@ printer|none
 == action=jobs
 job|none
 [result_status] OK / FULL /
+
+== action=clear_queue
+[not captured] Destructive/Irreversible: mutating action, not executed in a docs capture
+

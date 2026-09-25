@@ -475,6 +475,48 @@ TEST_CASE("Wave 7: ServerImpl's boot sequence actually calls "
     CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
+TEST_CASE("Wave 10: ServerImpl's boot sequence actually calls "
+          "seed_kill_switch_default_off(\"browser_inventory\", ...) and fails the boot "
+          "closed on a seed error — source tripwire against server.cpp, since a full "
+          "ServerImpl construction is not practical at the unit level",
+          "[server][killswitch][source_tripwire]") {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(input.is_open());
+    const std::string source{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+
+    // browser_inventory's seed call is the SECOND
+    // `seed_kill_switch_default_off(` call site in server.cpp (the first is
+    // execution_artifacts', asserted above) — find the first occurrence and
+    // resume the search past it so this case can't accidentally match that
+    // earlier block.
+    const auto first_marker = source.find("seed_kill_switch_default_off(\n");
+    REQUIRE(first_marker != std::string::npos);
+    const auto marker =
+        source.find("seed_kill_switch_default_off(\n", first_marker + 1);
+    REQUIRE(marker != std::string::npos);
+    // Bound the block to the call's own enclosing braces so the assertions
+    // below can't accidentally match some unrelated later call site.
+    const auto block_end = source.find("\n        }\n", marker);
+    REQUIRE(block_end != std::string::npos);
+    const auto block = source.substr(marker, block_end - marker);
+
+    CHECK(block.find("\"browser_inventory\"") != std::string::npos);
+
+    // The call is gated on the store existing and the boot not already
+    // having failed — never unconditional.
+    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
+                                          marker);
+    REQUIRE(guard_start != std::string::npos);
+    CHECK(guard_start < marker);
+
+    // A seed failure sets startup_failed_ = true — the same fail-closed
+    // shape every other boot-time Postgres store initialisation in this
+    // function uses.
+    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+    CHECK(block.find("Refusing to start") != std::string::npos);
+}
+
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);

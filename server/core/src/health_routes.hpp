@@ -91,7 +91,7 @@
 ///                                     load-bearing and must run identically on
 ///                                     both routes)
 ///   GET /livez                      (no gate, no deps — trivial process-alive probe)
-///   GET /readyz                     (no gate — draining_/store is_open() checks only)
+///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 
 #include <yuzu/metrics.hpp>
@@ -122,6 +122,7 @@ class PgPool;
 
 // Stores checked by /health AND /readyz (also /fragments/health/summary
 // where noted).
+class PgReachabilityProbe; // HA WS-8: /readyz pg_reachable + /metrics gauges
 class ResponseStore;       // + fragment summary
 class AuditStore;          // + fragment summary
 class InstructionStore;
@@ -227,6 +228,14 @@ struct Deps {
     // above for the ones ALSO read by /fragments/health/summary or
     // /metrics) ----
     pg::PgPool* pg_pool{nullptr};
+    /// HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe —
+    /// `/readyz`'s gating `pg_reachable` row, and the `yuzu_server_pg_*`
+    /// reachability gauges refreshed on `/metrics` scrape. Read only through
+    /// `snapshot()`/`verdict()` — a copy under the probe's leaf mutex, never
+    /// held across I/O, so a stalled probe cannot stall a handler. Null degrades
+    /// FAIL-CLOSED (row reports not ready), matching the store-pointer idiom;
+    /// never null in production whenever `pg_pool` is set.
+    PgReachabilityProbe* pg_reachability_probe{nullptr};
     ResponseStore* response_store{nullptr};
     AuditStore* audit_store{nullptr};
     InstructionStore* instruction_store{nullptr};

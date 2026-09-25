@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
+#include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -23,6 +24,8 @@
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
+#include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
+#include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "compliance_model.hpp"         // shared REST/MCP/fragment builders (#4034)
 #include "dashboard_routes.hpp"         // DashboardRoutes::gather_tar_retention_paused (#4027)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -30,7 +33,6 @@
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
-#include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
@@ -64,7 +66,8 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
-#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -82,6 +85,7 @@
 #include "plugin_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
+#include <yuzu/log_token.hpp> // is_valid_rule_id — shared REST/MCP/agent rule id charset (#4665)
 #include <yuzu/server/auth_db.hpp> // B4: is_valid_username (unlock_account, mirrors the REST route)
 
 // B5 (api-parity #2146) — offload-target / platform-license / software-
@@ -789,7 +793,11 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
     {"get_management_group",
-     "Get one management group's metadata plus its current member list. Mirrors GET "
+     "Get one management group's metadata plus its current member list. #1762: "
+     "a DEGRADED read of EITHER the group row itself or its "
+     "member list (store closed / pool-acquire timeout / query error) returns a "
+     "retryable error, never a fabricated healthy result — do not conflate that with "
+     "the not-found case (a genuinely nonexistent group_id, no retry hint). Mirrors GET "
      "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
@@ -1001,7 +1009,7 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
-     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -1038,8 +1046,14 @@ static const ToolDef kTools[] = {
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
-     "dispatches a real command to the fleet; poll instead.",
+     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or an "
+     "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1056,7 +1070,13 @@ static const ToolDef kTools[] = {
      "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
-     "error — it dispatches a real command to the fleet; poll instead.",
+     "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
+     "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
+     "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
+     "carries a positive retry_after_ms and IS safe to retry; a post-dispatch "
+     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
+     "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
+     "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1072,9 +1092,19 @@ static const ToolDef kTools[] = {
      "follow-up). If the stored source_payload nests past the JSON depth guard (#4493), the "
      "row is healed in place (payload discarded, status/members untouched) as a side effect "
      "of the rejection, so a later re-eval attempt is refused for a different reason (no "
-     "re-runnable source) instead of repeating the same depth error. REST v1 twin: POST "
+     "re-runnable source) instead of repeating the same depth error. If the original was "
+     "narrowed to a parent set at creation time and that parent has since been deleted, this "
+     "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
+     "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
-     "NEVER re-send this call on a timeout or error.",
+     "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
+     "re-dispatches a real command to the fleet. Two distinct fault tokens distinguish "
+     "when retry is safe: a pre-dispatch RESULT_SET_STORE_UNAVAILABLE (the quota check "
+     "degraded before anything was sent) carries a positive retry_after_ms and IS safe "
+     "to retry; a post-dispatch RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store "
+     "faulted after a real command already reached the fleet) carries no retry_after_ms "
+     "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -1122,9 +1152,26 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{"deleted":{"type":"boolean"}},"required":["deleted"]})j"},
 
-    {"list_pending_approvals", "List pending approval requests.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
-     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
+    {"list_pending_approvals", "List approval requests (REST v1 twin: GET /api/v1/approvals; "
+     "also matches the legacy GET /api/approvals field set — #2146 A2-R4). Rows now also carry "
+     "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
+     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure never "
+     "presents as a false empty list -- retry_after_ms is a concrete hint on a transient "
+     "failure, null on a permanent one that will NOT clear on retry. The underlying query is hard-capped at "
+     "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
+     "exactly 100 matching rows is a complete, non-truncated result.",
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string","maxLength":256,"description":"Exact-match filter on the submitting principal"}}})",
+     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
+
+    {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
+     "/api/v1/approvals/pending/count; also matches the legacy GET "
+     "/api/approvals/pending/count — #2146 A2-R4). Gated on pending_count_checked: a "
+     "store/pool failure never presents as a false zero count -- retry_after_ms is a "
+     "concrete hint on a transient failure, null on a permanent one that will NOT clear "
+     "on retry.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]})j"},
 
     // ── #4031: AD/Entra directory-sync read twins — parity with GET
     // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
@@ -1224,7 +1271,7 @@ static const ToolDef kTools[] = {
      "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
      "(architecture-wide gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
-     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
+     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
      R"j("version":{"type":"integer","minimum":1,"default":1},)j"
      R"j("enabled":{"type":"boolean","default":true},)j"
@@ -1390,12 +1437,15 @@ static const ToolDef kTools[] = {
     // GuaranteedState:Read gate as query_software_licenses/get_dex_device_app_perf
     // below, not the global perm gate.
     {"get_dex_device_score",
-     "Per-device DEX read model: the 0-100 experience score (-1 when unavailable — no "
-     "store, or the score cannot be computed) plus this device's OWN signal summary "
+     "Per-device DEX read model: the 0-100 experience score (-1 when no store is "
+     "configured) plus this device's OWN signal summary "
      "(obs_type -> count/distinct_devices/last_seen). The per-device twin of "
      "list_dex_signals's fleet rollup. Behavioral PII — every call is audit-logged "
      "(dex.device.view), same verb as the REST twin and the dashboard's per-device DEX "
-     "lens. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
+     "lens. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / "
+     "query error) returns a retryable error instead of a score — never conflate the -1 "
+     "'no store' case above with a degraded read, which is an ERROR response, not a -1 "
+     "score. Mirrors GET /api/v1/dex/devices/{id}. Requires GuaranteedState:Read, "
      "management-group-scoped to this device.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact agent/device id"},)j"
@@ -1519,11 +1569,14 @@ static const ToolDef kTools[] = {
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
      "devices list. The devices list names affected agent IDs (behavioral data), confined to "
      "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "Mirrors GET /api/v1/dex/overview. Requires GuaranteedState:Read.",
+     "unscored (#4855) counts connected devices whose per-device score could not be computed "
+     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
+     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
-     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -3575,6 +3628,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"unpin_result_set", {"Infrastructure", "Write"}},
     {"delete_result_set", {"Infrastructure", "Delete"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    // #2146 A2-R4 — same gate as list_pending_approvals: a fleet-wide
+    // operator-facing review-queue count with no per-agent axis, matching
+    // the legacy GET /api/approvals/pending/count's bare gate.
+    {"get_pending_approval_count", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
@@ -4286,6 +4343,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"unpin_result_set", {ToolEffect::Additive, true, "Unpin result set"}},
     {"delete_result_set", {ToolEffect::Destructive, false, "Delete result set"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"get_pending_approval_count", {ToolEffect::ReadOnly, true, "Get pending approval count"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
@@ -5221,13 +5279,19 @@ McpServer::HandlerFn McpServer::build_handler(
     InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
     ResponseStore* response_store, AuditStore* audit_store, TagStore* tag_store,
     InventoryStore* inventory_store, PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+    // `schedule_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, seventh family — list_schedules routes through the member
+    // `schedule_api_`/`set_schedule_api` instead, mcp_server.hpp's doc
+    // comment). Kept, unremoved, for constructor-signature stability across
+    // the three forwarding overloads below — a disclosed, deferred
+    // follow-up, not an oversight.
     ApprovalManager* approval_manager, ScheduleEngine* schedule_engine, const bool& read_only_mode,
     const bool& mcp_disabled, DispatchFn dispatch_fn, CaStore* ca_store,
     PublishCrlFn publish_crl_fn, GuaranteedStateStore* guaranteed_state_store,
     DexPerfFn dex_perf_fn, std::shared_ptr<const NetworkApi> network_api,
     ResponseScopeFn response_scope_fn,
     SoftwareInventoryStore* software_inventory_store,
-    yuzu::MetricsRegistry* metrics, AppPerfProviders app_perf_providers,
+    yuzu::MetricsRegistry* metrics,
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
@@ -5237,6 +5301,12 @@ McpServer::HandlerFn McpServer::build_handler(
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
+    // `workflow_engine` is now UNUSED in this function's body (ADR-0031
+    // WS-A4, eighth family — list_workflows/get_workflow/get_workflow_
+    // execution route through the member `workflow_api_`/`set_workflow_api`
+    // instead, mcp_server.hpp's doc comment). Kept, unremoved, for
+    // constructor-signature stability across the two forwarding overloads
+    // below — a disclosed, deferred follow-up, not an oversight.
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
     std::shared_ptr<const VerifyApi> verify_api, LockoutClearFn lockout_clear_fn,
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
@@ -9818,10 +9888,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_management_group (B4, #2146 API-parity) ───────────────
-            // Mirrors GET /api/v1/management-groups/{id}. get_group's nullopt
-            // collapses "no such group" with "store degraded" (the store API's
-            // own limitation — REST reports both as a flat 404, mirrored here
-            // exactly rather than inventing a distinction REST does not make).
+            // Mirrors GET /api/v1/management-groups/{id}. get_group_checked
+            // (#1762) distinguishes a genuine not-found (404-equivalent) from
+            // a store degrade (a retryable error) — the two are no longer
+            // collapsed.
             if (tool_name == "get_management_group") {
                 if (!tier_allows(tier, "ManagementGroup", "Read")) {
                     res.set_content(
@@ -9855,18 +9925,43 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto g = mgmt_store->get_group(group_id);
+                // get_group_checked (not the fail-soft get_group()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as a flat "group not found" (#1762 shape);
+                // fail closed with a retryable error instead, matching the
+                // REST twin's 503. A genuine not-found still reports
+                // retry-hint-exempt, mirroring REST's flat 404 with no retry
+                // hint.
+                auto g = mgmt_store->get_group_checked(group_id);
                 if (!g) {
-                    // retry-hint-exempt: ManagementGroupStore::get_group's nullopt is a
-                    // genuine "no such group" (its own store-degrade case is
-                    // distinct and much rarer); REST reports the SAME flat 404 with no
-                    // retry hint, so this mirrors it rather than inventing one REST
-                    // does not have.
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*g) {
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
                 }
-                auto members = mgmt_store->get_members(group_id);
+                // get_members_checked (not the fail-soft get_members()) — a
+                // store-not-open / pool-acquire-timeout / query-error degrade
+                // must not render as an authoritative empty member list
+                // (#1762 shape); fail closed with a retryable error instead,
+                // matching the REST twin's 503.
+                auto members = mgmt_store->get_members_checked(group_id);
+                if (!members) {
+                    mcp_audit("failure", "management group store read degraded; group=" + group_id);
+                    res.set_content(
+                        a4_error(kInternalError, "management group store read degraded",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", group_id);
                 // Shared builder (management_group_model.hpp) - the REST twin
                 // GET /api/v1/management-groups/{id} calls the SAME function,
@@ -9874,7 +9969,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // §1 Rule 1).
                 res.set_content(
                     success_response(
-                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                        id, tool_result(management_group_detail_json(**g, *members), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -9987,8 +10082,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto existing = mgmt_store->get_group(group_id);
                 if (!existing) {
-                    // retry-hint-exempt: same collapsed not-found/degrade shape as
-                    // get_management_group above — mirrors REST's flat 404 exactly.
+                    // retry-hint-exempt: this write path stays on the fail-soft
+                    // get_group() (unlike get_management_group above, which
+                    // moved to get_group_checked for #1762) — a collapsed
+                    // not-found/degrade nullopt, mirroring REST's PUT route's
+                    // own flat 404 exactly (also still on get_group()).
                     mcp_audit("denied", "group not found");
                     res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
                     return;
@@ -10875,7 +10973,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                // ADR-0031 WS-A4 (seventh family): routed through the
+                // ScheduleApi seam (schedule_api_, set_schedule_api) —
+                // supersedes a direct `schedule_engine` reach; the
+                // `build_handler` parameter of that name is now unused in
+                // this handler, kept for constructor-signature stability
+                // across the two forwarding overloads that construct
+                // build_handler's caller (mcp_server.cpp's two
+                // `ScheduleEngine* schedule_engine` overload parameters
+                // that forward into this call -- a bounded, 2-site ripple,
+                // not an open-ended one; see mcp_server.hpp's
+                // set_schedule_api doc comment).
+                if (!schedule_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Schedule engine unavailable"),
                         "application/json");
@@ -10923,7 +11032,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 sq.enabled_only = *enabled_only_opt;
-                auto schedules_result = schedule_engine->query_schedules_checked(sq);
+                auto schedules_result = schedule_api_->list_schedules(sq);
                 if (!schedules_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -10933,10 +11042,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4030: shared builder (schedule_row_json, workflow_model.hpp) —
-                // widens this tool's output with execution_count, the one field
-                // the dashboard fragment showed that this tool didn't. Same
-                // builder as GET /api/v1/schedules, so the two cannot drift.
+                // #4030: shared builder (schedule_row_json, schedule_model.hpp,
+                // split out of workflow_model.hpp by the ADR-0031 WS-A4
+                // seventh-family seam) — widens this tool's output with
+                // execution_count, the one field the dashboard fragment
+                // showed that this tool didn't. Same builder as
+                // GET /api/v1/schedules, so the two cannot drift.
                 JArr arr;
                 for (const auto& s : schedules_result->schedules)
                     arr.add_raw(schedule_row_json(s).dump());
@@ -10962,6 +11073,10 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_workflows (#4030) ────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam (workflow_api_, set_workflow_api) — the SAME
+            // instance the REST v1 twin uses (server.cpp), so the two can
+            // never disagree.
             if (tool_name == "list_workflows") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -10971,7 +11086,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine || !workflow_engine->is_open()) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
@@ -10979,7 +11094,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 WorkflowQuery wq;
                 wq.name_filter = param_str(args, "name");
                 wq.limit = std::min(param_int32(args, "limit", 100), 500);
-                auto workflows_result = workflow_engine->list_workflows(wq);
+                auto workflows_result = workflow_api_->list_workflows(wq);
                 if (!workflows_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11002,6 +11117,8 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_workflow (#4030) ──────────────────────────────────────
+            // ADR-0031 WS-A4 (eighth family): routed through the
+            // WorkflowApi seam — see list_workflows above.
             if (tool_name == "get_workflow") {
                 if (!tier_allows(tier, "Workflow", "Read")) {
                     res.set_content(
@@ -11011,13 +11128,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto workflow_id = param_str(args, "workflow_id");
-                auto workflow_result = workflow_engine->get_workflow(workflow_id);
+                auto workflow_result = workflow_api_->get_workflow(workflow_id);
                 if (!workflow_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11046,7 +11163,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // model from get_execution_status's fan-out Execution. Confined:
             // agent_ids_json names agents directly, so this gates on
             // fleet_read_fn_ (not a plain perm_fn) and confines the emitted
-            // agent_ids to the caller's visible scope.
+            // agent_ids to the caller's visible scope. ADR-0031 WS-A4
+            // (eighth family): routed through the WorkflowApi seam — see
+            // list_workflows above.
             if (tool_name == "get_workflow_execution") {
                 if (!fleet_read_fn_) {
                     spdlog::error(
@@ -11058,13 +11177,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                if (!workflow_engine) {
+                if (!workflow_api_) {
                     res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                auto exec_result = workflow_engine->get_execution(exec_id);
+                auto exec_result = workflow_api_->get_workflow_execution(exec_id);
                 if (!exec_result) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -11369,8 +11488,40 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                if (result_set_store_->count_for_owner(session->username) >=
-                    ResultSetStore::kMaxPerOwner) {
+                // #4306 finding 1: the plain count_for_owner() returned 0 on
+                // a degraded read, indistinguishable from a genuinely-empty
+                // owner — an over-quota owner's dispatch would fire for real
+                // before create_pending's atomic in-txn recheck (which runs
+                // AFTER dispatch, below) ever got a chance to refuse it. Fail
+                // CLOSED instead: nothing has been dispatched yet here, so
+                // refusing is free. Mirrors REST's run_async fix exactly.
+                auto quota = result_set_store_->count_for_owner_checked(session->username);
+                if (!quota.has_value()) {
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
+                    // Deliberately minimal, not the full
+                    // <store>_read_degrade_total{reason} convention other
+                    // stores use, which would require wiring ResultSetStore
+                    // itself with a MetricsRegistry member, out of scope for
+                    // this fix round; a future PR can decide whether to
+                    // upgrade it.
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_check_degraded_total").increment();
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "failure", "ResultSet", "",
+                        "reason=quota_check_degraded source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: could not verify the "
+                                 "per-owner result-set quota; nothing was dispatched "
+                                 "execution_id=" + exec_id,
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (*quota >= ResultSetStore::kMaxPerOwner) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
@@ -11459,18 +11610,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         // compliance fix).
                         res.set_content(
                             a4_error(kInternalError,
-                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable "
-                                     "after dispatch already succeeded - do not re-send; poll "
-                                     "executions for the dispatched command's outcome"),
+                                     "RESULT_SET_STORE_FAULT_AFTER_DISPATCH: result-set store "
+                                     "unavailable after dispatch already succeeded - do not "
+                                     "re-send; poll executions for the dispatched command's "
+                                     "outcome execution_id=" + exec_id),
                             "application/json");
                         return;
                     }
                     // retry-hint-exempt: business-rule outcome (quota), not a
-                    // transient fault.
+                    // transient fault. Same "do not re-send" situation as the
+                    // DbError branch above -- a real dispatch already succeeded
+                    // (sent > 0, set_agents_targeted already called); only the
+                    // bookkeeping row lost the authoritative in-txn quota
+                    // recheck (#4306 gov-4306-S5).
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        std::string(to_string(created.error())) +
-                                           " execution_id=" + exec_id),
+                                           " - a command was already dispatched to the fleet; do "
+                                           "not re-send, poll executions for its outcome "
+                                           "execution_id=" + exec_id),
                         "application/json");
                     return;
                 }
@@ -11512,18 +11670,46 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int64_t limit = param_int(args, "limit", 50);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` (e.g. a string or bool) rather than rejecting it -
+                // param_int_strict returns nullopt for that shape instead,
+                // matching the established sites elsewhere in this file
+                // (e.g. list_definitions' iq.limit above).
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 500)
                     limit = 500;
-                std::string next;
-                auto sets = result_set_store_->list_by_owner(session->username, cursor,
-                                                              static_cast<int>(limit), next);
+                // #4306/#4307 finding 2: never a success response with an
+                // empty array on a degraded read — indistinguishable from a
+                // genuine no-result-sets owner.
+                auto page = result_set_store_->list_by_owner_checked(
+                    session->username, cursor, static_cast<int>(limit));
+                if (!page) {
+                    const bool audit_ok = mcp_audit("failure");
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not list "
+                                                  "result sets",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& s : sets)
+                for (const auto& s : page->sets)
                     arr.push_back(result_set_json(s));
-                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -11536,8 +11722,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = param_str(args, "source_kind", "manual_curate");
-                cr.source_payload =
-                    args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                // #4306 follow-up (Kimi/Codex adversarial review): this tool
+                // accepts an UNRESTRICTED source_kind/source_payload (no
+                // allowlist) plus a caller-supplied parent_id, so a row
+                // minted here is otherwise indistinguishable at re-eval time
+                // from a genuinely parentless original once its parent is
+                // deleted (ON DELETE SET NULL) -- the same #4306/#2500
+                // target-erasure shape the dedicated
+                // create_result_set_from_tar_query/_instruction_result tools
+                // are already protected against. Parse into a mutable object
+                // so scope_input_id can be merged in below, once pid's
+                // ownership check (rs_load_owned) succeeds -- mirrors those
+                // tools' identical payload["scope_input_id"] = ... pattern.
+                // Named req_payload (not payload) - this handler separately
+                // builds a RESPONSE-body `payload` further down from the
+                // created row, an unrelated JSON object with the same
+                // conventional name.
+                nlohmann::json req_payload =
+                    args.contains("source_payload") ? args["source_payload"] : nlohmann::json::object();
                 // #4353 follow-up: this tool is never approval-gated (Write, but
                 // no ManagementGroup/UserManagement/Security/Policy/Execution
                 // securable_type here - see requires_approval()), so the
@@ -11558,6 +11760,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 // device_ids bound was ever checked - the exact "same input
                 // class, different outcome" inconsistency update_management_
                 // group's own fix (above) closed for a sibling tool.
+                //
+                // #4307 item 6: a malformed/empty parent_id (`{"parent_id":
+                // 123}` or `{"parent_id":""}`) previously fell straight
+                // through the is_string()+!empty() guard below and was
+                // silently treated as "no parent_id" -- mirrors REST's
+                // identical fix on the generic POST /api/v1/result-sets
+                // route. Unlike the three create_result_set_from_*/
+                // reevaluate_result_set producers' identically-shaped guard
+                // (#2500), parent_id here is NOT a dispatch-targeting
+                // argument -- this tool is synchronous and never dispatches
+                // -- so this is a caller-UX/lineage-correctness fix, not a
+                // dispatch-safety one: no
+                // yuzu_server_dispatch_target_rejected_total counter (that
+                // metric family is reserved for the targeting-argument
+                // tools).
+                if (args.contains("parent_id") &&
+                    (!args["parent_id"].is_string() ||
+                     args["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason = args["parent_id"].is_string()
+                                                        ? kReasonParentIdEmpty
+                                                        : kReasonParentIdType;
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason));
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to leave the set "
+                                       "parentless"),
+                        "application/json");
+                    return;
+                }
                 std::optional<std::string> pid;
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
@@ -11602,7 +11835,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return; // rs_load_owned already wrote the error
                     cr.parent_id = *pid;
+                    // #4306 follow-up: do NOT add the marker for a parent_id
+                    // that failed ownership above -- that request is already
+                    // rejected before reaching here.
+                    if (req_payload.is_object())
+                        req_payload["scope_input_id"] = *pid;
                 }
+                cr.source_payload = req_payload.dump();
                 if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
@@ -11802,7 +12041,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = std::string(source_kind::kInventoryQuery);
-                cr.source_payload = args.dump();
+                // #4306 governance follow-up (Gate 2 security-guardian LOW): mirrors
+                // the identical REST fix on POST /api/v1/result-sets/from-inventory-query
+                // (rest_api_v1.cpp) -- see that comment for the full rationale.
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     // Length already checked above, ahead of the store gates.
@@ -11811,18 +12052,44 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return;
                     cr.parent_id = pid;
+                    args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
                     std::string cur;
                     while (true) {
-                        std::string next;
-                        auto page = result_set_store_->members(pid, cur, 5000, next);
-                        ms.insert(page.begin(), page.end());
-                        if (next.empty())
+                        // #4306 finding 3: the plain members() silently
+                        // truncated the loop on a degraded page,
+                        // indistinguishable from a genuine last page — this
+                        // tool MATERIALISES the narrowed match set into a
+                        // durable result set, so a truncated read here
+                        // silently narrows who future dispatches against it
+                        // reach. Fail CLOSED: refuse the whole operation
+                        // rather than materialise a partial parent_members
+                        // set. Mirrors REST's identical fix.
+                        auto page_result = result_set_store_->members_checked(pid, cur, 5000);
+                        if (!page_result) {
+                            const bool audit_ok = audit_fn(
+                                req, "result_set.create", "failure", "ResultSet", "",
+                                "reason=store_degraded source_kind=inventory_query");
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "RESULT_SET_STORE_UNAVAILABLE: could not read the "
+                                         "parent set's members; refusing to materialise a "
+                                         "partial result set",
+                                         "retry once the server reports ready",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                         audit_ok),
+                                "application/json");
+                            return;
+                        }
+                        ms.insert(page_result->device_ids.begin(), page_result->device_ids.end());
+                        if (page_result->next_cursor.empty())
                             break;
-                        cur = std::move(next);
+                        cur = std::move(page_result->next_cursor);
                     }
                     parent_members = std::move(ms);
                 }
+                // `args` is not read anywhere below this point in this handler.
+                cr.source_payload = args.dump();
                 InventoryQuery iq;
                 iq.limit = 5000;
                 bool inv_truncated = false;
@@ -12240,12 +12507,85 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                // #4306 follow-up (adversarial review, Kimi+Codex): the
+                // source_kind support check must run BEFORE the parent-gone /
+                // scope_input_id guard below, or a manual_curate (or any
+                // other unsupported-source_kind) row minted via the generic
+                // create_result_set tool with a crafted
+                // source_payload={"scope_input_id":"..."} but no real parent
+                // gets misclassified as RESULT_SET_BAD_REQUEST
+                // (reason=parent_gone) instead of RESULT_SET_REEVAL_UNSUPPORTED.
+                // Both outcomes are refusals with nothing dispatched either
+                // way (not a dispatch-safety bug -- an error/audit-reason
+                // correctness bug), but the unsupported-kind rejection takes
+                // priority: it depends on nothing computed below (no synth,
+                // no reeval_name), so hoist it to an early return right after
+                // sp is parsed. Mirrors REST's identical reorder on this
+                // route (rest_api_v1.cpp).
+                if (orig->source_kind != source_kind::kTarQuery &&
+                    orig->source_kind != source_kind::kInstructionResult) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                       "is not yet supported"),
+                        "application/json");
+                    return;
+                }
                 // Synthesise the parent so the sibling shares the original's
                 // parent (re-eval re-asks the same question against today's
                 // estate).
                 nlohmann::json synth = nlohmann::json::object();
-                if (orig->parent_id && !orig->parent_id->empty())
-                    synth["parent_id"] = *orig->parent_id;
+                if (orig->parent_id && !orig->parent_id->empty()) {
+                    synth["parent_id"] = *orig->parent_id; // live parent: canonical, exact
+                } else if (sp.is_object() && sp.contains("scope_input_id") &&
+                           sp["scope_input_id"].is_string() &&
+                           !sp["scope_input_id"].get_ref<const std::string&>().empty()) {
+                    // #4306 / #2500-class target erasure: the original was
+                    // NARROWED at creation (scope_input_id persisted into
+                    // source_payload by create_result_set_from_tar_query /
+                    // create_result_set_from_instruction_result, OR by the
+                    // generic create_result_set -- #4306 follow-up, all three
+                    // mirror the same payload["scope_input_id"] = ... pattern),
+                    // but its live parent_id FK is now null (schema: `parent_id ... ON DELETE
+                    // SET NULL`, result_set_store.cpp) because the parent set was
+                    // deleted since. An absent parent_id reaching rs_run_async
+                    // below reads as "omitted -> broadcast to __all__" (the SAME
+                    // rule rs_run_async's own parent_id-empty guard applies to a
+                    // caller-supplied empty string), so "re-ask the same narrow
+                    // question" would silently become "ask the whole visible
+                    // fleet". Mirrors REST's identical guard on this route
+                    // (rest_api_v1.cpp).
+                    //
+                    // Deliberately NOT re-resolving scope_input_id as a fresh
+                    // alias lookup: it is the RAW caller-supplied value at
+                    // creation time and may be an ALIAS, not a canonical rs_ id.
+                    // rs_resolve_owned_parent routes a non-rs_-prefixed string
+                    // through resolve_alias(), whose SQL is `ORDER BY created_at
+                    // DESC LIMIT 1` — newest-wins — so the alias may since have
+                    // been re-bound to a DIFFERENT, newer set. Resolving it now
+                    // would retarget the dispatch to whatever the alias means
+                    // TODAY, not what it meant when this original was created: a
+                    // precision regression, not a fix. Refuse instead, before
+                    // rs_run_async / exec_visible derivation — nothing is
+                    // dispatched, no execution row is created, nothing needs
+                    // cancelling.
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", rs_id,
+                        "reason=parent_gone source_kind=" + audit_token(orig->source_kind) +
+                            " scope_input_id=" +
+                            audit_token(sp["scope_input_id"].get<std::string>()));
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "RESULT_SET_BAD_REQUEST: the original's parent set no longer "
+                                 "exists; re-eval cannot reconstruct its target scope -- create "
+                                 "a new set from the intended parent instead",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                // else: genuinely parentless original (no scope_input_id was ever
+                // recorded) -> broadcast, today's behaviour, unchanged (an
+                // omitted parent_id is deliberately "the whole fleet").
                 // Skip the suffix if it's already there, else repeated
                 // re-evals of a sibling grow "foo (re-eval) (re-eval) ..."
                 // unboundedly.
@@ -12388,13 +12728,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                     rs_run_async(def->plugin, def->action, params, source_kind::kInstructionResult,
                                 orig->source_payload, orig->matcher, synth, reeval_name);
-                } else {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
-                                       "is not yet supported"),
-                        "application/json");
                 }
+                // else: unreachable -- the early return above already refused
+                // every source_kind other than kTarQuery/kInstructionResult
+                // before we got here.
                 return;
             }
 
@@ -12447,18 +12784,44 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                int64_t limit = param_int(args, "limit", 1000);
+                // #4307 item 7 (#2970B convention): param_int silently
+                // substitutes the default on a present-but-wrong-typed
+                // `limit` rather than rejecting it - param_int_strict
+                // returns nullopt for that shape instead, matching this
+                // tool's sibling list_result_sets above.
+                const auto limit_opt = param_int_strict(args, "limit", 1000);
+                if (!limit_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not
+                        // a store/query fault - resending the identical
+                        // malformed argument cannot succeed.
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                int64_t limit = *limit_opt;
                 if (limit < 1)
                     limit = 1;
                 if (limit > 10000)
                     limit = 10000;
-                std::string next;
-                auto devs =
-                    result_set_store_->members(rs_id, cursor, static_cast<int>(limit), next);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty result on a degraded read.
+                auto page =
+                    result_set_store_->members_checked(rs_id, cursor, static_cast<int>(limit));
+                if (!page) {
+                    const bool audit_ok = mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set members",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : devs)
+                for (const auto& d : page->device_ids)
                     arr.push_back(d);
-                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", next}};
+                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", page->next_cursor}};
                 mcp_audit("success", rs_id);
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -12483,9 +12846,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                auto chain = result_set_store_->lineage(rs_id, session->username);
+                // #4306 finding 3 / #4307 finding 2: never a success response
+                // with an empty/truncated chain on a degraded read.
+                auto chain_result = result_set_store_->lineage_checked(rs_id, session->username);
+                if (!chain_result) {
+                    const bool audit_ok = mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_STORE_UNAVAILABLE: could not read "
+                                                  "result-set lineage",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& n : chain)
+                for (const auto& n : *chain_result)
                     arr.push_back({{"id", n.id},
                                    {"name", n.name},
                                    {"source_kind", n.source_kind},
@@ -12667,25 +13042,132 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 ApprovalQuery aq;
-                aq.status = param_str(args, "status", "pending");
-                aq.submitted_by = param_str(args, "submitted_by");
-                auto approvals = approval_manager->query(aq);
-                JArr arr;
-                for (const auto& a : approvals) {
-                    arr.add(JObj()
-                                .add("id", a.id)
-                                .add("definition_id", a.definition_id)
-                                .add("status", a.status)
-                                .add("submitted_by", a.submitted_by)
-                                .add("submitted_at", a.submitted_at)
-                                .add("scope_expression", a.scope_expression));
+                // Gate 2 governance finding (#2146 A2-R4, same defect class as
+                // #2970B/#2146 A2-R1/A2-R2's param_int_strict/param_bool_strict/
+                // param_string_strict family): a present-but-wrong-JSON-type
+                // status/submitted_by must not silently read as absent and
+                // default to "pending"/"" -- reject it instead.
+                auto status_opt = param_string_strict(args, "status", "pending");
+                if (!status_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "status must be a JSON string"),
+                        "application/json");
+                    return;
                 }
-                mcp_audit("success");
+                // unhappy-path governance finding (#2146 A2-R4): a well-typed
+                // but out-of-enum status -- a typo, a case mismatch, or an
+                // explicit "" (which query_checked's filter-building treats
+                // as "no filter", silently returning EVERY status instead of
+                // the documented pending-on-omission default) -- must be
+                // rejected, not silently misinterpreted.
+                if (std::find(ApprovalManager::allowed_status().begin(),
+                              ApprovalManager::allowed_status().end(),
+                              *status_opt) == ApprovalManager::allowed_status().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid status"),
+                                    "application/json");
+                    return;
+                }
+                auto submitted_by_opt = param_string_strict(args, "submitted_by");
+                if (!submitted_by_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "submitted_by must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                aq.status = *status_opt;
+                aq.submitted_by = *submitted_by_opt;
+                // #2146 A2-R4 review finding: was the unchecked query(), which
+                // silently returned an empty list on pool exhaustion / a
+                // failed query, indistinguishable from a genuinely empty
+                // queue -- mirrors list_schedules' checked/a4_error shape
+                // immediately above.
+                auto list_result = approval_manager->query_checked(aq);
+                if (!list_result) {
+                    mcp_audit("failure", "store degraded; list_pending_approvals");
+                    // review finding (PR #4656): a permanent store failure
+                    // (schema drift, disk-full, store never opened) was
+                    // answered with the same retry_after_ms as a transient
+                    // one -- an unbounded "retry forever" loop that also
+                    // writes an audit row every attempt. Read-only sibling
+                    // of consume_ticket's approval_store_error_body -- same
+                    // sqlstate classification, wording that doesn't imply a
+                    // ticket was in play.
+                    res.set_content(
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       list_result.error().sqlstate),
+                        "application/json");
+                    return;
+                }
+                // Shared builder (approval_model.hpp, #2146 A2-R4 Rule 1) --
+                // same JSON shape as GET /api/v1/approvals and the single-
+                // fetch GET /api/v1/approvals/{id}, so the three cannot
+                // drift from each other.
+                JArr arr;
+                for (const auto& a : list_result->approvals)
+                    arr.add_raw(approval_row_json(a).dump());
+                // compliance-officer governance finding (#2146 A2-R4):
+                // detail content, matching the REST twin's audit posture
+                // (surface=list count=N) rather than an empty detail string.
+                mcp_audit("success", "surface=list count=" + std::to_string(arr.size()));
+                // result_truncated_by_cap (declared in the output schema
+                // above, precedent: list_schedules): the underlying query is
+                // hard-capped at 100 rows with no limit/cursor parameter on
+                // this tool; tells a caller when this response is a partial
+                // page rather than the complete approval queue.
+                // content[].text stays the bare `approvals` array unchanged
+                // for backward compat -- the flag lives only in
+                // structuredContent, same split as list_schedules.
+                JObj structured;
+                structured.raw("approvals", arr.str());
+                if (list_result->truncated)
+                    structured.add("result_truncated_by_cap", true);
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("approvals", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_pending_approval_count (#2146 A2-R4) ───────────────────
+            if (tool_name == "get_pending_approval_count") {
+                if (!tier_allows(tier, "Approval", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Approval", "Read"))
+                    return;
+                if (!approval_manager) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Approval manager unavailable"),
+                        "application/json");
+                    return;
+                }
+                // #2146 A2-R4: the unchecked pending_count() silently returns
+                // 0 on pool exhaustion / a failed query, indistinguishable
+                // from a genuine "zero pending approvals" state -- the exact
+                // false-negative a maker-checker backlog monitor cannot
+                // tolerate. Same checked/a4_error shape as list_pending_approvals
+                // above.
+                auto count_result = approval_manager->pending_count_checked();
+                if (!count_result) {
+                    mcp_audit("failure", "store degraded; get_pending_approval_count");
+                    // review finding (PR #4656): same permanent-vs-transient
+                    // misclassification as list_pending_approvals above.
+                    res.set_content(
+                        approval_store_read_error_body(*approval_manager, a4_error,
+                                                       count_result.error().sqlstate),
+                        "application/json");
+                    return;
+                }
+                // compliance-officer governance finding (#2146 A2-R4): detail
+                // content, matching the REST twin's audit posture.
+                mcp_audit("success", "surface=count count=" + std::to_string(*count_result));
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().add("count", *count_result).str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -12807,16 +13289,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status.
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                // #4037: guardian_status_rollup (guardian_model.hpp) is the SAME function
-                // REST's GET /guaranteed-state/status calls — cannot drift on
+                // #4037/ADR-0031 WS-A4 (ninth family): GuardianApi::status wraps the
+                // SAME guardian_status_rollup function REST's
+                // GET /guaranteed-state/status calls — cannot drift on
                 // total_rules/errored_rules derivation by construction.
-                auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
+                auto rollup = guardian_api_->status(gate.scope);
                 if (!rollup) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -12858,13 +13341,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guaranteed_state_store->list_rules();
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_rules.
+                auto rows = guardian_api_->list_rules();
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -12913,7 +13397,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -12979,7 +13463,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "dex.device.view", "success",
                     fleet ? "GuaranteedState" : "Agent", q.agent_id,
                     "Guaranteed State events via MCP list_guardian_events");
-                auto rows = guaranteed_state_store->query_events(q);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
+                // plain-vector, empty-on-degrade contract (ADR-0038 "deferred
+                // widening", #2659; see guardian_api.hpp).
+                auto rows = guardian_api_->list_events(q);
                 JArr arr;
                 for (const auto& e : rows) {
                     arr.add(JObj()
@@ -13027,7 +13514,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = list_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13041,8 +13528,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely
                 // absent / degraded — a degrade must error, never collapse
-                // into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // into "not found". ADR-0031 WS-A4 (ninth family):
+                // GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13066,7 +13554,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
+                auto rows = guardian_api_->rule_status(rule_id);
                 if (!rows) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13125,13 +13613,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rows = guardian_device_all_guards(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_guards.
+                auto rows = guardian_api_->device_guards(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/agents/{agent_id}/rules and the
                 // dashboard Guardian device lens. MCP set-and-proceed
@@ -13238,11 +13727,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     row.yaml_source = param_str(args, "yaml_source");
                 }
 
-                if (row.rule_id.empty() || row.name.empty() ||
+                if (!is_valid_rule_id(row.rule_id) || row.name.empty() ||
                     (!spec.structured && row.yaml_source.empty())) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id,
+                        "invalid rule_id, missing name, or missing yaml_source");
+                    // retry-hint-exempt: validation failure, not a store fault.
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "rule_id and name are required, plus either a "
+                                       "rule_id must be non-empty, match [A-Za-z0-9._-]+, and "
+                                       "be at most 256 bytes; name is required, plus either a "
                                        "structured spark+assertion or a yaml_source"),
                         "application/json");
                     return;
@@ -13305,7 +13800,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13313,7 +13808,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // get_rule is three-state (ADR-0038): found / genuinely absent /
                 // degraded — a degrade must error, never collapse into "not found".
-                auto row = guaranteed_state_store->get_rule(rule_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::get_rule.
+                auto row = guardian_api_->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
@@ -13698,13 +14194,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
                     return;
                 }
-                auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::agent_status.
+                auto rollup = guardian_api_->agent_status(agent_id);
                 // Behavioral-PII access audit — same verb/target as REST GET
                 // /guaranteed-state/status/{agent_id}. MCP set-and-proceed posture
                 // (audit_persisted:false on a dropped row, never fail closed — MCP
@@ -13785,7 +14282,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                     return;
-                if (!guaranteed_state_store || !baseline_store_) {
+                if (!guardian_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
                         "application/json");
@@ -13797,11 +14294,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // fires below - the prior inline version audited "success" right
                 // after the first read, so a degrade in any of the other three
                 // still surfaced a 500 the audit had already called successful.
+                // ADR-0031 WS-A4 (ninth family): GuardianApi::device_compliance
+                // wraps guardian_device_compliance_rollup verbatim.
                 bool store_degraded = false;
                 bool pii_access_began = false;
-                auto rollup = guardian_device_compliance_rollup(
-                    *baseline_store_, *guaranteed_state_store, baseline_name, agent_id,
-                    &store_degraded, &pii_access_began);
+                auto rollup = guardian_api_->device_compliance(baseline_name, agent_id,
+                                                                &store_degraded, &pii_access_began);
                 if (store_degraded) {
                     // Scoped re-review fix: a degrade in the baseline lookup itself is
                     // genuinely pre-PII (no audit owed, same posture as before), but a
@@ -14130,9 +14628,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // three. Set-and-proceed: MCP has no Sec-Audit-Failed header, so the
                 // persist bool is captured and surfaced as audit_persisted:false in the
                 // body instead (never a failed call — see docs/api-twin-recipe.md §4).
+                // #4858: the read above may have degraded; this behavioural row
+                // records the access, not the outcome (#4855) — it stays "success"
+                // regardless of a `model.degraded` result below (the device WAS
+                // accessed on the caller's behalf) — the separate `mcp_audit`
+                // tool-invocation record is what flips to "failure" on a degrade.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.view", "success", "Agent", agent_id,
                     "DEX per-device score + signal summary via MCP get_dex_device_score");
+                if (model.degraded) {
+                    // #4855: never serialize a degraded model as a healthy score of
+                    // 100 with no signals -- a retryable error, matching the REST
+                    // twin's 503 and get_dex_device_app_perf's degrade branch below.
+                    mcp_audit("failure", "DEX store read degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success", agent_id);
                 res.set_content(
                     success_response(
@@ -14171,8 +14685,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Behavioral-PII access audit BEFORE the read (provider-null already
-                // checked, matching the REST twin's ordering) — same verb/target as
-                // the REST twin and the dashboard's app-perf-over-time drill.
+                // checked, matching the REST twin's ordering) — same audit verb/target
+                // as the REST twin and the dashboard's app-perf-over-time drill (the
+                // dashboard's own ordering differs — it audits BEFORE its null-seam
+                // check, over-auditing on an unwired provider — see dex_routes.cpp's
+                // "#4626 Concern A" comment; only the verb/target match here, not the
+                // ordering).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.device.app_perf.view", "success", "Agent", agent_id,
                     "device app-perf-over-time drill (B1 retained) via MCP "
@@ -15076,7 +15594,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (member resolution then B1 aggregate), membership via
                     // TagStore::agents_with_tag instead of
                     // ManagementGroupStore::get_members — see
-                    // AppPerfTagCohortFn's doc comment (dex_app_perf_model.hpp)
+                    // DexPerfApi::tag_trend's doc comment (dex_perf_api.hpp)
                     // for why the SAME kDexCohortFloor suppression applies. No
                     // interim deny_fleet_wide_service_scoped() call is needed
                     // here for the reason the sibling branch's own comment
@@ -24071,7 +24589,6 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24109,7 +24626,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(dispatch_fn), ca_store, std::move(publish_crl_fn),
                     guaranteed_state_store, std::move(dex_perf_fn), std::move(network_api),
                     std::move(response_scope_fn), software_inventory_store, metrics,
-                    std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
+                    quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
                     mcp_streamed_post_enabled, std::move(allowed_origins),
                     software_licensing_store, engine_principal_store,
@@ -24140,7 +24657,6 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 ResponseScopeFn response_scope_fn,
                                 SoftwareInventoryStore* software_inventory_store,
                                 yuzu::MetricsRegistry* metrics,
-                                AppPerfProviders app_perf_providers,
                                 QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
@@ -24189,7 +24705,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(publish_crl_fn), guaranteed_state_store,
                             std::move(dex_perf_fn), std::move(network_api),
                             std::move(response_scope_fn), software_inventory_store, metrics,
-                            std::move(app_perf_providers), quarantine_store,
+                            quarantine_store,
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                             sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                             std::move(allowed_origins),

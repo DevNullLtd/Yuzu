@@ -1,0 +1,3 @@
+host: Docker Desktop linuxkit VM (Apple Silicon), container alpine:latest, Linux 7.0.12-linuxkit, root; date 2026-09-21
+status: REAL CAPTURE: for each of bios_vendor bios_version bios_date bios_release, cat /sys/class/dmi/id/<f>, printing `<f>=!ENOENT` when the read fails
+notes: /sys/class/dmi does not exist in this VM, so every key is absent. This is the no-DMI host path (containers, some VMs), not a failure. Format: "<file>=<raw content>" or "<file>=!ENOENT".

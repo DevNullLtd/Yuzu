@@ -405,7 +405,38 @@ Mechanics:
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
-  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+  stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
+  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list`, `query` AND
+  the hashed `inv|` rows, so any change to it must be checked against the
+  hashed rows. *Amended 2026-09-21:* `list` gained two trailing columns
+  (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
+  `app` tag, `name`, `version`, `publisher` and `install_date` keep their
+  position and value for every real value; every `list` field is now
+  escape-aware (`\`→`/`, `|`→`\|`, CR/LF→space, 4 KiB cut) — `list` rows are
+  never hashed. On macOS, the collector `list`/`query`/`list_per_user` share now
+  sorts same-named apps by (name, `install_location`) instead of an arbitrary
+  order; their row shape is otherwise unchanged. The `inv|` rows are unchanged
+  for real Location values (a relative or control-byte Location, which only a
+  hostile bundle produces, is now ignored rather than feeding the #2273
+  enrichment): the Windows name+version dedupe (`dedupe_uninstall_records`)
+  keeps the same survivor as before and sets that survivor's `install_location`
+  to the lexicographically smallest populated location in its run. Data
+  classification: `install_location` is
+  operator-tier — an ordinary stored Response (90-day default retention, no
+  per-subject erasure, not covered by `--inventory-disable`), never in this
+  blob — and can name an account's home directory
+  (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
+  sync neither crawls a logged-in user's hive nor `~/Applications` — is about
+  the sync and the Windows `HKCU` path specifically; it does not extend to
+  `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
+  both run CAN list entries under `/Users/<account>/Applications` (4 of the
+  323 rows in the committed macOS sample), so `list` may name a home
+  directory. Any change that puts `install_location` into a hashed or synced
+  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
+  §8's classification first. `list`/`list_inventory` keep their
+  `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
+  gate exists for profile enumeration, which `list` does not do (CC6.3
+  decision recorded here).
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`

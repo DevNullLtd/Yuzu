@@ -1,0 +1,8 @@
+test cases:   3469 |   3464 passed | 1 failed | 4 skipped
+
+../tests/unit/test_spark_mechanism.cpp(7053): FAILED:
+  CHECK( max_active <= kTestLaneCap )
+with expansion:
+  9 <= 8
+with message:
+  max observed probe_workers_active=9 (test cap=8)

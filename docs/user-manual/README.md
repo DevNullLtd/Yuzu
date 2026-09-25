@@ -33,6 +33,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Network Quality](network.md) | Continuous fleet TCP network quality — RTT, retransmit, and throughput (evidence-first; device/app co-occurrence is a later slice). Linux reports all three; Windows reports throughput + retransmit (RTT deferred). A DEX sub-view |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
 | [Server Administration](server-admin.md) | Configuration, TLS, user management, first-run setup, and backup |
+| [TLS policy](tls.md) | Pinned TLS 1.2 cipher allow-list and version floor across the gRPC and HTTPS listeners -- what's pinned, what isn't yet, and what CI proves |
 | [REST API Reference](rest-api.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |

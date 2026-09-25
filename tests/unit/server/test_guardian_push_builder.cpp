@@ -708,3 +708,83 @@ TEST_CASE("build_agent_push: excluding the same poisoned rule repeatedly increme
                   .value() == static_cast<double>(attempt));
     }
 }
+
+// #4665 Phase-3 governance (architect/security-guardian/sre/compliance-officer/
+// enterprise-readiness/unhappy-path all independently found this gap): before
+// this fix, a legacy rule_id violating the post-#4665 charset/length contract
+// (creatable only pre-#4665, when creation enforced no such bound) reached
+// every agent in its push unfiltered, and the upgraded agent's whole-push-reject
+// in apply_rules() then refused the ENTIRE push -- wedging delivery to every
+// OTHER rule in scope too, with no server-side signal. Mirrors the depth-guard
+// TEST_CASE above: the bad row is excluded entirely, siblings are unaffected.
+TEST_CASE("build_agent_push: a rule with a non-conforming rule_id is excluded; "
+          "other rules in the same batch still push normally",
+          "[guardian_push_builder][security][rule_id]") {
+    GuaranteedStateRuleRow legacy_bad = row("legacy bad\nid", "windows", "");
+    GuaranteedStateRuleRow healthy = row("healthy2", "windows", "");
+
+    auto push = guardian::build_agent_push({legacy_bad, healthy}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/3);
+
+    CHECK(rule_ids(push) == std::vector<std::string>{"healthy2"});
+}
+
+TEST_CASE("build_agent_push: excluding a non-conforming rule_id increments its own "
+          "metric reason, distinct from depth_exceeded",
+          "[guardian_push_builder][security][rule_id][observability]") {
+    yuzu::MetricsRegistry metrics;
+    GuaranteedStateRuleRow legacy_bad = row("legacy bad id metric", "windows", "");
+
+    auto push = guardian::build_agent_push({legacy_bad}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/1, &metrics);
+
+    CHECK(push.rules_size() == 0);
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total",
+                      {{"reason", "invalid_rule_id"}})
+              .value() == 1.0);
+    // Never counted under the unrelated depth_exceeded reason.
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total",
+                      {{"reason", "depth_exceeded"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("build_agent_push: an over-long rule_id (>256 bytes, charset-clean) is "
+          "excluded too -- length-only violations, not just charset ones",
+          "[guardian_push_builder][security][rule_id]") {
+    GuaranteedStateRuleRow too_long = row(std::string(300, 'a'), "windows", "");
+    GuaranteedStateRuleRow healthy = row("healthy3", "windows", "");
+
+    auto push = guardian::build_agent_push({too_long, healthy}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/1);
+
+    CHECK(rule_ids(push) == std::vector<std::string>{"healthy3"});
+}
+
+// Mirrors the depth_exceeded repeated-call TEST_CASE above (#4665 Phase-3
+// governance sre re-verification): the invalid_rule_id counter must increment
+// unconditionally on every exclusion, uncoupled from the sampler's log-line
+// suppression decision, exactly like its depth_exceeded sibling — a future
+// refactor that accidentally couples the two reason branches differently
+// would otherwise go uncaught.
+TEST_CASE("build_agent_push: excluding the same non-conforming rule_id repeatedly "
+          "increments the metric on every call regardless of whether the log line "
+          "was suppressed",
+          "[guardian_push_builder][security][rule_id][observability][sampler]") {
+    yuzu::MetricsRegistry metrics;
+    GuaranteedStateRuleRow legacy_bad = row("legacy bad\nid repeated", "windows", "");
+
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        INFO("attempt " << attempt);
+        auto push = guardian::build_agent_push({legacy_bad}, "windows", always_in_scope,
+                                               /*full_sync=*/true,
+                                               /*generation=*/static_cast<std::uint64_t>(attempt),
+                                               &metrics);
+        CHECK(push.rules_size() == 0);  // excluded every time
+        CHECK(metrics
+                  .counter("yuzu_guardian_push_rule_excluded_total",
+                          {{"reason", "invalid_rule_id"}})
+                  .value() == static_cast<double>(attempt));
+    }
+}

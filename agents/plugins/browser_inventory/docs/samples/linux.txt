@@ -1,0 +1,12 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 66c026fa18f1
+== action=browsers
+status|browsers|supported|-
+browser|chrome|0|-
+browser|edge|0|-
+browser|chromium|0|-
+[result_status] OK / FULL / 
+
+== action=profiles
+status|profiles|supported|-
+[result_status] OK / FULL / 
+

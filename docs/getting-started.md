@@ -162,7 +162,7 @@ Expected response:
 2. It constructed a gRPC `CommandRequest` with `plugin=os_info` and `action=os_name`.
 3. The request was dispatched to all connected agents over the bidirectional gRPC stream.
 4. Each agent's plugin host loaded the `os_info` plugin, invoked the `os_name` action, and streamed the result back as a `CommandResponse`.
-5. The server's `ResponseStore` persisted each response in SQLite with the command ID, agent ID, timestamp, status, and output.
+5. The server's `ResponseStore` persisted each response in PostgreSQL with the command ID, agent ID, timestamp, status, and output.
 6. An audit event was logged with your username, the action taken, and the number of agents targeted.
 
 ---
@@ -863,7 +863,7 @@ Expected response:
 
 ## Step 8: Exporting Results
 
-Yuzu stores every response in its SQLite-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
+Yuzu stores every response in its PostgreSQL-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
 
 ### Query responses for an instruction
 

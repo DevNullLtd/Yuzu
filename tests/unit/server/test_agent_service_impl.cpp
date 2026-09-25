@@ -37,6 +37,7 @@
 #include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
+#include "gateway_mgmt_stub_pool.hpp" // #4672: build_gateway_forward_terminal_failure
 #include "gateway_service_impl.hpp"
 #include "inventory_store.hpp"
 #include "notification_store.hpp"
@@ -318,6 +319,124 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     CHECK(rows[0].error_detail == "plugin returned non-zero");
     CHECK(rows[0].execution_id == "exec-fail");
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
+}
+
+// ── #4672 — gateway-forward terminal-failure synthesis resolves the
+//    command_id exactly like a real gateway response would ────────────────
+//
+// forward_gateway_pending's four terminal-failure branches (unauthenticated,
+// exhausted unavailable, unknown_cluster, a stream with no legitimate
+// resolution for the targeted agent) build a synthetic FAILURE CommandResponse
+// (build_gateway_forward_terminal_failure, gateway_mgmt_stub_pool.hpp) and
+// apply it through THIS SAME process_gateway_response path — never a bespoke
+// second mechanism. These tests drive that exact call shape end-to-end so a
+// regression that stops calling process_gateway_response on one of those
+// branches (or that starts double-resolving) is caught here rather than only
+// by reading forward_gateway_pending's un-unit-testable body.
+
+TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal failure "
+          "resolves the command's execution row exactly like a real FAILURE response",
+          "[pg][agent_service][executions][4672]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+    h.svc.record_execution_id("cmd-gwfwd", "exec-gwfwd");
+
+    auto synth = yuzu::server::build_gateway_forward_terminal_failure(
+        "cmd-gwfwd", "gateway_unauthenticated",
+        "Gateway REJECTED by the gateway's mgmt-plane peer pin (UNAUTHENTICATED) — command "
+        "not delivered");
+    h.svc.process_gateway_response("agent-1", synth);
+
+    auto rows_opt = h.responses.query_by_execution("exec-gwfwd");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
+    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22): the
+    // reason code is now prefixed onto the persisted message (see
+    // build_gateway_forward_terminal_failure's updated doc comment).
+    CHECK(rows[0].error_detail ==
+         "[gateway_unauthenticated] Gateway REJECTED by the gateway's mgmt-plane peer pin "
+         "(UNAUTHENTICATED) — command not delivered");
+    CHECK(rows[0].execution_id == "exec-gwfwd");
+    CHECK(rows[0].agent_id == "agent-1");
+    CHECK(rows[0].instruction_id == "cmd-gwfwd");
+}
+
+TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 synthetic "
+          "terminal failure ends up FAILURE, never stuck RUNNING (the bug #4672 closes)",
+          "[pg][agent_service][executions][4672]") {
+    // Before #4672, forward_gateway_pending's terminal-failure branches
+    // logged + counted + dropped: a command that streamed a RUNNING frame
+    // and then hit e.g. exhausted UNAVAILABLE retries never got a matching
+    // terminal write, so its execution/response row idled at RUNNING
+    // forever (only the executions-ladder materialise timeout, a much later
+    // and coarser signal, would eventually notice). This pins the fix: the
+    // SAME command_id, first a real RUNNING frame, then the synthesized
+    // terminal failure — the row must resolve to FAILURE, not stay RUNNING
+    // and not produce a second, orphaned row.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+    h.svc.record_execution_id("cmd-stuck", "exec-stuck");
+
+    auto running = GatewayResponseHarness::make_response(
+        "cmd-stuck", apb::CommandResponse::RUNNING, /*output=*/"still going");
+    h.svc.process_gateway_response("agent-1", running);
+
+    auto synth = yuzu::server::build_gateway_forward_terminal_failure(
+        "cmd-stuck", "gateway_unavailable",
+        "Gateway unreachable after 3 attempts — command not delivered");
+    h.svc.process_gateway_response("agent-1", synth);
+
+    auto rows_opt = h.responses.query_by_execution("exec-stuck");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
+    REQUIRE(rows.size() == 1); // updated in place, not a second orphaned row
+    CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
+    CHECK(rows[0].error_detail ==
+         "[gateway_unavailable] Gateway unreachable after 3 attempts — command not delivered");
+}
+
+TEST_CASE("process_gateway_response: each of the five #4672 reason codes produces a distinct, "
+          "resolved FAILURE row",
+          "[pg][agent_service][executions][4672]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    struct Case {
+        const char* command_id;
+        const char* reason;
+    };
+    // Gate 4 consistency-auditor SHOULD (2026-09-21): this list previously
+    // omitted "gateway_forward_failed" (the generic non-UNAVAILABLE
+    // grpc-status branch, the 5th of forward_gateway_pending's 5 terminal-
+    // failure call sites) — a typo/rename there would have gone uncaught.
+    const Case cases[] = {
+        {"cmd-unauth", "gateway_unauthenticated"},
+        {"cmd-unavail", "gateway_unavailable"},
+        {"cmd-unknown-cluster", "gateway_unknown_cluster"},
+        {"cmd-mismatch", "gateway_agent_mismatch"},
+        {"cmd-forward-failed", "gateway_forward_failed"},
+    };
+    for (const auto& c : cases) {
+        INFO("reason=" << c.reason);
+        auto synth =
+            yuzu::server::build_gateway_forward_terminal_failure(c.command_id, c.reason, c.reason);
+        h.svc.process_gateway_response("agent-1", synth);
+
+        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id);
+        REQUIRE(by_cmd_opt.has_value());
+        const auto& by_cmd = *by_cmd_opt;
+        REQUIRE(by_cmd.size() == 1);
+        CHECK(by_cmd[0].status == static_cast<int>(apb::CommandResponse::FAILURE));
+        CHECK(by_cmd[0].error_detail == std::string("[") + c.reason + "] " + c.reason);
+    }
 }
 
 TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_id",

@@ -1,6 +1,9 @@
 /**
  * test_guardian_health_fleet_tags.cpp - Guardian M1 health-stream fleet-telemetry
- * contract (#2298 gate 3, item 6d; #2993 added the 4th counter).
+ * contract (#2298 gate 3, item 6d; #2993 added the 4th counter; #4783 commit 4 added
+ * the 5th/6th - legacy-sink loss visibility, same shape, unrelated feature; a #4783
+ * governance follow-up added the 7th - the pre-network-arm legacy-sink drop, wired to
+ * fleet visibility for the first time).
  *
  * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
  * (no age/MAX sibling table here - all of these are plain sparse cumulative counters,
@@ -62,6 +65,9 @@ GuardianHealthStats all_nonzero_stats() {
     s.unhealthy_refreshed = 2;
     s.priority_demoted = 3;
     s.outbox_backpressure_drops = 4;
+    s.legacy_sink_events_lost = 5;     // #4783
+    s.legacy_sink_gap_rules = 6;       // #4783
+    s.legacy_sink_dropped_unwired = 7; // #4783 governance follow-up
     return s;
 }
 
@@ -95,6 +101,9 @@ TEST_CASE("guardian health: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_unhealthy_refreshed", "2"},
         {"yuzu.guardian_priority_demoted", "3"},
         {"yuzu.guardian_outbox_backpressure_drops", "4"},
+        {"yuzu.guardian_legacy_sink_events_lost", "5"},    // #4783
+        {"yuzu.guardian_legacy_sink_gap_rules", "6"},      // #4783
+        {"yuzu.guardian_legacy_sink_dropped_unwired", "7"}, // #4783 governance follow-up
     };
     // Per-key, NOT `CHECK(tags == expected)` - see the guardian-journal pin test's
     // comment for why a whole-map compare hides which key drifted.

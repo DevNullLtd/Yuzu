@@ -128,7 +128,12 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
-**Verified 2026-09-20 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
+**WS-6 re-stamped 2026-09-23 (PR #4833):** slice 6.1 (cross-replica CRL publication, #4126) in
+review; 6.1b / 6.2 / 6.3 planned; the operator decisions (shared CA key custody, not
+`SecretCodec`; a one-time `.cfg` enrollment import) are recorded in ADR-2002 §8 "Update
+(2026-09-23)".
+
+**Verified 2026-09-21 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
 4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
 stream-generation fence (PR #4492, merge commit `c37306113`, 2026-09-17T22:05:58Z,
@@ -146,8 +151,42 @@ review rejected the originally-proposed design and surfaced that
 `ProxyRegister` was unconditionally wiping placement on every replay-adopted
 registration (a live, single-replica bug, not just a multi-replica gap) — see
 the blockquote below and ADR-2002 §7c for the full mechanism.
-Next gate items: the rest of WS-4 (4.3 cross-cluster fan-out), WS-5, WS-6,
-WS-8-readyz.**
+**WS-4 rest of 4.3 DONE** (2026-09-21, ADR-2002 §7d): cross-cluster gateway
+fan-out — `AgentSession`/`GatewayPendingCmd` now carry `cluster_id` end-to-end
+from the common `send_to`/`send_to_all` path (not just the 4.2b directory
+fallback), a new eager `GatewayMgmtStubPool` dials the OWNING cluster per
+command instead of the single legacy stub, `--gateway-cluster-addr` config,
+a response-agent forgery guard (closes ONE forgery shape — a cluster answering
+as a different agent — NOT a rogue gateway claiming an agent's own identity via
+`ProxyRegister`, which needs no per-agent secret; **multi-cluster mode does NOT
+yet provide trust-zone isolation between clusters for a given agent, tracked
+as `#4669`, pr-rev-caught pre-merge**), and one small required Erlang fix
+(`stream_responses/3` threads the real `command_id` so a gateway-side
+"not connected on this cluster" error is no longer invisible). **Closes WS-4's
+dial-selection half** — the durable re-drive-on-failure half of §7's design
+remains open (`#4672`), and `#4669` above is a separate, not-yet-closed item
+(non-blocking today: zero production multi-cluster deployments). The
+remaining safe-to-scale gate items are WS-5, WS-6, WS-8-readyz. See the
+blockquote below and ADR-2002 §7d for the full mechanism, including the 5
+findings a pre-implementation Fable review caught before any code was written
+(the original resolution rule would have broken every upgrade), and the
+pr-rev (FortitudeEtc/Codex+Kimi) round that caught the response-forgery
+overclaim plus two real code bugs (terminal-outcome double-counting; an
+oversized `cluster_id` silently routing to the default cluster instead of
+being rejected) before merge.
+Next gate items: WS-5, WS-6, WS-8-readyz. Also open: `#4669`, `#4672`.**
+
+**Re-verified 2026-09-24 (against `origin/dev` + `gh`):** `#4672` CLOSED; `#4669`
+still OPEN (mitigation 1, agent↔cluster affinity, merged; mitigation 2, peer-identity
+binding, open). **WS-5 slice 1 MERGED** (PR #4745, 2026-09-22) — decommission
+cascade, plugin-capability visibility, fleet gauge and its WS-9 scenario remain.
+**WS-6 6.1 MERGED** (PR #4833, 2026-09-23) — 6.1b / 6.2 / 6.3 and WS-9 scenario
+#4832 remain. **WS-8 readyz DONE for the monolith** (this change): runtime
+`pg_reachable` probe + `--shutdown-drain-seconds` drain grace + WS-9 scenarios
+`scripts/ha/ha-readyz-scenarios.sh`; tier-split readyz lands with the ADR-1005
+split; the BYO-LB doc (P2) is open and not in the gate.
+**Remaining gate items: the rest of WS-5, the rest of WS-6, and WS-13 for
+gateway-fronted fleets.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -325,10 +364,10 @@ WS-8-readyz.**
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
 | **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence + `#4555` cluster formation + 4.3a intra-cluster lookup + 4.4 (`gateway_node` convergence + `#4246` #6 writeback) all MERGED to `origin/dev`; rest of 4.3 (cross-cluster fan-out) / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
-| **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
-| **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
+| **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | **slice 1 MERGED (#4745); decommission cascade / capability visibility / fleet gauge / WS-9 scenario remain** |
+| **WS-6** | PKI/CA HA: shared CA key custody + node admission (**NOT** a `SecretCodec` blob — ADR-2002 §8 Update 2026-09-23, keeps ADR-0010 Decision 6), `CaStore` → PG (**already done**, ADR-0053), **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG (one-time `.cfg` import) | WS-3 (freshness pass); `ca_store` migration done | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` (+`authdb` on 6.2) | P1 | **6.1 CRL publication (#4126, PR #4833); 6.1b / 6.2 / 6.3 planned** — see `docs/ha-delivery-matrix.md` |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
-| **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | planned |
+| **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | **readyz DONE (monolith, 2026-09-24): `pg_reachable` probe + drain grace; tier-split with the split; BYO-LB doc (P2) planned** |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | planned |
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
 | **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N (ship *with* the 2nd replica) | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
@@ -379,19 +418,30 @@ constraint. Delivery phases (dependency-ordered):
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
-**Suggested next slices** (as of 2026-09-20 — `docs/ha-delivery-matrix.md` row
+**Suggested next slices** (as of 2026-09-24 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
-- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
-  (3.1–3.4, #4011/#4134/#4169/#4194), WS-4 4.1+4.2a+4.2b+`#4324`+`#4555`
-  (gateway multi-node cluster formation, `495cf24c4`)+4.3a (intra-cluster
-  `pg`-group agent→node lookup, no longer inert)+4.4 (`gateway_node`
-  convergence + `#4246` #6 writeback, ADR-2002 §7c), WS-7 (#3627),
-  WS-10 10.1/10.2. The storage axis is complete.
-- The **highest-leverage next** is the **rest of WS-4** — cross-cluster
-  gateway fan-out (today one `gw_mgmt_stub_`) — it also unblocks the
-  cross-replica session lookup that WS-5 needs. Then the remaining gate set:
-  **WS-5** (presence), **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free
-  cross-replica reconnect (durable outbox replay) is the open 2a-2 follow-up.
+- **Done (dial-selection, the safe-to-scale gate's WS-4 item):** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a
+  (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4's
+  dial-selection half** (4.1+4.2a+4.2b+`#4324`+`#4555` (gateway multi-node
+  cluster formation, `495cf24c4`)+4.3a (intra-cluster `pg`-group agent→node
+  lookup)+4.4 (`gateway_node` convergence + `#4246` #6 writeback, ADR-2002
+  §7c)+rest-of-4.3 (cross-cluster gateway fan-out, ADR-2002 §7d)), WS-7
+  (#3627), WS-10 10.1/10.2. The storage axis is complete. **WS-4 is NOT
+  entirely done** — two named items remain open and are tracked, not
+  disclosed-only: `#4669` (multi-cluster mode has no agent↔cluster
+  affinity/peer-identity binding, so it does not yet provide trust-zone
+  isolation — caught by pr-rev, FortitudeEtc/Codex+Kimi, pre-merge on the
+  rest-of-4.3 PR) and `#4672` (§7's durable outbox re-drive was never wired
+  into `forward_gateway_pending`'s terminal-failure branches). Neither blocks
+  the safe-to-scale gate today (multi-cluster mode has zero production
+  deployments; the re-drive gap is inherited from before 4.3, not introduced
+  by it), but do not read "WS-4 done" as "WS-4's every design goal closed."
+- The **highest-leverage next** is now the remaining gate set directly:
+  the rest of **WS-5** (slice 1 merged, #4745 — decommission cascade,
+  capability visibility, fleet gauge, WS-9 scenario) and the rest of **WS-6**
+  (6.1 merged, #4833 — 6.1b / 6.2 / 6.3, WS-9 scenario #4832). **WS-8**-readyz
+  is DONE for the monolith (2026-09-24). A loss-free cross-replica reconnect
+  (durable outbox replay) is the open 2a-2 follow-up.
 
 **Shared with ADR-1005 (do not duplicate):** engine-tier HA (incl. NVD/CVE
 sync, withdrawn from WS-1), the MCP Decision-15 pre-commitments WS-2 inherits,

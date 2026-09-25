@@ -80,8 +80,9 @@ constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
                                             "add_management_group_member",
                                             "list_management_group_roles",
                                             "assign_management_group_role"};
-constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
-                                           "reject_request"};
+constexpr std::string_view kApprovals[] = {"list_pending_approvals",
+                                           "get_pending_approval_count", // #2146 A2-R4
+                                           "approve_request", "reject_request"};
 constexpr std::string_view kDexSignals[] = {
     "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",

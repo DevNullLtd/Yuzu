@@ -2,8 +2,8 @@
  * test_printing_local_dispatcher.cpp — loads the ACTUAL built `printing`
  * plugin (printing.dylib/.so/.dll) via `PluginHandle::load` and drives it
  * through `yuzu::agent::LocalDispatcher` (power_health's local-dispatcher
- * pattern), exercising `printers`/`jobs`'s real per-OS legs end to end on
- * the build host.
+ * pattern), exercising `printers`/`jobs`/`clear_queue`'s real per-OS legs
+ * end to end on the build host.
  *
  * DELIBERATELY UNGUARDED — no `#ifdef` gating this whole TU to one platform
  * (per `test_power_health_local_dispatcher.cpp`'s own header comment: a
@@ -12,14 +12,25 @@
  * a host with no CUPS socket / no `yuzu_test` print queue SKIPs by NAME,
  * never silently.
  *
- * POSIX LIVE COVERAGE has two cases, deliberately not merged, because the
+ * NEVER cancels a real job — `clear_queue`'s live-effect cases below only
+ * target job ids that cannot resolve to a real queued job (a missing param,
+ * `job_id=all`, or a numeric id against a printer name that does not
+ * exist), so every assertion is on the plugin's own validation/error
+ * shaping, not on any live cupsd/winspool mutation.
+ *
+ * POSIX LIVE COVERAGE has three cases, deliberately not merged, because the
  * root-cause bug this file exists to prevent is a live path that SKIPs on
  * every host with the suite still green:
  *   1. Live read (printers + jobs) over the real per-OS leg — unconditional
  *      whenever a CUPS Unix socket exists (it does on this Mac and on any
  *      CUPS host); SKIPs by name ONLY when no socket path exists at all,
  *      never for want of a populated queue.
- *   2. Populated-queue assertion (a real `yuzu_test` row) — the ONLY case
+ *   2. Live clear_queue negative, over the real socket WITH the
+ *      `Authorization: PeerCred` header — unconditional; on POSIX it stops at
+ *      the pre-cancel Get-Jobs (the printer cannot exist), so it never sends
+ *      a Cancel-Job and cancels nothing. The bind-then-cancel ladder itself is
+ *      covered by the pure run_clear_queue() tests in test_printing_parsers.cpp.
+ *   3. Populated-queue assertion (a real `yuzu_test` row) — the ONLY case
  *      in this file allowed to SKIP, and only by name.
  */
 #include <catch2/catch_test_macros.hpp>
@@ -114,10 +125,10 @@ struct LoadedPlugin {
 
 #if !defined(_WIN32)
 // Mirrors printing_plugin.cpp's own candidate list — used ONLY to decide
-// whether the live-read cases below may SKIP (they may, per the package
-// spec, ONLY when no CUPS Unix socket exists at all; never for want of a
-// populated queue). Not a build dependency on the plugin's internals — a
-// plain filesystem probe.
+// whether the live-read/live-clear_queue cases below may SKIP (they may,
+// per the package spec, ONLY when no CUPS Unix socket exists at all; never
+// for want of a populated queue). Not a build dependency on the plugin's
+// internals — a plain filesystem probe.
 bool any_cups_socket_present() {
     static constexpr const char* kCandidates[] = {
         "/private/var/run/cupsd",
@@ -158,7 +169,7 @@ TEST_CASE("printing plugin: ABI4 descriptors declare all three OS legs for every
         return;
     }
 
-    REQUIRE(plugin->descriptor->action_descriptor_count == 2);
+    REQUIRE(plugin->descriptor->action_descriptor_count == 3);
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
 
     for (std::size_t i = 0; i < plugin->descriptor->action_descriptor_count; ++i) {
@@ -178,7 +189,7 @@ TEST_CASE("printing plugin: ABI4 descriptors declare all three OS legs for every
 // rc 0 per this plugin's read-never-fails contract), or 8 fields (a
 // populated printer row: printer|name|state|state_reasons|is_default|
 // make_model|uri|queued_jobs). This case never SKIPs for want of a
-// populated queue — only the dedicated case 2 below does that.
+// populated queue — only CHANGE 4's dedicated case 3 below does that.
 TEST_CASE("printing plugin: printers action — live read over the real per-OS leg, rc 0 and a "
           "well-formed row, unconditional whenever a CUPS socket exists",
           "[printing][actions]") {
@@ -241,11 +252,12 @@ TEST_CASE("printing plugin: jobs action — live read over the real per-OS leg, 
     }
 }
 
-// Case 2 (populated-queue assertion, SKIP-by-name permitted): the ONLY
+// Case 3 (populated-queue assertion, SKIP-by-name permitted): the ONLY
 // case in this file allowed to SKIP. Re-runs printers looking specifically
 // for a live `yuzu_test` row (8 fields, name == "yuzu_test") — present
-// only on a host that happens to have one configured. Every other host
-// SKIPs by name, never silently.
+// only after a manual `capture.sh --phase-b` run leaves the queue up, or
+// on a host that happens to have one configured. Every other host SKIPs
+// by name, never silently.
 TEST_CASE("printing plugin: printers action — a populated yuzu_test row is observed when the "
           "queue exists; SKIP by name otherwise",
           "[printing][actions]") {
@@ -270,5 +282,115 @@ TEST_CASE("printing plugin: printers action — a populated yuzu_test row is obs
     if (!saw_yuzu_test) {
         SKIP("no cupsd socket / no yuzu_test queue on this host — live printer row not observed");
         return;
+    }
+}
+
+TEST_CASE("printing plugin: clear_queue — missing job_id is rc 1 error|invalid_job_id, before "
+          "any I/O",
+          "[printing][actions][clear_queue]") {
+    auto plugin = load_printing_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    const YuzuParam params[] = {{"printer", "yuzu_test"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "clear_queue", params);
+    CHECK(result.rc == 1);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto f = split_fields(rows.front());
+    REQUIRE(f.size() == 5);
+    CHECK(f[0] == "clear_queue");
+    CHECK(f[3] == "error");
+    CHECK(f[4] == "invalid_job_id");
+}
+
+TEST_CASE("printing plugin: clear_queue — missing printer is rc 1 error|missing_printer with a "
+          "\"-\" printer field, before any I/O",
+          "[printing][actions][clear_queue]") {
+    auto plugin = load_printing_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    const YuzuParam params[] = {{"job_id", "1"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "clear_queue", params);
+    CHECK(result.rc == 1);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto f = split_fields(rows.front());
+    REQUIRE(f.size() == 5);
+    CHECK(f[0] == "clear_queue");
+    CHECK(f[1] == "-");
+    CHECK(f[3] == "error");
+    CHECK(f[4] == "missing_printer");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+TEST_CASE("printing plugin: clear_queue — job_id=\"all\" is rc 1, never a purge-all path",
+          "[printing][actions][clear_queue]") {
+    auto plugin = load_printing_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    const YuzuParam params[] = {{"printer", "yuzu_test"}, {"job_id", "all"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "clear_queue", params);
+    CHECK(result.rc == 1);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto f = split_fields(rows.front());
+    CHECK(f[0] == "clear_queue");
+    CHECK(f[3] == "error");
+}
+
+// Case 2 (live clear_queue negative, unconditional): dispatched for real
+// over whatever socket/leg this host has — on POSIX this exercises the
+// pre-cancel Get-Jobs round trip including the `Authorization: PeerCred`
+// header (do_clear_queue attaches it unconditionally whenever a socket is
+// found) with no sudo and without cancelling anything: the target printer
+// cannot exist, so it never reaches Cancel-Job. Asserted on the PARSED outcome the plugin
+// actually returns, never a value hardcoded ahead of the real dispatch.
+TEST_CASE("printing plugin: clear_queue — live negative round trip over the real per-OS leg "
+          "(POSIX: with the Authorization: PeerCred header) — rc 1, never a crash, never a "
+          "successful cancel",
+          "[printing][actions][clear_queue]") {
+    auto plugin = load_printing_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    const YuzuParam params[] = {{"printer", "yuzu_test_definitely_does_not_exist"}, {"job_id", "1"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "clear_queue", params);
+    CHECK(result.rc == 1);
+
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto f = split_fields(rows.front());
+    REQUIRE(f.size() == 5);
+    CHECK(f[0] == "clear_queue");
+    CHECK((f[3] == "not_found" || f[3] == "refused" || f[3] == "error"));
+    // The shell must pair the outcome with the matching status/completeness.
+    if (f[3] == "not_found") {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else if (f[3] == "refused") {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    } else {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
 }

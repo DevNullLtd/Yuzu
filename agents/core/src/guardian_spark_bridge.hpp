@@ -61,6 +61,7 @@
 #include "guaranteed_state.pb.h"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <charconv>
 #include <cstdint>
@@ -259,7 +260,8 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
         default_debounce_ms = kGuardianLegacyDebounceMs;
         spdlog::error("Guardian: rule '{}' has spark type '{}' unhandled by the debounce-"
                       "default switch - falling back to the legacy {}ms default (#3531)",
-                      out.rule_id, spark_type_token(*spark_type), *default_debounce_ms);
+                      log_id_token(out.rule_id), spark_type_token(*spark_type),
+                      *default_debounce_ms);
     }
     (void)parse_resilience_params(get, out.debounce_ms, *default_debounce_ms);
 
@@ -292,7 +294,7 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
             if (const auto clamped = clamp_max_hash_bytes(out.max_bytes); clamped != out.max_bytes) {
                 spdlog::warn("Guardian: rule '{}' authored max_bytes={} exceeds the {}-byte "
                             "ceiling - clamped (#2233 item 6)",
-                            out.rule_id, out.max_bytes, kMaxFileHashBytes);
+                            log_id_token(out.rule_id), out.max_bytes, kMaxFileHashBytes);
                 out.max_bytes = clamped;
             }
             return out;

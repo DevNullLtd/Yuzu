@@ -97,6 +97,11 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -115,14 +120,27 @@ FRAGMENT_FILES = [
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
-# Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
-# focused follow-up PR on top of this one.
+# Wave 9 PR9.1b: +2 printing (printers/jobs).
+# Wave 9 PR9.1b (follow-up): +1 printing.clear_queue (merged to dev as PR #4616).
+# Wave 8 PR8.4: +1 firmware_posture (firmware).
+# Wave 10 P2a-3: +2 browser_inventory (browsers/profiles); its extensions action follows as its own PR (+1 then).
+# Wave 8 PR8.6: +2 app_control (wdac_policy/applocker_policy) — read-only
+# posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
+# Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
+# Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
 # Wave 10 PR10.1-d: +1 update_source_trust (sources).
-# Running total: 194 (base, already includes __sync__.now — see above) +
-# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
-# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
-# 1 (update_source_trust) = 210.
-EXPECTED_TOTAL_ROWS = 210
+# This constant has been bumped independently on both sides of a merge several times
+# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
+# always the same: never combine two possibly-stale running totals — recount every
+# fragment file directly (`grep -c '\.plugin\s*=\s*"' <fragment>`) and sum. Doing
+# that across all twenty-one sources (twenty per-group fragments + core) after
+# merging update_source_trust into dev's tip gives 4 (core) + 5 (content_dist) +
+# 45 (a) + 55 (b) + 34 (c) + 42 (d) + 2 (disk_actions) + 3 (filesystem_posture) +
+# 4 (power_health) + 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
+# 2 (windows_optional_features) + 3 (peripherals) + 3 (printing, incl. clear_queue) +
+# 1 (update_source_trust) + 2 (app_control) + 1 (firmware_posture) + 2 (runtimes) +
+# 2 (platform_security) + 2 (browser_inventory) = 220.
+EXPECTED_TOTAL_ROWS = 220
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

@@ -183,7 +183,7 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `GET` | `/api/v1/result-sets` | — | `{result_sets: [...]}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
 | `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, pinned, parent_id, source_kind, source_payload, device_count}` | |
 | `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...]}` | Pagination by `?cursor=`. |
-| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count, narrowing}, ...]}` | Walks `parent_id` to root. Used by the dashboard breadcrumb. |
+| `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count, narrowing}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
 | `POST` | `/api/v1/result-sets/{id}/pin` | — | `{ttl_at, pinned}` | |
 | `POST` | `/api/v1/result-sets/{id}/unpin` | — | `{ttl_at, pinned}` | |
 | `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
@@ -212,7 +212,65 @@ point, and only one of them wants everything. Refusals are counted as
 `yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
 `result_set.create|denied`.
 
-Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
+**The generic `POST /api/v1/result-sets` route and MCP `create_result_set` apply the same
+malformed/empty-`parent_id` refusal (#4307) but are NOT dispatch surfaces** — unlike the three
+async producers above, they never call `command_dispatch_fn`, so their `RESULT_SET_BAD_PARENT`
+refusals are audited as `result_set.create|denied` but deliberately do **not** increment
+`yuzu_server_dispatch_target_rejected_total`; that metric family is reserved for the
+dispatch-targeting routes. Do not mistake the absent counter on these two call sites for a
+regression of the alerting coverage the metric otherwise provides.
+
+**`parent_id` is additionally length-capped at 64 bytes (#4734, `kResultSetParentIdMaxLen`)**
+on all five create surfaces (the generic route, all three async producers, and
+`from-inventory-query`) before the value can reach the persisted `scope_input_id` lineage
+marker. Because `parent_id` also accepts a per-operator alias (a result-set `name`, valid up to
+256 bytes) on the three async producers, a real alias longer than 64 bytes that previously
+resolved successfully is now refused before resolution is attempted — reference the set by its
+canonical `rs_...` id instead. A length-cap refusal is audited
+(`result_set.create|denied`, `reason=parent_id_too_long`) but never counted on
+`yuzu_server_dispatch_target_rejected_total`, on any of the five surfaces — see section 9's
+audit-detail catalog. See the `vNEXT` breaking-change note in
+`docs/user-manual/server-admin.md` for the full operator-facing account.
+
+**`{id}/re-eval` is refused, never broadcast, when the original's recorded parent no longer
+exists (#4306).** `re-eval` synthesises the sibling's dispatch scope from the LIVE, nullable
+`parent_id` FK column on the original — `parent_id TEXT REFERENCES result_sets(id) ON DELETE SET
+NULL`. If the original's parent set is later deleted, `parent_id` is nulled and an absent
+`parent_id` reaching the shared dispatch synthesis reads as "omitted → broadcast to `__all__`",
+the same rule the `#2500` guard above applies to a caller-supplied empty string. Left unhandled,
+"re-ask the same narrow question" would silently become "ask the whole visible fleet" — the same
+target-erasure shape as `#2500`. Both REST and MCP check the original's *persisted*
+`source_payload` for a non-empty `scope_input_id` (the RAW caller-supplied `parent_id` at
+creation time, independent of the live FK) before falling through to broadcast: if the live
+parent is gone AND `scope_input_id` shows the original was narrowed at creation, the call is
+refused with `400 RESULT_SET_BAD_REQUEST` (REST) / `kInvalidParams` (MCP) rather than either
+re-resolving `scope_input_id` or broadcasting. Re-resolution is deliberately not attempted —
+`scope_input_id` may be an alias rather than a canonical `rs_` id, and `resolve_alias`'s
+`ORDER BY created_at DESC LIMIT 1` means the alias may since have been re-bound to a different,
+newer set; resolving it at re-eval time would retarget the dispatch to whatever the alias means
+*today*, not what it meant when the original was created. `scope_input_id` is recorded whenever
+`parent_id` was supplied at creation, on all four creation paths -- the dedicated
+`from-tar-query`/`from-instruction-result`/`from-inventory-query` producers (which always build a
+well-formed JSON object payload themselves) and the generic `POST /api/v1/result-sets` / MCP
+`create_result_set` create routes (#4306 follow-up), all mirroring the identical
+`payload["scope_input_id"] = ...` persistence -- **except** that the two generic routes only merge
+the marker when the caller's `source_payload` was itself supplied as a JSON object; a non-object
+`source_payload` (a string/array/number) skips the merge. This is safe today: the same
+`is_object()` predicate independently gates the `sql`/`instruction_id`-presence check at re-eval
+time on the identical stored value, so a non-object payload is refused ("no re-runnable source")
+before ever reaching dispatch, regardless of whether `scope_input_id` was recorded. This is a
+coincidence rather than a documented joint invariant (a regression test locks it down --
+`tests/unit/server/test_rest_result_sets_async.cpp`/`test_mcp_server.cpp`, `#4306` governance
+follow-up), so a future change to either check in isolation should re-verify the other. A genuinely
+parentless original -- no `parent_id` was ever supplied at creation, by *any* creation path -- still
+broadcasts on re-eval, unchanged, existing behaviour for a deliberately fleet-wide original. The
+refusal happens before `run_async`/`rs_run_async` — no execution row is created, nothing is
+dispatched, nothing needs cancelling — and is audited as `result_set.create|denied` with
+`reason=parent_gone`. It is **not** counted on `yuzu_server_dispatch_target_rejected_total`
+(that family's `reason` label set is closed and boot-pre-seeded from `dispatch_target_shape.hpp`;
+widening it is a separate, reviewed decision).
+
+Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This list is illustrative, not exhaustive: #4306 widened the same 503 to also cover a degraded `members`/`list_by_owner`/`lineage` page read and the async producers' pre-dispatch per-owner quota check (a post-dispatch store fault after that quota check maps to `500 RESULT_SET_STORE_FAULT_AFTER_DISPATCH` instead, not a 503) — the exhaustive per-route list lives in `docs/user-manual/rest-api.md`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
 ## 7. YAML DSL surface
 
@@ -293,7 +351,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`. `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind (plus `execution_id` and the dispatched-agent count on the async producers); parent_id and device_count are not yet recorded (#4088). `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`, or when it exceeds 64 bytes (#4734), with `detail=reason=parent_id_too_long[ source_kind=<src_kind>]` -- audited on all five create surfaces but, unlike the shape-check refusal just named, never counted on `yuzu_server_dispatch_target_rejected_total`; also `denied` on `{id}/re-eval` when the original's live parent is gone but its persisted `scope_input_id` shows it was narrowed at creation (#4306), with `detail=reason=parent_gone source_kind=<orig source_kind> scope_input_id=<stale value>`, target_id=`<original id>` (`scope_input_id` added in the #4306 governance follow-up, run through `audit_token()`/`log_token` neutralisation like every other caller-influenced audit-detail token in this file, so the erased target is still forensically identifiable after the originating row TTL-expires when it is a canonical `rs_` id; when it is an ALIAS rather than a canonical id, the recorded string is only the caller's typed reference at creation time -- `resolve_alias`'s newest-wins lookup means the same alias may since be re-bound to a different set, so it must never be re-resolved later to mean "the erased target," only read as "what the caller typed"). `failure` on the inventory-query producer (#4496, extended by the #4496 follow-up) with `detail=reason=store_degraded\|query_truncated\|poison_excluded\|parse_error_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.heal` | `success` / `failure` | #4493: written by REST `/re-eval` and MCP `reevaluate_result_set` when the stored `source_payload` is found nested past `kMcpMaxJsonDepth`. `success` = `heal_poisoned_payload` discarded the poisoned payload; `failure` = the caller's own depth check found poison but `heal_poisoned_payload`'s return was `false` - a genuine write failure (row unchanged, still poisoned), a benign race where a concurrent caller already healed the row first (row unchanged, already healthy), or the row was deleted between heal's own SELECT and UPDATE (#4540: a concurrent `delete_set` or the TTL GC sweep, neither holding a shared lock) and no longer exists at all - the three are not currently distinguished (#4524). Not written on a row already healthy at the caller's own check (heal is a no-op there, nothing to audit). |
 | `result_set.pin` / `result_set.unpin` | `success` | |
@@ -355,9 +413,9 @@ Step 11. Watch: heightened TAR retention + IOC subscription scoped to rs_04 for 
          (creates a TriggerTemplate-bound policy: rs_04 keeps its pin until the watch ends)
 ```
 
-Every step's audit row carries `parent_result_set_id` and `result_result_set_id` so a forensic timeline reconstructs the full reasoning chain — *exactly the limited-context-window problem this primitive exists to solve*.
+Design intent, not yet implemented: every step's audit row should carry the parent and resulting result-set ids so a forensic timeline can reconstruct the full reasoning chain — *exactly the limited-context-window problem this primitive exists to solve*. Today a `result_set.create` row records the new set's id (`target_id`) and its `source_kind` (plus `execution_id` and the dispatched-agent count on the async producers), but not its `parent_id` or device count (#4088), and action-dispatch rows (steps 5–10) carry no result-set id. The walkable lineage is held in the result-set store's `parent_id` column, which is nulled when an ancestor set is deleted or garbage-collected, so pin every set in a chain you need to reconstruct later.
 
-This walkthrough is the reference test for end-to-end correctness. A regression test fixture in `tests/integration/test_chrome_ir_chain.cpp` should drive the chain against a live UAT stack with synthetic agents and assert lineage / audit completeness.
+This walkthrough is the reference scenario for end-to-end correctness. `tests/unit/server/test_chrome_ir_chain.cpp` covers a three-set narrowing chain modelled on steps 1–4 (the TAR-query and instruction-result producers), in-process through the real `/api/v1/result-sets` REST surface via `TestRouteSink`. It asserts that `GET /{id}/lineage` walks the chain to its root, that each narrowing step writes one `result_set.create` audit row (plus the pin and unpin rows), that a pinned set is not removed by `gc_sweep()` and cannot be deleted until unpinned (409), and that the chain tears down cleanly. It does not cover steps 5–11 (no scoped actions, no watch). The ground set uses the direct-create endpoint in place of the inventory-query producer, command dispatch is faked, and async sets are materialised directly rather than by live agents — see the test's own header. Its GC check runs on unexpired sets; the store-level `[result_set][gc]` tests in `tests/unit/server/test_result_set_store.cpp` back-date an unpinned set beside a pinned one and assert that only the unpinned set is swept.
 
 ## 11. Roll-out — what ships when
 

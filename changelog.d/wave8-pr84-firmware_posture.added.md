@@ -1,0 +1,1 @@
+- firmware_posture plugin: read-only BIOS/firmware vendor, version, release date and update-pending posture (Windows WMI+SMBIOS, Linux sysfs DMI + fwupd D-Bus, macOS IOKit device tree).

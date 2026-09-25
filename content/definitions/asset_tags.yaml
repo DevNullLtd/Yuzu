@@ -149,7 +149,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: change_count
         type: int32
-        description: 'Number of entries currently in the in-memory change log (the persisted store keeps only the last 50). Values: integer >= 0.'
+        description: 'Number of entries currently in the change log (in memory and persisted, capped at the last 50). Values: integer 0-50.'
         example: "0"
         platforms: [windows, linux, darwin]
 

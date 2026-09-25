@@ -74,6 +74,20 @@ jobs:
       - name: No conn-less libpq escape references (#1611)
         run: python3 tests/test_no_connless_pq_escape.py
 
+      # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
+      # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
+      # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered
+      # in tests/meson.build for local `meson test --suite docs` parity.
+      - name: Spark evidence format lockstep (#4665)
+        run: python3 tests/test_spark_evidence_format_lockstep.py
+
+      # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+      # subsystem that fails the moment a NEW spdlog:: call prints a rule-id/Spark-key-
+      # shaped argument unwrapped. Also registered in tests/meson.build for local
+      # `meson test --suite docs` parity.
+      - name: Guardian/Spark log-injection tripwire (#4665)
+        run: python3 tests/test_guardian_spark_log_injection_tripwire.py
+
       # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's

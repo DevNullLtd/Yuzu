@@ -2,7 +2,7 @@
 
 **This file is a contents page, not a knowledge base.** Before adding anything, read
 `docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
-here*. This file, `CLAUDE.md`, and the two routed-concern tables load into every session; each is
+here*. This file, `CLAUDE.md`, and the four routed-concern tables load into every session; each is
 budgeted at 40,000 characters and capped at 48,000 (`tests/test_issue_docs.py`).
 
 This file is the Codex/Kimi twin of `CLAUDE.md` and deliberately carries the same content. **Where
@@ -78,7 +78,7 @@ addressed → iterate.
 merely POINT at them are defined ONCE — in `.claude/skills/governance/SKILL.md`.** This file loses on
 conflict, and so does `.codex/skills/governance/SKILL.md`, which defers there for severity and the
 ledger. That runner does carry its own text for rules 1 and 4: it performs **no routed-concerns walk
-at all** (tracked as **#2684** — which is why the instruction above to open both tables by hand is
+at all** (tracked as **#2684** — which is why the instruction above to open all four tables by hand is
 load-bearing on this leg), and its Gate 8 phrasing is the weaker "affected gates" wording that
 shipped a broken macOS leg on #2580. The skill is read from your **working tree**, so a branch predating a change to it, or to
 the routed-concern tables, silently runs the old pipeline; Step 0 opens with a per-file currency
@@ -88,14 +88,17 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 ## Routed concerns (read the doc, not this file)
 
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
-two files solely for the per-file ceiling: the first holds platform/product/data/observability
-concerns, the second auth, access-control, and request-admission chokepoints. Same authority as this
-file.
+four files solely for the per-file ceiling: the first holds platform/product/data/observability
+concerns, the second auth, access-control, and request-admission chokepoints, the third the
+security-posture plugins (the Wave 8 split), the fourth Forensics / per-user-software-data concerns
+(the Wave 10 split). Same authority as this file.
 
-**OPEN AND READ BOTH FILES — they are not auto-loaded on this leg:**
+**OPEN AND READ ALL FOUR FILES — they are not auto-loaded on this leg:**
 
 - `.claude/routed-concerns.md`
 - `.claude/routed-concerns-access-control.md`
+- `.claude/routed-concerns-security-posture.md`
+- `.claude/routed-concerns-software-estate.md`
 
 Match them row by row against the paths your change touches. **This file deliberately does NOT carry
 its own copy of the tables.** It used to, and that copy drifted badly — it still described `CaStore`
@@ -184,10 +187,13 @@ docs/             Architecture docs, conventions, roadmap, capability map
 ```
 
 **`common/include/` firewall (#2549) — pure decision code only:** no I/O, no store/wire types, no
-server-trust-boundary authority. One named exception, not a category: `shutdown_watcher.hpp` (#3007)
+server-trust-boundary authority. Two named exceptions, not a category: `shutdown_watcher.hpp` (#3007)
 — a self-pipe fd, a dedicated watcher thread, and firewalled failure-path logging, with the
 signal-handler side staying a single async-signal-safe `write()`; no store/wire access, no
-trust-boundary authority. **A new I/O-bearing file here must be named in this annotation** (amend it
+trust-boundary authority. And `tls_policy.hpp` (#4722) — the shared TLS cipher policy: OpenSSL-only,
+memory-only SSL_CTX calls plus ONE process-environment write (`GRPC_SSL_CIPHER_SUITES`), no file/socket
+I/O, no store/wire types, no trust-boundary authority (it selects cipher suites; it authenticates
+nobody). **A new I/O-bearing file here must be named in this annotation** (amend it
 in the same change) — this does not open the root to I/O generally.
 
 `proto/meson.build` invokes `proto/gen_proto.py`, which runs `protoc` and flattens `#include`

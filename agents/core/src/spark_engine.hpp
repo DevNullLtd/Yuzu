@@ -309,6 +309,11 @@ public:
     /// subscription_health()'s Dead case (same sub_keys_/armed_ lookup).
     /// Cheap, lock-only (mu_), no I/O.
     ///
+    /// `coverage` is overlaid to None while the type's mechanism reports itself
+    /// inert (whatever it last reported); `established_at` is never touched. The
+    /// result is a conservative snapshot, not a coherent one: inert is an atomic
+    /// read beside the mu_-guarded cache, so it can disagree with a newer report.
+    ///
     /// R4: after stop(), this returns the LAST-KNOWN values (stop() never
     /// erases armed_ — the same precedent subscription_health() already sets,
     /// and emit_spark_heartbeat_tags()'s ABSENT posture on !running takes the

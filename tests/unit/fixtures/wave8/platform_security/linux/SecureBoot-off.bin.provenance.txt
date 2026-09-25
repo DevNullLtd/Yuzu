@@ -1,0 +1,1 @@
+status: RECONSTRUCTION from the UEFI 2.x global-variable layout, not a capture: attributes 0x00000006 then data byte 0x00. Same reason and residual gap as SecureBoot-on.bin.

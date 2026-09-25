@@ -46,6 +46,7 @@
 
 #include <array>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -931,6 +932,48 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope succeeds once the gateway h
     CHECK(pending[0].cmd.command_id() == "routed-cmd-ok");
 }
 
+TEST_CASE("AgentRegistry::send_to: cluster_id published via set_gateway_route is carried onto "
+          "GatewayPendingCmd — HA WS-4 4.3",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-gw-cluster"));
+    REQUIRE(registry.set_gateway_route("dev-gw-cluster", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-a"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-cluster"));
+
+    CHECK(registry.send_to("dev-gw-cluster", classified));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-gw-cluster");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-a");
+}
+
+TEST_CASE("AgentRegistry::send_to: an empty cluster_id (no gateway build predating 4.1/4.3, or a "
+          "direct-session path) carries nullopt, not an empty-string cluster_id",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-gw-nocluster"));
+    // set_gateway_route's cluster_id parameter defaults to {} (empty) — same
+    // shape every pre-4.3 call site (tests, an old gateway build) keeps.
+    REQUIRE(registry.set_gateway_route("dev-gw-nocluster", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)}));
+
+    auto classified =
+        ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-nocluster"));
+
+    CHECK(registry.send_to("dev-gw-nocluster", classified));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK_FALSE(pending[0].cluster_id.has_value());
+}
+
 TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing the "
           "advertisement is excluded from the count without failing the rest of the broadcast",
           "[server][dispatch][chokepoint]") {
@@ -950,6 +993,35 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
     auto pending = registry.drain_gateway_pending();
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].agent_id == "dev-ok");
+}
+
+TEST_CASE("AgentRegistry::send_to_all: each recipient's own cluster_id is carried onto its "
+          "GatewayPendingCmd — HA WS-4 4.3",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-cluster-a"));
+    REQUIRE(registry.set_gateway_route("dev-cluster-a", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-a"));
+    (void)registry.register_agent(make_agent_info("dev-cluster-b"));
+    REQUIRE(registry.set_gateway_route("dev-cluster-b", /*session_id=*/{}, "gw-node-2",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-b"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("broadcast-cluster"));
+
+    CHECK(registry.send_to_all(classified) == 2);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2);
+    std::unordered_map<std::string, std::optional<std::string>> by_agent;
+    for (auto& gp : pending)
+        by_agent[gp.agent_id] = gp.cluster_id;
+    REQUIRE(by_agent["dev-cluster-a"].has_value());
+    CHECK(*by_agent["dev-cluster-a"] == "cluster-a");
+    REQUIRE(by_agent["dev-cluster-b"].has_value());
+    CHECK(*by_agent["dev-cluster-b"] == "cluster-b");
 }
 
 // ═════════════════════════════════════════════════════════════════════════

@@ -549,8 +549,13 @@ if build_agent
   subdir('agents/plugins/peripherals')  # Wave 9 PR9.1a
   subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
   subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
+  subdir('agents/plugins/app_control')  # Wave 8 PR8.6
+  subdir('agents/plugins/firmware_posture')  # Wave 8 PR8.4
+  subdir('agents/plugins/platform_security')  # Wave 8 PR8.1-a1
   subdir('agents/plugins/printing')  # Wave 9 PR9.1b
   subdir('agents/plugins/update_source_trust')  # Wave 10 PR10.1-d
+  subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
+  subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────

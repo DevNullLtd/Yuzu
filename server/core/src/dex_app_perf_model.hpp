@@ -26,8 +26,9 @@
 // PURE half (ADR-0031 WS-A4 DexPerfApi split, PR #4582-review pattern): the
 // abstract dex_perf_api.hpp includes ONLY this.
 #include "dex_app_perf_pure.hpp"
-// CORE-ONLY half: the store-reaching builders + AppPerfProviders. Kept as a
-// SEPARATE #include (not inlined here) so a TU can pull the pure half alone;
+// CORE-ONLY half: the store-reaching builders (the retired `AppPerfProviders`
+// bundle used to live here too, #4626). Kept as a SEPARATE #include (not
+// inlined here) so a TU can pull the pure half alone;
 // this umbrella header re-exports both for every EXISTING caller (ODR-safe
 // relocation, not a duplication — ADD NOTHING NEW to this file, see the two
 // headers above for where new content belongs).

@@ -262,6 +262,7 @@ agent_test_exe = executable(
     'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
@@ -289,6 +290,7 @@ agent_test_exe = executable(
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
+    'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
@@ -308,6 +310,7 @@ agent_test_exe = executable(
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
     'unit/test_guardian_outbox_send_executor.cpp',
+    'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_guardian_arm_ack.cpp',
@@ -318,6 +321,7 @@ agent_test_exe = executable(
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
+    'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
@@ -493,6 +497,11 @@ agent_test_exe = executable(
                                                 # row/parameter parsers (agents/shared, agent-core primitive)
     'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
                                                 # dylib/.so/.dll driven end to end via LocalDispatcher
+    'unit/test_app_control_parsers.cpp',         # Wave 8 PR8.6: pure app_control mappers/row formatters/dump
+                                                # parsers over the-rig REAL CAPTURE fixtures (REQUIRE(exists))
+    'unit/test_app_control_local_dispatcher.cpp', # Wave 8 PR8.6: real app_control dylib/.so/.dll driven end to
+                                                # end via LocalDispatcher (unguarded: non-Windows asserts the
+                                                # exact unsupported row)
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -522,6 +531,21 @@ agent_test_exe = executable(
     'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822 row parsers, portable
     'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt walk + rpm-planned tripwire over committed fixture trees (bodies POSIX-only)
     'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
+    'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
+    'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
+    'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
+    'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
+    'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
+    'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
+    'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
+    'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
+    'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
+    'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -531,10 +555,14 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
+    include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
+    include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -565,6 +593,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
     include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
+    include_directories('../agents/plugins/asset_tags/src'),     # asset_tags_parsers.hpp / asset_tags_store.hpp (#232)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -589,6 +618,10 @@ agent_test_exe = executable(
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
              # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
              # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
+             # Wave 8 PR8.4: test_firmware_posture_parsers.cpp reads REAL CAPTURE fixtures via
+             # this same define.
+             # Wave 8 PR8.1-a1: test_platform_security_{parsers,win_parsers}.cpp read
+             # Docker/this-Mac/the-rig REAL CAPTURE fixtures via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -682,10 +715,16 @@ agent_test_exe = executable(
                 app_usage_plugin_lib,  # Wave 7b PR7b.3
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
+                app_control_plugin_lib,  # Wave 8 PR8.6
+                platform_security_plugin_lib,  # Wave 8 PR8.1-a1
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
+                firmware_posture_plugin_lib,  # Wave 8 PR8.4
+                browser_inventory_plugin_lib,  # Wave 10 P2a
+                asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
+                runtimes_plugin_lib,  # Wave 10 PR10.1-b
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -758,7 +797,16 @@ endif
 # [tsan-heavy] is ALWAYS excluded from this entry (previously only in a plain build) - see
 # the #2373/#4153 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
 # below, which is the only place a sanitizer build runs the sole survivor now.
-agent_test_args = ['~[tsan-heavy]']
+#
+# [flaky-4086] is excluded the same way: a single quarantined case (test_guard_file.cpp,
+# "FileGuard rename: the compliant edge cache...") with a measured 9/10 standalone failure
+# rate (issue #4086 - guard_win_handle.hpp's cancel_and_close_ doesn't drain a cancelled
+# OVERLAPPED read before reuse). Its own [.] tag was NOT reliably observed to keep it out
+# of this entry on its own - repeat real-hardware runs against this entry's `~[tsan-heavy]`
+# filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
+# unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
+# verified to work - see the header comment on the TEST_CASE for detail.
+agent_test_args = ['~[tsan-heavy]~[flaky-4086]']
 test(
   'agent unit tests',
   agent_test_exe,
@@ -1083,11 +1131,14 @@ if build_server
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
+      'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
+      'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
+      'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -1205,6 +1256,9 @@ if build_server
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
+      'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
+      'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
+      'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
@@ -1235,6 +1289,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
@@ -1246,6 +1301,7 @@ if build_server
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
+      'unit/server/test_printing_clear_queue_gate.cpp', # Wave 9 PR9.1b: printing.clear_queue against the same Destructive targeting gate + AdminOrApproval chokepoint
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_route_registration.cpp', # #2542 PR-6: McpServer register_routes(HttpRouteSink&, ...) seam — registration shape + kill-switch-before-auth ordering + server.cpp wiring tripwire
@@ -1292,6 +1348,7 @@ if build_server
       'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_grpc_tls_policy.cpp', # #4722: TLS 1.2 floor + cipher allow-list over REAL handshakes against the production builders
       'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
       'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
       'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
@@ -1330,6 +1387,7 @@ if build_server
       'unit/server/test_pg_migration_skip_predicate.cpp',
       'unit/server/test_pg_template_cleanup.cpp',
       'unit/server/test_offline_endpoint_store.cpp',
+      'unit/server/test_agent_registry_presence.cpp',
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_vuln_finding_store.cpp',
@@ -2237,6 +2295,20 @@ test('proto gen_proto version check',
   timeout: 30,
 )
 
+# ── Gateway build wrapper ──────────────────────────────────────────────────
+# scripts/build_gateway.py (+ the shared erlang_toolchain.py) driven with a
+# fake Python child — no Erlang needed, so it runs on every leg, including the
+# Windows one whose stdio/timeout/Ctrl-C behaviour it mostly pins. ~51s
+# measured (Windows and Linux); several cases deliberately wait out a
+# grandchild to prove the whole tree was killed, so the timeout leaves room
+# for a loaded shared runner box.
+test('gateway build wrapper',
+  _python3_test,
+  args: [files('test_build_gateway.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
@@ -2263,6 +2335,26 @@ test('capability catalogue completeness',
 test('capability gate consistency',
   _python3_test,
   args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# firmware_posture's definition-column contract (content/definitions/firmware_posture.yaml):
+# row_kind must be the first result column and the order must match the wire row
+# firmware_posture_parsers.hpp emits. Parses the YAML directly -- catches a reordered or
+# renamed column the C++ test's hard-coded literal cannot.
+test('firmware_posture definition columns',
+  _python3_test,
+  args: [files('test_firmware_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# runtimes' definition-column contract (content/definitions/runtimes.yaml): row_kind first and the
+# column order match the wire row runtimes_parsers.hpp emits; parses the YAML directly.
+test('runtimes definition columns',
+  _python3_test,
+  args: [files('test_runtimes_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -2540,6 +2632,30 @@ test('split interlock tripwire selftest',
 test('no conn-less libpq escape references',
   _python3_test,
   args: [files('test_no_connless_pq_escape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4665 lockstep: the #4606-pinned format_arm_committed_line shape
+# (tests/unit/fixtures/spark/arm_committed_line.json) still parses through the #3990
+# driver's own T2_RE, and the driver's evidence regexes still refuse a forged rule-id/Spark-key
+# free-text injection. Also runs in .github/workflows/docs-lint.yml on every PR.
+test('spark evidence format lockstep (#4665)',
+  _python3_test,
+  args: [files('test_spark_evidence_format_lockstep.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+# subsystem (agents/core/src + server/core/src + common/include, filtered to the
+# guardian_*/guard_*/spark_*/guaranteed_state* basename glob) that fails the moment
+# a NEW spdlog:: call prints a rule-id/Spark-key-shaped argument unwrapped -- see the
+# script's own module docstring for the full design (why position-aware, file scope,
+# known limitations). Also runs in .github/workflows/docs-lint.yml on every PR.
+test('guardian/spark log-injection tripwire (#4665)',
+  _python3_test,
+  args: [files('test_guardian_spark_log_injection_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

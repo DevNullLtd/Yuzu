@@ -4,8 +4,8 @@ and the instruction-file standard (docs/instruction-file-standard.md).
 
 Invariants that must hold on every platform:
 
-1. The four ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
-   two routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
+1. The six ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
+   four routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
    character budget, behind the 48,000 hard cap. Counted UTF-8-decoded in
    Python deliberately: these files are dense with multi-byte punctuation, so
    byte counts (`wc -c`, and `wc -m` on Windows Git Bash, which degrades to
@@ -18,7 +18,7 @@ Invariants that must hold on every platform:
    routed-concern tables had independently reached 38,545 and 37,808 while
    AGENTS.md sat 25% over a cap nothing applied to it.
 
-   Also enforced on those four files:
+   Also enforced on those six files:
      - EXPIRES: markers -- a temporary section whose date has passed fails the
        build. A workstreams block outlived its stated window by four weeks,
        with its own teardown procedure already written, because nothing checked.
@@ -63,11 +63,11 @@ CLAUDE_MD_CHAR_CAP = 48_000
 INSTRUCTION_FILE_BUDGET = 40_000
 
 # Every file here loads into an agent session before any work starts: CLAUDE.md
-# and AGENTS.md directly, the two routed-concern tables via CLAUDE.md's
+# and AGENTS.md directly, the four routed-concern tables via CLAUDE.md's
 # @-imports. Only CLAUDE.md was measured before; the routed-concern tables had
 # reached 38,545 and 37,808 unmeasured, and AGENTS.md 49,859 -- already 25% over
 # the cap nothing was applying to it.
-# The two routed-concern tables, checked for column structure as well as size.
+# The four routed-concern tables, checked for column structure as well as size.
 # A cell containing an unescaped "|" silently shifts every column to its right,
 # which is how a CATASTROPHIC row's "Loaded by" agent list was once overwritten
 # by a copy of its own "Doc" column -- leaving a credential-revocation surface
@@ -75,6 +75,8 @@ INSTRUCTION_FILE_BUDGET = 40_000
 ROUTED_CONCERN_FILES = (
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
+    ".claude/routed-concerns-security-posture.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 INSTRUCTION_FILES = (
@@ -82,6 +84,8 @@ INSTRUCTION_FILES = (
     "AGENTS.md",
     ".claude/routed-concerns.md",
     ".claude/routed-concerns-access-control.md",
+    ".claude/routed-concerns-security-posture.md",
+    ".claude/routed-concerns-software-estate.md",
 )
 
 # <!-- EXPIRES: YYYY-MM-DD owner:@who -->
@@ -238,6 +242,17 @@ def main() -> int:
                     f"review trigger. Standing rule 1: the matrix decides WHICH "
                     f"agents, never WHETHER."
                 )
+
+    # 1c. Every routed-concern table is @-imported by CLAUDE.md (so it loads into every session) and
+    # named in AGENTS.md (the only loader on the Codex/Kimi leg). A dropped or mistyped line would
+    # silently unload a table while every other gate stayed green.
+    claude_lines = (ROOT / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    agents_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for rel in ROUTED_CONCERN_FILES:
+        if f"@{rel}" not in claude_lines:
+            failures.append(f"CLAUDE.md does not @-import {rel}: that table would not load into any session.")
+        if f"`{rel}`" not in agents_text:
+            failures.append(f"AGENTS.md does not name {rel}: the Codex/Kimi leg would never open it.")
 
     # 2. do-not-close.txt parses clean
     dnc_path = ROOT / "scripts" / "tracker" / "do-not-close.txt"

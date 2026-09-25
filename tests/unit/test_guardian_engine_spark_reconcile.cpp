@@ -3442,15 +3442,28 @@ TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an
     CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1); // still K1
     CHECK(f.mechanism->watching_count() == 1);                         // K1's real watch untouched
 
-    // R2's own hung, wedged claim still recovers normally once released - nobody
-    // ever adopted it (no live follower was ever queued behind it for K2, and R's
-    // own refused retarget never queued one either), so it self-disarms the
-    // ordinary way, the ONLY disarm this whole scenario ever produces.
+    // Once released, R2's wedged claim is ADOPTED (#4508, CommitPath::CallbackAdopt):
+    // R2 is still the desired rule for K2 and nothing superseded it, so the late
+    // watch() success commits as R2's real arm rather than being unwatched. The
+    // terminal state is therefore TWO watches and TWO armed rules - R on K1, R2 on
+    // K2. This test predates #4508 and used to wait for watching_count() == 1,
+    // which was already true BEFORE the worker committed, so it passed vacuously
+    // whenever the test thread won the race and timed out whenever the worker
+    // inserted first (#4863). Wait for the real terminal state instead.
     f.mechanism->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 1; },
-                                   std::chrono::seconds(10)));
-    CHECK(f.engine->spark_armed_rule_count() == 1); // still just R, on K1, throughout
-    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return f.mechanism->watching_count() == 2 && f.engine->spark_armed_rule_count() == 2;
+        },
+        std::chrono::seconds(10)));
+    const auto watched = f.mechanism->watched_snapshot();
+    const auto watches = [&](std::string_view svc) {
+        return std::any_of(watched.begin(), watched.end(),
+                           [&](const std::string& k) { return k.find(svc) != std::string::npos; });
+    };
+    CHECK(watches("Spooler")); // R's K1 arm survived the whole scenario (the UP-1 invariant)
+    CHECK(watches("Notepad")); // R2's adopted arm on K2
+    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

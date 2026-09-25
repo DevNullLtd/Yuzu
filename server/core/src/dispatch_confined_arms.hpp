@@ -71,23 +71,58 @@ struct ConfinedDispatchSink {
     /// fallback.
     std::function<int()> send_to_all_unfiltered;
     /// Every currently-known agent id, used to narrow a broadcast when the
-    /// caller IS filtered.
+    /// caller IS filtered. HA WS-5 (ADR-2002 §7a): once `known_agent_ids` is
+    /// wired to a presence-merged source (`AgentRegistry::all_ids()`), a
+    /// Broadcast/None candidate is no longer by construction always locally
+    /// known — see `prepare_route_fallback` and `presence_widens` below,
+    /// both updated for exactly this reason.
     std::function<std::vector<std::string>()> known_agent_ids;
     /// WS-4 4.2b Task C (fallback-only gateway routing-directory consult,
-    /// #4246). Called ONCE per arm — Group/Scope/Ids only, never
-    /// Broadcast/None, whose candidates come from `known_agent_ids()` and are
-    /// therefore by construction always locally known — with the arm's FULL
-    /// candidate list, BEFORE any `send_to` call for that arm. Default
-    /// (unset — every dispatch before this slice, and every dispatch with no
-    /// directory wired, e.g. `forward_legacy_command`'s Broadcast-only sink)
-    /// is a pure no-op: `send_to` alone decides delivery, unchanged. Returns
-    /// true iff the batched directory read itself degraded
+    /// #4246). Called ONCE per arm — with the arm's FULL candidate list,
+    /// BEFORE any `send_to` call for that arm. Default (unset — every
+    /// dispatch before this slice, and every dispatch with no directory
+    /// wired, e.g. `forward_legacy_command`'s Broadcast-only sink) is a pure
+    /// no-op: `send_to` alone decides delivery, unchanged. Returns true iff
+    /// the batched directory read itself degraded
     /// (store_unavailable/db_error) — surfaced as
     /// `ArmDispatchResult::route_unreadable` /
     /// `ConfinedDispatchOutcome::route_unreadable` (see that field's own doc
     /// comment: this slice only DEFINES and PRODUCES the flag; wiring its
     /// outbox-reschedule / cascade consumption is the next task).
+    ///
+    /// HA WS-5 update: Broadcast/None's `confined_broadcast()` now calls this
+    /// too, on its FILTERED path — Group/Scope/Ids always did; Broadcast's
+    /// candidates stopped being "by construction always locally known" the
+    /// moment `known_agent_ids` could return a presence-only (remote) id, and
+    /// an unprepared remote id would otherwise reach `send_to` with no
+    /// directory consult, silently fail, and land in `not_sent` — a
+    /// wired-but-behaviorally-dead reader, the exact class of bug WS-4 hit
+    /// twice before shipping. `confined_broadcast`'s UNFILTERED fast path
+    /// (`send_to_all_unfiltered`) does NOT call this — see
+    /// `presence_widens` below for how that path stays safe instead.
     std::function<bool(const std::vector<std::string>& candidates)> prepare_route_fallback;
+    /// HA WS-5 (governance Gate 4 unhappy-path hardening, 2026-09-22):
+    /// `AgentRegistry::has_remote_presence(candidates)` — a SINGLE-lock
+    /// membership check against the registry's CURRENT local state, given
+    /// the candidate list `confined_broadcast()` already fetched via
+    /// `known_agent_ids()`. `confined_broadcast()`'s UNFILTERED fast path
+    /// (`send_to_all_unfiltered`, which walks ONLY local sessions and has no
+    /// per-id hook to consult the directory) is eligible only when this
+    /// returns false — i.e. presence added nothing reachable this call, so
+    /// the fast path's local-only walk is provably complete. This
+    /// SUPERSEDES an earlier `local_agent_count()`-vs-`known_agent_ids().
+    /// size()` comparison, which was racy: those were two SEPARATE lock
+    /// acquisitions, so concurrent local churn between them could make the
+    /// SIZES coincidentally match while the SETS differed, silently taking
+    /// the fast path with a presence-only id still in `candidates`. A direct
+    /// membership check against the already-fetched list has no such gap —
+    /// see `has_remote_presence`'s own doc comment. UNSET (a test/legacy
+    /// sink that predates this field) is treated as "presence widens" (an
+    /// unconditional true) by `confined_broadcast` — so an unmigrated sink
+    /// always takes the SLOW (filtered, `prepare_route_fallback`-covered)
+    /// path instead of silently skipping this check: fail-closed on missing
+    /// wiring, never fail-open into a stale fast path.
+    std::function<bool(const std::vector<std::string>& candidates)> presence_widens;
 };
 
 /// Targets the CALLER has already resolved. Each arm reads only its own field;
@@ -741,10 +776,30 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     // exactly the dispatches where it matters, never on the common case where
     // every agent has the plugin.
     const auto confined_broadcast = [&]() -> int {
-        if (!exec_visible && !gate.enforced && plugin_missing.empty())
+        // HA WS-5 (ADR-2002 §7a): `known_agent_ids()` can now include
+        // presence-only (remote) ids, so the fast path below — which walks
+        // ONLY local sessions via `send_to_all_unfiltered` and has no per-id
+        // hook to consult the routing directory for one — is eligible only
+        // when presence added nothing reachable this call. A DIRECT
+        // membership check against the already-fetched `candidates`
+        // (`presence_widens`), not a two-call size comparison — the latter
+        // raced (governance Gate 4 unhappy-path finding, 2026-09-22): see
+        // `presence_widens`'s own doc comment. Unset (a sink predating this
+        // field) is treated as "presence widens" (true), so a genuinely
+        // non-empty fleet always falls through to the filtered path below.
+        auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
+        const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
+        if (!exec_visible && !gate.enforced && plugin_missing.empty() && !widened)
             return sink.send_to_all_unfiltered();
+        // WS-4 4.2b Task C: same batched-before-the-walk shape Group/Scope/Ids
+        // already use — Broadcast/None previously skipped this call on the
+        // (pre-WS-5) assumption that a broadcast candidate is always locally
+        // known; that assumption no longer holds once known_agent_ids() can
+        // return a presence-only id (see the sink field's own doc comment).
+        if (sink.prepare_route_fallback)
+            result.route_unreadable = sink.prepare_route_fallback(candidates);
         int n = 0;
-        for (const auto& aid : authz::filter_to_scope(sink.known_agent_ids(), exec_visible))
+        for (const auto& aid : candidates)
             if (!contained(aid) && !plugin_absent(aid) && sink.send_to(aid))
                 ++n;
         return n;

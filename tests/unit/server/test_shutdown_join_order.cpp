@@ -171,3 +171,62 @@ TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the policy-
          << fn_null_wait_line);
     CHECK(shutdown_line < fn_null_wait_line);
 }
+
+/**
+ * Governance Gate 6 (sre SHOULD-2, feat/split-a4-schedule-seam, ADR-0031
+ * WS-A4 seventh family) -- refined TWICE during the same governance run
+ * before landing on the actual invariant, both corrections worth recording:
+ *
+ * (1) Gate 3 cpp-safety corrected the citation: `web_server_->stop()`
+ *     (server.cpp:~9090) only closes the listening socket; it does NOT
+ *     itself join anything. The actual drain guarantee -- that every
+ *     in-flight httplib `ThreadPool` task has finished -- comes from
+ *     `httplib::Server::listen()`'s internal `task_queue->shutdown()`,
+ *     which unblocks `web_thread_.join()`. That join is the real
+ *     synchronization point.
+ *
+ * (2) Gate 7 (writing this test) then found `ScheduleEngine::stop()` itself
+ *     is a NO-OP (schedule_engine.cpp: "No engine-side resources to stop:
+ *     the poller thread ... is owned by ServerImpl ... joined before the
+ *     stores") -- it does not invalidate `query_schedules_checked`'s
+ *     callability, so asserting `web_thread_.join()` precedes
+ *     `schedule_engine_->stop()` is not a real safety requirement, and an
+ *     earlier draft of this test asserted it anyway and failed against the
+ *     live source (`schedule_engine_->stop()` at server.cpp:9247 genuinely
+ *     runs BEFORE `web_thread_.join()` at :9317 today -- harmless, because
+ *     `stop()` does nothing). The ONLY call that actually invalidates the
+ *     borrow is `schedule_engine_.reset()` (destruction), which this test
+ *     pins alone.
+ *
+ * `LocalScheduleApi` (schedule_api_local.hpp) holds a BORROWED
+ * `ScheduleEngine&` and is now reachable from THREE HTTP/MCP-facing call
+ * sites (the dashboard fragment, REST v1, and MCP `list_schedules`) via one
+ * shared `schedule_api` instance, instead of just the pre-existing
+ * background `ScheduleRunner`. That borrow is safe only because
+ * `web_thread_.join()` -- which cannot return until every such task has
+ * exited -- runs strictly BEFORE `schedule_engine_.reset()`, which would
+ * otherwise leave the borrow dangling. `schedule_api_local.hpp`'s own
+ * lifetime-contract doc comment states this ordering as load-bearing; this
+ * test pins it the same way the guard above pins #3495's, so a future
+ * reorder in `stop()` fails loudly here instead of silently reopening a UAF
+ * window for all three schedule-read surfaces.
+ *
+ * Same source-scan technique as the #3495 guard above -- see its doc comment
+ * for the rationale (`ServerImpl` is not unit-constructible) and its stated
+ * limits (proves relative source order only, not that the drain actually
+ * completes in practice).
+ */
+TEST_CASE("server.cpp: web_thread_.join() runs before schedule_engine_.reset() "
+          "(ADR-0031 WS-A4 schedule seam)",
+          "[shutdown_order]") {
+    const std::string text = strip_line_comments(read_server_cpp());
+
+    const int web_join_line =
+        require_one_line(text, std::regex(R"(web_thread_\.join\(\))"), "web_thread_.join()");
+    const int schedule_engine_reset_line = require_one_line(
+        text, std::regex(R"(schedule_engine_\.reset\(\))"), "schedule_engine_.reset()");
+
+    INFO("web_thread_.join() at server.cpp:" << web_join_line);
+    INFO("schedule_engine_.reset() at server.cpp:" << schedule_engine_reset_line);
+    CHECK(web_join_line < schedule_engine_reset_line);
+}

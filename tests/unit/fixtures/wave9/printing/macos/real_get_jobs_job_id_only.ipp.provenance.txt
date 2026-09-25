@@ -1,0 +1,29 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
+date: 2026-09-21 (UTC)
+identity: id -u = 501 (alex, non-root). Scratch queue `yuzu4616a` created with
+`lpadmin` on a dead socket device and removed afterwards; two held jobs (lp -H
+hold) with ids 6 and 7.
+
+request: Get-Jobs (0x000A), request-id 1, printer-uri
+ipp://localhost/printers/yuzu4616a, which-jobs=not-completed,
+requested-attributes=job-id ONLY (the first, narrower form of the binding-check
+request, before job-printer-uri was added to it).
+
+exact command:
+  curl --unix-socket /private/var/run/cupsd -s \
+      -H 'Content-Type: application/ipp' --data-binary @req.bin \
+      http://localhost/printers/yuzu4616a -o real_get_jobs_job_id_only.ipp
+
+decoded result: 104 bytes; HTTP 200; status-code 0x0000 (successful-ok); two job
+groups carrying only `job-id` 6 and `job-id` 7 -- NO job-printer-uri.
+
+why it exists: it is the real shape of a listing whose job groups carry no
+job-printer-uri (cupsd returns only the attributes asked for). Upstream cupsd
+emits job-printer-uri whenever it is requested, even under `JobPrivateValues`, so
+on a stock server this shape only arises from a request that did not ask for it;
+`run_clear_queue` treats it as unconfirmed as a defensive verdict for any server
+that omits the attribute. A job listed this way cannot be confirmed to
+be on the named printer, so `run_clear_queue` reports it as an error and sends
+no Cancel-Job.

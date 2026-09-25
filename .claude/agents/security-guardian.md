@@ -42,7 +42,8 @@ You perform a **mandatory deep-dive review of every code change**. You read ever
 - `server/core/src/api_token_store.cpp` — API token management
 - `server/core/src/oidc_provider.cpp` — OIDC SSO integration
 - `server/core/src/rest_api_v1.cpp` — All REST endpoints
-- `server/core/src/cert_store.cpp` — Certificate management
+- `server/core/src/ca_store.cpp` + `server/core/src/x509_ca.cpp` — Internal CA: issuance, revocation, CRL
+- `server/core/src/ca_routes.cpp`, `grpc_tls_credentials.cpp`, `cert_reloader.cpp`, `default_certs.cpp`, `insecure_tls_gate.hpp` + `common/include/yuzu/tls_policy.hpp` — CA REST routes, server TLS credentials, cert reload, first-boot certs, TLS policy
 - `server/core/src/audit_store.cpp` — Audit event storage
 - `server/core/src/scope_engine.cpp` — Expression parser (injection surface)
 - `server/core/src/instruction_store.cpp` — YAML parsing (deserialization surface)
@@ -60,7 +61,7 @@ CLAUDE.md no longer carries the auth or MCP invariants verbatim — they live in
 
 Triggers for loading each doc:
 
-- **Auth doc** — any modification to `auth.cpp`, `rbac_store.cpp`, `api_token_store.cpp`, `oidc_provider.cpp`, `cert_store.cpp`, `security_headers.{hpp,cpp}`, or any new REST endpoint that touches authentication/authorization/header emission/token lifecycle. Verify mTLS-mandatory, HTTPS-default, 127.0.0.1 bind, metrics localhost-only, private-key perms gate, JSON error envelope, `HeaderBundle::make()`/`apply()` as the only header construction path, and owner-scoped token revocation.
+- **Auth doc** — any modification to `auth.cpp`, `rbac_store.cpp`, `api_token_store.cpp`, `oidc_provider.cpp`, `agents/core/src/cert_store.cpp`, `security_headers.{hpp,cpp}`, or any new REST endpoint that touches authentication/authorization/header emission/token lifecycle. Verify mTLS-mandatory, HTTPS-default, 127.0.0.1 bind, metrics localhost-only, private-key perms gate, JSON error envelope, `HeaderBundle::make()`/`apply()` as the only header construction path, and owner-scoped token revocation.
 - **MCP doc** — any change in `server/core/src/mcp_*.{hpp,cpp}`, anything that adds a tool to `mcp_policy.hpp`, or any new REST/MCP path that needs tier classification. Verify tier check **before** RBAC, kill-switch coverage (`--mcp-disable` / `--mcp-read-only`), audit-event shape, and `JObj`/`JArr` output (never `nlohmann::json` output — parse only).
 
 ## Severity Levels

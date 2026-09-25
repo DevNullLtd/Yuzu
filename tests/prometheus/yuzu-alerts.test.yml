@@ -1853,6 +1853,34 @@ tests:
   # (a truly isolated first failure may lag one evaluation cycle) lives in
   # the rule's own `description` in docs/prometheus/yuzu-alerts.yml instead.
 
+  # ── YuzuBreakGlassLogin ─────────────────────────────────────────────────
+
+  # A single break-glass login after the boot seed pages. The flat-0 prefix is
+  # the boot seed in server.cpp; without it the series would be born at 1 and
+  # increase() could not see the first use.
+  - interval: 1m
+    name: break-glass login - one use after the boot seed fires
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuBreakGlassLogin", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # No break-glass use, no page.
+  - interval: 1m
+    name: break-glass login - a flat seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_break_glass_login_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuBreakGlassLogin"}'
+        eval_time: 45m
+        exp_samples: []
+
   # ── YuzuScimDeprovisionRoleRefusedWithActiveLink (D1) ───────────────────
 
   # CASE 41 -- D1 fires: a still-linked out-of-band admin was refused
@@ -2779,4 +2807,105 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
         eval_time: 25m
+        exp_samples: []
+
+  # ── YuzuServerPostgresUnreachable (HA WS-8, ADR-2002 §12) ────────────────
+  #
+  # CASE - sustained unreachability fires, per instance. RED if the comparison
+  # is inverted (== 1 would page on every healthy replica) or the gauge name
+  # drifts from what health_routes.cpp exports on /metrics.
+  - interval: 1m
+    name: postgres unreachable - sustained zero fires
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0x10"
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s2"}'
+        values: "1x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerPostgresUnreachable", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE - a failover-length red blip stays quiet. Every replica goes red for
+  # an ordinary Patroni switchover (10-30s, one scrape here); paging on that
+  # would page every failover. RED if `for:` is dropped or shortened below a
+  # scrape interval.
+  - interval: 1m
+    name: postgres unreachable - a one-scrape failover blip stays quiet
+    input_series:
+      - series: 'yuzu_server_pg_reachable{job="yuzu",instance="s1"}'
+        values: "1x5 0 1x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerPostgresUnreachable"}'
+        eval_time: 7m
+        exp_samples: []
+
+  # ── YuzuGuardianReadDegraded (#4856) ─────────────────────────────────────
+  #
+  # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
+  # source) > 0`, for: 5m, warning. Two sources share the counter:
+  # "guardian_state" (DEX/observation reads, fail-soft) and "guardian_rules"
+  # (authoritative rule/status reads, fail-hard) - both must page on a
+  # sustained non-zero rate, keyed by both labels.
+
+  # CASE — a sustained degrade on the DEX/observation family (guardian_state)
+  # pages, carrying both its reason and source labels.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_state degrade pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_state"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="query_error", source="guardian_state", severity="warning"}'
+            value: 1
+
+  # CASE — a sustained degrade on the AUTHORITATIVE rule/status family
+  # (guardian_rules) pages independently, on its OWN source label - proof the
+  # two families are counted (and paged) separately, not merged into one
+  # undifferentiated series.
+  - interval: 1m
+    name: guardian read degraded - a sustained guardian_rules degrade pages
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_rules"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReadDegraded", alertstate="firing", reason="store_not_open", source="guardian_rules", severity="warning"}'
+            value: 1
+
+  # CASE — the boot-time pre-seed alone (both sources x all three reasons
+  # present at zero, never incremented) must stay quiet: present-at-zero is
+  # the HEALTHY steady state, not a degrade.
+  - interval: 1m
+    name: guardian read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_state"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout",source="guardian_rules"}'
+        values: "0x30"
+      - series: 'yuzu_server_guardian_read_degrade_total{job="yuzu",instance="s1",reason="query_error",source="guardian_rules"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
+        eval_time: 20m
         exp_samples: []

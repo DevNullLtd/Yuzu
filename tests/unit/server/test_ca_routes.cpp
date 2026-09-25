@@ -386,7 +386,7 @@ TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the publ
     rec.der = {0x30, 0x01, 0x00};
     rec.this_update = 1;
     rec.next_update = 2;
-    REQUIRE(h.store->record_crl(rec));
+    REQUIRE(h.store->record_crl_for_test(rec));
     auto served = h.sink.Get("/api/v1/ca/crl");
     REQUIRE(served);
     REQUIRE(served->status == 200);

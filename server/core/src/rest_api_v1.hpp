@@ -14,13 +14,13 @@
 #include "authz_model.hpp"
 #include "dispatch_caller.hpp"
 #include "device_token_store.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -430,9 +430,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
         // optional dep; nullptr leaves the assign/unassign routes answering
@@ -504,16 +501,31 @@ public:
         // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-
         // over-time API seam — backs the 9 GET /api/v1/dex/perf/* resources
         // (minus /compare, VerifyApi's) + GET /api/v1/dex/devices/{id}/app-perf
-        // (the SAME instance the MCP DEX perf tools use). REQUIRED: nullptr →
-        // those routes answer 503, equivalent to the old
-        // `!dex_perf_fn`/`!app_perf_providers.<member>` readiness guards.
-        // Unlike dex_api above, server.cpp constructs this UNCONDITIONALLY
-        // (never null) — each backing store pointer is checked individually
-        // inside the impl, matching the old per-lambda null-checks, so the
-        // route guard is defense-in-depth, never expected to fire.
-        // `app_perf_providers`/`dex_perf_fn` above stay wired too — this is an
-        // ADDITIONAL seam, not a replacement, until every consumer migrates.
-        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
+        // (the SAME instance the MCP DEX perf tools and the dashboard
+        // fragments use, #4626). REQUIRED: nullptr → those routes answer 503,
+        // equivalent to the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+        // readiness guards. Unlike dex_api above, server.cpp constructs this
+        // UNCONDITIONALLY (never null) — each backing store pointer is
+        // checked individually inside the impl, matching the old per-lambda
+        // null-checks, so the route guard is defense-in-depth, never expected
+        // to fire. `AppPerfProviders` (the pre-seam bundle) is retired.
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read
+        // API seam — backs 8 of the 9 GET /api/v1/guaranteed-state/*
+        // resources (the SAME instance the MCP Guardian tools use;
+        // `schemas` stays outside the seam, store-free — see
+        // guardian_api.hpp). server.cpp constructs this UNCONDITIONALLY
+        // (never null) — each of the two backing store pointers is checked
+        // INDIVIDUALLY inside the impl (guardian_api.cpp), mirroring
+        // dex_perf_api's own multi-dependency posture: a null
+        // `guaranteed_state_store_` degrades every method, a null
+        // `baseline_store_` degrades ONLY device_compliance. The
+        // `!guardian_api` guard the 8 routes still carry is therefore
+        // defense-in-depth only, matching the pre-seam
+        // `!guaranteed_state_store` guard's practical behaviour.
+        // `guaranteed_state_store` above stays wired too, for the
+        // rule/baseline MUTATORS this seam does not cover.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -562,9 +574,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // routes (/api/v1/engine-principals/{id}/roles), which capture this
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
@@ -608,7 +617,10 @@ public:
         std::shared_ptr<const DexApi> dex_api = nullptr,
         // ADR-0031 WS-A4 (sixth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr);
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

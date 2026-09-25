@@ -1,231 +1,246 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 47e1dd9008d0
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated; profile name redacted to jsmith) · leg-hash 3690edc65cda
 == action=list
-app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-
-app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-
-app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617
-app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617
-app|Baldur's Gate 3|-|Larian Studios|-
-app|Battle.net|-|Blizzard Entertainment|-
-app|CCleaner 7|7.10.1464.1889|Piriform|-
-app|CMake|4.3.3|Kitware|20260617
-app|Cities: Skylines II|-|Colossal Order Ltd.|-
-app|Crusader Kings III|-|Paradox Development Studio|-
-app|DayZ|-|Bohemia Interactive|-
-app|Defraggler|2.22|Piriform|-
-app|Diablo IV|-|Blizzard Entertainment|-
-app|DiagnosticsHub_CollectionService|17.14.36412|Microsoft Corporation|20260617
-app|Docker Desktop|4.84.0|Docker Inc.|-
-app|Erlang OTP 28.5.0.1 (16.4.0.1)|28.5.0.1|Ericsson AB|-
-app|Flawless Widescreen version 1.0.15|1.0.15|Flawless Widescreen|20220919
-app|Football Manager 2024|-|Sports Interactive|-
-app|Git|2.54.0|The Git Development Community|20260715
-app|GitHub CLI|2.89.0|GitHub, Inc.|20260403
-app|Google Chrome|149.0.7827.201|Google LLC|20260629
-app|Google Update Helper|1.3.101.0|Google LLC|20211018
-app|HELLDIVERS™ 2|-|Arrowhead Game Studios|-
-app|Kits Configuration Installer|10.1.26100.7705|Microsoft|20260617
-app|Logi Options+|2.6.944893|Logitech|-
-app|Logi Plugin Service|6.4.0.3079|Logitech|20260717
-app|MSI Development Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Magic: The Gathering Arena|-|Wizards of the Coast LLC|-
-app|Manor Lords|-|Slavic Magic|-
-app|Microsoft .NET Host - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731
-app|Microsoft .NET Host - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018
-app|Microsoft .NET Host - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619
-app|Microsoft .NET Host - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622
-app|Microsoft .NET Host FX Resolver - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731
-app|Microsoft .NET Host FX Resolver - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018
-app|Microsoft .NET Host FX Resolver - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619
-app|Microsoft .NET Host FX Resolver - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622
-app|Microsoft .NET Runtime - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731
-app|Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018
-app|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619
-app|Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622
-app|Microsoft 365 Apps for enterprise - en-us|16.0.19822.20114|Microsoft Corporation|-
-app|Microsoft Edge|152.0.4191.66|Microsoft Corporation|20260906
-app|Microsoft Edge WebView2 Runtime|152.0.4191.66|Microsoft Corporation|20260906
-app|Microsoft GameInput|3.3.221.0|Microsoft Corporation|20260521
-app|Microsoft Teams Meeting Add-in for Microsoft Office|1.25.28902|Microsoft|20260208
-app|Microsoft Update Health Tools|5.72.0.0|Microsoft Corporation|20260201
-app|Microsoft Visual C++ 2005 Redistributable|8.0.61001|Microsoft Corporation|20240608
-app|Microsoft Visual C++ 2005 Redistributable (x64)|8.0.61000|Microsoft Corporation|20240608
-app|Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219|10.0.40219|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2010  x86 Redistributable - 10.0.40219|10.0.40219|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2012 Redistributable (x64) - 11.0.61030|11.0.61030.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2012 Redistributable (x86) - 11.0.61030|11.0.61030.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2012 x64 Additional Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2012 x64 Minimum Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2012 x86 Additional Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2012 x86 Minimum Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109
-app|Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.30501|12.0.30501.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40664|12.0.40664.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.30501|12.0.30501.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.40664|12.0.40664.0|Microsoft Corporation|-
-app|Microsoft Visual C++ 2013 x64 Additional Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402
-app|Microsoft Visual C++ 2013 x64 Minimum Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402
-app|Microsoft Visual C++ 2013 x86 Additional Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402
-app|Microsoft Visual C++ 2013 x86 Minimum Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402
-app|Microsoft Visual C++ 2022 X64 Additional Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619
-app|Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|20260617
-app|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619
-app|Microsoft Visual C++ 2022 X86 Additional Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619
-app|Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|20260617
-app|Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619
-app|Microsoft Visual C++ v14 Redistributable (x64) - 14.51.36247|14.51.36247.0|Microsoft Corporation|-
-app|Microsoft Visual C++ v14 Redistributable (x86) - 14.51.36247|14.51.36247.0|Microsoft Corporation|-
-app|Microsoft Visual Studio Installer|4.7.25.22189|Microsoft Corporation|20260617
-app|Microsoft Visual Studio Setup Configuration|3.12.2140.44225|Microsoft Corporation|20260617
-app|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation|20260617
-app|Microsoft Windows Application Compatibility Fix Database|-|-|-
-app|Microsoft Windows Desktop Runtime - 6.0.11 (x64)|48.47.50419|Microsoft Corporation|20230731
-app|Microsoft Windows Desktop Runtime - 6.0.11 (x64)|6.0.11.31823|Microsoft Corporation|-
-app|Microsoft Windows Desktop Runtime - 6.0.20 (x86)|48.83.63194|Microsoft Corporation|20231018
-app|Microsoft Windows Desktop Runtime - 6.0.20 (x86)|6.0.20.32621|Microsoft Corporation|-
-app|Microsoft Windows Desktop Runtime - 8.0.28 (x64)|64.112.53617|Microsoft Corporation|20260619
-app|Microsoft Windows Desktop Runtime - 8.0.28 (x64)|8.0.28.36119|Microsoft Corporation|-
-app|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|64.112.53617|Microsoft Corporation|20260622
-app|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|8.0.28.36119|Microsoft Corporation|-
-app|Mozilla Firefox (x64 en-GB)|154.0.1|Mozilla|-
-app|Mozilla Maintenance Service|106.0.1|Mozilla|-
-app|NVIDIA AIUser Container|1.48|NVIDIA Corporation|20260715
-app|NVIDIA App 11.0.8.299|11.0.8.299|NVIDIA Corporation|20260715
-app|NVIDIA App driver settings|1.0|NVIDIA Corporation|20260715
-app|NVIDIA Backend|11.0.8.299|NVIDIA Corporation|20260715
-app|NVIDIA Container|1.48|NVIDIA Corporation|20260715
-app|NVIDIA FrameView SDK 1.8.12612.38276700|1.8.12612.38276700|NVIDIA Corporation|20260715
-app|NVIDIA Graphics Driver 610.74|610.74|NVIDIA Corporation|20260715
-app|NVIDIA HD Audio Driver 1.4.5.7|1.4.5.7|NVIDIA Corporation|20260715
-app|NVIDIA Install Application|2.1002.463.0|NVIDIA Corporation|20260715
-app|NVIDIA LocalSystem Container|1.48|NVIDIA Corporation|20260715
-app|NVIDIA MessageBus 3 for NvApp|3.21|NVIDIA Corporation|20260715
-app|NVIDIA NvDLISR|1.0|NVIDIA Corporation|20260715
-app|NVIDIA PhysX System Software 9.23.1019|9.23.1019|NVIDIA Corporation|20260201
-app|NVIDIA Session Container|1.48|NVIDIA Corporation|20260715
-app|NVIDIA ShadowPlay 11.0.8.0|11.0.8.0|NVIDIA Corporation|20260715
-app|NVIDIA Telemetry Client|19.6.6.0|NVIDIA Corporation|20260715
-app|NVIDIA User Container|1.48|NVIDIA Corporation|20260715
-app|NVIDIA Virtual Audio 4.65.0.12|4.65.0.12|NVIDIA Corporation|20260715
-app|NVIDIA Watchdog Plugin for NvContainer|1.48|NVIDIA Corporation|20260715
-app|NordUpdater|1.5.0.997|Nord Security|20260130
-app|NordVPN|7.60.1.0|Nord Security|20260326
-app|NordVPN network TAP|1.0.1|NordVPN|20211018
-app|NordVPN network TUN|1.0.1|NordVPN|20211018
-app|Notepad++ (64-bit x64)|8.9.6.4|Notepad++ Team|-
-app|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|Microsoft Corporation|20260330
-app|PUBG: BATTLEGROUNDS|-|PUBG Corporation|-
-app|Paradox Launcher v2|2.4.0|Paradox Interactive|20241214
-app|PlayStation® Accessories|2.0.0.13|Sony Interactive Entertainment Inc.|20241007
-app|PostgreSQL 18 |18.2-1|PostgreSQL Global Development Group|20260803
-app|Project Zomboid|-|The Indie Stone|-
-app|Python 3.12.10 Add to Path (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Core Interpreter (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Development Libraries (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Documentation (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Executables (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Standard Library (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Tcl/Tk Support (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 Test Suite (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python 3.12.10 pip Bootstrap (64-bit)|3.12.10150.0|Python Software Foundation|20260617
-app|Python Launcher|3.12.10150.0|Python Software Foundation|20260617
-app|Razer Synapse|3.9.0430.042305|Razer Inc.|-
-app|Razer Virtual Ring Light|2.0.0.23|Razer Inc.|-
-app|Realtek USB Audio|6.3.9600.2370|Realtek Semiconductor Corp.|20250227
-app|RimWorld|-|Ludeon Studios|-
-app|SDK ARM64 Additions|10.1.26100.7705|Microsoft Corporation|20260617
-app|SDK ARM64 Redistributables|10.1.26100.7705|Microsoft Corporation|20260617
-app|Sid Meier's Civilization VII|-|Firaxis Games|-
-app|Speccy|1.33|Piriform|-
-app|Steam|2.10.91.91|Valve Corporation|-
-app|Stellaris|-|Paradox Development Studio|-
-app|Sunless Sea|-|Failbetter Games|-
-app|Tabletop Simulator|-|Berserk Games|-
-app|Tailscale|1.102.2|Tailscale Inc.|20260816
-app|Universal CRT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Universal CRT Headers Libraries and Sources|10.1.26100.7705|Microsoft Corporation|20260617
-app|Universal CRT Redistributable|10.0.26624|Microsoft Corporation|20260617
-app|Universal CRT Redistributable|10.1.26100.7705|Microsoft Corporation|20260617
-app|Universal CRT Tools x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Universal CRT Tools x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Universal General MIDI DLS Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Update for x64-based Windows Systems (KB5001716)|8.94.0.0|Microsoft Corporation|20250702
-app|VS Script Debugging Common|17.0.157.0|Microsoft Corporation|20260617
-app|Valheim|-|Iron Gate AB|-
-app|Visual Studio Build Tools 2022|17.14.34|Microsoft Corporation|20260617
-app|Warhammer 40,000: Rogue Trader|-|Owlcat Games|-
-app|Warhammer 40,000: Space Marine 2|-|Saber Interactive|-
-app|WinAppDeploy|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense Desktop - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense Desktop - en-us|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense IoT - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense IoT - en-us|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense Mobile - en-us|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense PPI - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense PPI - en-us|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense UAP - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617
-app|WinRT Intellisense UAP - en-us|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows 11 Installation Assistant|1.4.19041.5003|Microsoft Corporation|-
-app|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows App Certification Kit SupportedApiList x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Desktop Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows IoT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Mobile Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Mobile Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows PC Health Check|3.6.2204.08001|Microsoft Corporation|20220425
-app|Windows SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK ARM64 Desktop Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK AddOn|10.1.0.0|Microsoft Corporation|20260617
-app|Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Headers x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Headers x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Libs arm64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Libs x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Libs x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Tools arm64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Tools x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Desktop Tools x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK DirectX x64 Remote|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK EULA|10.1.26100.7705|Microsoft Corporations|20260617
-app|Windows SDK Facade Windows WinMD Versioned|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Modern Non-Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Modern Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK OnecoreUap Headers arm64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK OnecoreUap Headers x86|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Redistributables|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK Signing Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Contracts|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Headers|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Headers OnecoreUap|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Libs|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Metadata|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Apps Tools|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Software Development Kit - Windows 10.0.26100.7705|10.1.26100.7705|Microsoft Corporation|-
-app|Windows Subsystem for Linux|2.6.3.0|Microsoft Corporation|20260330
-app|Windows Team Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617
-app|Windows Team Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617
-app|vcpp_crt.redist.clickonce|14.44.35211|Microsoft Corporation|20260617
-app|vs_CoreEditorFonts|17.7.40001|Microsoft Corporation|20260617
-app|vs_FileTracker_Singleton|17.14.36015|Microsoft Corporation|20260617
-app|vs_communitymsires|17.14.36015|Microsoft Corporation|20260617
-app|vs_communitysharedmsi|17.14.36025|Microsoft Corporation|20260617
-app|vs_communityx64msi|17.14.36025|Microsoft Corporation|20260617
-app|vs_filehandler_amd64|17.14.36024|Microsoft Corporation|20260617
-app|vs_filehandler_x86|17.14.36024|Microsoft Corporation|20260617
-app|vs_githubprotocolhandlermsi|17.14.36015|Microsoft Corporation|20260617
-app|vs_minshellinteropmsi|17.14.36015|Microsoft Corporation|20260617
-app|vs_minshellinteropsharedmsi|17.14.36015|Microsoft Corporation|20260617
-app|vs_minshellmsi|17.14.36301|Microsoft Corporation|20260617
-app|vs_minshellmsires|17.14.36015|Microsoft Corporation|20260617
-app|vs_minshellsharedmsi|17.14.36024|Microsoft Corporation|20260617
-app|vs_vswebprotocolselectormsi|17.14.36323|Microsoft Corporation|20260617
+app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-
+app|Age of Empires II: Definitive Edition|-|Forgotten Empires|-|D:/SteamLibrary/steamapps/common/AoE2DE|-
+app|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|-|-
+app|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|-|-
+app|BCD and Boot|10.1.22621.5337|Microsoft|20260908|-|-
+app|Baldur's Gate 3|-|Larian Studios|-|D:/SteamLibrary/steamapps/common/Baldurs Gate 3|-
+app|Battle.net|-|Blizzard Entertainment|-|C:/Program Files (x86)/Battle.net|-
+app|CCleaner 7|7.11.1522.1958|Piriform|-|C:/Program Files/Piriform/CCleaner 7|-
+app|CMake|4.3.3|Kitware|20260617|C:/Program Files/CMake/|-
+app|Cities: Skylines II|-|Colossal Order Ltd.|-|D:/SteamLibrary/steamapps/common/Cities Skylines II|-
+app|Crusader Kings III|-|Paradox Development Studio|-|D:/SteamLibrary/steamapps/common/Crusader Kings III|-
+app|DayZ|-|Bohemia Interactive|-|D:/SteamLibrary/steamapps/common/DayZ|-
+app|Defraggler|2.22|Piriform|-|C:/Program Files/Defraggler|-
+app|Diablo IV|-|Blizzard Entertainment|-|D:/Diablo IV|-
+app|DiagnosticsHub_CollectionService|17.14.36412|Microsoft Corporation|20260617|-|-
+app|Docker Desktop|4.84.0|Docker Inc.|-|C:/Program Files/Docker/Docker|-
+app|Erlang OTP 28.5.0.1 (16.4.0.1)|28.5.0.1|Ericsson AB|-|-|-
+app|Flawless Widescreen version 1.0.15|1.0.15|Flawless Widescreen|20220919|C:/Program Files (x86)/Flawless Widescreen/|-
+app|Football Manager 2024|-|Sports Interactive|-|D:/SteamLibrary/steamapps/common/Football Manager 2024|-
+app|Git|2.54.0|The Git Development Community|20260715|C:/Program Files/Git/|-
+app|GitHub CLI|2.89.0|GitHub, Inc.|20260403|-|-
+app|Google Chrome|149.0.7827.201|Google LLC|20260629|-|-
+app|Google Update Helper|1.3.101.0|Google LLC|20211018|-|-
+app|HELLDIVERS™ 2|-|Arrowhead Game Studios|-|D:/SteamLibrary/steamapps/common/Helldivers 2|-
+app|Kits Configuration Installer|10.1.22621.5337|Microsoft|20260908|-|-
+app|Logi Options+|2.7.961922|Logitech|-|-|-
+app|Logi Plugin Service|6.4.1.3246|Logitech|20260914|-|-
+app|MSI Development Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Magic: The Gathering Arena|-|Wizards of the Coast LLC|-|-|-
+app|Manor Lords|-|Slavic Magic|-|D:/SteamLibrary/steamapps/common/Manor Lords|-
+app|Microsoft .NET Host - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731|-|-
+app|Microsoft .NET Host - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018|-|-
+app|Microsoft .NET Host - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619|-|-
+app|Microsoft .NET Host - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622|-|-
+app|Microsoft .NET Host FX Resolver - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731|-|-
+app|Microsoft .NET Host FX Resolver - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018|-|-
+app|Microsoft .NET Host FX Resolver - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619|-|-
+app|Microsoft .NET Host FX Resolver - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622|-|-
+app|Microsoft .NET Runtime - 6.0.11 (x64)|48.47.50420|Microsoft Corporation|20230731|-|-
+app|Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|20231018|-|-
+app|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619|-|-
+app|Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622|-|-
+app|Microsoft 365 Apps for enterprise - en-us|16.0.19822.20114|Microsoft Corporation|-|C:/Program Files/Microsoft Office|-
+app|Microsoft Edge|153.0.4234.48|Microsoft Corporation|20260921|-|-
+app|Microsoft Edge WebView2 Runtime|153.0.4234.48|Microsoft Corporation|20260921|C:/Program Files (x86)/Microsoft/EdgeWebView/Application|-
+app|Microsoft GameInput|3.3.221.0|Microsoft Corporation|20260521|-|-
+app|Microsoft Teams Meeting Add-in for Microsoft Office|1.25.28902|Microsoft|20260208|-|-
+app|Microsoft Update Health Tools|5.72.0.0|Microsoft Corporation|20260201|-|-
+app|Microsoft Visual C++ 2005 Redistributable|8.0.61001|Microsoft Corporation|20240608|-|-
+app|Microsoft Visual C++ 2005 Redistributable (x64)|8.0.61000|Microsoft Corporation|20240608|-|-
+app|Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219|10.0.40219|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2010  x86 Redistributable - 10.0.40219|10.0.40219|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2012 Redistributable (x64) - 11.0.61030|11.0.61030.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2012 Redistributable (x86) - 11.0.61030|11.0.61030.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2012 x64 Additional Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2012 x64 Minimum Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2012 x86 Additional Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2012 x86 Minimum Runtime - 11.0.61030|11.0.61030|Microsoft Corporation|20220109|-|-
+app|Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.30501|12.0.30501.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40664|12.0.40664.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.30501|12.0.30501.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.40664|12.0.40664.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ 2013 x64 Additional Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402|-|-
+app|Microsoft Visual C++ 2013 x64 Minimum Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402|-|-
+app|Microsoft Visual C++ 2013 x86 Additional Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402|-|-
+app|Microsoft Visual C++ 2013 x86 Minimum Runtime - 12.0.40664|12.0.40664|Microsoft Corporation|20260402|-|-
+app|Microsoft Visual C++ 2022 X64 Additional Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619|-|-
+app|Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|20260617|-|-
+app|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619|-|-
+app|Microsoft Visual C++ 2022 X86 Additional Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619|-|-
+app|Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211|14.44.35211|Microsoft Corporation|20260617|-|-
+app|Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.51.36247|14.51.36247|Microsoft Corporation|20260619|-|-
+app|Microsoft Visual C++ v14 Redistributable (x64) - 14.51.36247|14.51.36247.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual C++ v14 Redistributable (x86) - 14.51.36247|14.51.36247.0|Microsoft Corporation|-|-|-
+app|Microsoft Visual Studio Installer|4.7.25.22189|Microsoft Corporation|20260617|"C:/Program Files (x86)/Microsoft Visual Studio/Installer"|-
+app|Microsoft Visual Studio Setup Configuration|3.12.2140.44225|Microsoft Corporation|20260617|-|-
+app|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation|20260617|-|-
+app|Microsoft Windows Application Compatibility Fix Database|-|-|-|-|-
+app|Microsoft Windows Desktop Runtime - 6.0.11 (x64)|48.47.50419|Microsoft Corporation|20230731|-|-
+app|Microsoft Windows Desktop Runtime - 6.0.11 (x64)|6.0.11.31823|Microsoft Corporation|-|-|-
+app|Microsoft Windows Desktop Runtime - 6.0.20 (x86)|48.83.63194|Microsoft Corporation|20231018|-|-
+app|Microsoft Windows Desktop Runtime - 6.0.20 (x86)|6.0.20.32621|Microsoft Corporation|-|-|-
+app|Microsoft Windows Desktop Runtime - 8.0.28 (x64)|64.112.53617|Microsoft Corporation|20260619|-|-
+app|Microsoft Windows Desktop Runtime - 8.0.28 (x64)|8.0.28.36119|Microsoft Corporation|-|-|-
+app|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|64.112.53617|Microsoft Corporation|20260622|-|-
+app|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|8.0.28.36119|Microsoft Corporation|-|-|-
+app|Mozilla Firefox (x64 en-GB)|154.0.1|Mozilla|-|C:/Program Files/Mozilla Firefox|-
+app|Mozilla Maintenance Service|106.0.1|Mozilla|-|-|-
+app|NVIDIA AIUser Container|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvContainer.AIUser.{7FF3F54B-1440-4556-8AAE-03A9278C9132}|-
+app|NVIDIA App 11.0.8.299|11.0.8.299|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/Display.NvApp.{505290A5-CB3F-48E3-8B8C-E8FE75327CA2}|-
+app|NVIDIA App driver settings|1.0|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/Display.NvApp.NvCPL.{DB39923E-C387-4E2F-B673-BBA7A3A6227B}|-
+app|NVIDIA Backend|11.0.8.299|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/Display.NvApp.NvBackend.{8137CD02-175D-41ED-B8E3-C74AA2E2617C}|-
+app|NVIDIA Container|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/NvContainer|-
+app|NVIDIA FrameView SDK 1.8.12612.38276700|1.8.12612.38276700|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/FrameViewSDK|-
+app|NVIDIA Graphics Driver 610.74|610.74|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/Display.Driver.{18C198EA-702C-4F01-9538-12567D0D69EC}|-
+app|NVIDIA HD Audio Driver 1.4.5.7|1.4.5.7|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/HDAudio.Driver.{0BD3C3C8-8A83-40FF-8044-EE078C15715D}|-
+app|NVIDIA Install Application|2.1002.463.0|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/InstallerCore|-
+app|NVIDIA LocalSystem Container|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvContainer.LocalSystem.{7327B7D7-359B-4904-847A-E1F8994FC23C}|-
+app|NVIDIA MessageBus 3 for NvApp|3.21|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/Display.NvApp.MessageBus.{DAE3F5DF-1389-4F6B-A16A-510057D80274}|-
+app|NVIDIA NvDLISR|1.0|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvDLISR.{71E8D52D-60AC-4AF4-9B22-C08D2D1DCED6}|-
+app|NVIDIA PhysX System Software 9.23.1019|9.23.1019|NVIDIA Corporation|20260201|C:/Program Files (x86)/NVIDIA Corporation/PhysX|-
+app|NVIDIA Session Container|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvContainer.Session.{89153A7C-C3EB-4B84-BAD7-C98DE8FB4838}|-
+app|NVIDIA ShadowPlay 11.0.8.0|11.0.8.0|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/NVIDIA App/ShadowPlay|-
+app|NVIDIA Telemetry Client|19.6.6.0|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/NvTelemetry|-
+app|NVIDIA User Container|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvContainer.User.{469F2A30-B780-4DB2-AE8B-2CE5ED8336F2}|-
+app|NVIDIA Virtual Audio 4.65.0.12|4.65.0.12|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/VirtualAudio.Driver.{D26219CA-9803-49A1-83A7-F8E17995DC2E}|-
+app|NVIDIA Watchdog Plugin for NvContainer|1.48|NVIDIA Corporation|20260715|C:/Program Files/NVIDIA Corporation/Installer2/NvPlugin.Watchdog.{5BFA0687-2C37-452A-A45A-B2DBF1860082}|-
+app|NordUpdater|1.5.0.997|Nord Security|20260130|C:/Program Files/NordUpdater/|-
+app|NordVPN|7.60.1.0|Nord Security|20260326|C:/Program Files/NordVPN/|-
+app|NordVPN network TAP|1.0.1|NordVPN|20211018|C:/Program Files (x86)/NordVPN network TAP/|-
+app|NordVPN network TUN|1.0.1|NordVPN|20211018|C:/Program Files/NordVPN network TUN/|-
+app|Notepad++ (64-bit x64)|8.9.6.4|Notepad++ Team|-|-|-
+app|OA3Tool|10.1.22621.5337|Microsoft|20260908|-|-
+app|OACheck|10.1.22621.5337|Microsoft|20260908|-|-
+app|OATool|10.1.22621.5337|Microsoft|20260908|-|-
+app|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|Microsoft Corporation|20260330|-|-
+app|Oscdimg (DesktopEditions)|10.1.22621.5337|Microsoft|20260908|-|-
+app|Oscdimg (OnecoreUAP)|10.1.22621.5337|Microsoft|20260908|-|-
+app|PUBG: BATTLEGROUNDS|-|PUBG Corporation|-|D:/SteamLibrary/steamapps/common/PUBG|-
+app|Paradox Launcher v2|2.4.0|Paradox Interactive|20241214|-|-
+app|PlayStation® Accessories|2.0.0.13|Sony Interactive Entertainment Inc.|20241007|C:/Program Files/Sony/PlayStationAccessories/|-
+app|PostgreSQL 18 |18.2-1|PostgreSQL Global Development Group|20260803|C:/Program Files/PostgreSQL/18|-
+app|Project Zomboid|-|The Indie Stone|-|D:/SteamLibrary/steamapps/common/ProjectZomboid|-
+app|Python 3.12.10 Add to Path (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Core Interpreter (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Development Libraries (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Documentation (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Executables (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Standard Library (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Tcl/Tk Support (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 Test Suite (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python 3.12.10 pip Bootstrap (64-bit)|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Python Launcher|3.12.10150.0|Python Software Foundation|20260617|-|-
+app|Razer Synapse|3.9.0430.042305|Razer Inc.|-|-|-
+app|Razer Virtual Ring Light|2.0.0.23|Razer Inc.|-|-|-
+app|Realtek USB Audio|6.3.9600.2370|Realtek Semiconductor Corp.|20250227|C:/Program Files (x86)/Realtek/Audio|-
+app|RimWorld|-|Ludeon Studios|-|D:/SteamLibrary/steamapps/common/RimWorld|-
+app|SDK ARM64 Additions|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|SDK ARM64 Redistributables|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Sid Meier's Civilization VII|-|Firaxis Games|-|D:/SteamLibrary/steamapps/common/Sid Meier's Civilization VII|-
+app|Speccy|1.33|Piriform|-|C:/Program Files/Speccy|-
+app|Steam|2.10.91.91|Valve Corporation|-|-|-
+app|Stellaris|-|Paradox Development Studio|-|D:/SteamLibrary/steamapps/common/Stellaris|-
+app|Sunless Sea|-|Failbetter Games|-|D:/SteamLibrary/steamapps/common/SunlessSea|-
+app|Tabletop Simulator|-|Berserk Games|-|D:/SteamLibrary/steamapps/common/Tabletop Simulator|-
+app|Tailscale|1.102.2|Tailscale Inc.|20260816|-|-
+app|Toolkit Documentation|10.1.22621.5337|Microsoft|20260908|-|-
+app|Universal CRT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Universal CRT Headers Libraries and Sources|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Universal CRT Redistributable|10.0.26624|Microsoft Corporation|20260617|-|-
+app|Universal CRT Redistributable|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Universal CRT Tools x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Universal CRT Tools x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Universal General MIDI DLS Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Update for x64-based Windows Systems (KB5001716)|8.94.0.0|Microsoft Corporation|20250702|-|-
+app|VS Script Debugging Common|17.0.157.0|Microsoft Corporation|20260617|-|-
+app|Valheim|-|Iron Gate AB|-|D:/SteamLibrary/steamapps/common/Valheim|-
+app|Visual Studio Build Tools 2022|17.14.34|Microsoft Corporation|20260617|C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools|-
+app|Warhammer 40,000: Rogue Trader|-|Owlcat Games|-|D:/SteamLibrary/steamapps/common/Warhammer 40,000 Rogue Trader|-
+app|Warhammer 40,000: Space Marine 2|-|Saber Interactive|-|D:/SteamLibrary/steamapps/common/Space Marine 2|-
+app|WinAppDeploy|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense Desktop - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense Desktop - en-us|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense IoT - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense IoT - en-us|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense Mobile - en-us|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense PPI - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense PPI - en-us|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense UAP - Other Languages|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|WinRT Intellisense UAP - en-us|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows 11 Installation Assistant|1.4.19041.5003|Microsoft Corporation|-|-|-
+app|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows App Certification Kit SupportedApiList x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Assessment and Deployment Kit|10.1.22621.5337|Microsoft Corporation|-|-|-
+app|Windows Deployment Customizations|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Deployment Image Servicing and Management - Headers and Libraries|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Deployment Image Servicing and Management Tools (DesktopEditions)|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Deployment Image Servicing and Management Tools (OnecoreUAP)|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Deployment Tools|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Deployment Tools Environment|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Desktop Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows IoT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows IoT Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Mobile Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Mobile Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows PC Health Check|3.6.2204.08001|Microsoft Corporation|20220425|-|-
+app|Windows SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK ARM64 Desktop Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK AddOn|10.1.0.0|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Headers arm64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Headers x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Headers x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Libs arm64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Libs x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Libs x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Tools arm64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Tools x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Desktop Tools x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK DirectX x64 Remote|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK EULA|10.1.26100.7705|Microsoft Corporations|20260617|-|-
+app|Windows SDK Facade Windows WinMD Versioned|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Modern Non-Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Modern Versioned Developer Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK OnecoreUap Headers arm64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK OnecoreUap Headers x86|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Redistributables|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK Signing Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Contracts|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps DirectX x86 Remote|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Headers|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Headers OnecoreUap|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Libs|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Metadata|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Apps Tools|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Software Development Kit - Windows 10.0.26100.7705|10.1.26100.7705|Microsoft Corporation|-|-|-
+app|Windows Subsystem for Linux|2.6.3.0|Microsoft Corporation|20260330|-|-
+app|Windows System Image Manager on amd64|10.1.22621.5337|Microsoft|20260908|-|-
+app|Windows Team Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|Windows Team Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|-|-
+app|vcpp_crt.redist.clickonce|14.44.35211|Microsoft Corporation|20260617|-|-
+app|vs_CoreEditorFonts|17.7.40001|Microsoft Corporation|20260617|-|-
+app|vs_FileTracker_Singleton|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_communitymsires|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_communitysharedmsi|17.14.36025|Microsoft Corporation|20260617|-|-
+app|vs_communityx64msi|17.14.36025|Microsoft Corporation|20260617|-|-
+app|vs_filehandler_amd64|17.14.36024|Microsoft Corporation|20260617|-|-
+app|vs_filehandler_x86|17.14.36024|Microsoft Corporation|20260617|-|-
+app|vs_githubprotocolhandlermsi|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_minshellinteropmsi|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_minshellinteropsharedmsi|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_minshellmsi|17.14.36301|Microsoft Corporation|20260617|-|-
+app|vs_minshellmsires|17.14.36015|Microsoft Corporation|20260617|-|-
+app|vs_minshellsharedmsi|17.14.36024|Microsoft Corporation|20260617|-|-
+app|vs_vswebprotocolselectormsi|17.14.36323|Microsoft Corporation|20260617|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=query name=Microsoft
@@ -243,8 +258,8 @@ app|Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169|Microsoft Corporation
 app|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|Microsoft Corporation
 app|Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549|Microsoft Corporation
 app|Microsoft 365 Apps for enterprise - en-us|16.0.19822.20114|Microsoft Corporation
-app|Microsoft Edge|152.0.4191.66|Microsoft Corporation
-app|Microsoft Edge WebView2 Runtime|152.0.4191.66|Microsoft Corporation
+app|Microsoft Edge|153.0.4234.48|Microsoft Corporation
+app|Microsoft Edge WebView2 Runtime|153.0.4234.48|Microsoft Corporation
 app|Microsoft GameInput|3.3.221.0|Microsoft Corporation
 app|Microsoft Teams Meeting Add-in for Microsoft Office|1.25.28902|Microsoft
 app|Microsoft Update Health Tools|5.72.0.0|Microsoft Corporation
@@ -289,16 +304,16 @@ app|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|8.0.28.36119|Microsoft Corp
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_per_user
-user_app|Alex|Signal 8.18.0|8.18.0|Signal Messenger, LLC|-
-user_app|Alex|Discord|1.0.9255|Discord Inc.|20212118
-user_app|Alex|NordPass|7.9.5|NordPass Team|-
-user_app|Alex|Inno Setup version 6.7.3|6.7.3|jrsoftware.org|20260714
-user_app|Alex|ninja|1.13.2|ninja-build|20260617
-user_app|Alex|Node.js (LTS)|24.16.0|Node.js Foundation|20260617
-user_app|Alex|Microsoft Visual Studio Code (User)|1.128.1|Microsoft Corporation|20260715
-user_app|Alex|Python 3.12.10 (64-bit)|3.12.10150.0|Python Software Foundation|-
-user_app|Alex|MSYS2|20260611|The MSYS2 Developers|Wed Jun 17 17:28:18 2026
-user_app|Alex|Paradox Launcher v2|1.0.0.0|Paradox Interactive|-
+user_app|jsmith|Signal 8.18.0|8.18.0|Signal Messenger, LLC|-
+user_app|jsmith|Discord|1.0.9255|Discord Inc.|20212118
+user_app|jsmith|NordPass|7.9.5|NordPass Team|-
+user_app|jsmith|Inno Setup version 6.7.3|6.7.3|jrsoftware.org|20260714
+user_app|jsmith|ninja|1.13.2|ninja-build|20260617
+user_app|jsmith|Node.js (LTS)|24.16.0|Node.js Foundation|20260617
+user_app|jsmith|Microsoft Visual Studio Code (User)|1.128.1|Microsoft Corporation|20260715
+user_app|jsmith|Python 3.12.10 (64-bit)|3.12.10150.0|Python Software Foundation|-
+user_app|jsmith|MSYS2|20260611|The MSYS2 Developers|Wed Jun 17 17:28:18 2026
+user_app|jsmith|Paradox Launcher v2|1.0.0.0|Paradox Interactive|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_inventory
@@ -306,9 +321,10 @@ inv|7-Zip 26.02 (x64)|26.02|Igor Pavlov||app|windows||||||
 inv|Age of Empires II: Definitive Edition||Forgotten Empires||app|windows||||||
 inv|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|Microsoft|20260617|app|windows||||||
 inv|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|Microsoft|20260617|app|windows||||||
+inv|BCD and Boot|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Baldur's Gate 3||Larian Studios||app|windows||||||
 inv|Battle.net||Blizzard Entertainment||app|windows||||||
-inv|CCleaner 7|7.10.1464.1889|Piriform||app|windows||||||
+inv|CCleaner 7|7.11.1522.1958|Piriform||app|windows||||||
 inv|CMake|4.3.3|Kitware|20260617|app|windows||||||
 inv|Cities: Skylines II||Colossal Order Ltd.||app|windows||||||
 inv|Crusader Kings III||Paradox Development Studio||app|windows||||||
@@ -325,9 +341,9 @@ inv|GitHub CLI|2.89.0|GitHub, Inc.|20260403|app|windows||||||
 inv|Google Chrome|149.0.7827.201|Google LLC|20260629|app|windows||||||
 inv|Google Update Helper|1.3.101.0|Google LLC|20211018|app|windows||||||
 inv|HELLDIVERS™ 2||Arrowhead Game Studios||app|windows||||||
-inv|Kits Configuration Installer|10.1.26100.7705|Microsoft|20260617|app|windows||||||
-inv|Logi Options+|2.6.944893|Logitech||app|windows||||||
-inv|Logi Plugin Service|6.4.0.3079|Logitech|20260717|app|windows||||||
+inv|Kits Configuration Installer|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Logi Options+|2.7.961922|Logitech||app|windows||||||
+inv|Logi Plugin Service|6.4.1.3246|Logitech|20260914|app|windows||||||
 inv|MSI Development Tools|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Magic: The Gathering Arena||Wizards of the Coast LLC||app|windows||||||
 inv|Manor Lords||Slavic Magic||app|windows||||||
@@ -344,8 +360,8 @@ inv|Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169|Microsoft Corporation|2023
 inv|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|Microsoft Corporation|20260619|app|windows||||||
 inv|Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549|Microsoft Corporation|20260622|app|windows||||||
 inv|Microsoft 365 Apps for enterprise - en-us|16.0.19822.20114|Microsoft Corporation||app|windows||||||
-inv|Microsoft Edge|152.0.4191.66|Microsoft Corporation|20260906|app|windows||||||
-inv|Microsoft Edge WebView2 Runtime|152.0.4191.66|Microsoft Corporation|20260906|app|windows||||||
+inv|Microsoft Edge|153.0.4234.48|Microsoft Corporation|20260921|app|windows||||||
+inv|Microsoft Edge WebView2 Runtime|153.0.4234.48|Microsoft Corporation|20260921|app|windows||||||
 inv|Microsoft GameInput|3.3.221.0|Microsoft Corporation|20260521|app|windows||||||
 inv|Microsoft Teams Meeting Add-in for Microsoft Office|1.25.28902|Microsoft|20260208|app|windows||||||
 inv|Microsoft Update Health Tools|5.72.0.0|Microsoft Corporation|20260201|app|windows||||||
@@ -413,7 +429,12 @@ inv|NordVPN|7.60.1.0|Nord Security|20260326|app|windows||||||
 inv|NordVPN network TAP|1.0.1|NordVPN|20211018|app|windows||||||
 inv|NordVPN network TUN|1.0.1|NordVPN|20211018|app|windows||||||
 inv|Notepad++ (64-bit x64)|8.9.6.4|Notepad++ Team||app|windows||||||
+inv|OA3Tool|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|OACheck|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|OATool|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|Microsoft Corporation|20260330|app|windows||||||
+inv|Oscdimg (DesktopEditions)|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Oscdimg (OnecoreUAP)|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|PUBG: BATTLEGROUNDS||PUBG Corporation||app|windows||||||
 inv|Paradox Launcher v2|2.4.0|Paradox Interactive|20241214|app|windows||||||
 inv|PlayStation® Accessories|2.0.0.13|Sony Interactive Entertainment Inc.|20241007|app|windows||||||
@@ -442,6 +463,7 @@ inv|Stellaris||Paradox Development Studio||app|windows||||||
 inv|Sunless Sea||Failbetter Games||app|windows||||||
 inv|Tabletop Simulator||Berserk Games||app|windows||||||
 inv|Tailscale|1.102.2|Tailscale Inc.|20260816|app|windows||||||
+inv|Toolkit Documentation|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Universal CRT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Universal CRT Headers Libraries and Sources|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Universal CRT Redistributable|10.0.26624|Microsoft Corporation|20260617|app|windows||||||
@@ -470,6 +492,13 @@ inv|Windows App Certification Kit Native Components|10.1.26100.7705|Microsoft Co
 inv|Windows App Certification Kit SupportedApiList x86|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows App Certification Kit x64|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
+inv|Windows Assessment and Deployment Kit|10.1.22621.5337|Microsoft Corporation||app|windows||||||
+inv|Windows Deployment Customizations|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Windows Deployment Image Servicing and Management - Headers and Libraries|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Windows Deployment Image Servicing and Management Tools (DesktopEditions)|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Windows Deployment Image Servicing and Management Tools (OnecoreUAP)|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Windows Deployment Tools|10.1.22621.5337|Microsoft|20260908|app|windows||||||
+inv|Windows Deployment Tools Environment|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows Desktop Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows IoT Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
@@ -511,6 +540,7 @@ inv|Windows SDK for Windows Store Apps Tools|10.1.26100.7705|Microsoft Corporati
 inv|Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows Software Development Kit - Windows 10.0.26100.7705|10.1.26100.7705|Microsoft Corporation||app|windows||||||
 inv|Windows Subsystem for Linux|2.6.3.0|Microsoft Corporation|20260330|app|windows||||||
+inv|Windows System Image Manager on amd64|10.1.22621.5337|Microsoft|20260908|app|windows||||||
 inv|Windows Team Extension SDK|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|Windows Team Extension SDK Contracts|10.1.26100.7705|Microsoft Corporation|20260617|app|windows||||||
 inv|vcpp_crt.redist.clickonce|14.44.35211|Microsoft Corporation|20260617|app|windows||||||

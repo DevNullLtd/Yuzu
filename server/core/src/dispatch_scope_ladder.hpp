@@ -356,6 +356,18 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry] { return registry.all_ids(); },
         [route_fallback](const std::vector<std::string>& candidates) {
             return route_fallback->prepare(candidates);
+        },
+        // HA WS-5: this is the PRIMARY production dispatch surface (MCP
+        // execute_instruction, workflows, scheduled dispatch, policy
+        // remediation, via wire_and_dispatch_confined) — governance Gate 3
+        // (architect, 2026-09-22) caught this site missing from the initial
+        // WS-5 diff, which would have silently killed confined_broadcast's
+        // unfiltered fast path here (an unset presence_widens is treated as
+        // "widens", forcing the slow filtered + prepare_route_fallback path
+        // on every unfiltered fleet-wide dispatch through this surface,
+        // even single-replica) had it shipped unwired.
+        [&registry](const std::vector<std::string>& candidates) {
+            return registry.has_remote_presence(candidates);
         }};
 
     // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`

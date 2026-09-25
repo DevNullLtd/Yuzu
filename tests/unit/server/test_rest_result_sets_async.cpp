@@ -19,6 +19,8 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "mcp_input_bounds.hpp" // kResultSetParentIdMaxLen / kResultSetNameMaxLen
+#include "mcp_retry.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -122,6 +124,13 @@ struct AsyncHarness {
     int dispatch_sent{2}; // agents "reached" by each dispatch
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
+    /// #4306 fold-in B: fires INSIDE the fake dispatch closure, between the
+    /// (already-passed) pre-dispatch quota check and create_pending's own
+    /// INSERT below it — the one point in the request lifecycle where a test
+    /// can inject a real Postgres fault that lands strictly AFTER a real
+    /// dispatch already fired. A test sets this to take a table lock on a
+    /// second raw connection.
+    std::function<void()> on_dispatch;
     /// CWE-862: these producers DISPATCH, so they must gate on
     /// Execution:Execute. Set false to model an authenticated caller who
     /// holds no such grant — the case that previously reached the fleet.
@@ -219,6 +228,8 @@ struct AsyncHarness {
                     {plugin, action, scope_expr, agent_ids, params, exec_id, caller.exec_visible});
                 if (dispatch_throws)
                     throw std::runtime_error("simulated dispatch failure");
+                if (on_dispatch)
+                    on_dispatch();
                 return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
             };
         }
@@ -245,7 +256,7 @@ struct AsyncHarness {
                             /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+                            /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr, exec_visible_fn,
@@ -651,6 +662,144 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     }
 }
 
+// #4734: the shared run_async engine had no length bound on parent_id at
+// all -- an oversized value was copied verbatim into the persisted
+// source_payload's scope_input_id (both producer routes' own
+// payload["scope_input_id"] = ... lines) with no cap, and the request
+// otherwise proceeded through resolve_owned_parent/dispatch. Both producers
+// funnel through the same run_async closure, so one fix covers both -
+// exercised here on both routes to pin that.
+TEST_CASE("#4734 — an oversized parent_id is refused before dispatch, on all three "
+          "affected routes",
+          "[pg][result_set][async][security][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    const std::string big(65, 'p');
+    const std::string exact(yuzu::server::mcp::kResultSetParentIdMaxLen, 'p');
+
+    SECTION("from-tar-query") {
+        AsyncHarness h(pool);
+        int status = 0;
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-tar-query -- exactly 64 bytes clears the length cap (boundary, "
+            "404s on ownership since it's a random unowned id, but never the "
+            "length-cap 400)") {
+        AsyncHarness h(pool);
+        int status = 0;
+        nlohmann::json body;
+        body["sql"] = "SELECT 1";
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-instruction-result") {
+        AsyncHarness h(pool);
+        auto iid = make_instruction(*h.instr);
+        int status = 0;
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-instruction-result -- exactly 64 bytes clears the length cap "
+            "(boundary)") {
+        AsyncHarness h(pool);
+        auto iid = make_instruction(*h.instr);
+        int status = 0;
+        nlohmann::json body;
+        body["instruction_id"] = iid;
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("from-inventory-query -- a fifth site the #4307 brief didn't name, found "
+            "while verifying the other four: this REST route had no parent_id length "
+            "bound at all (its MCP twin already checks it), so an oversized value was "
+            "copied verbatim into the persisted body[\"scope_input_id\"]") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = nlohmann::json::array(
+            {{{"plugin", "os_info"}, {"field", "platform"}, {"op", "=="}, {"value", "linux"}}});
+        body["parent_id"] = big;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("from-inventory-query -- exactly 64 bytes clears the length cap "
+            "(boundary, 404s on ownership)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = nlohmann::json::array(
+            {{{"plugin", "os_info"}, {"field", "platform"}, {"op", "=="}, {"value", "linux"}}});
+        body["parent_id"] = exact;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+}
+
+// #4734 alias-length regression: `parent_id` accepts either a canonical
+// `rs_...` id or a per-operator alias (the set's own `name`, valid up to
+// kResultSetNameMaxLen == 256 bytes). The new 64-byte kResultSetParentIdMaxLen
+// bound is checked BEFORE alias resolution is attempted, so a real,
+// previously-working alias between 65 and 256 bytes is now refused rather
+// than resolved. This is the actual behaviour-changing case the fix
+// introduces (see changelog.d and docs/user-manual/server-admin.md's vNEXT
+// entry) -- it had zero test coverage until now.
+TEST_CASE("from-tar-query: a real alias longer than 64 bytes is refused before "
+          "resolution is attempted (the #4734 alias-length regression)",
+          "[pg][result_set][async][tar][alias][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string long_alias(100, 'n');
+    h.seed_materialized(long_alias, {"a1"});
+
+    int status = 0;
+    nlohmann::json body;
+    body["sql"] = "SELECT 1";
+    body["parent_id"] = long_alias;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("parent_id must be at most 64 bytes") !=
+          std::string::npos);
+    REQUIRE(h.calls.empty());
+}
+
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
           "[pg][result_set][async][tar]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -980,10 +1129,282 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     // Re-dispatched the original SQL.
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].params.at("sql") == "SELECT 7");
+    // #4306: the still-live parent narrows the re-dispatch, not a broadcast.
+    REQUIRE(h.calls[0].scope_expr == "from_result_set:" + grandparent);
     // Sibling: new set's parent == original's parent (NOT the original).
     auto row = get_ok(*h.store, new_id);
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == grandparent);
+}
+
+TEST_CASE("re-eval: a genuinely parentless original still broadcasts (no regression)",
+          "[pg][result_set][async][reeval][4306]") {
+    // Positive control for the #4306 fix: an original that was NEVER narrowed
+    // at creation (no parent_id supplied, so no scope_input_id was ever
+    // persisted) must still broadcast on re-eval, unchanged. Omitting a
+    // parent_id is deliberately "the whole fleet" everywhere else on this
+    // route family; the parent-gone refusal must not widen to cover this case.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+    h.calls.clear();
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].scope_expr == "__all__");
+}
+
+TEST_CASE("re-eval: refused when the original's live parent was deleted, "
+          "never falls back to broadcast (#4306 target erasure)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.calls.clear();
+    h.audits.clear();
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched.
+    REQUIRE(h.calls.empty());
+    // No new pending/materialized row landed -- only the original remains.
+    std::string next;
+    auto rows = h.store->list_by_owner("operator-1", "", 50, next);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0].id == orig_id);
+    // Denied and audited with reason=parent_gone.
+    bool found = false;
+    for (auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos)
+            found = true;
+    CHECK(found);
+}
+
+TEST_CASE("re-eval: the parent-gone refusal surfaces a dropped audit row via "
+          "Sec-Audit-Failed, not silently",
+          "[pg][result_set][async][reeval][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-2", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE(h.store->delete_set(parent).has_value());
+
+    h.audit_ok = false; // models a dropped audit row (#1647 posture)
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(h.last_sec_audit_failed == "true");
+}
+
+TEST_CASE("re-eval: an alias-referenced parent is refused after deletion, never "
+          "silently re-resolved to a newer set bound to the same alias (#4306)",
+          "[pg][result_set][async][reeval][security][4306][alias]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("my-alias", {"a1"});
+    int status = 0;
+    // Original parented via the ALIAS, not the canonical rs_ id.
+    auto orig = h.post("/api/v1/result-sets/from-tar-query",
+                       R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
+    REQUIRE(status == 202);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    // The alias was pre-resolved to the canonical id at creation time.
+    REQUIRE(*get_ok(*h.store, orig_id)->parent_id == parent);
+    h.calls.clear();
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    // Re-bind the alias to a DIFFERENT, newer set. If the fix silently
+    // re-resolved scope_input_id as a fresh alias lookup, THIS is the set it
+    // would wrongly retarget to.
+    h.seed_materialized("my-alias", {"b1", "b2"});
+
+    int rstat = 0;
+    h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: refused when a GENERIC-create original's live parent was "
+          "deleted, never falls back to broadcast (#4306 follow-up: the "
+          "generic POST /api/v1/result-sets route persists scope_input_id too)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that
+    // scope_input_id was ONLY persisted by the two dedicated producer routes
+    // (from-tar-query / from-instruction-result). This route accepts an
+    // UNRESTRICTED source_kind/source_payload (no allowlist) plus a
+    // caller-supplied, owner-checked parent_id -- a row minted here with a
+    // crafted tar_query-shaped payload was indistinguishable at re-eval time
+    // from a genuinely parentless original once its parent was deleted, and
+    // would have silently broadcast to __all__ (the same #2500 shape #4306
+    // itself closed for the producer routes).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-generic", {"a1"});
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":{"sql":"SELECT 1"},)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Positive control: the generic route now records scope_input_id, the
+    // same as the dedicated producers do.
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    REQUIRE(sp.value("scope_input_id", "") == parent);
+
+    // Delete the parent -- exercise ON DELETE SET NULL rather than assume it.
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    CHECK(re["error"]["message"].get<std::string>().find("parent set no longer exists") !=
+          std::string::npos);
+    // THE assertion: nothing was ever dispatched -- before this fix, a
+    // generic-create original with no recorded scope_input_id would have
+    // fallen through to the genuinely-parentless branch and broadcast to
+    // __all__ here.
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: the parent-gone audit detail neutralises a delimiter-bearing "
+          "scope_input_id instead of forging adjacent k=v tokens (Gate 8 governance "
+          "follow-up, #4306)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // scope_input_id is the raw caller-supplied parent_id/alias at creation time
+    // and can be an arbitrary string (an alias, not just a canonical rs_ id).
+    // Craft one containing a space and '=' -- the exact shape that could forge
+    // an adjacent k=v token or split the audit line if not neutralised. This
+    // reaches the vulnerable branch WITHOUT ever supplying a real parent_id: the
+    // generic create route stores source_payload verbatim when parent_id is
+    // absent, so a caller can hand-craft scope_input_id directly.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query",)"
+                       R"("source_payload":{"sql":"SELECT 1","scope_input_id":)"
+                       R"("evil target_id=rs_other"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    h.audits.clear();
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    REQUIRE(h.calls.empty());
+
+    bool found = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "denied" &&
+            a.detail.find("reason=parent_gone") != std::string::npos) {
+            found = true;
+            // The raw delimiter-bearing value must NOT survive verbatim.
+            CHECK(a.detail.find("evil target_id=rs_other") == std::string::npos);
+            // The neutralised form (log_token: space and '=' -> '_') must be
+            // present exactly.
+            CHECK(a.detail.find("scope_input_id=evil_target_id_rs_other") !=
+                  std::string::npos);
+        }
+    }
+    REQUIRE(found);
+}
+
+TEST_CASE("re-eval: a non-object source_payload on a GENERIC-create original with a "
+          "real parent_id never reaches dispatch after the parent is deleted (#4306 "
+          "governance follow-up -- locks the is_object() joint invariant between the "
+          "create-time scope_input_id merge and the re-eval-time sql/instruction_id "
+          "extraction, currently a coincidence rather than a documented contract)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Both the create-time scope_input_id merge (generic create routes) and the
+    // re-eval-time sql/instruction_id extraction independently gate on
+    // source_payload.is_object() -- a caller supplying a non-object source_payload
+    // (a bare JSON string here) alongside a real, owned parent_id skips the
+    // scope_input_id merge at creation, but the SAME predicate also blocks the
+    // sql/instruction_id extraction at re-eval time, so the row 400s "no
+    // re-runnable source" before ever reaching dispatch. Currently safe only by
+    // this coincidence (Gate 4/5 governance) -- this test locks it down.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto parent = h.seed_materialized("narrow-target-nonobject", {"a1"});
+    int status = 0;
+    // source_payload is a bare JSON STRING, not an object.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"tar_query","source_payload":"not-an-object",)"
+                       R"("parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+
+    // Confirm the marker was NOT recorded (is_object() gate skipped the merge).
+    auto orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    auto sp = nlohmann::json::parse(orig_row->source_payload, nullptr, false);
+    REQUIRE_FALSE(sp.is_object());
+
+    REQUIRE(h.store->delete_set(parent).has_value());
+    orig_row = get_ok(*h.store, orig_id);
+    REQUIRE(orig_row.has_value());
+    REQUIRE_FALSE(orig_row->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    // Refused for lack of a re-runnable "sql" field (the coincidental gate),
+    // NOT the parent_gone message -- confirms it fell into the "genuinely
+    // parentless" branch (no scope_input_id found) and was THEN stopped by the
+    // separate sql-presence check, never reaching run_async.
+    CHECK(re["error"]["message"].get<std::string>().find("no SQL") != std::string::npos);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {
@@ -995,6 +1416,45 @@ TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][re
     int status = 0;
     h.post("/api/v1/result-sets/" + manual + "/re-eval", "", status);
     REQUIRE(status == 400);
+}
+
+TEST_CASE("re-eval: an unsupported source_kind is refused as RESULT_SET_REEVAL_UNSUPPORTED "
+          "even when a crafted scope_input_id would otherwise trip the parent-gone guard "
+          "(#4306 follow-up misclassification fix)",
+          "[pg][result_set][async][reeval][security][4306]") {
+    // Adversarial review (Kimi + Codex) of the #4306 fix found that a
+    // manual_curate (or any other unsupported-source_kind) row minted via
+    // the generic create route with a crafted
+    // source_payload={"scope_input_id":"..."} but NO real parent_id reached
+    // the scope_input_id / parent-gone guard BEFORE the source_kind check,
+    // so it was misclassified as RESULT_SET_BAD_REQUEST (reason=parent_gone)
+    // instead of the correct RESULT_SET_REEVAL_UNSUPPORTED. Both outcomes
+    // were already 400 refusals with nothing dispatched either way (not a
+    // dispatch-safety bug) -- this proves the reorder fixed the
+    // classification, not merely that both still 400.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    // No parent_id supplied at all -- source_payload's scope_input_id is
+    // entirely caller-crafted and points at an id that never existed, never
+    // exercising the real parent_id owner-check/merge path.
+    auto orig = h.post("/api/v1/result-sets",
+                       R"({"source_kind":"manual_curate",)"
+                       R"("source_payload":{"scope_input_id":"rs_deadbeefdeadbeef"}})",
+                       status);
+    REQUIRE(status == 201);
+    auto orig_id = orig["data"]["id"].get<std::string>();
+    REQUIRE_FALSE(get_ok(*h.store, orig_id)->parent_id.has_value());
+
+    int rstat = 0;
+    auto re = h.post("/api/v1/result-sets/" + orig_id + "/re-eval", "", rstat);
+    REQUIRE(rstat == 400);
+    const auto msg = re["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_REEVAL_UNSUPPORTED") != std::string::npos);
+    CHECK(msg.find("parent set no longer exists") == std::string::npos);
+    REQUIRE(h.calls.empty());
 }
 
 TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][reeval]") {
@@ -1765,6 +2225,37 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     CHECK(body["data"]["device_count"] == 1);
 }
 
+TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "
+          "(Gate 8 governance follow-up positive control, #4306)",
+          "[pg][result_set][async][inventory][reeval][security][4306]") {
+    // Gate 7's #4306 follow-up added this route's own scope_input_id merge
+    // (rest_api_v1.cpp, body["scope_input_id"] = pid) but shipped with no
+    // direct test proving the merge actually happens -- only the fact that
+    // re-eval's source_kind allowlist independently refuses kInventoryQuery
+    // was covered. This does not need a full re-eval assertion (re-eval never
+    // accepts inventory_query regardless) -- just confirm the stored row.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    auto parent = h.seed_materialized("inv-query-parent", {"a1"});
+
+    int status = 0;
+    auto body = h.post("/api/v1/result-sets/from-inventory-query",
+                       R"({"name":"child-of-parent","parent_id":")" + parent + R"("})",
+                       status);
+    REQUIRE(status == 201);
+    auto new_id = body["data"]["id"].get<std::string>();
+
+    auto row = get_ok(*h.store, new_id);
+    REQUIRE(row.has_value());
+    auto sp = nlohmann::json::parse(row->source_payload, nullptr, false);
+    REQUIRE(sp.is_object());
+    CHECK(sp.value("scope_input_id", "") == parent);
+}
+
 // #2437-class guard (C11/C12): a stored data_json row nesting past
 // kMcpMaxJsonDepth reaches evaluate_inventory() (inventory_eval.cpp) via this
 // exact route. json::parse handles very deep input fine, so without the
@@ -2386,6 +2877,90 @@ TEST_CASE("POST /api/v1/result-sets: an oversized source_kind is refused with 40
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
+// #4307 item 6: the generic create route's parent_id shape check used to be
+// `contains && is_string && !empty`, so a malformed/empty parent_id fell
+// through to the untargeted "no parent" arm and was silently accepted --
+// unlike the async producers above, this route never dispatches, so the
+// consequence is a lineage/UX defect (the caller believes the set is
+// parented and it silently isn't), not a dispatch-safety one -- no
+// yuzu_server_dispatch_target_rejected_total counter (that metric family is
+// reserved for the targeting-argument routes named in #2500).
+TEST_CASE("POST /api/v1/result-sets: a malformed or empty parent_id is refused with 400, "
+          "not silently treated as parentless",
+          "[pg][result_set][security][4307]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("numeric parent_id") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x","parent_id":123})", status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("empty-string parent_id") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x","parent_id":""})", status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("omitting parent_id still creates a parentless set (regression)") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x"})", status);
+        CHECK(status == 201);
+        CHECK(j.contains("data"));
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1);
+    }
+}
+
+// #4734: this route had no length bound on parent_id at all -- an oversized
+// value was copied verbatim into the persisted source_payload's
+// scope_input_id with no cap.
+TEST_CASE("POST /api/v1/result-sets: an oversized parent_id is refused with 400",
+          "[pg][result_set][security][4734]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("65 bytes is refused") {
+        AsyncHarness h(pool);
+        nlohmann::json body;
+        body["name"] = "x";
+        body["parent_id"] = std::string(65, 'p');
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") != std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("exactly 64 bytes clears the length cap (boundary, 404s on ownership "
+            "since it's a random unowned id, but never the length-cap 400)") {
+        AsyncHarness h(pool);
+        nlohmann::json body;
+        body["name"] = "x";
+        body["parent_id"] = std::string(yuzu::server::mcp::kResultSetParentIdMaxLen, 'p');
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        CHECK(status == 404);
+        CHECK(j["error"]["message"].get<std::string>().find(
+                  "parent_id must be at most 64 bytes") == std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -2617,4 +3192,308 @@ TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
             return a.action == "result_set.heal" && a.result == "success";
         });
     CHECK_FALSE(heal_success_audited);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4306 PR-B: findings 1 + 3 (+ #4307 finding 2) — a degraded ResultSetStore
+// read must fail closed (503/500), never silently read as "empty"/"under
+// quota" on a store the async producers dispatch real commands through.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("from-tar-query: a degraded quota pre-check fails closed BEFORE any dispatch — "
+          "nothing reaches an agent, the execution is cancelled, audit shows the failure "
+          "(#4306 finding 1)",
+          "[pg][result_set][async][tar][security][4306]") {
+    // No parent_id: a supplied parent_id would hit resolve_owned_parent's own
+    // DB read first and 503 there instead, before ever reaching the quota
+    // pre-check under test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    AsyncHarness h(short_lock_pool);
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 503);
+    REQUIRE(j.contains("error"));
+    const std::string msg = j["error"]["message"].get<std::string>();
+    CHECK(msg.find("could not verify the per-owner result-set quota") != std::string::npos);
+    CHECK(msg.find("nothing was dispatched") != std::string::npos);
+    // #4306/#4307 adversarial review (Kimi + Codex): REST's fail-closed 503
+    // dropped the retry hint the MCP twin carries for the identical fault
+    // (kMcpStoreFaultRetryMs) - REST was the outlier. Nothing was dispatched
+    // here, so this IS safe to retry.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
+
+    // The load-bearing assertion: dispatch never fired.
+    CHECK(h.calls.empty());
+
+    // yuzu_result_set_quota_rejected is untouched -- this is a store-fault
+    // refusal, not a quota rejection.
+    CHECK(h.metrics.counter("yuzu_result_set_quota_rejected").value() == 0.0);
+
+    bool saw_failure_audit = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("quota_check_degraded") != std::string::npos)
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
+
+    // The execution row was cancelled, not left running forever. Extract the
+    // execution_id the handler minted from the error message.
+    auto pos = msg.find("execution_id=");
+    REQUIRE(pos != std::string::npos);
+    const std::string exec_id = msg.substr(pos + std::string("execution_id=").size());
+    auto exec = h.tracker->get_execution(exec_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // No pending row was ever created.
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("from-tar-query: a DbError from create_pending AFTER a successful dispatch maps "
+          "to 500, not 400 — a server fault after real agents were already reached is not a "
+          "client error (#4306 fold-in B)",
+          "[pg][result_set][async][tar][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    // Short lock_timeout_ms (established technique) so the deliberately-held
+    // lock below fails the blocked query deterministically and fast, rather
+    // than waiting out the default 10s lock_timeout.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    // Take the table lock INSIDE the fake dispatch closure — strictly AFTER
+    // the (already-passed) quota pre-check and BEFORE create_pending's own
+    // INSERT, so the pre-check succeeds and dispatch genuinely fires before
+    // the fault lands.
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.on_dispatch = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE result_set_store.result_sets IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query",
+                    R"({"sql":"SELECT 1","name":"foldinb"})", status);
+    REQUIRE(status == 500);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "result-set store unavailable after dispatch already succeeded") !=
+          std::string::npos);
+    // gov-4306-S4/S9: distinct token from the pre-dispatch quota-check-
+    // degraded 503 (RESULT_SET_STORE_UNAVAILABLE). An agentic caller
+    // pattern-matching the message text alone must not conflate "safe to
+    // retry" with "already dispatched, never re-send". Also carries
+    // execution_id, matching MCP's identical branch.
+    CHECK(j["error"]["message"].get<std::string>().starts_with(
+        "RESULT_SET_STORE_FAULT_AFTER_DISPATCH:"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "execution_id=" + h.calls[0].execution_id) != std::string::npos);
+    // #4306/#4307 adversarial review: this branch is DELIBERATELY left
+    // non-retryable (unlike the five 503 pre-dispatch branches above/below) -
+    // a real dispatch already succeeded here, so a positive retry hint would
+    // tell a caller to re-send a command that already reached the fleet.
+    // Regression-lock the null.
+    REQUIRE(j["error"].contains("retry_after_ms"));
+    CHECK(j["error"]["retry_after_ms"].is_null());
+
+    // Dispatch DID fire -- the whole point of this branch: create_pending
+    // failed AFTER a real command already reached agents.
+    REQUIRE(h.calls.size() == 1);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // The execution was cancelled, not left running forever.
+    auto exec = h.tracker->get_execution(h.calls[0].execution_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+
+    // No pending row was ever persisted (the whole point of this branch).
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("from-inventory-query: a degraded members-table read on the parent-narrowing loop "
+          "refuses rather than materialising an unnarrowed result set (#4306 finding 3)",
+          "[pg][result_set][async][inventory][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    auto parent = h.seed_materialized("members-parent", {"a1", "a2"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-inventory-query",
+                    R"({"name":"x","parent_id":")" + parent + R"("})", status);
+    REQUIRE(status == 503);
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "could not read the parent set's members") != std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
+
+    bool saw_failure_audit = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("store_degraded") != std::string::npos)
+            saw_failure_audit = true;
+    CHECK(saw_failure_audit);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // No new result set was created -- only the seeded parent exists.
+    std::string next;
+    auto sets = h.store->list_by_owner("operator-1", "", 50, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].id == parent);
+}
+
+TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 with an "
+          "empty array indistinguishable from a genuinely empty owner (#4306/#4307 "
+          "finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    h.seed_materialized("has-one", {"a"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = h.sink.Get("/api/v1/result-sets");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find("could not list result sets") !=
+          std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read refuses "
+          "(503), never a 200 with an empty array (#4306 finding 3 / #4307 finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto id = h.seed_materialized("has-members", {"a", "b"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // load_owned's own get() reads `result_sets`, NOT `result_set_members`, so
+    // it passes under this lock -- the members read itself is what's under
+    // test here (distinct from the list/lineage tests, which lock
+    // result_sets and so exercise load_owned's PRE-EXISTING gate instead;
+    // see the lineage test below for the discrimination caveat).
+    auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["message"].get<std::string>().find("could not read result-set members") !=
+          std::string::npos);
+    // #4306/#4307 adversarial review: retry hint parity with the MCP twin.
+    REQUIRE(j["error"]["retry_after_ms"].is_number());
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == mcp::kMcpStoreFaultRetryMs);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read refuses (503) "
+          "-- NOTE: this exercises load_owned's PRE-EXISTING ownership-check gate (get() also "
+          "reads result_sets), not lineage_checked specifically, since both hit the same "
+          "table under a table-wide lock and load_owned runs first. lineage_checked's own "
+          "DbError branch is covered directly in test_result_set_store.cpp; this test proves "
+          "the ROUTE as a whole stays fail-closed end to end (#4306 finding 3 / #4307 "
+          "finding 2)",
+          "[pg][result_set][security][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto id = h.seed_materialized("has-lineage", {"a"});
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto res = h.sink.Get("/api/v1/result-sets/" + id + "/lineage");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("error"));
+    // load_owned's own message, not lineage_checked's -- see the TEST_CASE
+    // name for why.
+    CHECK(j["error"]["message"].get<std::string>().find(
+              "could not verify result-set ownership") != std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
 }

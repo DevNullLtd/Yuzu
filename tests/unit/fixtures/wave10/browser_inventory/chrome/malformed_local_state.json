@@ -1,0 +1,6 @@
+{
+  "_provenance": "RECONSTRUCTION -- Alex sign-off 2026-09-21 (run-context.md Phase-0 item 2); a Local State file truncated mid-object to exercise profiles_from_local_state()'s parse-failed path. Not a real capture, not a real parse error observed in the wild -- synthesized to hit nlohmann::json::parse throwing on truncated input.
+  "profile": {
+    "info_cache": {
+      "Default": {
+        "name": "Person 1"

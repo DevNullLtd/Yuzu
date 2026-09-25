@@ -6,9 +6,14 @@
  * Watches a target file in REAL TIME via ReadDirectoryChangesW on its parent
  * directory (kernel-notified, NO polling — unlike the Trigger Engine's mtime
  * poll). Resilient like RegistryGuard (C1/C2): the watch is live from arm until
- * the rule is disabled, survives the parent directory being deleted and
- * recreated (a nearest-existing-ancestor watch catches the recreation), and
- * reconciles the target's state from scratch on every wake.
+ * the rule is disabled, and reconciles the target's state from scratch on every
+ * wake. It survives the armed directory (the target's parent, or its nearest
+ * existing ancestor) being deleted and recreated anywhere in that ancestor
+ * chain (a nearest-existing-ancestor watch catches the recreation). A rename
+ * or move of the armed directory ITSELF is caught separately, via a watch on
+ * its own parent — one level up only: a rename or move of that parent, or of
+ * anything above it, is not itself detected in real time (picked up once the
+ * target's content next changes).
  *
  * B1 implements the `file-exists` assertion: drift when the file's presence
  * (exists / absent) differs from the rule's expected state — i.e. realtime
@@ -28,6 +33,7 @@
 #include <yuzu/agent/guard.hpp>   // IGuard, GuardDrift, GuardSink
 
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -66,6 +72,15 @@ public:
         /// Event/sink debounce window (ms) — collapses rapid drift events into a
         /// count (shared convention with RegistryGuard). 0 = emit every drift.
         std::uint64_t event_debounce_ms{1000};
+        /// Cadence at which the disabled-parent-watch "guard.unhealthy" report is
+        /// re-sent while the guard stays disabled — a lost-edge backstop mirroring
+        /// the Spark runtime's `errored_refresh_ms` (default 300s; see
+        /// docs/spark-legacy-delta-registry.md D1). The legacy sink drops events on
+        /// disconnect with no retry (agent.cpp), so a single edge-only report can be
+        /// silently lost; the refresh corrects a stale-green census on the next tick
+        /// without depending on that one report's delivery. 0 = edge-only, no
+        /// refresh. No filesystem work happens on a refresh tick.
+        std::uint64_t parent_unhealthy_refresh_ms{300'000};
         /// #4021: fired EXACTLY ONCE, on the run() worker thread, the moment
         /// `expected_hash.empty() && !baseline_set` captures a fresh baseline (never
         /// again for this FileGuard instance — mirrors the source guard above's own
@@ -110,6 +125,21 @@ public:
 
     const std::string& rule_id() const override { return cfg_.rule_id; }
 
+    /// Test-only. When set, forces the parent-directory watch's teardown (whether a
+    /// mid-run rebuild or run()'s own exit) to treat an otherwise-confirmed cancel
+    /// drain as UNCONFIRMED — i.e. deterministically exercises the abandon-rather-
+    /// than-free path (sec-1) without depending on a real, timing-dependent delayed
+    /// kernel completion, which cannot be forced on local NTFS from user mode. Never
+    /// overrides a genuinely-unconfirmed drain the other way. No-op when unset
+    /// (default; production is unaffected). Set before start(). CONTRACT: invoked
+    /// inside a noexcept teardown path with no try/catch around the call — the hook
+    /// must not throw, or the process terminates.
+    void set_parent_drain_fail_hook_for_test(std::function<bool()> hook) {
+        assert((!hook || !thread_.joinable()) &&
+               "set_parent_drain_fail_hook_for_test: arm before start()");
+        parent_drain_fail_hook_for_test_ = std::move(hook);
+    }
+
 private:
     void run();
 
@@ -118,6 +148,7 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
     void* stop_event_{nullptr}; ///< HANDLE (void* keeps windows.h out of this header)
+    std::function<bool()> parent_drain_fail_hook_for_test_; ///< test seam; see setter doc
 };
 
 } // namespace yuzu::agent

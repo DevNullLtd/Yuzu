@@ -4,8 +4,8 @@
 /// CORE-ONLY. The store-backed factory for the DEX app-perf-over-time seam
 /// (ADR-0031 WS-A4, mirroring `dex_api_local.hpp` / `verify_api_local.hpp`).
 /// Included by server.cpp (the REST + MCP consumer wiring is already live —
-/// see `dex_perf_api.hpp`'s "Consumer rewire status" note; only the dashboard
-/// is deferred, tracked #4626), the impl (dex_perf_api.cpp), and the parity
+/// see `dex_perf_api.hpp`'s "Consumer rewire status" note; the dashboard
+/// rewire completed too, #4626), the impl (dex_perf_api.cpp), and the parity
 /// test — NEVER by a presentation/renderer/route TU; the
 /// seam-closure lint forbids `*_api_local.hpp` in a family's enforced
 /// presentation TUs so the abstract/local boundary is enforced, not

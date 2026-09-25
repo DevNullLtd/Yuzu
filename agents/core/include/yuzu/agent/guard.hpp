@@ -51,6 +51,21 @@ struct GuardDrift {
     /// state stays silent (network-kindness / NFR). Remediation fields stay default
     /// (a compliant edge is never a remediation). Slice B.
     bool compliant{false};
+
+    /// Health report (NOT a compliance verdict). Unhealthy = the guard is still
+    /// running but one detection channel has permanently failed, so it can no
+    /// longer vouch for the watched state end to end. The engine maps it to
+    /// event_type "guard.unhealthy" (server census: errored) and IGNORES every
+    /// compliance field on the same report — a health report never mints
+    /// drift.detected or guard.compliant. health_detail travels as detail_json
+    /// {"detail": ...}, byte-identical to the Spark health stream
+    /// (guardian_spark_send.cpp). No Healthy enumerator yet: no legacy producer
+    /// emits a recovery today — a fresh guard instance's first verdict clears the
+    /// census (see docs/spark-legacy-delta-registry.md D11 for why a bare
+    /// guard.healthy alone could not).
+    enum class Health : std::uint8_t { None, Unhealthy };
+    Health health{Health::None};
+    std::string health_detail;
 };
 
 /// Sink a guard calls on each (debounced) drift detection.

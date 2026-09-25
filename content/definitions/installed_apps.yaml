@@ -6,6 +6,12 @@
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
 ##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
 ##   macOS:   system_profiler SPApplicationsDataType
+##
+## The `list` action carries six columns: name, version, publisher,
+## install_date, install_location, bundle_id. install_location is the
+## Uninstall-key InstallLocation on Windows and the location system_profiler
+## reports (normally the .app bundle) on macOS ("-" on Linux by design);
+## bundle_id is the macOS CFBundleIdentifier ("-" elsewhere).
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,11 +19,13 @@ kind: InstructionDefinition
 metadata:
   id: crossplatform.software.inventory
   displayName: List Installed Applications
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Enumerates all installed applications on the endpoint. On Windows,
     reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and
-    HKCU), deduplicates by name+version, and skips system components.
+    HKCU), and deduplicates by name+version (the `SystemComponent` filter
+    is inert today -- the value is a REG_DWORD the string reader rejects --
+    and is a tracked follow-up).
     The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a
     logged-in user's: the agent runs as a system-context service
     (LocalSystem today, see #1442), so HKCU resolves to that account's
@@ -26,7 +34,17 @@ metadata:
     action (list_per_user) that this one never invokes.
     On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
     On macOS, queries system_profiler for GUI applications. Returns
-    application name, version, publisher, and install date.
+    application name, version, publisher, install date, install location,
+    and (macOS) bundle identifier. Rows are seven escape-aware tokens (every
+    field: `\` to `/`, `|` to `\|`, CR/LF to a space, over 4 KiB cut); split
+    on an unescaped `|`. The dashboard results table shows this definition's
+    rows as key/value (app plus one remainder cell); read the six columns
+    positionally from the raw output on the REST/MCP response routes. Agents
+    older than plugin 1.2.0 emit five tokens and do NOT escape `|` in name,
+    version, publisher or install date, so such a row can split into any
+    count: accept a row only when it has exactly 5 or exactly 7 tokens under
+    the escape-aware split, reject any other count, and read the sixth and
+    seventh columns only for agents known to run plugin 1.2.0 or later.
   tags: [software, inventory, compliance]
 
 spec:
@@ -64,6 +82,16 @@ spec:
         description: "Install date in the OS's native format (Windows registry InstallDate, rpm's formatted install time); \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
         example: "20260617"
         platforms: [windows, darwin]
+      - name: install_location
+        type: string
+        description: "Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\\Vendor is NOT expanded — or \"-\" when the value is absent (many MSI-registered products, SDK/runtime component packages and NSIS/portable installers write none — 182 of 241 rows on one developer workstation), longer than 511 characters, not a string type, or a per-user install (this action is machine scope). Where the same product is registered in more than one hive the smallest populated value wins. Unlike windows.software.msi.list, separators are \"/\": backslashes are emitted as \"/\" (a UNC path reads //srv/share; not reversible), so C:\\Program Files\\7-Zip\\ reads C:/Program Files/7-Zip/. macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\". The value is as reported by the OS: untrusted and non-canonical."
+        example: "C:/Program Files/7-Zip/"
+        platforms: [windows, darwin]
+      - name: bundle_id
+        type: string
+        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows beyond the per-run enrichment cap (5000 applications / 120 s), which is not reported as degraded. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
+        example: "com.apple.ActivityMonitor"
+        platforms: [darwin]
     aggregation:
       groupBy:
         - name
@@ -211,7 +239,7 @@ spec:
       - name: username
         type: string
         description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae. Values: profile name, "system", "brew", or "-".'
-        example: "Alex"
+        example: "jsmith"
         platforms: [windows, linux, darwin]
       - name: name
         type: string

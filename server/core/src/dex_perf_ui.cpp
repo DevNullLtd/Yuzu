@@ -11,8 +11,17 @@
 /// absent metrics render "—" (never 0), aggregates carry their reporting
 /// population, sub-floor cohorts render "n too small", untagged devices are
 /// an explicit residual row.
+///
+/// #4626 Concern B: includes the PURE `dex_perf_model.hpp` directly rather
+/// than the httplib-coupled `dex_routes.hpp` (which still transitively pulls
+/// store headers via its own `#include "dex_read_builders.hpp"`; the former
+/// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` chain was severed in
+/// #4626). This TU's include-closure store-freedom is enforced by
+/// `scripts/ci/check-seam-closure.py`'s `dex_perf` family — a header-closure
+/// check over include basenames; it does not scan this file's text for store
+/// type names.
 
-#include "dex_routes.hpp"
+#include "dex_perf_model.hpp"
 
 #include "web_utils.hpp"
 

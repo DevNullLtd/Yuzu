@@ -230,4 +230,21 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
                                                    const std::optional<std::string>& cohort_filter,
                                                    int limit);
 
+// ── F2a PR2: device drill perf extensions (relocated from dex_routes.hpp,
+//    #4626 Concern B — dex_perf_ui.cpp needs this pure struct without pulling
+//    in the httplib-coupled route header) ──────────────────────────────────
+
+/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
+/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
+struct DexProcPerfRow {
+    std::string name; ///< image name — agent bytes, HTML-escape at render
+    std::int64_t samples{0};
+    std::int64_t instances_max{0};
+    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
+    double cpu_max{0.0};
+    double ws_avg_bytes{0.0};
+    double ws_max_bytes{0.0};
+    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
+};
+
 } // namespace yuzu::server

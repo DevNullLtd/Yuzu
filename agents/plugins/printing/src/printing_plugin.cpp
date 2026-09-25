@@ -1,5 +1,7 @@
 /**
- * printing_plugin.cpp — printer and print-job inventory.
+ * printing_plugin.cpp — printer/job inventory plus one narrowly-scoped
+ * `clear_queue` mutation (Destructive/Irreversible — cancelling a job has no
+ * compensating Yuzu dispatch; see plugin_action_catalogue_printing.hpp).
  *
  * Actions:
  *   "printers"    — one row per printer: name, state (idle/processing/
@@ -10,11 +12,20 @@
  *                    name/title — see printing_parsers.hpp's file banner for
  *                    the retention posture), status, submitted_at (ISO-8601
  *                    UTC), size in bytes.
- *
- * Read-only: this file contains no mutating action. A single narrowly-scoped
- * `clear_queue` cancellation (Destructive/Irreversible) lands in a focused
- * follow-up PR on top of this one, matching this workstream's
- * read-only-then-destructive split.
+ *   "clear_queue" — cancels EXACTLY ONE job (`printer` + `job_id`, both
+ *                   required) via SetJobW(JOB_CONTROL_CANCEL) on Windows or
+ *                   an IPP Cancel-Job over the CUPS Unix domain socket on
+ *                   macOS/Linux. This file contains NO whole-queue-clearing
+ *                   code path of any kind: no repeated per-job cancel loop,
+ *                   no every-job control code, no "act on every job"
+ *                   selector on the Cancel-Job request — one Cancel-Job call,
+ *                   one job id, every time. On macOS/Linux the named printer
+ *                   is BOUND to the job first: cupsd's Cancel-Job looks a job
+ *                   up by id alone and ignores the printer, so a Get-Jobs of
+ *                   that printer's not-completed jobs must list the id on
+ *                   that printer before the Cancel-Job is sent
+ *                   (run_clear_queue in printing_parsers.hpp). Windows binds
+ *                   it in the spooler.
  *
  * No libcups, no vcpkg cups entry (verified absent from vcpkg.json) — the
  * IPP codec (printing_ipp.hpp) is a from-scratch minimal RFC 8010 encoder/
@@ -24,9 +35,44 @@
  * fixed local socket path or `localhost:631`, never an operator-supplied
  * URL.
  *
- * Windows: EnumPrintersW/EnumJobsW/OpenPrinterW/GetJobW (winspool.h).
- * `kReadDesiredAccess` below is RECONCILED against P93-2's the-rig
- * measurement (both admin and SYSTEM, against `Microsoft Print to PDF`).
+ * AUTHORIZATION (macOS) — measured vs. unmeasured, stated explicitly so
+ * neither gets overstated:
+ *   - MEASURED: /etc/cups/cupsd.conf:88-90 `<Limit Cancel-Job
+ *     CUPS-Authenticate-Job> Require user @OWNER
+ *     @AUTHKEY(system.print.operator) @admin @lpadmin`, no `@SYSTEM`.
+ *     cupsd consults the Unix-domain-socket peer's credentials ONLY when
+ *     the request carries header `Authorization: PeerCred <username>` —
+ *     hence `clear_queue` sends BOTH
+ *     `requesting-user-name=<getpwuid(geteuid())->pw_name>` in the IPP
+ *     request body AND that same header, over the Unix socket ONLY. No
+ *     socket -> refused, `<os>:cups:socket_unavailable`, never a TCP
+ *     fallback for this action (TCP `localhost:631` is used for READ
+ *     actions only, and only when no socket is found).
+ *   - MEASURED: cupsd accepts the header and returns a normal IPP response
+ *     with it present — real capture
+ *     tests/unit/fixtures/wave9/printing/macos/
+ *     real_cancel_job_not_found_peercred.ipp is byte-identical to its
+ *     without-header sibling real_cancel_job_not_found.ipp, proving the
+ *     header does not disturb request framing or the IPP response.
+ *   - EXPLICITLY UNMEASURED: whether the header changes the authorisation
+ *     *outcome* for a job the daemon identity does not own. Both real
+ *     captures above target a job id that does not exist, so both
+ *     short-circuit at not-found (0x0406) before cupsd's Cancel-Job policy
+ *     is ever evaluated — this open question is closed only by a
+ *     privileged `capture.sh --phase-b` run (an owner-mismatch cancel
+ *     against a real job) or by I93-7's Debian/Ubuntu cupsd container
+ *     capture. No sentence here may resolve it in either direction until
+ *     one of those exists. No identity-mismatch control is possible on a
+ *     stock macOS host at all — every local account is a print operator
+ *     via `_lpoperator`'s nested groups — so even Phase B cannot supply
+ *     the identity-refusal half of that control; only the Linux container
+ *     can.
+ *
+ * Windows: EnumPrintersW/EnumJobsW/OpenPrinterW/GetJobW/SetJobW
+ * (winspool.h). `kReadDesiredAccess`/`kCancelDesiredAccess` below are
+ * RECONCILED against P93-2's the-rig measurement (both admin and SYSTEM,
+ * against `Microsoft Print to PDF`) — see
+ * tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
  */
 
 #include <yuzu/plugin.hpp>
@@ -64,6 +110,8 @@
 #else
 #include <httplib.h>
 
+#include <cstdio>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -81,7 +129,7 @@ uint32_t next_request_id() {
 #ifdef _WIN32
 
 // Used to open the handle for every read (EnumJobsW/GetJobW). Confirmed by
-// P93-2's the-rig measurement.
+// P93-2's the-rig measurement (admin and SYSTEM, both cancel paths below).
 constexpr DWORD kReadDesiredAccess = PRINTER_ACCESS_USE;
 
 // Round-3 review Should-fix: failure tokens for the Windows leg, mirroring
@@ -93,9 +141,10 @@ constexpr std::string_view kTokEnumPrintersFailed = "windows:winspool:enum_print
 constexpr std::string_view kTokJobEnumFailed = "windows:winspool:enum_jobs_failed";
 // Round-4 review minor: a denied/failed OpenPrinterW is a different failure
 // point than EnumJobsW itself failing -- folding both under the enum token
-// mislabels the actual failing call for triage. Used only when every
+// mislabels the actual failing call for triage. do_jobs uses it when every
 // per-printer job-read problem in one dispatch was an open failure, never an
-// enum one (see do_jobs's token-selection comment).
+// enum one (see do_jobs's token-selection comment); do_clear_queue uses it
+// for an open failure that is neither not-found nor access-denied.
 constexpr std::string_view kTokOpenPrinterFailed = "windows:winspool:open_printer_failed";
 
 // Round-3 review Should-fix: EnumPrintersW/EnumJobsW are plain synchronous
@@ -145,6 +194,20 @@ auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
     return yuzu::shared::bounded_call(kSpoolerCallTimeout, std::move(fn));
 }
 
+// SetJobW(JOB_CONTROL_CANCEL) through a PRINTER_ACCESS_USE-only handle
+// cancelled a real job on `Microsoft Print to PDF` under BOTH
+// BUILTIN\Administrators and NT AUTHORITY\SYSTEM (GetLastError()==0) -- see
+// tests/unit/fixtures/wave9/printing/windows/setjob_cancel.txt.provenance.txt.
+// Both measured tokens are already elevated, so the outcome for a
+// least-privileged identity cancelling ANY job (its own or another user's)
+// was NOT measured (docs/agent-privilege-model.md); nor is it measured
+// whether job access is judged against the caller's token or the handle's
+// access mask. "USE is enough" must not be read as "no administer right is
+// ever needed". Kept narrower than
+// PRINTER_ALL_ACCESS/JOB_ACCESS_ADMINISTER on purpose: clear_queue cancels
+// exactly one job id and needs no broader grant than that.
+constexpr DWORD kCancelDesiredAccess = PRINTER_ACCESS_USE;
+
 // Move-only RAII owner for an HPRINTER (PH-015-style ownership rule, same
 // shape as power_health's DirHandle / the repo's other Scoped* wrappers):
 // takes ownership only once OpenPrinterW has actually succeeded, and
@@ -176,12 +239,23 @@ private:
     HANDLE h_ = nullptr;
 };
 
-[[nodiscard]] std::optional<PrinterHandle> open_printer(const std::wstring& name, DWORD access) {
+// `last_error`, when non-null, receives GetLastError() read immediately after
+// a failed OpenPrinterW -- before anything else can overwrite it -- so a
+// caller can tell access-denied from a nonexistent printer. It is a plain
+// caller-stack pointer written synchronously: do NOT run this under
+// bounded_call_tracked (an abandoned worker would write into a dead frame).
+// A TRUE return with a null handle is not known to occur; if it did, the
+// code read here would be stale and meaningless.
+[[nodiscard]] std::optional<PrinterHandle> open_printer(const std::wstring& name, DWORD access,
+                                                         DWORD* last_error = nullptr) {
     PRINTER_DEFAULTSW defaults{};
     defaults.DesiredAccess = access;
     HANDLE raw = nullptr;
-    if (!OpenPrinterW(const_cast<LPWSTR>(name.c_str()), &raw, &defaults) || raw == nullptr)
+    if (!OpenPrinterW(const_cast<LPWSTR>(name.c_str()), &raw, &defaults) || raw == nullptr) {
+        if (last_error != nullptr)
+            *last_error = GetLastError();
         return std::nullopt;
+    }
     return PrinterHandle{raw};
 }
 
@@ -477,6 +551,139 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     return 0;
 }
 
+// Round-3/4 review bounded enum_printers_raw() (a network-reachable-server
+// hang risk, PRINTER_ENUM_CONNECTIONS) but deliberately left enum_jobs_raw()
+// unbounded -- see that function's own comment: it is handed a live HANDLE
+// the CALLER owns and closes on return, and bounded_call()'s own documented
+// contract (bounded_wait.hpp) says a caller holding an OS handle across a
+// timeout "races a live call and it has to be leaked". open_printer/GetJobW/
+// SetJobW below are in exactly that same shape -- all three run against
+// `handle`, which PrinterHandle's destructor closes the moment this function
+// returns -- so they follow enum_jobs_raw's precedent and stay unbounded on
+// purpose, not by oversight. Wrapping them in bounded_call_tracked() would
+// reintroduce the exact handle-close race that precedent exists to avoid.
+int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
+    const std::string printer{params.get("printer")};
+    const std::string job_id_str{params.get("job_id")};
+
+    if (printer.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "missing required param 'printer'");
+        ctx.write_output(format_clear_queue_row("", 0, "error", "missing_printer"));
+        return 1;
+    }
+    const auto job_id = parse_job_id(job_id_str);
+    if (!job_id) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "invalid or missing 'job_id'");
+        ctx.write_output(format_clear_queue_row(printer_name_is_valid_windows(printer) ? printer : "-", 0, "error",
+                                                 "invalid_job_id"));
+        return 1;
+    }
+    // OpenPrinterW gives `,` special meaning (address syntaxes such as `,XcvPort ...`,
+    // `Printer, Job N`, `,LocalPrintServer`) and a Windows printer name cannot contain
+    // one, so such a name is never a real printer: refuse it, do not open it. (On real
+    // Windows, with this agent's PRINTER_ACCESS_USE, only `,XcvMonitor Local Port` was
+    // recognised, with error 5; this is hardening, not a closed hole.)
+    if (!printer_name_is_valid_windows(printer)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "invalid printer name");
+        ctx.write_output(format_clear_queue_row("-", *job_id, "error", "invalid_printer"));
+        return 1;
+    }
+
+    const std::wstring wprinter = yuzu::win::to_wide(printer);
+
+    DWORD open_error = 0;
+    auto handle = open_printer(wprinter, kCancelDesiredAccess, &open_error);
+    if (!handle) {
+        const OpenPrinterFailure failure = classify_open_printer_error(static_cast<uint32_t>(open_error));
+        if (failure == OpenPrinterFailure::refused) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                                   "OpenPrinterW: access denied");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "refused", "windows:winspool:access_denied"));
+            return 1;
+        }
+        if (failure == OpenPrinterFailure::not_found) {
+            // 1801 is definitive for a plain local name, but OpenPrinterW returns
+            // the SAME 1801 for a UNC name whose server is unreachable (observed
+            // on real Windows). A name with a path separator or colon may name a
+            // remote server (UNC, URL forms), so it cannot claim the printer is
+            // gone: report it, but PARTIAL.
+            const bool plain = printer_name_is_plain_local(printer);
+            ctx.set_result_status(
+                YUZU_RESULT_STATUS_UNAVAILABLE,
+                plain ? YUZU_RESULT_COMPLETENESS_FULL : YUZU_RESULT_COMPLETENESS_PARTIAL,
+                plain ? "OpenPrinterW: printer not found"
+                      : "OpenPrinterW: printer not found (name may be remote; the server may be unreachable)");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:printer_not_found"));
+            return 1;
+        }
+        // Every other failure (spooler stopped, RPC unavailable, ...): always
+        // reported, so a future OpenPrinterFailure enumerator cannot fall out
+        // of a switch silently on MSVC (where -Wswitch is not enabled).
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("OpenPrinterW failed (Win32 error {})", open_error));
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", kTokOpenPrinterFailed));
+        return 1;
+    }
+
+    // GetJobW confirms the job exists before attempting SetJobW.
+    DWORD needed = 0;
+    GetJobW(handle->get(), static_cast<DWORD>(*job_id), 1, nullptr, 0, &needed);
+    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+        // PARTIAL, not FULL: 87 for a nonexistent job was measured only under
+        // elevated identities, and what GetJobW returns for an EXISTING job the
+        // caller may not read is unmeasured -- a FULL not_found could hide a
+        // denial. Upgrade only once a non-elevated identity has been measured.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "GetJobW: job not found");
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:job_not_found"));
+        return 1;
+    }
+
+    // Microsoft documents JOB_CONTROL_CANCEL as "do not use" in favour of
+    // JOB_CONTROL_DELETE; cancel was nonetheless measured working on real
+    // hardware (setjob_cancel.txt.provenance.txt), which is what this leg is
+    // reconciled against.
+    if (!SetJobW(handle->get(), static_cast<DWORD>(*job_id), 0, nullptr, JOB_CONTROL_CANCEL)) {
+        const DWORD set_error = GetLastError();
+        if (set_error == ERROR_ACCESS_DENIED) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                                   "SetJobW: access denied");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "refused", "windows:winspool:access_denied"));
+            return 1;
+        }
+        if (set_error == ERROR_INVALID_PARAMETER) {
+            // The job finished between the GetJobW check above and this call
+            // (SetJobW returned 87 for a nonexistent JobId when measured on
+            // real hardware, under elevated identities only).
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   "SetJobW: job not found");
+            ctx.write_output(
+                format_clear_queue_row(printer, *job_id, "not_found", "windows:winspool:job_not_found"));
+            return 1;
+        }
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("SetJobW failed (Win32 error {})", set_error));
+        ctx.write_output(format_clear_queue_row(printer, *job_id, "error", "windows:winspool:set_job_failed"));
+        return 1;
+    }
+
+    // Best-effort readback — does not change the outcome; SetJobW already
+    // reported success. A readback failure here would not un-succeed the
+    // cancellation, so it is not consulted for the status/exit code.
+    DWORD readback_needed = 0;
+    GetJobW(handle->get(), static_cast<DWORD>(*job_id), 1, nullptr, 0, &readback_needed);
+
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    ctx.write_output(format_clear_queue_row(printer, *job_id, "canceled", "-"));
+    return 0;
+}
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "printers",
@@ -500,6 +707,29 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "winspool EnumJobsW level 2", nullptr},
     },
+    {
+        /* .action      = */ "clear_queue",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+         "measured in a Debian/Ubuntu cupsd container: container root/@SYSTEM (SystemGroup root "
+         "lpadmin) cancelling another user's job succeeds (status 0x0000, I93-7) — but the "
+         "production Linux agent runs unprivileged (docs/agent-privilege-model.md), never root "
+         "or @SYSTEM, so an ordinary non-owning cancel is correctly refused (403) before "
+         "Cancel-Job is ever reached; reliable only for a job the agent's own identity owns"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+         "PROVISIONAL — cupsd.conf Cancel-Job policy requires @OWNER/"
+         "@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by "
+         "cupsd, authorisation outcome for a non-owned job UNMEASURED"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
+         "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
+         "a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and "
+         "that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see "
+         "docs/agent-privilege-model.md"},
+    },
 };
 
 #else // POSIX (macOS + Linux) — one leg for both, per this plugin's failure-token split below
@@ -510,13 +740,21 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 // sets are present in this file's text, and the leg picks the right one at
 // compile time (never a runtime string substitution).
 #if defined(__APPLE__)
+constexpr std::string_view kTokSocketUnavailable = "macos:cups:socket_unavailable";
 constexpr std::string_view kTokConnectFailed = "macos:cups:connect_failed";
 constexpr std::string_view kTokDecodeFailed = "macos:cups:decode_failed";
+constexpr std::string_view kTokAccessDenied = "macos:cups:access_denied";
+constexpr std::string_view kTokNotFound = "macos:cups:not_found";
 constexpr std::string_view kTokUnexpectedStatus = "macos:cups:unexpected_status";
+constexpr std::string_view kTokNoIdentity = "macos:cups:no_identity";
 #else
+constexpr std::string_view kTokSocketUnavailable = "linux:cups:socket_unavailable";
 constexpr std::string_view kTokConnectFailed = "linux:cups:connect_failed";
 constexpr std::string_view kTokDecodeFailed = "linux:cups:decode_failed";
+constexpr std::string_view kTokAccessDenied = "linux:cups:access_denied";
+constexpr std::string_view kTokNotFound = "linux:cups:not_found";
 constexpr std::string_view kTokUnexpectedStatus = "linux:cups:unexpected_status";
+constexpr std::string_view kTokNoIdentity = "linux:cups:no_identity";
 #endif
 
 constexpr int kConnectTimeoutSec = 2;
@@ -539,11 +777,14 @@ constexpr int kReadTimeoutSec = 5;
     return std::nullopt;
 }
 
-struct IppResult {
-    bool transport_ok = false;
-    long http_status = 0;
-    std::optional<ipp::Message> message;
-};
+[[nodiscard]] std::string current_username() {
+    // getpwuid(geteuid()) — the real effective-user CUPS's peer-credential
+    // check reads off the Unix socket; not getlogin(), which reads the
+    // controlling terminal's login name and can disagree with euid.
+    if (struct passwd* pw = getpwuid(geteuid()); pw != nullptr && pw->pw_name != nullptr)
+        return std::string(pw->pw_name);
+    return std::string();
+}
 
 // Issues one IPP POST over the CUPS Unix socket (set_address_family(AF_UNIX)
 // BEFORE the first Post — httplib 0.37.1 only emits `Host: localhost` once
@@ -588,7 +829,8 @@ struct IppResult {
 
 // Shared by "printers" and "jobs": a READ-only IPP round trip, preferring
 // the Unix socket and falling back to TCP localhost:631 when no socket is
-// found.
+// found (reads only — clear_queue never falls back to TCP, see its own
+// comment).
 [[nodiscard]] IppResult do_read_ipp(const std::string& body) {
     if (const auto socket_path = find_cups_socket())
         return post_ipp_unix(*socket_path, body, httplib::Headers{});
@@ -668,8 +910,7 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     // client-error-not-found ("The printer or class does not exist"), which
     // the status check below now catches instead of silently reporting an
     // empty queue.
-    const std::string uri =
-        printer.empty() ? std::string("ipp://localhost/") : ("ipp://localhost/printers/" + printer);
+    const std::string uri = printer.empty() ? std::string("ipp://localhost/") : printer_uri_for(printer);
     attrs.push_back({ipp::kTagUri, "printer-uri", uri, {}});
     attrs.push_back({ipp::kTagKeyword, "which-jobs", "not-completed", {}});
     // Get-Jobs' server-chosen default attribute set is minimal (verified
@@ -682,6 +923,12 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
                        "job-k-octets", "date-time-at-creation"}});
 
     const auto req = ipp::encode_request(ipp::kGetJobs, next_request_id(), attrs);
+    if (req.empty()) { // the encoder refused an over-long attribute: never sent
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "Get-Jobs: printer name too long");
+        ctx.write_output("job|unavailable|invalid_printer");
+        return 0;
+    }
     const auto result = do_read_ipp(req);
 
     if (!result.transport_ok) {
@@ -717,6 +964,81 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     return 0;
 }
 
+int do_clear_queue(yuzu::CommandContext& ctx, const yuzu::Params& params) {
+    const std::string printer{params.get("printer")};
+    const std::string job_id_str{params.get("job_id")};
+
+    if (printer.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "missing required param 'printer'");
+        ctx.write_output(format_clear_queue_row("", 0, "error", "missing_printer"));
+        return 1;
+    }
+    const auto job_id = parse_job_id(job_id_str);
+    if (!job_id) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "invalid or missing 'job_id'");
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), 0, "error", "invalid_job_id"));
+        return 1;
+    }
+
+    // No socket -> refused, never a TCP fallback for this mutating action: a
+    // deliberate policy refusal (the agent will not cancel over TCP), even though
+    // the same token also covers cupsd simply not running. `no_identity` below is
+    // an `error` instead, because a failed local lookup is not a policy decision.
+    const auto socket_path = find_cups_socket();
+    if (!socket_path) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_FULL,
+                               "no CUPS Unix socket found; refusing to cancel over TCP");
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), *job_id, "refused", kTokSocketUnavailable));
+        return 1;
+    }
+
+    // No resolvable effective-user identity -> do not send. Sending an empty
+    // requesting-user-name and a malformed `Authorization: PeerCred ` header
+    // would make cupsd's answer about a request we never meant to send. This is
+    // a local precondition failure, NOT an authorization decision (cupsd was
+    // never asked), so it reports `error`, not `refused`: a transient NSS
+    // failure must not read as a final denial.
+    const std::string user = current_username();
+    if (user.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               "no resolvable effective-user identity; not sending the cancel");
+        ctx.write_output(format_clear_queue_row(printer_echo_posix(printer), *job_id, "error", kTokNoIdentity));
+        return 1;
+    }
+
+    httplib::Headers headers;
+    headers.emplace("Authorization", "PeerCred " + user);
+
+    // The whole cancel ladder is the pure run_clear_queue() (printing_parsers.hpp):
+    // it binds the job to the named printer with a Get-Jobs BEFORE sending
+    // Cancel-Job, because cupsd's Cancel-Job looks a job up by id alone and
+    // ignores the printer (observed on a real cupsd: a nonexistent printer name
+    // plus a valid job id cancelled the job and reported `canceled`). Windows
+    // needs no such step: the spooler itself binds a job to its printer. This
+    // shell only owns the transport and the per-OS tokens.
+    const ClearQueueTokens tokens{.connect_failed = kTokConnectFailed,
+                                  .decode_failed = kTokDecodeFailed,
+                                  .access_denied = kTokAccessDenied,
+                                  .not_found = kTokNotFound,
+                                  .unexpected_status = kTokUnexpectedStatus};
+    const ClearQueueDisposition d = run_clear_queue(
+        printer, *job_id, user, tokens, [&](uint16_t op, const std::vector<ipp::OperationAttr>& attrs) {
+            const std::string body = ipp::encode_request(op, next_request_id(), attrs);
+            if (body.empty()) // an over-long attribute was refused by the encoder; never sent
+                return IppResult{};
+            return post_ipp_unix(*socket_path, body, headers);
+        });
+    ctx.set_result_status(d.status == ClearQueueStatus::ok
+                              ? YUZU_RESULT_STATUS_OK
+                              : (d.status == ClearQueueStatus::permission_denied ? YUZU_RESULT_STATUS_PERMISSION_DENIED
+                                                                                  : YUZU_RESULT_STATUS_UNAVAILABLE),
+                          d.full ? YUZU_RESULT_COMPLETENESS_FULL : YUZU_RESULT_COMPLETENESS_PARTIAL, d.detail);
+    ctx.write_output(d.row);
+    return d.rc;
+}
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "printers",
@@ -740,6 +1062,29 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "winspool EnumJobsW level 2", nullptr},
     },
+    {
+        /* .action      = */ "clear_queue",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+         "measured in a Debian/Ubuntu cupsd container: container root/@SYSTEM (SystemGroup root "
+         "lpadmin) cancelling another user's job succeeds (status 0x0000, I93-7) — but the "
+         "production Linux agent runs unprivileged (docs/agent-privilege-model.md), never root "
+         "or @SYSTEM, so an ordinary non-owning cancel is correctly refused (403) before "
+         "Cancel-Job is ever reached; reliable only for a job the agent's own identity owns"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "IPP Cancel-Job on one job id over the CUPS Unix socket with Authorization: PeerCred",
+         "PROVISIONAL — cupsd.conf Cancel-Job policy requires @OWNER/"
+         "@AUTHKEY(system.print.operator)/@admin/@lpadmin (no @SYSTEM); header accepted by "
+         "cupsd, authorisation outcome for a non-owned job UNMEASURED"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "winspool SetJobW JOB_CONTROL_CANCEL on one job id",
+         "cancel measured only under Administrators and SYSTEM (SYSTEM is today's agent identity, #1442); "
+         "a least-privileged identity cancelling any job (its own or another user's) is unmeasured, and "
+         "that a PRINTER_ACCESS_USE handle suffices for it is an extrapolation - see "
+         "docs/agent-privilege-model.md"},
+    },
 };
 
 #endif // _WIN32
@@ -751,11 +1096,11 @@ public:
     std::string_view name() const noexcept override { return "printing"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Printer and print-job inventory";
+        return "Printer/job inventory plus a single narrowly-scoped clear_queue cancellation";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"printers", "jobs", nullptr};
+        static const char* acts[] = {"printers", "jobs", "clear_queue", nullptr};
         return acts;
     }
 
@@ -807,6 +1152,8 @@ public:
             return do_printers(ctx);
         if (action == "jobs")
             return do_jobs(ctx, params);
+        if (action == "clear_queue")
+            return do_clear_queue(ctx, params);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

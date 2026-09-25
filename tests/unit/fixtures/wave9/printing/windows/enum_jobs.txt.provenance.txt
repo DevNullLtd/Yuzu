@@ -7,4 +7,4 @@ command: probe_wave9_print_win.exe, run via the yuzu-wave9-print-probe SYSTEM sc
          section == EnumJobsW(level 2) ==
 note: cl /std:c++latest /EHsc /nologo /W3 probe_wave9_print_win.cpp winspool.lib compiled clean,
       no warnings. Same shape (2 jobs, level-2 fields populated) also captured under the admin
-      SSH identity -- see the-rig-print-probe-findings.md.
+      SSH identity.

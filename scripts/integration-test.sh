@@ -661,7 +661,8 @@ else
     # server's /metrics endpoint (no auth) — `yuzu_fleet_agents_healthy`
     # gauge shows how many agents are currently heartbeating. Name was
     # confirmed 2026-04-19 against a live v0.11.0 server; keep in sync
-    # with server/core/src/metrics.cpp if it drifts.
+    # with its metrics_.describe() registration in server/core/src/server.cpp
+    # if it drifts.
     log "Phase 4 reuse: verifying registered agent count via /metrics..."
     # The fleet-health recompute thread runs on a 15s interval, so a freshly
     # registered agent can take up to one full interval to appear in /metrics.

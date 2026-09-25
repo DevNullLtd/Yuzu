@@ -65,6 +65,13 @@ public:
     /// released store. Optional — null = no persistence (legacy behavior).
     void set_offline_endpoint_store(OfflineEndpointStore* s) { offline_store_ = s; }
 
+    /// HA WS-5 (ADR-2002 §7a): lets a disconnect handler reach the same
+    /// durable presence store this class writes, for a session-guarded
+    /// delete (`OfflineEndpointStore::remove_if_session`) — reusing the
+    /// existing wiring rather than threading a second pointer through
+    /// `AgentServiceImpl`/`GatewayUpstreamServiceImpl`. May be null.
+    [[nodiscard]] OfflineEndpointStore* offline_endpoint_store() const { return offline_store_; }
+
     /// Ingest one heartbeat. `agent_id` is the session-resolved agent id
     /// (already validated by the caller). `via` is "direct" or "gateway"
     /// — the only label that varies between the two ingestion paths.

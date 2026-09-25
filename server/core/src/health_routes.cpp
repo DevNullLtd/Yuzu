@@ -33,6 +33,7 @@
 #include "offload_target_store.hpp"
 #include "patch_manager.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg_reachability_probe.hpp" // HA WS-8
 #include "plugin_config_store.hpp"
 #include "policy_store.hpp"
 #include "process_health.hpp"
@@ -106,6 +107,21 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                 deps.metrics->gauge("yuzu_server_command_outbox_pending")
                     .set(static_cast<double>(*pending));
         }
+        // HA WS-8: Postgres reachability as THIS replica sees it (a leaf-locked
+        // copy of the probe's snapshot, no I/O). Set on scrape so the value is
+        // never older than the scrape itself.
+        if (deps.pg_reachability_probe) {
+            const auto snap = deps.pg_reachability_probe->snapshot();
+            const auto now = yuzu::server::PgReachabilityProbe::now_ns();
+            deps.metrics->gauge("yuzu_server_pg_reachable")
+                .set(yuzu::server::pg_reachability::classify(snap, now) ==
+                             yuzu::server::pg_reachability::Verdict::Ready
+                         ? 1
+                         : 0);
+            if (snap.last_success_ns != yuzu::server::pg_reachability::kNever)
+                deps.metrics->gauge("yuzu_server_pg_reachability_last_success_age_seconds")
+                    .set(static_cast<double>(now - snap.last_success_ns) / 1e9);
+        }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
             deps.metrics->gauge("yuzu_server_management_groups_total")
@@ -177,6 +193,11 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // failures without treating a saturated-but-healthy pool as down.
         bool pg_pool_ok =
             deps.pg_pool && deps.pg_pool->valid() && !deps.pg_pool->connect_breaker_open();
+        // HA WS-8: the runtime reachability probe — mirrors /readyz's gating
+        // `pg_reachable` row so the two probes agree (a leaf-locked copy, no I/O).
+        bool pg_reachable_ok =
+            deps.pg_reachability_probe &&
+            deps.pg_reachability_probe->verdict() == yuzu::server::pg_reachability::Verdict::Ready;
         auto response_ok = deps.response_store && deps.response_store->is_open();
         auto audit_ok = deps.audit_store && deps.audit_store->is_open();
         auto instruction_ok = deps.instruction_store && deps.instruction_store->is_open();
@@ -215,7 +236,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // not here, so /healthz could report "healthy" with a degraded store —
         // the same gap the Guardian/CA rows above closed. The server fails
         // closed at boot if PG is unreachable, so on a running server these are
-        // normally open; the row catches a post-boot store-level failure.
+        // open. is_open() is latched at construction (#3061), so these rows report
+        // BOOT state only; a post-boot Postgres outage shows on the pg_reachable row
+        // of /readyz, not here.
         bool offline_endpoint_ok =
             deps.offline_endpoint_store && deps.offline_endpoint_store->is_open();
         bool software_inventory_ok =
@@ -252,8 +275,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool discovery_ok = deps.discovery_store && deps.discovery_store->is_open();
         // DeploymentStore (ADR-0043, gov sre finding, hardening
         // round) — parity with every other migrated authoritative store's
-        // readyz/healthz wiring; construction is already fail-closed, this
-        // is belt-and-braces against a runtime is_open() flip.
+        // readyz/healthz wiring; construction is already fail-closed, and
+        // is_open() is latched (#3061), so this reports boot state only.
         bool deployment_ok = deps.deployment_store && deps.deployment_store->is_open();
         // QuarantineStore (ADR-0047) — wired into /readyz; adding here
         // too so this store never joins the readyz-vs-healthz drift
@@ -269,8 +292,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // if migration/open fails) but was absent from both /healthz and
         // /readyz, the same readyz-vs-healthz drift class the rows above
         // document. Startup fail-closed limits the immediate blast radius,
-        // but if is_open() ever flips false post-startup, /api/v1/upload-
-        // grants* would 503 while both probes still reported healthy.
+        // and a store that failed to open would leave /api/v1/upload-grants*
+        // 503ing while both probes reported healthy. (is_open() is latched at
+        // boot, #3061 — this row reports that boot state.)
         bool upload_grant_ok = deps.upload_grant_store && deps.upload_grant_store->is_open();
         // TagStore (ADR-0050) — born-on-PG (as of this migration), wired
         // into both /readyz and /healthz from the start (the
@@ -287,8 +311,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool runtime_config_ok = deps.runtime_config_store && deps.runtime_config_store->is_open();
         // ADR-0062 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz
         // drift class the rows above document; wired into both from the
-        // start rather than shipping the gap. Construction is fail-closed,
-        // so this is belt-and-braces against a runtime is_open() flip.
+        // start rather than shipping the gap. Construction is fail-closed and
+        // is_open() is latched (#3061), so this reports boot state only.
         bool patch_manager_ok = deps.patch_manager && deps.patch_manager->is_open();
         // HA WS-1/1a: durable operator sessions. /readyz's StoreCheck vector
         // names this store; mirror it here so the two probes agree (same
@@ -298,8 +322,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool session_store_ok = deps.auth_mgr && deps.auth_mgr->is_session_store_ok();
         // ADR-0063 (migration-programme PR 3) — same readyz-vs-healthz
         // drift class the rows above document; wired into both from the
-        // start rather than shipping the gap. Construction is fail-closed,
-        // so this is belt-and-braces against a runtime is_open() flip.
+        // start rather than shipping the gap. Construction is fail-closed and
+        // is_open() is latched (#3061), so this reports boot state only.
         bool directory_sync_ok = deps.directory_sync && deps.directory_sync->is_open();
         // ADR-0064 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz drift class:
         // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
@@ -321,15 +345,15 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
 
         // Determine overall status
         bool all_stores_ok =
-            pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
-            guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
-            update_registry_ok && offline_endpoint_ok && software_inventory_ok &&
-            vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
-            device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
-            mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
-            notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-            patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok &&
-            schedule_engine_ok && execution_tracker_ok && command_outbox_ok;
+            pg_pool_ok && pg_reachable_ok && response_ok && audit_ok && instruction_ok &&
+            policy_ok && guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok &&
+            ca_ok && update_registry_ok && offline_endpoint_ok && software_inventory_ok &&
+            vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
+            inventory_ok && approval_ok && rbac_ok && result_set_ok && mgmt_group_ok &&
+            discovery_ok && deployment_ok && quarantine_ok && notification_ok && upload_grant_ok &&
+            tag_ok && runtime_config_ok && patch_manager_ok && session_store_ok &&
+            directory_sync_ok && workflow_engine_ok && schedule_engine_ok && execution_tracker_ok &&
+            command_outbox_ok;
         std::string status = all_stores_ok ? "healthy" : "degraded";
 
         nlohmann::json health = {
@@ -338,6 +362,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"agents", {{"online", online}}}, // pending added below for authed callers
             {"stores",
              {{"pg_pool", pg_pool_ok ? "ok" : "error"},
+              {"pg_reachable", pg_reachable_ok ? "ok" : "error"},
               {"responses", response_ok ? "ok" : "error"},
               {"audit", audit_ok ? "ok" : "error"},
               {"instructions", instruction_ok ? "ok" : "error"},
@@ -493,13 +518,34 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // Check every store that is load-bearing for request handling.
-        // A store with a failed migration has had db_ closed and nullified
-        // inside create_tables(), so is_open() will correctly return false.
+        // WHAT THESE ROWS MEAN (HA WS-8, #3061 — read before adding a row).
+        //
+        // Every `is_open()` / `is_*_ok()` row below is BOOT-STATE reporting.
+        // Each Postgres store latches `open_` at the end of its constructor and
+        // never clears it; construction failure is already fail-closed
+        // (startup_failed_ stops the server before it serves). So on a running
+        // server these rows never flip, and they do NOT detect a post-boot
+        // outage. That includes the session_store and auth_db rows
+        // (`AuthManager::is_session_store_ok()` / `is_auth_db_ok()` read the same
+        // latched flags).
+        //
+        // RUNTIME reachability is the `pg_reachable` row — one dedicated-
+        // connection probe for the one substrate every store shares
+        // (pg_reachability_probe.hpp). Per-store runtime degradation (a revoked
+        // schema grant, a dropped table) is DELIBERATELY out of scope for
+        // /readyz: every replica shares the same database, so moving traffic to
+        // another replica fixes nothing; it surfaces as request-path 503s plus
+        // metrics instead. Recorded decision: docs/postgres-store-playbook.md.
+        //
+        // LEADERSHIP IS NOT READINESS (#4014 decision): a follower serves every
+        // operator-synchronous path, so the LeaderElector is deliberately absent.
         struct StoreCheck {
             const char* name;
             bool ok;
         };
+        const auto pg_verdict = deps.pg_reachability_probe
+                                    ? deps.pg_reachability_probe->verdict()
+                                    : yuzu::server::pg_reachability::Verdict::NotYetProbed;
         std::vector<StoreCheck> checks = {
             {"response_store", deps.response_store && deps.response_store->is_open()},
             {"audit_store", deps.audit_store && deps.audit_store->is_open()},
@@ -576,9 +622,10 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"schedule_engine", deps.schedule_engine && deps.schedule_engine->is_open()},
             // WS-3 3.3 (gov HC-1, arch-F1/sre-F1): the born-on-PG command outbox
             // is on the live scheduled-dispatch path. Construction is already
-            // fail-closed (startup_failed_), so this row guards the RUNTIME
-            // is_open()-flip case — without it a post-boot PG hiccup leaves
-            // /readyz green while every scheduled fire silently stops delivering.
+            // fail-closed (startup_failed_) and is_open() is latched (#3061), so
+            // this row reports boot state only. A post-boot PG hiccup (which would
+            // stop every scheduled fire from delivering) is what the gating
+            // pg_reachable row below catches — this row does not.
             {"command_outbox_store",
              deps.command_outbox_store && deps.command_outbox_store->is_open()},
             // gov R3 HC-1: FleetTopologyStore became load-bearing for
@@ -599,20 +646,28 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // histogram + pool gauges + their alert rules, not /readyz.
             {"pg_pool", deps.pg_pool != nullptr && deps.pg_pool->valid() &&
                             !deps.pg_pool->connect_breaker_open()},
+            // HA WS-8 (ADR-2002 §12): THE runtime "can this replica reach the
+            // `yuzu` primary?" signal — the row that makes /readyz go red when
+            // core cannot reach Postgres. The pg_pool row above cannot: its
+            // breaker arms only when a NEW connect fails, so with idle pooled
+            // connections (or no traffic) it stays green through an outage.
+            // A leaf-locked copy of the probe's snapshot (no I/O); a null probe fails closed.
+            {"pg_reachable", pg_verdict == yuzu::server::pg_reachability::Verdict::Ready},
             // First migrated store (#1368). The server fails closed without
             // Postgres, so this is true whenever it serves; a false here is
             // the loud signal that the migration path is broken even though
             // the pool answered.
             {"offline_endpoint_store",
              deps.offline_endpoint_store && deps.offline_endpoint_store->is_open()},
-            // ADR-0016 born-on-Pg store. Fail-closed at boot, but a not-open
-            // state post-boot makes ReportInventory silently ack with no
-            // ingest and no readiness signal — surface it (gov Pattern E).
+            // ADR-0016 born-on-Pg store. Fail-closed at boot; a store that
+            // failed to open would make ReportInventory silently ack with no
+            // ingest — surface that boot state (gov Pattern E; latched, #3061).
             {"software_inventory_store",
              deps.software_inventory_store && deps.software_inventory_store->is_open()},
-            // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a
-            // not-open post-boot state means the PR-4 matching engine would
-            // silently no-op findings persistence — surface it (Pattern E).
+            // CAVM born-on-PG store (ADR-0012). Fail-closed at boot; a store
+            // that failed to open would silently no-op the PR-4 matching
+            // engine's findings persistence — surface that boot state
+            // (Pattern E; latched, #3061).
             {"vuln_finding_store", deps.vuln_finding_store && deps.vuln_finding_store->is_open()},
             // Periodic Access Reviews (SOC 2 CC6.2) born-on-PG store. AUTHORITATIVE
             // per ADR-0012 §1 — the /api/v1/access-reviews campaign lifecycle
@@ -631,19 +686,18 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"device_inventory_store",
              deps.device_inventory_store && deps.device_inventory_store->is_open()},
             // ADR-0024 SLE born-on-Pg stores (roadmap G-10, HC-1 Pattern E). Same
-            // rationale as the inventory stores: fail-closed at boot, but a not-open
-            // state post-boot makes ReportInventory silently ack the licensing blob
-            // with no ingest (software_licensing_store) and the /api/v1/sle/* reads
-            // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
+            // rationale as the inventory stores: fail-closed at boot; a store that
+            // failed to open would make ReportInventory silently ack the licensing
+            // blob with no ingest (software_licensing_store) and the /api/v1/sle/*
+            // reads degrade to 503 (both) — surface that boot state (latched, #3061).
             {"software_licensing_store",
              deps.software_licensing_store && deps.software_licensing_store->is_open()},
             // Wave 7 PR7.2 born-on-Pg store (ADR-0016 §5, gov Gate 3 sre HIGH
             // finding). Same rationale as software_licensing_store above:
-            // fail-closed at boot, but a not-open state post-boot makes
+            // fail-closed at boot; a store that failed to open would make
             // ReportInventory/ProxyInventory silently ack the app_usage blob
             // with no ingest and the Forensics REST/MCP reads degrade to
-            // 503/kInternalError — surface it so an LB/operator sees the
-            // half-state instead of only discovering it per-request.
+            // 503/kInternalError — surface that boot state (latched, #3061).
             {"app_usage_store", deps.app_usage_store && deps.app_usage_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
@@ -663,15 +717,15 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // schema `result_set_store`, ADR-0036) would silently degrade
             // every scoped dispatch to zero targets while /readyz reported
             // "ready" — this construction is already fail-closed
-            // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
-            // as belt-and-braces against a runtime is_open() flip.
+            // (startup_failed_) per ADR-0012 §1; the readyz entry reports boot
+            // state only (is_open() is latched, #3061).
             {"result_set_store", deps.result_set_store && deps.result_set_store->is_open()},
             // Migrated Postgres store (ADR-0043, gov sre finding, hardening
             // round). Load-bearing for all 4 /api/deployment-jobs routes;
             // construction is already fail-closed (startup_failed_), but the
             // readyz entry stays for parity with every OTHER migrated
             // authoritative store on this ladder (all of which are wired in
-            // here) as belt-and-braces against a runtime is_open() flip.
+            // here); boot state only (is_open() is latched, #3061).
             {"deployment_store", deps.deployment_store && deps.deployment_store->is_open()},
             // PKI PR2: ca_store is load-bearing only when the install is on
             // built-in default certs (PR3+ make it load-bearing for mTLS
@@ -711,29 +765,27 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // operator-set `managed` flag is real state. Construction
             // fail-closed already makes a not-open state unreachable in
             // production (startup_failed_ stops the server before it
-            // serves), so this is belt-and-braces against a runtime
-            // is_open() flip, matching result_set_store's equivalent row.
+            // serves); boot state only (is_open() is latched, #3061),
+            // matching result_set_store's equivalent row.
             {"discovery_store", deps.discovery_store && deps.discovery_store->is_open()},
             // Wave 2 migrated Postgres store (ADR-0006/0009/0047, schema
             // `quarantine_store`). AUTHORITATIVE per ADR-0012 §1 — an
             // active quarantine record is live security containment
             // state. Construction fail-closed already makes a not-open
             // state unreachable in production (startup_failed_ stops
-            // the server before it serves), so this is belt-and-braces
-            // against a runtime is_open() flip, matching
-            // discovery_store's equivalent row.
+            // the server before it serves); boot state only (is_open() is
+            // latched, #3061), matching discovery_store's equivalent row.
             {"quarantine_store", deps.quarantine_store && deps.quarantine_store->is_open()},
             // ADR-0046 born-on-PG (as of this migration) store — same
-            // rationale as the other rows above: fail-closed at boot, but
-            // a not-open post-boot state would leave the notification
-            // feed silently dead while /readyz reported "ready" (gov
-            // Pattern E).
+            // rationale as the other rows above: fail-closed at boot; this
+            // row reports that boot state (latched, #3061), so a failed open
+            // cannot leave the notification feed dead behind a "ready"
+            // /readyz (gov Pattern E).
             {"notification_store", deps.notification_store && deps.notification_store->is_open()},
             // ADR-3004 (PR1.6a) — review finding (#3135): same
             // readyz-vs-healthz drift class as the rows above.
-            // Fail-closed at boot, but a not-open post-boot state would
-            // leave /api/v1/upload-grants* silently 503ing while
-            // /readyz still reported "ready".
+            // Fail-closed at boot; this row reports that boot state
+            // (latched, #3061).
             {"upload_grant_store",
              deps.upload_grant_store && deps.upload_grant_store->is_open()},
             // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
@@ -743,9 +795,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"patch_manager", deps.patch_manager && deps.patch_manager->is_open()},
             // Wave 7b PR7b.1 execution_artifacts — PluginConfigStore backs the
             // plugin kill switch; action_allowed() fails closed when the store
-            // is not open, so a not-open post-boot state silently denies every
-            // kill-switched action with no readiness signal. Same
-            // readyz-vs-healthz drift class the rows above document.
+            // is not open, so a store that failed to open would silently deny
+            // every kill-switched action. Same readyz-vs-healthz drift class
+            // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
         };
 
@@ -757,10 +809,16 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // that posture and the comment that used to sit on this row. Reported
         // separately so on-call can still tell feature-off from feature-on-but-
         // dead without pulling a healthy node out of LB/orchestrator rotation.
+        // nvd_db is the same shape: construction is fail-OPEN by design (a CVE
+        // cache that fails to open leaves matching empty, never a 503), and it
+        // is always constructed, so a null pointer or a not-open handle is
+        // genuinely "broken", not "feature off". Without this row a dead CVE
+        // cache showed only as the yuzu_nvd_* gauges going absent.
         std::vector<StoreCheck> notices = {
             {"analytics_event_store",
              !deps.cfg->analytics_enabled ||
                  (deps.analytics_store && deps.analytics_store->is_open())},
+            {"nvd_db", deps.nvd_db && deps.nvd_db->is_open()},
         };
 
         std::string failed_list;
@@ -792,6 +850,11 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         } else {
             res.status = 503;
             std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
+            // A stable reason token only (pg_reachability_rules.hpp `reason()`):
+            // no host, DSN or libpq text — this endpoint is unauthenticated.
+            if (pg_verdict != yuzu::server::pg_reachability::Verdict::Ready)
+                body += std::string(",\"pg\":\"") +
+                        yuzu::server::pg_reachability::reason(pg_verdict) + "\"";
             if (!degraded_list.empty())
                 body += ",\"degraded\":[" + degraded_list + "]";
             body += "}";
@@ -826,7 +889,11 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         bool guaranteed_state_ok =
             deps.guaranteed_state_store && deps.guaranteed_state_store->is_open();
         bool baseline_ok = deps.baseline_store && deps.baseline_store->is_open();
-        bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+        // HA WS-8: the one RUNTIME signal — the store rows above are boot state.
+        bool pg_reachable_ok =
+            deps.pg_reachability_probe &&
+            deps.pg_reachability_probe->verdict() == yuzu::server::pg_reachability::Verdict::Ready;
+        bool all_ok = pg_reachable_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
                       guaranteed_state_ok && baseline_ok;
 
         // Execution stats
@@ -894,6 +961,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
 
         if (!all_ok) {
             html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
+            if (!pg_reachable_ok)
+                html += "postgres ";
             if (!response_ok)
                 html += "responses ";
             if (!audit_ok)

@@ -20,8 +20,11 @@
 #include "dex_routes.hpp"              // dex_iso_since / dex_window_to_days
 #include "guaranteed_state_store.hpp"  // seed + direct-read parity oracles
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"              // PgConn/PgResult -- the DROP-TABLE degrade tests below
 
 #include "../test_helpers.hpp"
+
+#include <libpq-fe.h>
 
 #include <optional>
 #include <set>
@@ -135,6 +138,43 @@ TEST_CASE("DexApi: device_score matches the shared builder (seam is a pure forwa
     CHECK(via_api.window == via_builder.window);
     CHECK(via_api.score == via_builder.score);
     CHECK(via_api.signals.size() == via_builder.signals.size());
+    CHECK_FALSE(via_api.degraded);
+}
+
+// #4855: a WIRED store whose signal-summary read DEGRADES (not merely
+// null/unopened) must render score=-1, signals empty AND degraded=true —
+// the pre-fix bug was exactly this case reading as a perfectly healthy
+// score-100 with no signals. DROP TABLE on a second connection forces a
+// genuine query-level failure while the store itself stays open (same
+// technique test_guardian_routes.cpp uses for the Guardian census reads).
+TEST_CASE("DexApi: device_score on a degraded signal-summary read reports "
+          "score=-1 and degraded=true, never a fabricated healthy score",
+          "[pg][dex_api][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_crash(store, "e1", "a1", "notepad.exe", "windows", kTs);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto api = make_local_dex_api(&store, {});
+    const auto via_api = api->device_score("a1", "7d");
+    CHECK(via_api.score == -1);
+    CHECK(via_api.signals.empty());
+    CHECK(via_api.degraded);
+
+    // The pure dex_device_score(...) oracle the health-fragment/overview
+    // per-device loops call must ALSO report -1 on this same degrade, not
+    // just the builder above (closing the same bug on the fleet-scale path).
+    const std::string since = yuzu::server::dex_iso_since(yuzu::server::dex_window_to_days("7d"));
+    CHECK(yuzu::server::dex_device_score(&store, "a1", since) == -1);
 }
 
 TEST_CASE("DexApi: fleet-dependent reads use the injected FleetFn", "[pg][dex_api]") {

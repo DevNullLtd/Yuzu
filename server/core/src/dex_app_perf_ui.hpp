@@ -7,8 +7,17 @@
 /// REST endpoints, and the MCP tools all read the SAME numbers. Declared here (not
 /// in the already-large dex_routes.hpp) so the renderer + its scope-selector type
 /// stay a small, separately-testable unit.
+///
+/// #4626 Concern B: includes the PURE halves directly (`dex_app_perf_pure.hpp`
+/// for `AppPerfVersionSummary`/`AppPerfDeviceApp`, `app_perf_types.hpp` for
+/// `AppPerfAppSummary`/`AppPerfVersionDeviceRow`) rather than the store-coupled
+/// umbrella `dex_app_perf_model.hpp` (which also pulls `dex_app_perf_builders.hpp`
+/// — the B1/B2 store headers) — this header + `dex_app_perf_ui.cpp` are enrolled
+/// in `scripts/ci/check-seam-closure.py`'s `dex_perf` family, so a store
+/// `#include` here is now lint-caught, not just reviewed.
 
-#include "dex_app_perf_model.hpp" // AppPerfVersionSummary, AppPerfAppSummary (via fleet store)
+#include "app_perf_types.hpp"    // AppPerfAppSummary, AppPerfVersionDeviceRow
+#include "dex_app_perf_pure.hpp" // AppPerfVersionSummary, AppPerfDeviceApp
 
 #include <cstdint>
 #include <string>
@@ -43,9 +52,9 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 /// PURE: the per-(app,version) perf-over-time table. `versions` is the reduced
 /// per-version summary (`app_perf_version_summaries` over the trend points) —
 /// already narrowed to `active_version` UPSTREAM (by the caller passing `version`
-/// into the same `AppPerfFleetFn`/`AppPerfGroupFn` provider the REST twin uses,
-/// mirroring `GET /dex/perf/app?version=`) when one is selected; `versions` then
-/// carries just that one entry. `active_version` empty (the default) = all
+/// into the same `DexPerfApi::app_fleet_trend`/`group_trend`/`tag_trend` call the
+/// REST twin uses, mirroring `GET /dex/perf/app?version=`) when one is selected;
+/// `versions` then carries just that one entry. `active_version` empty (the default) = all
 /// versions, unnarrowed. `scope_group_id` empty = whole fleet; non-empty = the
 /// named-group rollup (the suppression cells render for sub-floor points).
 /// `groups` populates the scope selector; `group_floor` is shown in the
@@ -54,9 +63,21 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 /// label links to `?version=<v>`, narrowing; a filtered view shows a single row
 /// plus an "All versions" link back to `?version=` cleared.
 ///
-/// `model_values` (distinct device-model tag values, F2c) populates a SECOND,
-/// independent scope selector alongside the management-group one — empty hides
-/// it, same convention as `groups`. `active_model` mirrors `scope_group_id`'s
+/// `model_values` (distinct device-model cohort values sourced from
+/// `DexPerfApi::fleet_snapshot(kDexDefaultCohortKey)` via `dex_perf_cohorts()`
+/// — the SAME derivation the public `GET /api/v1/dex/perf/cohorts` resource
+/// uses, #4857 D1) populates a SECOND, independent scope selector alongside
+/// the management-group one. Unlike `groups`, an empty `model_values` does NOT
+/// silently hide the selector — `fleet_snapshot` has no degrade channel, so it
+/// never renders a claimed "degraded" state. An unwired `DexPerfApi` does NOT
+/// reach this note: the caller (dex_routes.cpp's route handler) returns an
+/// "unavailable" placeholder before ever populating `model_values` in that
+/// case. The empty-list case this note actually covers is NOT uniformly
+/// "devices reporting with no `model` tag value" (governance round-2, G8-2)
+/// — it is equally reached when zero devices report anything this cycle at
+/// all (a genuinely empty fleet snapshot), so the rendered text is
+/// deliberately neutral over both causes: "Model: no device-model values in
+/// the current fleet snapshot." rather than a selector. `active_model` mirrors `scope_group_id`'s
 /// convention (empty = unfiltered). The two scopes are MUTUALLY EXCLUSIVE in
 /// this slice (group takes precedence — see dex_routes.cpp's route handler);
 /// selecting one clears the other via the emitted links so a caller can never

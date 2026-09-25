@@ -46,7 +46,14 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            /*prepare_route_fallback=*/nullptr,
+            // HA WS-5 (governance hardening, 2026-09-22): see
+            // test_dispatch_confined_arms.cpp's RecordingSink — this mock
+            // has no presence concept, so every candidate is always locally
+            // known (never widens) for the fast-path eligibility check to
+            // hold.
+            [](const std::vector<std::string>&) { return false; }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {

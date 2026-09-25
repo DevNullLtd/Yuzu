@@ -1626,6 +1626,8 @@ Extend the connector framework with additional integrations:
 
 > **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. **As of dev @ `d295db964` (2026-09-07, pinned 12:01 UTC+1 / 11:01 UTC)** — verified by `git merge-base --is-ancestor <merge-sha> d295db964`, not `gh pr view` state (a PR's current state can postdate the pin): WS-0, WS-1, WS-7, and **WS-2a (both 2a-1 and 2a-2, #3924 — cross-replica SSE delivery, merged 2026-09-03, IS an ancestor)** are done; **WS-3 slice 3.1** (fenced `LeaderElector` primitive, #4011, merged 2026-09-06, IS an ancestor) is done but inert — no loop wired yet, no runtime behaviour change. **WS-10 is NOT done at the pin** — #4092 (background-job replica-safety classification) merged 2026-09-07 **12:58 UTC**, roughly an hour *after* the pin, and is confirmed NOT an ancestor of `d295db964`; at the pin, WS-10 remains **PR #4092 open**, matching `docs/ha-delivery-matrix.md`'s own state at the pin (which also still records WS-2a-2 outstanding and WS-3 as merely "planned" — that file's own re-stamp commits landed on `dev` after this pin too; the roadmap follows verified PR-ancestry facts over the matrix file's stamp date, and the matrix will catch up on its own schedule). The remaining workstreams (WS-2b, WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz, WS-9, WS-10, WS-11…WS-14) are not started at the pin. See "Delivered outside the roadmap" above and the Dependency Graph below.
 
+> **Since the pin (re-verified against dev @ `c7f3a5bed`, 2026-09-13):** WS-10 is **done** (#4092, merged 2026-09-07). WS-3 3.2 (#4134, the elector now gates `FencedLeaderOnly` passes — not `DisabledUntilFixed` ones, see the gate note below), 3.3 (#4169, durable command outbox — a fifth `FencedLeaderOnly` pass, `command_outbox.deliver`, sharing 3.2's `schedule_tick_thread_` loop with `schedule_runner.tick` rather than adding one; five passes across four background loops in total) and 3.4 (#4194, remediation CAS) are **done**, and WS-4 slice 4.1 (fenced `GatewayRouteStore`, #4245) is done but **inert** — nothing reads it for dispatch until 4.2. `docs/ha-delivery-matrix.md` is the live record. Live active-active HA is still not delivered.
+
 <details><summary>Original active-passive design (superseded — kept for history)</summary>
 
 Active-passive failover for server resilience:
@@ -1935,6 +1937,56 @@ Land after the foundational IPC plugins (19.1) ship and the rendering model prov
 
 ---
 
+## Phase 20: Reflex — Agent-Local Automated Response (Proposed)
+
+*Sparks (ADR-0021) already give the agent a converged, use-case-agnostic detection layer; Reflex is
+the third and last sovereign Spark consumer alongside Guardian (real-time compliance enforcement)
+and DEX (curated telemetry) — a YAML-authored, agent-local binding from a Spark to a small chain of
+plugin-action Reactions, executed on the device the instant the Spark fires, with or without server
+connectivity. Design contract: `docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md`
+(Decisions 2, 4, 5, 6, 7, 8, 9, 10 and the 2026-09-17 Reflex amendment). No GitHub tracking issue filed yet
+for this phase as a whole — file one before implementation slices land, per
+`docs/agents/issue-standard.md`.*
+
+### Issue 20.1: Reflex Set Authoring, Storage, and Safety/Consent Gates
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+YAML-authoritative Reflex Set CRUD (`ReflexSetStore`, born-on-PostgreSQL per ADR-0012), the
+`dangerous_reactions_in_spec()` safety chokepoint (extends the existing `dangerous_*_in_spec`
+doctrine, fed by `CommandCapabilityRegistry::classify`), and the device-classification consent gate
+(the free-form `device_class` asset tag, `server` | `workstation`, unclassified = workstation =
+fail-closed — see `docs/asset-tagging-guide.md` "Recipe: Reflex consent gate").
+
+### Issue 20.2: Digest-Bound Two-Person Approval and Deploy/Push
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+Deploy gated on a dedicated `Reflex:Execute` RBAC permission (never the Guardian-only `Push` cross-seed),
+approved by a different principal than both the last editor and the deployer, bound to a canonical
+digest over compiled content + assignment scope, recomputed and compared at every compile. Compiled
+Reflex Sets fan out over the reserved `__reflex__` plugin name's `push_sets` action.
+
+### Issue 20.3: Agent-Local Spark→Reaction Execution
+**Capability:** new | **Scope:** Agent | **Status:** Proposed
+
+`ReflexEngine`, a queued SparkEngine consumer (never inline) that runs each fired Reflex's Reaction
+chain locally via the agent's `LocalDispatcher` — authorized once, at deploy time, by 20.1/20.2, never
+re-authorized per fire (agent-local dispatch is architecturally distinct from the server's
+operator-dispatch `classify_and_authorize_dispatch`/`DispatchCaller` chokepoint — see
+`docs/reflex-design.md` "Safety chokepoint"). Per-set serialized concurrency, bounded detached reaction
+workers counted into the agent's hard-exit grace sum, crash-safe (an in-flight chain marker is aborted,
+never resumed).
+
+### Issue 20.4: Reflex Outcomes, Observability, and Dashboard
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+Outcomes ride the existing `__guard__`/`event` channel (`GuaranteedStateEvent.family == "reflex"`),
+land in a Reflex-only `reflex_outcomes` table (ADR-0021 Decision 6 partial supersession), and are
+never surfaced on the executions-history ladder (agent-local automation, not operator dispatch).
+Fleet Prometheus families, heartbeat tags, audit verbs, SOC 2 evidence rows, REST + MCP CRUD, and an
+HTMX `/reflex` dashboard round-tripping the YAML — never the model.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -2114,7 +2166,9 @@ before acting on any "open" / "in progress" claim:
    `docs/adr-1005-execution-plan.md` Phase 7. (No dependency on Phase 9 — see Phase 9's own entry.)
 2. **High Availability (ADR-2002).** As of dev @ `d295db964` (11:01 UTC) — verified by merge-commit
    ancestry (`git merge-base --is-ancestor`), not `gh pr view` state: Phase A partly done — WS-0/WS-1/
-   WS-7/WS-2a (both 2a-1 and 2a-2, #3924 merged 2026-09-03, IS an ancestor) are done; **WS-10 is NOT
+   WS-7/WS-2a (both 2a-1 and 2a-2, #3924 merged 2026-09-03, IS an ancestor) are done — 2a-2's own row
+   text names loss-free cross-replica reconnect (durable outbox replay `ORDER BY event_id`) as a
+   still-outstanding 2nd-replica precondition (see the gate note below); **WS-10 is NOT
    done at the pin** — #4092 merged 2026-09-07 12:58 UTC, ~1h *after* the pin, confirmed NOT an
    ancestor, so WS-10 stays PR #4092 open here. Phase B has one early slice landed — WS-3 3.1 (fenced
    `LeaderElector` primitive, #4011 merged 2026-09-06, IS an ancestor) is done but **inert** (no loop
@@ -2127,8 +2181,29 @@ before acting on any "open" / "in progress" claim:
    state. WS-10's docs update ships inside PR #4092 itself (merged 2026-09-07 12:58 UTC) — likewise
    **after** this pin, so the matrix and this roadmap should converge once `dev` moves past them; the
    roadmap here follows verified ancestry, not the matrix file's stamp date or `gh pr view`'s live
-   state. See
-   `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
+   state. **Since the pin (re-verified 2026-09-13 @ `c7f3a5bed`):** WS-10 and WS-3 3.2/3.3/3.4 are done
+   (#4092, #4134, #4169, #4194) and WS-4 4.1 is done (#4245; inert — nothing reads it for dispatch until
+   4.2), so the 2nd-replica gate is now at least the rest of WS-4 plus WS-5, WS-6, WS-8-readyz and
+   WS-13 — see below, four more items belong in that gate too. Those four are easy to miss because
+   each shows "done" at a coarser grain: the two `DisabledUntilFixed` named fixes (`nvd_sync`'s
+   engine-tier migration, the concurrency-claims reconciler's PG-clock fix #4093) that
+   `background_jobs.hpp`'s classification holds out of the safe-to-scale set regardless of WS-10's
+   status — `leader_gate.hpp` deliberately lets both keep running today; the hold is the deployment
+   safe-to-scale gate, procedural only, never this runtime gate; WS-2a's own
+   unshipped precondition (loss-free cross-replica reconnect via durable outbox replay `ORDER BY
+   event_id` — WS-2a shows "done" at the row-status level, but its own row text in
+   `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica precondition,
+   corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID` mechanism);
+   #4014 (WS-11 leader identity/epoch + CRL-freshness-staleness metrics + split-brain alert + the
+   `/readyz` decision), which the WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd
+   replica or any WS-9 failover scenario** and which is distinct from WS-8-readyz's per-tier health
+   contract already listed above; and #4098 (verify webhook/offload emit sites are per-replica-origin
+   before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
+   thread — or a fleet-triggered emit double-delivers). That gate is procedural: nothing in code
+   refuses a 2nd replica today. See
+   `docs/ha-delivery-matrix.md`; re-verify before acting — its own boxed "Gate" callout hasn't caught
+   up to WS-11/WS-13 yet, so read the per-row exit-criteria notes too, not the callout alone
+   (Tr3kkR/Yuzu#4618). This cluster of PRs merged within a 4-day
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
 3. **Guardian hardening (Phase 16).** 16.A Windows-first soak continues (Spark engine, BaselineStore,

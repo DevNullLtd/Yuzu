@@ -1,0 +1,3 @@
+host: braga, Docker Desktop linuxkit VM, debian:12 --privileged (root); os: Linux 7.0.12-linuxkit; date: 2026-09-21
+command: mount -t securityfs securityfs /sys/kernel/security && cat /sys/kernel/security/lsm
+status: REAL CAPTURE. 23 bytes, NO trailing newline (a real kernel writes none); no MAC LSM in the list.

@@ -445,19 +445,21 @@ campaign's inline-route-extraction goal is complete.
 | Agent KV storage | SQLite (`agent.db`) | Cross-instruction persistent state |
 | Server substrate | **PostgreSQL** (shared `PgPool`) | Server storage substrate (ADR-0006/0007); server **fails closed** without it |
 | Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store) |
-| Server responses | SQLite (sharded) | Command response persistence with TTL *(SQLite today; per-store PG migration pending)* |
-| Server audit | SQLite | User action audit trail *(SQLite today; per-store PG migration pending)* |
-| Server identity/auth | AuthDB (`auth.db`) + config files (`.cfg`) | Users, tokens, enrollment, settings *(AuthDB since v0.12.0; per-store PG migration pending)* |
-| NVD/CVE data | SQLite | Vulnerability database |
-| Policy state | SQLite | Rule evaluation history, compliance |
-| Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
-| VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
+| Server responses | **PostgreSQL** (shared `PgPool`) | Command response persistence with TTL |
+| Server audit | **PostgreSQL** (shared `PgPool`) | User action audit trail |
+| Server identity/auth | **PostgreSQL** (`auth` + `scim_store` schemas) + config files (`.cfg`) | Users, tokens, enrollment, settings |
+| NVD/CVE data | SQLite (`nvd_cves.db`) | Vulnerability database *(the one server store still on SQLite — a recorded deferral, not an exemption; see `docs/postgres-migration-ladder.md`)* |
+| Policy state | **PostgreSQL** (shared `PgPool`) | Rule evaluation history, compliance |
+| Threat-graph recommendations *(proposed, §28.9)* | **PostgreSQL** (born-on-PG, ADR-0006) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
+| VirusTotal hash cache *(proposed, §28.8)* | **PostgreSQL** (born-on-PG, ADR-0006) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
 **Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** As of the
 flip (#1320 PR 3) the server **constructs a shared PostgreSQL pool at startup and fails closed
-without it** — the substrate is live, not aspirational, and the rows above marked "per-store PG
-migration pending" still open their own SQLite files only because each store migrates
-incrementally behind its own ADR. The SQLite-everywhere principle has been **retired for the
+without it** — the substrate is live, not aspirational. Every server store except the NVD/CVE
+cache is on the shared pool. `NvdDatabase` is a **recorded deferral, not an exemption**: it was
+kept on SQLite to ship matching precision sooner, and its born-on-PG reshape stays queued as
+vuln-scan milestone M1a (`docs/postgres-migration-ladder.md`) — ADR-0006's end state, no server
+store on SQLite, still applies to it. The SQLite-everywhere principle has been **retired for the
 server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
 joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
 scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
@@ -465,13 +467,14 @@ is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the fe
 warehouse (ADR-0003) and `agent.db` KV/identity — because endpoint locality is exactly what
 makes SQLite right there.
 
-New server stores default to Postgres; the existing server SQLite stores migrate
-incrementally, each behind its own per-store ADR + migration plan (`SqliteTxn`/`SqliteStmt`
-→ a pg transaction owner; `MigrationRunner` → a pg schema-migration mechanism). This is a
-**breaking deployment change** — the server gains an external database dependency (compose,
-Dockerfile, systemd, UAT/demo rigs, install docs, a CI Postgres service). Secrets are **not**
-a plain Postgres column (envelope encryption / KMS / `pgcrypto`, separate review). Substrate
-decision of record: `docs/adr/0006-server-postgresql-substrate.md` (generalising ADR-0004).
+New server stores default to Postgres. The existing server stores other than `NvdDatabase` were
+migrated incrementally, each behind its own per-store ADR + migration plan
+(`SqliteTxn`/`SqliteStmt` → a pg transaction owner; `MigrationRunner` → a pg schema-migration
+mechanism). This is a **breaking deployment change** — the server gains an external database
+dependency (compose, Dockerfile, systemd, UAT/demo rigs, install docs, a CI Postgres service).
+Secrets are **not** a plain Postgres column (envelope encryption / KMS / `pgcrypto`, separate
+review). Substrate decision of record: `docs/adr/0006-server-postgresql-substrate.md`
+(generalising ADR-0004).
 
 ## Plugin Architecture
 

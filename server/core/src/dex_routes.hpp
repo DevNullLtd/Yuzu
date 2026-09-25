@@ -30,6 +30,7 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam (#4626)
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
 #include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
@@ -40,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -199,18 +201,11 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 
 // ── F2a PR2: device drill perf extensions ────────────────────────────────────
 
-/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
-/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
-struct DexProcPerfRow {
-    std::string name; ///< image name — agent bytes, HTML-escape at render
-    std::int64_t samples{0};
-    std::int64_t instances_max{0};
-    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
-    double cpu_max{0.0};
-    double ws_avg_bytes{0.0};
-    double ws_max_bytes{0.0};
-    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
-};
+// `DexProcPerfRow` — relocated to the pure `dex_perf_model.hpp` (#4626 Concern
+// B) so `dex_perf_ui.cpp` can include that header alone instead of this
+// httplib-coupled one. Re-exported here transitively (dex_perf_model.hpp is
+// already included above), so every existing caller of THIS header is
+// unaffected.
 
 /// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
 /// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
@@ -319,10 +314,17 @@ public:
     /// includer, with ONE definition.
     using ResponsesFn = DexResponsesFn;
 
-    /// F2a: resolve the fleet perf snapshot for a cohort tag key (assembled in
-    /// server.cpp from AgentHealthStore + AgentRegistry + TagStore). May be
-    /// empty → the Performance tab renders an honest "unavailable" placeholder.
-    using PerfFn = DexPerfFn;
+    /// ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-
+    /// time API seam (`dex_perf_api.hpp`) — backs BOTH the F2a heartbeat-now
+    /// fragments (`fleet_snapshot`) and the F2b over-time fragments (`apps`/
+    /// `app_fleet_trend`/`app_version_devices`/`group_trend`/`tag_trend`/
+    /// `device_app_perf_json`/`device_app_summaries`), replacing `PerfFn`/
+    /// `AppPerfProviders` (#4626). `nullptr` (the default) degrades every
+    /// consuming fragment to an honest "unavailable" placeholder — matching
+    /// server.cpp's own posture of constructing `dex_perf_api` UNCONDITIONALLY
+    /// and letting each method collapse a null/degraded backing store to
+    /// `nullopt` individually (see `dex_perf_api.hpp`'s own doc comment).
+    using DexPerfApiPtr = std::shared_ptr<const DexPerfApi>;
 
     /// F2b: the management groups offered in the app-perf scope selector (id +
     /// name + member count), sourced from ManagementGroupStore::list_groups. May
@@ -359,8 +361,8 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
@@ -369,8 +371,8 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
-                         PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
-                         VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
+                         ScopedPermFn scoped_perm_fn = {},
+                         VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
                          GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
 private:
@@ -401,8 +403,7 @@ private:
     AuditFn audit_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
-    PerfFn perf_fn_;
-    AppPerfProviders app_perf_providers_;
+    DexPerfApiPtr dex_perf_api_;
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
 };

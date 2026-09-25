@@ -29,6 +29,8 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "pg/pg_exec.hpp" // #2146 A2-R4: DROP TABLE fault injection for the store-degrade tests
+#include "pg/pg_raii.hpp"
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -223,7 +225,6 @@ struct RestEventsHarness {
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{},
-                            /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
                             /*directory_sync=*/nullptr, stream_budget,
@@ -1307,6 +1308,12 @@ struct RestApprovalsHarness {
     bool perm_grant{true};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
+    // compliance-officer governance finding (#2146 A2-R4): captures each
+    // audit_fn call's (action, result, detail) so a test can assert content,
+    // not just that a 200 came back -- a future refactor deleting the
+    // audit_fn(...) call on a handler would otherwise pass every existing
+    // test silently.
+    std::vector<std::tuple<std::string, std::string, std::string>> audit_calls;
 
     explicit RestApprovalsHarness(bool with_manager = true) {
         if (with_manager)
@@ -1333,8 +1340,10 @@ struct RestApprovalsHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string&, const std::string& detail) -> bool {
+            audit_calls.emplace_back(action, result, detail);
             return true;
         };
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -1418,4 +1427,245 @@ TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[pg][events]
     auto res = h.sink.Get("/api/v1/approvals/anything");
     REQUIRE(res);
     REQUIRE(res->status == 403);
+}
+
+// ── GET /api/v1/approvals — approval list (#2146 A2-R4) ──────────────────────
+
+TEST_CASE("GET /api/v1/approvals: happy path lists the seeded approval with the full "
+          "field set",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto id = h->submit("def-list-1", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["id"] == *id);
+    CHECK(j["data"][0]["definition_id"] == "def-list-1");
+    CHECK(j["data"][0]["status"] == "pending");
+    CHECK(j["data"][0]["submitted_by"] == "alice");
+    CHECK(j["data"][0]["scope_expression"] == "tag:prod");
+    CHECK(j["data"][0].contains("reviewed_by"));
+    CHECK(j["data"][0].contains("reviewed_at"));
+    CHECK(j["data"][0].contains("review_comment"));
+    CHECK(j["pagination"]["total"] == 1);
+    CHECK_FALSE(j["pagination"].contains("result_truncated_by_cap"));
+    CHECK(j["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("GET /api/v1/approvals: status and submitted_by filters, matching the legacy route",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction);
+    h->submit("def-b", "operator2", "scope-b", "", ApprovalOrigin::kInstruction);
+    auto to_approve = h->submit("def-c", "operator1", "scope-c", "", ApprovalOrigin::kInstruction);
+    REQUIRE(to_approve.has_value());
+    REQUIRE(h->approve(*to_approve, "reviewer1", "").has_value());
+
+    auto by_status = h.sink.Get("/api/v1/approvals?status=approved");
+    REQUIRE(by_status);
+    auto approved = nlohmann::json::parse(by_status->body)["data"];
+    REQUIRE(approved.size() == 1);
+    CHECK(approved[0]["definition_id"] == "def-c");
+
+    auto by_submitter = h.sink.Get("/api/v1/approvals?submitted_by=operator1");
+    REQUIRE(by_submitter);
+    CHECK(nlohmann::json::parse(by_submitter->body)["data"].size() == 2); // def-a + def-c
+}
+
+TEST_CASE("GET /api/v1/approvals: status AND submitted_by combined filter (happy-path "
+          "governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction);
+    auto to_approve1 =
+        h->submit("def-b", "operator1", "scope-b", "", ApprovalOrigin::kInstruction);
+    auto to_approve2 =
+        h->submit("def-c", "operator2", "scope-c", "", ApprovalOrigin::kInstruction);
+    REQUIRE(to_approve1.has_value());
+    REQUIRE(to_approve2.has_value());
+    REQUIRE(h->approve(*to_approve1, "reviewer1", "").has_value());
+    REQUIRE(h->approve(*to_approve2, "reviewer1", "").has_value());
+
+    // Two rows are status=approved; only one of those is also
+    // submitted_by=operator1 -- proves the two filters AND-compose rather
+    // than one silently overriding the other or an off-by-one in the SQL
+    // placeholder indexing when both are present.
+    auto res = h.sink.Get("/api/v1/approvals?status=approved&submitted_by=operator1");
+    REQUIRE(res);
+    auto data = nlohmann::json::parse(res->body)["data"];
+    REQUIRE(data.size() == 1);
+    CHECK(data[0]["definition_id"] == "def-b");
+}
+
+TEST_CASE("GET /api/v1/approvals: an out-of-enum status is rejected with 400, not silently "
+          "producing a false-empty result (unhappy-path governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    // Pre-fix: this silently produced data:[] -- indistinguishable from a
+    // genuinely empty match -- instead of rejecting the malformed input.
+    auto res = h.sink.Get("/api/v1/approvals?status=aproved");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/v1/approvals: audits a success read with surface/count detail "
+          "(compliance-officer governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A future refactor that deletes the audit_fn(...) call on this handler
+    // would otherwise pass every other test in this file silently.
+    bool found = false;
+    for (const auto& [action, result, detail] : h.audit_calls) {
+        if (action == "approval.read" && result == "success") {
+            found = true;
+            CHECK(detail.find("surface=list") != std::string::npos);
+            CHECK(detail.find("count=1") != std::string::npos);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /api/v1/approvals: result_truncated_by_cap appears when more than 100 "
+          "approvals match (#2146 A2-R4 boundary)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    for (int i = 0; i < 101; ++i)
+        REQUIRE(h->submit("def-cap", "operator1", "scope-" + std::to_string(i), "",
+                          ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"].size() == 100);
+    CHECK(j["pagination"]["result_truncated_by_cap"] == true);
+}
+
+TEST_CASE("GET /api/v1/approvals: unwired store → 503 A4 envelope with retry",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h(/*with_manager=*/false);
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals: permission denied → 403", "[pg][events][approvals][perm]") {
+    RestApprovalsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/approvals: a genuine store failure answers 503, never a false "
+          "empty list, and a permanent one (DROP TABLE, 42P01) is NOT presented as "
+          "retryable (review finding, PR #4656)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    {
+        auto lease = h.approvals_bundle->pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    // DROP TABLE is a class-42 (42P01) failure -- is_permanent_pg_error
+    // classifies it PERMANENT, so this must NOT carry the retryable hint:
+    // retry_after_ms=5000 on a condition that will not clear without an
+    // operator is an unbounded retry loop.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
+}
+
+// ── GET /api/v1/approvals/pending/count (#2146 A2-R4) ────────────────────────
+
+TEST_CASE("GET /api/v1/approvals/pending/count: happy path reflects the pending queue, "
+          "excluding a non-pending row (review finding, PR #4656: a query counting ALL "
+          "statuses would have passed the prior version of this test unnoticed)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto pending_id = h->submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(pending_id.has_value());
+    REQUIRE(h->submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    // Approve one of the two -- the count must exclude it, proving the
+    // underlying query is actually WHERE status='pending', not a bare
+    // COUNT(*) that would also pass with two submitted-then-untouched rows.
+    REQUIRE(h->approve(*pending_id, "reviewer-bob", "").has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["count"] == 1);
+    CHECK(j["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: unwired store → 503 A4 envelope with retry",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h(/*with_manager=*/false);
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: permission denied → 403",
+          "[pg][events][approvals][perm]") {
+    RestApprovalsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 503, "
+          "never a false zero, and a permanent one (DROP TABLE, 42P01) is NOT "
+          "presented as retryable (review finding, PR #4656)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    {
+        auto lease = h.approvals_bundle->pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    // Same permanent (42P01) classification as the list route above.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }

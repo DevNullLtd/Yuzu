@@ -210,7 +210,20 @@ numbers match.
   **mutually exclusive**: picking one clears the other, and a management
   group takes precedence if a URL somehow names both. Choosing a model calls
   the same trend read the `GET /api/v1/dex/perf/tag` / `get_dex_tag_app_perf`
-  endpoints expose. A **version filter**
+  endpoints expose. The **Model** picker's own value list is the current fleet
+  snapshot's device-model cohorts — the SAME population `GET
+  /api/v1/dex/perf/cohorts?key=model` reports, so the two can never disagree —
+  which means it lists device models **seen reporting performance in the
+  current heartbeat cycle**, not every model ever tagged; a model with only
+  retained historical data (no device of that model currently reporting) is
+  omitted from the dropdown but can still be viewed directly by URL
+  (`?model=<value>`). When the current fleet snapshot carries no device-model
+  values at all — whether because no device is reporting this cycle, or
+  devices are reporting but none carry a `model` tag — the picker shows an
+  honest "Model: no device-model values in the current fleet snapshot." note
+  instead of an empty or misleading selector (a genuine empty cohort list is
+  never conflated with a degraded read — `fleet_snapshot` has no degrade
+  channel). A **version filter**
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
@@ -306,6 +319,16 @@ numbers match.
   adjacent rows. It is the same behavioral-PII access class as the REST drill and
   carries the **same audit action (`dex.device.app_perf.view`)**; per-version
   crashes/hangs are a planned enrichment (a separate central crash-store join).
+  When this panel's data cannot be read (the app-perf backing store is either
+  not configured or degraded — the two are no longer distinguished), it shows
+  "App performance data unavailable (not configured or degraded) — retry
+  shortly." The **fleet-wide application performance** trend/app-list panel
+  above shows the SAME unified wording on its own unwired-or-degraded path.
+  The fleet-now Performance tab (the live heartbeat panel, unrelated to this
+  retained B1/B2 surface) and the per-version "which devices" drill each keep
+  their OWN unchanged, more specific wording ("no perf snapshot provider
+  wired" / "no app-perf device provider wired" respectively) — only the two
+  app-perf-over-time surfaces above collapsed to one message.
 - **Per-signal-type** — from the Catalogue, open any type for its top subjects,
   live OS split, most-affected devices, and trend.
 - **Per-observation** — click any row in a device's signal history to load the

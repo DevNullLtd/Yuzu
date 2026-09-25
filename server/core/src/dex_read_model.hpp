@@ -45,6 +45,16 @@ struct DexDeviceScoreModel {
     std::string window; ///< echoes the validated "24h"|"7d"|"30d"|"all" token
     int score{-1};
     std::vector<DexSignalCount> signals;
+    /// #4855: true when the underlying signal-summary read DEGRADED (store
+    /// closed / pool-acquire timeout / query error) rather than genuinely
+    /// finding no signals — `score` stays -1 and `signals` stays empty in
+    /// this case too, but a caller MUST check this field first: a degraded
+    /// model must never be served/rendered as a healthy "no data" result.
+    /// Deliberately NOT serialized by `dex_device_score_json` (see its own
+    /// comment) — callers translate it into their own surface's degrade
+    /// response (lens placeholder / REST 503 / MCP retryable error) BEFORE
+    /// ever reaching the serializer.
+    bool degraded{false};
 };
 
 /// (`build_dex_device_score_model` — the store-reaching builder — is declared in
@@ -60,6 +70,14 @@ struct DexDeviceScoreModel {
 /// fails closed (503) before reaching this call at all; the field is omitted
 /// entirely when `true` (default), matching `get_dex_signal_detail`'s
 /// established shape ("absent on success — consumers key on absence").
+///
+/// #4855 guard: `model.degraded` is NEVER a JSON key here (a degraded read
+/// has no honest wire shape to serve — every caller must translate it into
+/// its own surface's degrade response before ever calling this). Debug-mode
+/// asserts a caller never reaches this serializer with a degraded model;
+/// release builds fall through to the plain score/signals fields (which are
+/// already -1/empty on a degraded model, so the worst a release build can
+/// do is the pre-#4855 "unavailable" shape — never a fabricated 100).
 std::string dex_device_score_json(const DexDeviceScoreModel& model, bool audit_persisted = true);
 
 // (MCP-only gap #2: the per-device app-perf drill serializer
@@ -259,6 +277,13 @@ struct DexOverviewModel {
     int overall_experience{-1}; ///< median of scoreable connected devices; -1 = none
     int device_score{-1}, app_score{-1}, network_score{-1};
     int great{0}, fair{0}, poor{0}; ///< per-device experience bucket counts
+    /// #4855: connected devices whose per-device score came back -1 — either
+    /// no store, or (the case this counter exists for) a degraded read on
+    /// that specific device. Counted so a fleet-wide read hiccup surfaces as
+    /// "N device(s) could not be scored" instead of silently thinning the
+    /// `great`/`fair`/`poor`/median population, which would read as a
+    /// healthier fleet than is actually known.
+    int unscored{0};
     int64_t coverage_monitored{0}, coverage_total{0};
     std::vector<DexOverviewSegment> segments; ///< by normalised OS
     // Reliability -- measured.

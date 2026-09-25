@@ -17,6 +17,7 @@
 #include "spark_engine.hpp"
 
 #include <yuzu/agent/guard_systemd.hpp> // valid_unit_name — pure, all-platform, shared with the guard
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -554,11 +555,11 @@ void SparkEngine::consumer_loop(std::shared_ptr<Consumer> consumer,
         } catch (const std::exception& e) {
             counters->errors.fetch_add(1, std::memory_order_relaxed);
             spdlog::warn("SparkEngine: consumer '{}' handler threw on spark '{}': {}",
-                         consumer->name, ev.key, e.what());
+                         consumer->name, ::yuzu::log_key_token(ev.key), e.what());
         } catch (...) {
             counters->errors.fetch_add(1, std::memory_order_relaxed);
             spdlog::warn("SparkEngine: consumer '{}' handler threw on spark '{}'", consumer->name,
-                         ev.key);
+                         ::yuzu::log_key_token(ev.key));
         }
     }
     // Signal clean exit so a bounded quiesce_consumer join succeeds (vs detach).
@@ -890,9 +891,14 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             // subscription. Losing a log line is strictly better than unwinding a
             // live arm. (Not the only allocating statement past the commit - see the
             // pre-built returns above for the ones that were removed rather than
-            // contained.)
+            // contained.) log_key_token(key) (#4665, CWE-117 log-injection
+            // neutralisation) is now a SECOND allocating expression inside this same
+            // try: it folds `key` into a new std::string before spdlog is even
+            // entered, so this line costs one allocation under QuietLog too, not
+            // zero - test_spark_alloc_budget.cpp's #2270 pin was bumped to match,
+            // not relaxed.
             try {
-                spdlog::info("SparkEngine: armed '{}'", key);
+                spdlog::info("SparkEngine: armed '{}'", ::yuzu::log_key_token(key));
             } catch (...) {
             }
         }
@@ -973,7 +979,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 try {
                     spdlog::error("SparkEngine: defensive unwatch('{}') after a failed "
                                   "watch() threw ({}) - a partial mechanism resource may "
-                                  "be orphaned", key, e.what());
+                                  "be orphaned", ::yuzu::log_key_token(key), e.what());
                 } catch (...) {
                 }
             } catch (...) {
@@ -981,7 +987,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 try {
                     spdlog::error("SparkEngine: defensive unwatch('{}') after a failed "
                                   "watch() threw - a partial mechanism resource may be "
-                                  "orphaned", key);
+                                  "orphaned", ::yuzu::log_key_token(key));
                 } catch (...) {
                 }
             }
@@ -1157,6 +1163,10 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         // necessity (Gate 9 — CA9-3/sec9-4 caught the earlier wording lumping all three). Copying it out to
         // use later would reintroduce exactly the allocation this teardown exists to
         // avoid. Do not "finish the job" by binding it wider without reading this.
+        // (#4665: the log line below now also folds `key` through log_key_token(),
+        // which allocates once on its own regardless of copy-vs-reference - that cost
+        // is separate from, and accounted for alongside, the extra copy this
+        // paragraph is about avoiding.)
         const std::string& located = ki->second;
         auto ai = armed_.find(located);
         if (ai != armed_.end()) {
@@ -1164,7 +1174,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
             std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
             if (subs.empty()) {
                 try {
-                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)",
+                                 ::yuzu::log_key_token(key));
                 } catch (...) {
                 }
                 // Only while running_: the watch was armed only while running, and
@@ -1237,7 +1248,7 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
                               "the OS watch is not reclaimed by this call; a File watch "
                               "(Windows) persists until a process restart, while other "
                               "mechanisms are reclaimed at the mechanism's stop()",
-                              key);
+                              ::yuzu::log_key_token(key));
             } catch (...) {
             }
         }
@@ -1269,11 +1280,14 @@ void SparkEngine::disarm(SubscriptionId id) {
             auto& subs = ai->second.subs;
             std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
             if (subs.empty()) {
-                // CONTAINED, matching teardown_arm_race. spdlog allocates, and the
-                // condition this whole layer exists for is the one that makes it
-                // throw; the engine's bookkeeping below must complete regardless.
+                // CONTAINED, matching teardown_arm_race. spdlog allocates - and so
+                // does log_key_token(key) (#4665), a second allocating expression
+                // inside this same try - and the condition this whole layer exists
+                // for is the one that makes either throw; the engine's bookkeeping
+                // below must complete regardless.
                 try {
-                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)",
+                                 ::yuzu::log_key_token(key));
                 } catch (...) {
                 }
                 // Only tear the OS watch down when the engine is live: the watch
@@ -1345,7 +1359,7 @@ void SparkEngine::disarm(SubscriptionId id) {
                               "is not reclaimed by this call; a File watch (Windows) persists "
                               "until a process restart, while other mechanisms are reclaimed "
                               "at the mechanism's stop()",
-                              unwatch_key);
+                              ::yuzu::log_key_token(unwatch_key));
             } catch (...) {
             }
         }
@@ -1556,7 +1570,7 @@ void SparkEngine::start() {
             // already started (mechanisms are running).
             try {
                 spdlog::error("SparkEngine: mechanism failed to arm pre-start watch '{}': {}",
-                              r.key, w.error());
+                              ::yuzu::log_key_token(r.key), w.error());
             } catch (...) {
             }
             report_fault(r.key, true, "pre-start replay watch failed");
@@ -1961,9 +1975,10 @@ void SparkEngine::report_fault(const std::string& key, bool faulted, std::string
         it->second.faulted = faulted;
         if (faulted) {
             watch_faults_.fetch_add(1, std::memory_order_relaxed);
-            spdlog::warn("SparkEngine: watch '{}' FAULTED — armed but not watching ({})", key, reason);
+            spdlog::warn("SparkEngine: watch '{}' FAULTED — armed but not watching ({})",
+                         ::yuzu::log_key_token(key), reason);
         } else {
-            spdlog::info("SparkEngine: watch '{}' recovered", key);
+            spdlog::info("SparkEngine: watch '{}' recovered", ::yuzu::log_key_token(key));
         }
         // #2818: the faulted-flag flip and its log/counter above already committed —
         // contained the same way as arm_impl's Lost snapshot: a bad_alloc here (the
@@ -2036,11 +2051,11 @@ void SparkEngine::deliver(const SparkEvent& ev, const std::vector<Subscriber>& s
             } catch (const std::exception& e) {
                 inline_errors_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("SparkEngine: INLINE handler threw on spark '{}' (contract breach): {}",
-                              out.key, e.what());
+                              ::yuzu::log_key_token(out.key), e.what());
             } catch (...) {
                 inline_errors_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::error("SparkEngine: INLINE handler threw on spark '{}' (contract breach)",
-                              out.key);
+                              ::yuzu::log_key_token(out.key));
             }
             const auto us = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2161,8 +2176,13 @@ SparkEngine::subscription_establishment(SubscriptionId id) const {
     auto ait = armed_.find(sit->second);
     if (ait == armed_.end())
         return std::nullopt;
-    return SubscriptionEstablishment{ait->second.armed_at, ait->second.established_at,
-                                     ait->second.coverage};
+    SubscriptionEstablishment out{ait->second.armed_at, ait->second.established_at,
+                                  ait->second.coverage};
+    // An inert mechanism may have dropped a coverage transition; do not trust the cache.
+    if (auto mit = mechanisms_.find(ait->second.spec.type);
+        mit != mechanisms_.end() && mit->second->stats().inert)
+        out.coverage = SparkCoverage::None;
+    return out;
 }
 
 std::map<SparkType, SparkMechanismStats> SparkEngine::stats_by_type() const {

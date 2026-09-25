@@ -1,0 +1,86 @@
+[DIAG] DLL static-init starting (before proto registration)
+Filters: [spark] [mechanism] [windows] [passfail]
+Randomness seeded to: 2117654067
+[2026-09-21 21:45:37.808] [error] spark_file: worker pass failed (consecutive #1) - retrying in 30000 ms
+[2026-09-21 21:45:37.824] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_after_dispatch_timer_12508900940524149705_1' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:45:37.934] [error] spark_file: worker pass failed (consecutive #1) - retrying in 10 ms
+[2026-09-21 21:45:37.950] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:45:37.970] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:45:37.984] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:45:38.206] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:45:38.306] [error] spark_file: worker pass failed (consecutive #2) - retrying in 200 ms
+[2026-09-21 21:45:38.506] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:38.906] [error] spark_file: worker pass failed (consecutive #4) - retrying in 800 ms
+[2026-09-21 21:45:41.335] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:45:41.385] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:45:41.485] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:41.502] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:45:41.926] [pf_stall] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:45:41.989] [pf_stall] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:45:42.101] [pf_stall] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:42.517] [pf_stall] [info] spark_file: worker pass recovered after 3 failure(s)
+[2026-09-21 21:45:42.539] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_later_deadline_12508900940524149705_10' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:45:43.014] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:45:43.126] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:45:43.158] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:45:43.222] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:45:43.908] [error] spark_file: worker pass failed (consecutive #1) - retrying in 10 ms
+[2026-09-21 21:45:43.918] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:45:43.927] [error] spark_file: worker pass failed (consecutive #1) - retrying in 500 ms
+[2026-09-21 21:45:44.427] [error] spark_file: worker pass failed (consecutive #2) - retrying in 1000 ms
+[2026-09-21 21:45:45.427] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:47.427] [info] spark_file: worker pass recovered after 3 failure(s)
+[2026-09-21 21:45:47.457] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:45:47.507] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:45:47.607] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:47.807] [error] spark_file: worker pass failed (consecutive #4) - retrying in 400 ms
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+yuzu_agent_tests.exe is a Catch2 v3.13.0 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+File worker (direct): a persistently throwing pass does not spin - the pass
+count is log-bounded by the backoff (#4658 PF-1)
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(6517)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(6553): FAILED:
+  CHECK( cpu_ms < elapsed_ms / 3 )
+with expansion:
+  1516 (0x5ec) < 504 (0x1f8)
+with messages:
+  passes=5 elapsed_ms=1514 bound=8
+  cpu_ms=1516 over elapsed_ms=1514
+
+[2026-09-21 21:45:48.986] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:45:49.002] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:45:49.022] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:45:49.072] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:45:49.172] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:45:49.177] [error] spark_file: worker pass failed (consecutive #4) - retrying in 400 ms
+-------------------------------------------------------------------------------
+File worker (direct): a real completion during a failure episode keeps the
+watch armed and the pass rate stays bounded (#4658 PF-9)
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(6980)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(7021): FAILED:
+  CHECK( cpu_ms < el / 3 )
+with expansion:
+  1500 (0x5dc) < 501 (0x1f5)
+with messages:
+  passes during 1503 ms after the write: 3 bound=9
+  cpu_ms=1500 over el=1503
+
+[2026-09-21 21:45:51.977] [info] spark_file: worker pass recovered after 6 failure(s)
+[2026-09-21 21:45:52.303] [pf_stall] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_stale_deadline_12508900940524149705_18' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:45:52.792] [pf_stall] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:45:53.096] [pf_stall] [info] spark_file: worker pass recovered after 1 failure(s)
+===============================================================================
+test cases:  16 |  14 passed | 2 failed
+assertions: 176 | 174 passed | 2 failed
+
+[DIAG] Catch2 Session::run() returned 42 (main about to return)
