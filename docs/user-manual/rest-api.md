@@ -2606,7 +2606,8 @@ Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
 through this route, even to hand it to someone else first); `409` —
 (`{name}=="Administrator"` only) removing this grant would leave the fleet
-with zero **authenticatable** Administrators — the guard counts a grant only
+with zero **authenticatable** Administrators (here: an active `auth.users` row,
+which is necessary for login but not sufficient) — the guard counts a grant only
 when its `principal_id` names an active `auth.users` row, so a grant naming a
 nonexistent, deactivated, soft-deleted, or group-held (not creatable via this
 surface) principal is never counted as a surviving administrator (the guard has

@@ -259,9 +259,10 @@ const std::vector<pg::PgMigration>& migrations() {
     // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
     // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
     // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
-    // order, or use one shared transaction-scoped advisory lock, which only removes
-    // the inversion if EVERY participant, including that guard, takes it first in its
-    // own statement.
+    // order, or have EVERY participant, the unassign guard as well as a `remove_user`
+    // guard, take one shared transaction-scoped advisory lock as the first statement of
+    // its own transaction; an advisory lock taken by only some of them removes no
+    // inversion.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("

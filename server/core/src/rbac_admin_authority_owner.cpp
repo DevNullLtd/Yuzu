@@ -250,9 +250,10 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL, and
         // #4966's fix must honour this order (or use one shared
         // transaction-scoped advisory lock) rather than invert it. A lock
-        // wait here is bounded by the pool's `lock_timeout` (10 s by default; not
-        // injected when the DSN's `options` or `PGOPTIONS` is set, so the wait is then
-        // bounded only by that setting); on timeout the statement errors and this
+        // wait here is bounded by the pool's `lock_timeout` (10 s by default; the
+        // pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is
+        // set, and the wait is then bounded only if that setting, or the server or role
+        // default, sets a `lock_timeout`); on timeout the statement errors and this
         // transaction rolls back. REST answers 503; the MCP twin answers an
         // internal error with a retry hint.
         const bool removed_a_counted_admin =
