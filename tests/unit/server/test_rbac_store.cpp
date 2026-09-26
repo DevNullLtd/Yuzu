@@ -1087,8 +1087,8 @@ TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a DEACTIVATED "
 
 // Doomgoose external review, PR #4985 (IMPORTANT finding #1, TOCTOU): the
 // `locked_admin_principal_ids` snapshot above is taken BEFORE the DELETE, and
-// `auth.users` is deliberately left unlocked by this guard (see the "never
-// lock auth.users rows here" note on `unassign_role` in rbac_store.cpp) — so a
+// the candidate `auth.users` rows are deliberately left unlocked by this guard
+// (see the Concurrency note on `unassign_role` in rbac_store.cpp) — so a
 // principal that is a ghost/deactivated Administrator grant at lock time (and
 // therefore excluded from the locked/counted set) can be reactivated by a
 // FULLY INDEPENDENT, concurrent transaction (`AuthDB::reactivate_user`) in the
@@ -1179,6 +1179,69 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard REFUSES when "
 
     // Refused ⇒ rolled back ⇒ the grant survives, and the account is (per the
     // reactivation) active — the fleet still has exactly one real admin.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+}
+
+// Doomgoose external review, PR #4985 round 3 (TOCTOU residual window): the test
+// above commits the reactivation BEFORE the post-DELETE recheck runs, so it also
+// passes against a plain (unlocked) recheck. This one holds the reactivation IN
+// FLIGHT across the recheck: connection A updates ghostadmin's own `auth.users`
+// row and leaves it uncommitted, so the recheck (`SELECT ... FOR UPDATE`) must
+// WAIT on that row lock and then re-read the COMMITTED reactivation. A plain
+// SELECT would not wait, would read the still-inactive committed row, and the
+// unassign would commit; the poll REQUIRE below is what fails in that case.
+//
+// The unassign's lock query reads `auth.users` through a JOIN without locking it
+// (`FOR UPDATE OF pr`), so it is not blocked by connection A's row lock; nor is
+// the DELETE, which targets the `principal_roles` row. The only statement that
+// can wait on A is the recheck.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
+          "reactivation still in flight across the post-DELETE recheck and then "
+          "REFUSES (FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // The in-flight reactivation: same effect as AuthDB::reactivate_user's UPDATE,
+    // issued on this lease so the test controls exactly when it commits.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    std::jthread unassign_thread([&] {
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    });
+
+    // The unassign has passed its lock query (ghostadmin's COMMITTED row is still
+    // inactive, so it is not counted) and its DELETE, and is now blocked in the
+    // recheck on connection A's row lock. Separate probe connection, never lease_a.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The recheck re-read the committed reactivation: ghostadmin is now the fleet's
+    // only real Administrator and this delete would leave zero.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+    // Refused => rolled back => the grant survives.
     CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
 }
 

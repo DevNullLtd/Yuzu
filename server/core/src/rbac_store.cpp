@@ -2053,9 +2053,11 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // construction, no separate degraded-vs-absent branch needed.
         //
         // Concurrency: lock the CANDIDATE Administrator rows with `FOR
-        // UPDATE OF pr` (the `principal_roles` alias only — never lock
-        // `auth.users` rows here, which would serialize unassigns against
-        // unrelated logins/role-changes, out of scope for this guard)
+        // UPDATE OF pr` (the `principal_roles` alias only — never lock the
+        // candidate SET of `auth.users` rows here, which would serialize
+        // unassigns against unrelated logins/role-changes. The one narrow
+        // exception is the single deleted principal's own `auth.users` row,
+        // locked by the post-DELETE recheck further down)
         // before the DELETE. Without this, two concurrent unassigns each
         // removing one of the last two Administrator grants can both read
         // "1 remaining" under READ COMMITTED (neither sees the other's
@@ -2079,20 +2081,16 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // (e.g. the only Administrator row left is a ghost/deactivated one).
         // (cpp-safety re-review, PR #4985 fix round: this reasoning assumes
         // `auth.users.is_active` is stable between the lock SELECT above and
-        // the DELETE below — `auth.users` is deliberately left unlocked by
-        // this guard, out of scope per the "never lock auth.users rows here"
-        // note further up. The scenario this narrowing newly permits is a
-        // principal reactivated inside that same window who is also the
-        // fleet's sole Administrator grant. UPDATE (Doomgoose external
-        // review, PR #4985, finding #1): this WAS a real, live exposure, not
-        // merely a theoretical one — "the fleet was already at zero COUNTED
-        // admins at lock time" does not make removing a since-reactivated
-        // sole admin's grant safe; A2's bootstrap-from-zero path covers a
-        // fleet that has NEVER had an admin, not one whose real admin just
-        // got reactivated mid-unassign. Closed below by a fresh, targeted
-        // post-DELETE re-check of `auth.users.is_active` for the specific
-        // deleted principal_id — see that comment, further down, for the
-        // fix and its own honestly-documented residual window.)
+        // the DELETE below, and it is not: the candidate `auth.users` rows are
+        // deliberately left unlocked (see the note further up). The scenario
+        // this narrowing newly permits is a principal reactivated inside that
+        // window who is also the fleet's sole Administrator grant. That was a
+        // real exposure, not a theoretical one (Doomgoose external review,
+        // PR #4985, finding #1): "the fleet was already at zero COUNTED admins
+        // at lock time" does not make removing a since-reactivated sole
+        // admin's grant safe. It is closed for an EXISTING `auth.users` row by
+        // the post-DELETE recheck further down, which locks the deleted
+        // principal's own row; that comment lists what remains open.)
         std::unordered_set<std::string> locked_admin_principal_ids;
         if (role_name == "Administrator") {
             pg::PgResult lock_rows = pg::exec_params(
@@ -2136,26 +2134,30 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         //
         // TOCTOU close (Doomgoose external review, PR #4985, finding #1):
         // `locked_admin_principal_ids` is a snapshot taken BEFORE the DELETE, and
-        // `auth.users` is deliberately left unlocked (see the "never lock auth.users
-        // rows here" note above) — so a row that was ghost/deactivated at lock time
-        // (and therefore excluded from the locked set) can be reactivated by a fully
-        // independent, concurrent transaction (e.g. `AuthDB::reactivate_user`) in the
-        // gap between the lock query and this DELETE. If that reactivated principal
-        // is the fleet's ONLY real Administrator, trusting the stale snapshot alone
-        // would evaluate `removed_a_counted_admin` false and skip the recount below
-        // entirely — silently removing the last real admin's grant with no refusal.
-        // Close this with a FRESH, targeted re-check of `auth.users.is_active` for
-        // the SPECIFIC principal_id just deleted, run here (after the DELETE, same
-        // transaction) rather than relying on the earlier snapshot for this decision:
-        // under READ COMMITTED this fresh statement sees any reactivation that has
-        // ALREADY COMMITTED by this point. Only needed when the principal wasn't
-        // already in the locked set — if it was, the recount below already fires
-        // regardless.
+        // the candidate `auth.users` rows are deliberately left unlocked, so a row
+        // that was ghost/deactivated at lock time (and therefore excluded from the
+        // locked set) can be reactivated by an independent, concurrent transaction
+        // (e.g. `AuthDB::reactivate_user`) after the lock query. If that principal
+        // is the fleet's ONLY real Administrator, trusting the snapshot alone would
+        // evaluate `removed_a_counted_admin` false and skip the recount below,
+        // removing a grant the principal can already use: the local password login
+        // query in AuthDB filters `is_active = TRUE`, and this transaction's DELETE
+        // is invisible to the admin gate until it commits.
+        // Close this with a fresh recheck of the SPECIFIC deleted principal's
+        // `auth.users` row, run after the DELETE in the same transaction, with
+        // FOR UPDATE. Under READ COMMITTED a reactivation that already committed
+        // is seen; one still in flight makes this statement wait and re-read its
+        // committed version; one that starts later blocks on this row lock until
+        // this transaction commits or rolls back, so it cannot commit between the
+        // recheck and our COMMIT. The WHERE deliberately has NO `is_active`
+        // filter: the re-read of a concurrently updated row must be able to return
+        // it. Only needed when the principal wasn't already in the locked set; if
+        // it was, the recount below fires regardless.
         bool reactivated_since_lock = false;
         if (role_name == "Administrator" && removed && principal_type == "user" &&
             locked_admin_principal_ids.count(principal_id) == 0) {
             pg::PgResult fresh_active = pg::exec_params(
-                c, "SELECT is_active FROM auth.users WHERE username = $1",
+                c, "SELECT is_active FROM auth.users WHERE username = $1 FOR UPDATE",
                 std::vector<std::string>{principal_id});
             if (fresh_active.status() != PGRES_TUPLES_OK) {
                 err = PQerrorMessage(c);
@@ -2164,13 +2166,21 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
             reactivated_since_lock = PQntuples(fresh_active.get()) == 1 &&
                                      to_bool(PQgetvalue(fresh_active.get(), 0, 0));
         }
-        // Residual window, documented honestly rather than claimed fully closed
-        // (matching this codebase's own accepted-staleness convention elsewhere,
-        // e.g. #2703's bounded stale-serve): a reactivation that commits strictly
-        // AFTER this fresh check but BEFORE this transaction's own commit is still
-        // unseen by this guard. Deliberately NOT closed by locking `auth.users`
-        // here — that remains the explicitly out-of-scope alternative per the
-        // "never lock auth.users rows here" design note above.
+        // NOT closed by this recheck (disclosed, not claimed closed):
+        //  (1) a pre-provisioned grant whose `auth.users` row is CREATED
+        //      concurrently: with no row to lock, `create_user`'s INSERT
+        //      (`is_active` defaults TRUE) can commit after this SELECT returns
+        //      zero rows;
+        //  (2) deactivation of a SURVIVING counted Administrator between the
+        //      recount below and this transaction's COMMIT (#4966: `remove_user`
+        //      has no last-Administrator guard).
+        // Lock order established here: `principal_roles` rows first, then this one
+        // `auth.users` row. A path that holds an `auth.users` row lock and then
+        // waits on `principal_roles` would deadlock against it. auth_db.cpp has no
+        // `principal_roles` SQL, and #4966's fix must honour this order (or use one
+        // shared transaction-scoped advisory lock) rather than invert it. A lock
+        // wait here is bounded by the pool's `lock_timeout`; on timeout the
+        // statement errors, this transaction rolls back and the caller sees 503.
         const bool removed_a_counted_admin =
             removed && principal_type == "user" &&
             (locked_admin_principal_ids.count(principal_id) > 0 || reactivated_since_lock);
