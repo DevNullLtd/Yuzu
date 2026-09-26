@@ -658,8 +658,13 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         return std::unexpected(ResultSetError::NotFound);
     // `owned` is identical on every returned row (it depends only on `id`'s
     // single owner_principal, not on which member row it's paired with) — the
-    // first row's value is authoritative for the whole result.
-    const bool owned = PQgetvalue(res.get(), 0, 0)[0] == 't';
+    // first row's value is authoritative for the whole result. `owner_principal`
+    // is `NOT NULL` (see the `result_sets` migration), so this column can
+    // never be NULL either — `to_bool` (this file's established boolean-
+    // column idiom, reused rather than re-inlined) treats a NULL/unexpected
+    // value as false (not-owned), the fail-closed direction, as a defensive
+    // fallback that should never actually trigger here.
+    const bool owned = to_bool(PQgetvalue(res.get(), 0, 0));
     if (!owned)
         return std::unexpected(ResultSetError::NotOwner);
     std::unordered_set<std::string> out;

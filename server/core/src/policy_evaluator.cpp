@@ -353,7 +353,7 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p,
                 if (out_reason)
                     *out_reason = to_string(result.error().kind);
             }
-            auto matched = result.value_or(std::vector<std::string>{});
+            auto matched = std::move(result).value_or(std::vector<std::string>{});
             for (const auto& a : matched)
                 if (seen.insert(a).second)
                     out.push_back(a);

@@ -11,3 +11,8 @@
   (`ScopeEvalError::Kind::PresenceDegraded`) instead of silently evaluating as if no presence-only
   agents existed. `AgentRegistry::evaluate_scope_local` (a new entry point, never presence-aware)
   keeps the three local-only Guardian push/reconcile paths unaffected by presence-store health.
+  `POST /api/policies/{id}/evaluate` and `POST /api/policies/{id}/remediate` (when `agent_ids` is
+  supplied) now correctly return `503` for a scope-evaluation abort of either kind above, instead
+  of a false-clean `409` "matches no agents" or a false-denial `400` audited as an operator
+  `denied` — both routes' non-error dispositions were previously indistinguishable from a genuine
+  empty-scope match.

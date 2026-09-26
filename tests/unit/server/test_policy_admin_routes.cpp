@@ -89,6 +89,17 @@ yuzu::test::PgTestTemplate policy_admin_store_tpl{
             throw std::runtime_error("policy_store template: failed to migrate");
     }};
 
+// Used by the degraded-presence 503/error test below — file-scope like
+// policy_admin_store_tpl above, not function-local, per this file's own
+// convention for PgTestTemplate instances.
+yuzu::test::PgTestTemplate presence_tpl{"policyadminpresence", [](const std::string& dsn) {
+                                             yuzu::server::pg::PgPool p{{.conninfo = dsn, .size = 1}};
+                                             OfflineEndpointStore s{p};
+                                             if (!s.is_open())
+                                                 throw std::runtime_error(
+                                                     "presence template: failed to migrate");
+                                         }};
+
 const std::string kFragmentYaml = R"(
 apiVersion: yuzu.io/v1alpha1
 kind: PolicyFragment
@@ -217,13 +228,6 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
     // ACCESS EXCLUSIVE lock by a second connection, with a short
     // lock_timeout so AgentRegistry::evaluate_scope's presence read fails
     // deterministically rather than racing a real timeout.
-    static yuzu::test::PgTestTemplate presence_tpl{
-        "policyadminpresence", [](const std::string& dsn) {
-            yuzu::server::pg::PgPool p{{.conninfo = dsn, .size = 1}};
-            OfflineEndpointStore s{p};
-            if (!s.is_open())
-                throw std::runtime_error("presence template: failed to migrate");
-        }};
     YUZU_REQUIRE_PG_DB_TPL(presence_db, presence_tpl);
     yuzu::server::pg::PgPool short_lock_pool{
         {.conninfo = presence_db.dsn(), .size = 2, .lock_timeout_ms = 100}};

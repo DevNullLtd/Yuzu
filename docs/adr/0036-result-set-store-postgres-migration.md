@@ -77,7 +77,9 @@ a single global `shared_mutex` serializing every writer.
   `tests/unit/server/test_scope_walking_authz.cpp`'s `[failclosed]` test drops the underlying
   Postgres table mid-test and asserts `evaluate_scope` returns `nullopt` rather than silently
   matching every registered agent under a `NOT` scope — the regression test for exactly this bug
-  class.
+  class. (`evaluate_scope`'s return type changed from `std::optional<...>`/`nullopt` to
+  `std::expected<..., ScopeEvalError>` in the 2026-09-26 Update below — this paragraph describes
+  the contract as it stood at this ADR's original writing, superseded but not wrong for its time.)
 - `list_by_owner`, `members`, `lineage`, `count_for_owner`, `counts`, and `list_pending` remain
   plain-optional/container reads — their failure modes are deny-or-benign (an empty sidebar page,
   a short lineage breadcrumb, an under-counted gauge; none grants/targets/enforces/skips/inverts).
@@ -214,7 +216,9 @@ library instead of leaning on a Postgres-side cast this store has no other reaso
   this ADR.
 - **The public C++ API's method NAMES and parameter shapes are unchanged; four return types
   widened (`get`, `contains`, `resolve_alias`, `member_set_owned` → `std::expected<...,
-  ResultSetError>`; `AgentRegistry::evaluate_scope` → `std::optional<std::vector<std::string>>`).**
+  ResultSetError>`; `AgentRegistry::evaluate_scope` → `std::optional<std::vector<std::string>>`
+  at the time this ADR was written — further widened to `std::expected<..., ScopeEvalError>` by
+  the 2026-09-26 Update below).**
   Every caller in `rest_api_v1.cpp` (`load_owned`/`resolve_owned_parent`), `scope_yaml.{hpp,cpp}`
   (`resolve_scope_aliases`/`scope_refs_failing_owner_check`, now themselves
   `std::expected`-returning and propagating), `agent_registry.{hpp,cpp}`, `server.cpp`'s

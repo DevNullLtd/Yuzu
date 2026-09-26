@@ -12,6 +12,7 @@
  */
 
 #include "agent_registry.hpp"
+#include "custom_properties_store.hpp"
 #include "event_bus.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -627,6 +628,38 @@ TEST_CASE("evaluate_scope: a result set deleted AFTER gate_scope_dispatch alread
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
         REQUIRE_FALSE(matched.has_value());
         CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+    }
+
+    SECTION("compound expression — a deleted result-set atom ANDed with a resolvable "
+            "props.<key> atom still aborts OwnerCheckFailed as a whole, never a "
+            "partial or fleet-wide match (#4981 PR-1 Finding A, compound-atom coverage)") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        REQUIRE(store.delete_set(set->id).has_value());
+
+        // Shares the pool/db with `store` above; CustomPropertiesStore migrates
+        // its own schema on construction regardless of which store's template
+        // built this database (see test_props_scope_authz.cpp's identical use).
+        CustomPropertiesStore props_store(pool);
+        REQUIRE(props_store.is_open());
+        REQUIRE(props_store.set_property("agent-win", "role", "web").has_value());
+
+        auto expr = yuzu::scope::parse(R"(props.role == "web" AND from_result_set:)" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched =
+            registry.evaluate_scope(*expr, /*tag_store=*/nullptr, &props_store, &store, "alice");
+        // The props.<key> atom resolves cleanly on its own (agent-win has
+        // role=web) — only the from_result_set: atom is broken by the TOCTOU
+        // delete. A resolver that evaluates atoms independently and merges by
+        // AND could produce a PARTIAL match (agent-win, from the props half)
+        // instead of aborting the whole expression; that is still a fail-open
+        // relative to the "never a fleet/partial match on a broken ref" contract.
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+        CHECK(matched.error().detail == set->id);
     }
 }
 

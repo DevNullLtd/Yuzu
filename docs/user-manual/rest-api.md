@@ -3840,11 +3840,16 @@ verdicts appear a few seconds later.
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
 policy is already in flight. **Response (503):** either the policy evaluator
-isn't wired ("policy evaluation not available"), or a genuine internal store
+isn't wired ("policy evaluation not available"), a genuine internal store
 failure occurred while reading the policy or fragment, recording the dispatch
 claim, or (ADR-0058) resolving the check instruction against InstructionStore
-("policy store degraded" / "policy evaluation degraded") — a transient failure
-of this kind is safe to retry and is never reported as a 409.
+("policy store degraded" / "policy evaluation degraded"), **or (#4981 PR-1) the
+policy's scope expression could not be evaluated** — a result-set reference
+that failed its ownership check due to a race with a concurrent delete, or a
+presence-store degradation on a cross-replica scope — reported as "scope
+evaluation degraded: \<reason>". A transient failure of any of these kinds is
+safe to retry and is never reported as a 409 (a genuine "matches no agents"
+result is distinguished from "could not determine whether it matches").
 
 **Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above
 (`result=error`, detail `degraded`).
@@ -3901,7 +3906,16 @@ not available"), or a genuine internal store failure occurred while resolving
 the policy or its remediation targets, including (ADR-0058) InstructionStore
 resolving the fix instruction ("policy store degraded" / "policy store
 unavailable") — safe to retry, and distinguished from the 400/409 business
-rejections above.
+rejections above. **When `agent_ids` is supplied** (#4981 PR-1), a 503 is also
+returned if the policy's own scope expression — used to confirm each requested
+agent is actually in-scope before remediating it — could not be evaluated (the
+same result-set-ownership-race or presence-degradation causes as `/evaluate`
+above); the message is `"could not determine the policy's scope (\<reason>) —
+remediation target resolution aborted, not evaluated as empty"`, distinguishing
+this from the ordinary 409 "no in-scope agents" case where the scope evaluated
+fine and genuinely excluded the requested agents. This path does not apply when
+`agent_ids` is omitted (the "remediate every non-compliant agent" case reads
+compliance status directly, not the scope expression).
 
 **Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
 is a store degrade, never a business rejection).
