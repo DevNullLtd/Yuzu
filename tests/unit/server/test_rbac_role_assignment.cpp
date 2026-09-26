@@ -1173,6 +1173,67 @@ TEST_CASE("MCP unassign_rbac_role: the admin gate's own kUnavailable outcome "
     CHECK(found);
 }
 
+// ── REST/MCP unassign: a genuine store fault returns a constant client message ────
+// (the assign routes were fixed in this PR to stop echoing the raw store error; the
+// unassign routes echoed it until now). The raw text, which names the dropped relation,
+// goes only to the audit row.
+
+TEST_CASE("REST unassign: a genuine store fault is 503 with a constant client message "
+          "that does not echo the store error",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false); // admin gate never touches principal_roles
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.unassign_rest("Operator", "jane");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("role unassignment store fault") != std::string::npos);
+    CHECK(res->body.find("principal_roles") == std::string::npos);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "rbac.role.unassigned");
+    CHECK(h.audit_log.back().result == "denied");
+    // The raw store error still reaches the audit row (which is what proves the client
+    // message above is a substitution and not an absence of the error).
+    CHECK(h.audit_log.back().detail.find("principal_roles") != std::string::npos);
+}
+
+TEST_CASE("MCP unassign_rbac_role: a genuine store fault is kInternalError with a "
+          "constant client message that does not echo the store error",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("role unassignment store fault") != std::string::npos);
+    CHECK(res->body.find("principal_roles") == std::string::npos);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "rbac.role.unassigned");
+    CHECK(h.audit_log.back().result == "denied");
+    // The raw store error still reaches the audit row (which is what proves the client
+    // message above is a substitution and not an absence of the error).
+    CHECK(h.audit_log.back().detail.find("principal_roles") != std::string::npos);
+}
+
 // ── REST: assign_role store-fault classification (Doomgoose external
 // review, PR #4985 IMPORTANT finding #3) — a genuine store/query fault on
 // assign_role must map to 503, never the 400 a genuine client-input

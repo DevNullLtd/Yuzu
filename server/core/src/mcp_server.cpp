@@ -22337,8 +22337,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // A store fault returns a constant client message; the raw text
+                    // goes only to the audit row above.
                     res.set_content(
-                        a4_error(kInternalError, result.error(), "retry shortly",
+                        a4_error(kInternalError,
+                                 "role unassignment store fault; retry, and if this persists "
+                                 "escalate to an operator",
+                                 "retry shortly",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;

@@ -207,6 +207,8 @@ That is no longer accurate: `AppPerfRollup` (`app_perf_rollup.{hpp,cpp}`) is a d
 that takes one pool lease and issues schema-qualified SQL across two store schemas, and
 `RbacAdminAuthorityOwner` (`rbac_admin_authority_owner.{hpp,cpp}`, PR #4985) is one for the
 last-Administrator guard, which needs the `rbac_store` grants and the `auth.users` account state
-inside one transaction. The rule in section 3 is unchanged: per-store classes stay single-schema
-owners, cross-schema work lives in a query owner, and `RbacStore::unassign_role` delegates to the
-owner rather than issuing `auth` SQL itself.
+inside one transaction. The condition in section 3 for building the seam (its first consumer) is
+therefore met by `AppPerfRollup`, and the interim prohibition on a per-store cross-schema method
+continues as the standing rule: per-store classes stay single-schema owners, cross-schema work
+lives in a query owner, and `RbacStore::unassign_role` delegates to the owner rather than issuing
+`auth` SQL itself.

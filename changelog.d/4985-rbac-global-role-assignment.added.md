@@ -11,8 +11,8 @@
   deactivated, or deleted username is never counted as a survivor. The guard also
   holds against a concurrent reactivation of the removed principal's existing
   account. Two races remain outside it: an account created concurrently for a
-  pre-provisioned grant (not tracked), and a surviving Administrator's account
-  deactivated concurrently (the account-deactivation path has no
-  last-Administrator guard, tracked at #4966).
+  pre-provisioned grant, and a surviving Administrator's account deactivated
+  concurrently (the account-deactivation path has no last-Administrator guard);
+  both are tracked at #4966.
   `ITServiceOwner` and any custom/unknown role are rejected uniformly (no role-catalog
   oracle); pre-provisioning a role ahead of a user's first login is allowed.
