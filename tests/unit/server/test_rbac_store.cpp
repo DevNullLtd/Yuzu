@@ -194,6 +194,7 @@ int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_at
 // therefore never leaves a joinable std::thread behind (std::terminate) and never waits
 // out a lock_timeout. std::jthread is not available on Apple Clang's libc++, so this
 // stands in for it.
+namespace {
 class ScopedJoin {
 public:
     explicit ScopedJoin(std::thread t, std::function<void()> before_join = {})
@@ -216,6 +217,7 @@ private:
     std::thread t_;
     std::function<void()> before_join_;
 };
+} // namespace
 
 TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
           "(#3623, governance unhappy-path fix)",
@@ -1594,8 +1596,9 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
     // `unassign_thread` blocks on connection A's row lock for at most
     // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
-    // indefinitely, so this test's worst case is bounded even if connection
-    // A's own COMMIT below never ran (e.g. a REQUIRE above it failed).
+    // indefinitely. If a REQUIRE above connection A's COMMIT fails, ScopedJoin
+    // rolls back lease_a first, so the worker unblocks at once instead of waiting
+    // out that timeout.
     ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "raceadmin2", "Administrator");

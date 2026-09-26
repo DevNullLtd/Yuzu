@@ -980,7 +980,7 @@ TEST_CASE("REST unassign C1(c): removing the fleet's real Administrator is "
 // denial. Closes a2-p7-doomgoose-11's own gap ("is_rbac_administrator's
 // kUnavailable outcome was exercised only via null-pointer inputs"). ───────
 
-TEST_CASE("REST assign: the admin gate's own kUnavailable outcome (RBAC-on, "
+TEST_CASE("REST assign: the admin gate's own kUnavailable outcome (RBAC-on and "
           "genuinely degraded store) is 503 with an audited denial (PR "
           "#4985 finding #2)",
           "[pg][rest][rbac][a2]") {
@@ -1016,7 +1016,7 @@ TEST_CASE("REST assign: the admin gate's own kUnavailable outcome (RBAC-on, "
 }
 
 TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
-          "(RBAC-on, genuinely degraded store) is kInternalError with an "
+          "(RBAC-on and genuinely degraded store) is kInternalError with an "
           "audited denial (PR #4985 finding #2)",
           "[pg][mcp][rbac][a2]") {
     RbacRoleHarness h;
@@ -1056,8 +1056,10 @@ TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
 // the OpenAPI 401 text says "MFA step-up required (stale/absent proof)". The harness
 // used to pass no step-up gate at all, so that claim had no test. These prove the
 // ROUTE contract only: when the gate returns false (it has already written its own
-// 401, including meta.challenge_url, which the real gate owns and tests where it
-// lives) the route stops before mutating and consulted the gate with the right label.
+// response) the route stops before mutating and consulted the gate with the right
+// label. The stub's 401 body carries no `meta`, so nothing here can regress
+// meta.challenge_url; the real gate's 401/challenge_url, stale-proof, OIDC and SAML
+// behaviour is tested in test_mfa_step_up.cpp.
 TEST_CASE("REST assign: a failing MFA step-up gate stops the route with its "
           "own 401 before any mutation",
           "[pg][rest][rbac][a2]") {
@@ -1114,7 +1116,7 @@ TEST_CASE("REST unassign: a failing MFA step-up gate stops the route with its "
 // ── REST/MCP unassign: the admin gate's own kUnavailable outcome (Doomgoose round-3
 // coverage gap: the shape-identical assign tests above were the only ones). ───────
 
-TEST_CASE("REST unassign: the admin gate's own kUnavailable outcome (RBAC-on, "
+TEST_CASE("REST unassign: the admin gate's own kUnavailable outcome (RBAC-on and "
           "genuinely degraded store) is 503 with an audited denial",
           "[pg][rest][rbac][a2]") {
     RbacRoleHarness h;
@@ -1141,7 +1143,7 @@ TEST_CASE("REST unassign: the admin gate's own kUnavailable outcome (RBAC-on, "
 }
 
 TEST_CASE("MCP unassign_rbac_role: the admin gate's own kUnavailable outcome "
-          "(RBAC-on, genuinely degraded store) is kInternalError with an "
+          "(RBAC-on and genuinely degraded store) is kInternalError with an "
           "audited denial",
           "[pg][mcp][rbac][a2]") {
     RbacRoleHarness h;
