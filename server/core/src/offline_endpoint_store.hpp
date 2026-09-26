@@ -14,10 +14,25 @@
 /// merge this store's live rows into cross-replica scope-evaluation
 /// visibility — a degraded/misbehaving `OfflineEndpointStore` on a
 /// multi-replica deployment now affects live dispatch targeting, not only a
-/// stale-cube viz render. It remains fail-SOFT for that consumer by design
-/// (a read failure degrades to local-only visibility, never a wrong
-/// dispatch — see `AgentRegistry::live_presence()`'s doc comment), so this
-/// widening does not change the store's own posture, only who depends on it.
+/// stale-cube viz render.
+///
+/// **#4981 PR-1 (Finding B) widens `query_live_ids` to a type-distinguishable
+/// read.** Pre-#4981, a store outage was silently indistinguishable from
+/// "confirmed zero presence-only agents" (both returned an empty vector) —
+/// `AgentRegistry::evaluate_scope` could return a normal-looking,
+/// successful-but-incomplete match set during an outage. `query_live_ids` now
+/// returns `std::expected<std::vector<PresenceIdentity>, PresenceReadError>`:
+/// a genuine store/query failure (or a row count past `kQueryRowCap`) is
+/// `std::unexpected`, NEVER a silently-empty/truncated vector. `live_presence()`
+/// (`agent_registry.cpp`) propagates this to `evaluate_scope`'s
+/// `ScopeEvalError::Kind::PresenceDegraded`, which aborts fleet-wide scope
+/// evaluation rather than proceeding with a partial presence view — the same
+/// fail-closed posture `member_set_owned` already holds for result-set
+/// membership. `evaluate_scope_local` never calls into presence at all and so
+/// can never fail this way (see its own doc comment). `query_stale_within`
+/// (the viz-only read) is UNCHANGED — it stays fail-soft (empty on error),
+/// since a stale-cube viz render has no dispatch/enforce/target decision
+/// downstream of it.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -27,6 +42,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -76,8 +92,25 @@ struct PresenceIdentity {
     std::string arch;
 };
 
+/// `query_live_ids`'s typed failure surface (#4981 PR-1, Finding B).
+/// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
+/// existing `reason` label vocabulary (`store_unavailable`/`db_error`,
+/// offline_endpoint_store.cpp) exactly — do not introduce a third spelling.
+/// `Truncated` is new: the query result exceeded `kQueryRowCap` rows, so the
+/// caller cannot trust it as the COMPLETE live set (silently dropping rows
+/// past the cap would under-count presence, the same fail-open class a
+/// genuine DB error guards against).
+enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
+
 class OfflineEndpointStore {
 public:
+    /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
+    /// (gov sec-LOW / UP-5): the viz machines_max ceiling, so the store can
+    /// never allocate more than the page could ever serve even if the table
+    /// has grown large. Public so tests can size a truncation fixture against
+    /// the real value rather than a hardcoded duplicate.
+    static constexpr int kQueryRowCap = 100000;
+
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
     /// migration failed (the server fails closed before reaching here, so in
@@ -128,11 +161,27 @@ public:
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
     /// `system_clock` — the #3715 precedent), for cross-replica
-    /// scope-evaluation visibility. Fail-soft: empty on any read error —
-    /// presence only WIDENS visibility (it grants no dispatch authority; see
-    /// `AgentRegistry::evaluate_scope`), so a degraded read just means "see
-    /// local agents only" for that one call, never a hard failure.
-    [[nodiscard]] std::vector<PresenceIdentity> query_live_ids(std::chrono::seconds ttl);
+    /// scope-evaluation visibility.
+    ///
+    /// #4981 PR-1 (Finding B): type-distinguishable — `std::unexpected` on a
+    /// genuine read failure (`StoreUnavailable`: no connection in time;
+    /// `DbError`: the query itself failed) or on a result exceeding
+    /// `kQueryRowCap` (`Truncated` — queried at `LIMIT kQueryRowCap + 1`; a
+    /// `(kQueryRowCap + 1)`-row result means the true live set is larger than
+    /// what was fetched, so the extra row is discarded and the whole read is
+    /// reported as untrustworthy rather than silently serving a partial set).
+    /// The caller (`AgentRegistry::live_presence()`) MUST treat any of these
+    /// as "cannot answer" (`ScopeEvalError::Kind::PresenceDegraded` for
+    /// `evaluate_scope`), never silently substitute an empty vector — an
+    /// empty presence set during a genuine outage is indistinguishable from
+    /// "confirmed zero presence-only agents" and, under a NOT combinator
+    /// elsewhere in the scope expression, would otherwise invert to a
+    /// fleet-wide match built on a degraded read the caller never even
+    /// noticed. `query_stale_within` above is UNCHANGED (still fail-soft,
+    /// empty on error) — a stale-cube viz render has no
+    /// dispatch/enforce/target decision downstream of it, unlike this method.
+    [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
+    query_live_ids(std::chrono::seconds ttl);
 
     /// Session-guarded delete (HA WS-5): removes the row ONLY when its
     /// stored `session_id` matches — mirrors

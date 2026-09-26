@@ -316,7 +316,8 @@ std::string PolicyEvaluator::gen_execution_id() {
     return "polchk-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 }
 
-std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const {
+std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p,
+                                                          std::string* out_reason) const {
     std::vector<std::string> out;
     std::set<std::string> seen;
     if (!p.management_groups.empty() && d_.mgmt_group_store) {
@@ -328,14 +329,31 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
         auto parsed = yuzu::scope::parse(p.scope_expression);
         if (parsed) {
             // No rs_store/principal passed. A from_result_set: atom in a
-            // policy scope now ABORTS to nullopt (H1, 2026-07-29) and
-            // value_or({}) collapses that to zero targets — evaluate nothing,
-            // the safe direction. Unreachable today (create_policy rejects
+            // policy scope now ABORTS (H1, 2026-07-29) and value_or({})
+            // collapses that to zero targets — evaluate nothing, the safe
+            // direction. Unreachable today (create_policy rejects
             // fromResultSet:, PR-E2 pending) but the comment must not claim
             // "cannot degrade" on an authz-adjacent branch.
-            auto matched = d_.registry
-                              ->evaluate_scope(*parsed, d_.tag_store, d_.custom_properties_store)
-                              .value_or(std::vector<std::string>{});
+            //
+            // #4981 PR-1 B6: this call site bypasses the dispatch ladder, so
+            // it owns its OWN observability for a degraded evaluation — the
+            // ladder's audit_scope_evaluation_aborted (server.cpp) never
+            // fires for this path. Increment here, never inside
+            // AgentRegistry::evaluate_scope itself (that would double-count
+            // every ladder-routed caller, which already increments via the
+            // audit path).
+            auto result = d_.registry->evaluate_scope(*parsed, d_.tag_store,
+                                                      d_.custom_properties_store);
+            if (!result) {
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_scope_eval_degraded_total",
+                                  {{"reason", to_string(result.error().kind)}})
+                        .increment();
+                if (out_reason)
+                    *out_reason = to_string(result.error().kind);
+            }
+            auto matched = result.value_or(std::vector<std::string>{});
             for (const auto& a : matched)
                 if (seen.insert(a).second)
                     out.push_back(a);
@@ -629,14 +647,25 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         // must be intersected with the policy's own scope. Otherwise a
         // Policy:Execute holder could dispatch the fragment's fix instruction to
         // arbitrary fleet agents the policy never targets.
-        auto scoped = resolve_targets(*p);
+        //
+        // #4981 PR-1 B6: `degrade_reason` distinguishes "the policy's scope
+        // genuinely matched nobody" from "the scope evaluation itself could
+        // not be trusted" (a presence/store degradation) — without this, an
+        // operator sees the same generic refusal for both, and the latter
+        // reads as a much less actionable message than it should.
+        std::string degrade_reason;
+        auto scoped = resolve_targets(*p, &degrade_reason);
         std::set<std::string> allowed(scoped.begin(), scoped.end());
         for (const auto& a : agent_ids)
             if (allowed.count(a))
                 targets.push_back(a);
         if (targets.empty()) {
-            out.error = "no in-scope agents to remediate (requested agents are outside the "
-                        "policy's scope)";
+            out.error = degrade_reason.empty()
+                          ? "no in-scope agents to remediate (requested agents are outside the "
+                            "policy's scope)"
+                          : "could not determine the policy's scope (" + degrade_reason +
+                                ") — remediation target resolution aborted, not evaluated as "
+                                "empty";
             return out;
         }
     }

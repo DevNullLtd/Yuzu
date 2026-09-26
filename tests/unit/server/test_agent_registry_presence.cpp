@@ -9,13 +9,17 @@
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,8 +30,12 @@
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
 using yuzu::server::OfflineEndpointStore;
+using yuzu::server::PresenceReadError; // #4981 PR-1
+using yuzu::server::ScopeEvalError;    // #4981 PR-1
 using yuzu::server::TagStore;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace agent_pb = ::yuzu::agent::v1;
 
@@ -351,5 +359,245 @@ TEST_CASE("HA WS-5: has_remote_presence — direct single-lock membership check"
 
     SECTION("empty candidate list: false") {
         CHECK_FALSE(registry.has_remote_presence({}));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 (Finding B): presence-store degradation must be type-distinguishable
+// from "confirmed zero presence-only agents" all the way up to evaluate_scope.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("HA WS-5: evaluate_scope (fleet-wide) ABORTS PresenceDegraded on a genuine "
+          "presence-store failure, never a silently-narrowed match set (#4981 PR-1 B)",
+          "[pg][ha][presence][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+    (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
+    REQUIRE(parsed.has_value());
+    auto matched = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(matched.has_value());
+    CHECK(matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("HA WS-5: evaluate_scope ABORTS PresenceDegraded on a DROP-TABLE-class presence "
+          "failure too (#4981 PR-1 B)",
+          "[pg][ha][presence][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+    (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE endpoint_state.endpoints CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
+    REQUIRE(parsed.has_value());
+    auto matched = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(matched.has_value());
+    CHECK(matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
+}
+
+TEST_CASE("HA WS-5: evaluate_scope_local SUCCEEDS with local-only matches under the SAME "
+          "presence degradation that aborts evaluate_scope (Guardian-collateral-safety, "
+          "#4981 PR-1 B4)",
+          "[pg][ha][presence][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+    (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
+    REQUIRE(parsed.has_value());
+
+    // The primary, presence-consulting entry point aborts under this exact
+    // degradation...
+    auto fleet_matched = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(fleet_matched.has_value());
+    CHECK(fleet_matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
+
+    // ...but evaluate_scope_local NEVER consults presence at all, so it
+    // succeeds with the local match regardless — this is the regression-
+    // prevention property the three Guardian push call sites depend on: a
+    // presence-store outage must never periodically disarm a scoped rule.
+    auto local_matched = registry.evaluate_scope_local(*parsed, nullptr);
+    REQUIRE(local_matched.has_value());
+    REQUIRE(local_matched->size() == 1);
+    CHECK((*local_matched)[0] == "local-agent");
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("HA WS-5: has_any_reachable() returns true under a degraded presence read even "
+          "with zero local agents (#4981 PR-1 B5)",
+          "[pg][ha][presence][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+    // Deliberately ZERO local agents registered.
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK_FALSE(registry.has_any());
+    // A degraded presence read must let the request proceed (so the ladder
+    // can produce the specific PresenceDegraded reason) rather than a
+    // confusingly-wrong "no agent connected" — see has_any_reachable()'s own
+    // doc comment.
+    CHECK(registry.has_any_reachable());
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("HA WS-5: live_presence()'s negative cache serves a degraded read back within "
+          "the TTL window — one real query, not one per caller (#4981 PR-1 B2)",
+          "[pg][ha][presence][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+    yuzu::MetricsRegistry metrics;
+    degraded_store.set_metrics(&metrics);
+
+    EventBus bus;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // Two calls back-to-back, both well within the 3s kPresenceCacheTtl
+    // window — the second must be served from the NEGATIVE cache, not issue
+    // a second real (failing) query.
+    auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
+    REQUIRE(parsed.has_value());
+    auto first = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(first.has_value());
+    auto second = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(second.has_value());
+
+    CHECK(metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "query_live_ids"}, {"reason", "db_error"}})
+              .value() == 1);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("HA WS-5: evaluate_scope ABORTS PresenceDegraded when query_live_ids reports "
+          "Truncated, succeeds normally exactly at kQueryRowCap (#4981 PR-1 B1/B)",
+          "[pg][ha][presence][slow][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&store, std::chrono::hours(1));
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+    auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
+    REQUIRE(parsed.has_value());
+
+    SECTION("kQueryRowCap + 1 rows: PresenceDegraded, never a silently-partial match set") {
+        std::string sql =
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            std::to_string(OfflineEndpointStore::kQueryRowCap + 1) + ") g";
+        PgResult ins{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(ins.ok());
+
+        auto matched = registry.evaluate_scope(*parsed, nullptr);
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
+    }
+
+    SECTION("exactly kQueryRowCap rows: succeeds normally") {
+        std::string sql =
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            std::to_string(OfflineEndpointStore::kQueryRowCap) + ") g";
+        PgResult ins{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(ins.ok());
+
+        auto matched = registry.evaluate_scope(*parsed, nullptr);
+        REQUIRE(matched.has_value());
+        CHECK(matched->size() == static_cast<std::size_t>(OfflineEndpointStore::kQueryRowCap));
     }
 }

@@ -45,8 +45,11 @@ using yuzu::server::DispatchArm;
 using yuzu::server::DispatchResolvers;
 using yuzu::server::resolve_and_dispatch_confined;
 using yuzu::server::resolve_scope_targets;
+using yuzu::server::ScopeAbortReason;    // #4981 PR-1
+using yuzu::server::ScopeEvalError;      // #4981 PR-1
 using yuzu::server::ScopeLadderAudit;
 using yuzu::server::ScopeLadderResult;
+using yuzu::server::to_abort_reason;     // #4981 PR-1
 using yuzu::server::authz::VisibleSet;
 
 namespace {
@@ -546,7 +549,7 @@ TEST_CASE("resolve_scope_targets: a matching expression with no from_result_set 
     audit.resolution_failed = [&](const std::string&) { audit_fired = true; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", "alice", /*result_set_store=*/nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
             return std::vector<std::string>{"dev-A", "dev-B"};
         },
         audit);
@@ -563,7 +566,7 @@ TEST_CASE("resolve_scope_targets: invalid scope syntax surfaces a parse_error an
     ScopeLadderAudit audit;
     const auto result = resolve_scope_targets(
         "(ostype == \"Windows\"", "alice", nullptr,
-        [&](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
+        [&](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
             evaluate_called = true;
             return std::vector<std::string>{};
         },
@@ -581,28 +584,81 @@ TEST_CASE("resolve_scope_targets: a degraded registry evaluation aborts as db_de
     audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", "alice", nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
-            return std::nullopt; // registry membership preload failed
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            // registry membership preload failed
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
         },
         audit);
     CHECK_FALSE(result.matched.has_value());
     CHECK(aborted_reason == "db_degraded");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::DbDegraded);
 }
 
-TEST_CASE("resolve_scope_targets: a degraded registry evaluation with no principal aborts as "
+TEST_CASE("resolve_scope_targets: a PrincipalUnresolved registry evaluation aborts as "
           "principal_unresolved",
           "[server][dispatch][scope]") {
+    // #4981 PR-1: the ladder no longer INFERS this reason from an empty
+    // `principal` argument (that heuristic is gone) — it directly relays
+    // whatever Kind evaluate_scope_fn returns. AgentRegistry::evaluate_scope's
+    // OWN empty-principal-with-a-from_result_set:-atom logic is pinned
+    // separately in test_scope_walking_authz.cpp; this test pins the ladder's
+    // relay of that Kind.
     std::string aborted_reason;
     ScopeLadderAudit audit;
     audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", /*principal=*/"", nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
-            return std::nullopt;
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PrincipalUnresolved, {}});
         },
         audit);
     CHECK_FALSE(result.matched.has_value());
     CHECK(aborted_reason == "principal_unresolved");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::PrincipalUnresolved);
+}
+
+TEST_CASE("resolve_scope_targets: a PresenceDegraded registry evaluation aborts as "
+          "presence_degraded, matched absent",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1 Finding B: ladder-level confirmation that a PresenceDegraded
+    // evaluator error produces evaluation_aborted("presence_degraded") with
+    // abort_reason set correctly and matched empty/absent.
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, {}});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "presence_degraded");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::PresenceDegraded);
+}
+
+TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
+    // dispatch_scope_ladder.hpp's to_string(ScopeAbortReason) are
+    // near-duplicate enums (kept separate so a caller bypassing the ladder,
+    // e.g. PolicyEvaluator::resolve_targets, can use the former without
+    // pulling in the latter's much heavier header) — pin that they can never
+    // silently drift apart.
+    using Kind = ScopeEvalError::Kind;
+    CHECK(std::string(to_string(Kind::Unresolvable)) ==
+          to_string(to_abort_reason(Kind::Unresolvable)));
+    CHECK(std::string(to_string(Kind::PrincipalUnresolved)) ==
+          to_string(to_abort_reason(Kind::PrincipalUnresolved)));
+    CHECK(std::string(to_string(Kind::StoreDegraded)) ==
+          to_string(to_abort_reason(Kind::StoreDegraded)));
+    CHECK(std::string(to_string(Kind::OwnerCheckFailed)) ==
+          to_string(to_abort_reason(Kind::OwnerCheckFailed)));
+    CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
+          to_string(to_abort_reason(Kind::PresenceDegraded)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1203,4 +1259,96 @@ TEST_CASE("wire_and_dispatch_confined: a narrowed exec_visible excludes a local-
     // ever reached the send step.
     for (const auto& p : pending)
         CHECK(p.agent_id != "dev-excluded");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 Finding A regression test: the TOCTOU race between
+// gate_scope_dispatch's early forensic owner-check pass and
+// AgentRegistry::evaluate_scope's own (later) member_set_owned preload. A
+// result set that passes the gate can still be deleted before evaluate_scope
+// runs -- pre-#4981, member_set_owned's plain owner-filtered JOIN returned a
+// SUCCESSFUL EMPTY set once the row was gone, which a `NOT from_result_set:`
+// combinator inverted to a fleet-wide match. This exercises the REAL ladder
+// (resolve_scope_targets) against a REAL AgentRegistry + a REAL
+// PG-backed ResultSetStore, deleting the set from inside the injected
+// evaluator closure -- i.e. strictly AFTER gate_scope_dispatch's own check
+// already ran and returned Proceed, and strictly BEFORE the real
+// registry.evaluate_scope call the closure then makes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+yuzu::test::PgTestTemplate dispatch_toctou_tpl{"dispatchtoctou", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("dispatchtoctou template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("resolve_scope_targets: a result set deleted between gate_scope_dispatch and "
+          "evaluate_scope's own read aborts OwnerCheckFailed, NEVER a fleet-wide match "
+          "(#4981 PR-1 Finding A TOCTOU regression)",
+          "[pg][server][dispatch][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_toctou_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    (void)registry.register_agent(make_wiring_test_info("dev-B"));
+
+    yuzu::server::CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(yuzu::server::source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto owned = store.create_materialized(cr, {"dev-A"});
+    REQUIRE(owned.has_value());
+    const std::string rsid = owned->id;
+
+    auto run_case = [&](std::string_view scope_expr) {
+        std::vector<std::string> resolution_failed_refs;
+        std::string aborted_reason;
+        ScopeLadderAudit audit;
+        audit.resolution_failed = [&](const std::string& ref) {
+            resolution_failed_refs.push_back(ref);
+        };
+        audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+        const auto result = resolve_scope_targets(
+            scope_expr, "alice", &store,
+            [&](const yuzu::scope::Expression& parsed)
+                -> std::expected<std::vector<std::string>, ScopeEvalError> {
+                // Simulates a concurrent delete_set/gc_sweep landing in the
+                // window between gate_scope_dispatch (already run, above,
+                // inside resolve_scope_targets, and already returned
+                // Proceed) and this evaluator's own real registry read.
+                REQUIRE(store.delete_set(rsid).has_value());
+                return registry.evaluate_scope(parsed, nullptr, nullptr, &store, "alice");
+            },
+            audit);
+        CHECK_FALSE(result.matched.has_value());
+        REQUIRE(result.abort_reason.has_value());
+        CHECK(*result.abort_reason == ScopeAbortReason::OwnerCheckFailed);
+        CHECK(aborted_reason == "owner_check_failed");
+        // The forensic per-ref row fires for the TOCTOU abort too (not only
+        // the gate-path AbortOwnerCheck case) -- see resolve_scope_targets's
+        // own comment on this.
+        REQUIRE(resolution_failed_refs.size() == 1);
+        CHECK(resolution_failed_refs[0] == rsid);
+        // dev-B (never a member) proves this never widened to a fleet-wide
+        // match; dev-A (the deleted set's only member) proves it, more
+        // strongly, never matched ANYONE -- an abort, not a match.
+        CHECK_FALSE(result.matched.has_value());
+    };
+
+    SECTION("bare form") { run_case("from_result_set:" + rsid); }
+    SECTION("NOT-combinator form -- the concrete fleet-wide-fail-open shape") {
+        run_case("NOT from_result_set:" + rsid);
+    }
+
+    // Re-create under the SAME id is astronomically unlikely (random suffix,
+    // see ResultSetStore::generate_id) so no re-fetch/cleanup is needed here.
 }
