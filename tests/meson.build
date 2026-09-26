@@ -1163,6 +1163,8 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
+      'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
@@ -2710,6 +2712,15 @@ test('split interlock tripwire selftest',
 test('no conn-less libpq escape references',
   _python3_test,
   args: [files('test_no_connless_pq_escape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL lives only in the
+# query owner, and its one shared SQL fragment has exactly one definition (PR #4985).
+test('rbac cross-schema query-owner seam',
+  _python3_test,
+  args: [files('test_rbac_query_owner_seam.py')],
   suite: 'docs',
   timeout: 30,
 )

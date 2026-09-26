@@ -2076,7 +2076,10 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"mint_engine_credential", false}, // additive
         {"rotate_engine_credential", true}, {"confirm_engine_rotation", true}, // was false-safe
         {"assign_engine_role", false},     // additive (INSERT OR IGNORE)
-        {"unassign_engine_role", true},    {"open_access_review", false}, // additive
+        {"unassign_engine_role", true},
+        {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
+        {"unassign_rbac_role", true},
+        {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
     for (const auto& e : kWriteAttestExpect) {
@@ -22796,6 +22799,13 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
         {"unassign_engine_role",
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
+        // A2 (delivery plan §2) — global human role assignment, same
+        // Security:Write-driven gate as assign/unassign_engine_role above.
+        {"assign_rbac_role",
+         nlohmann::json::parse(
+             R"({"principal_type":"user","principal_id":"jane","role":"Operator"})")},
+        {"unassign_rbac_role",
+         nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
