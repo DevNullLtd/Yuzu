@@ -57,7 +57,7 @@
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
-#include "mfa_step_up.hpp"          // StepUpFn — the step-up seam the REST routes call
+#include "mfa_step_up.hpp"          // StepUpFn, the step-up seam the REST routes call
 #include "rbac_admin_predicate.hpp" // kRbacAdminGateUnavailableAuditReason
 #include "rbac_assignable_roles.hpp"
 #include "rbac_store.hpp"
@@ -887,6 +887,10 @@ TEST_CASE("REST unassign: removing the fleet's last remaining Administrator "
     auto res = h.unassign_rest("Administrator", "soleadmin");
     REQUIRE(res);
     CHECK(res->status == 409);
+    // The refusal keeps its business-rule message; only store faults return the
+    // constant client message.
+    CHECK(res->body.find("zero administrators") != std::string::npos);
+    CHECK(res->body.find("role unassignment store fault") == std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "soleadmin").size() == 1);
     // Governance follow-up (item 3): the metric fires exactly once, under
     // the "rest" transport label.
@@ -1052,11 +1056,11 @@ TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
     CHECK(found);
 }
 
-// ── REST: the MFA step-up gate (Doomgoose external review, PR #4985 round 3) —
+// ── REST: the MFA step-up gate (Doomgoose external review, PR #4985 round 3):
 // the OpenAPI 401 text says "MFA step-up required (stale/absent proof)". The harness
 // used to pass no step-up gate at all, so that claim had no test. These prove the
 // ROUTE contract only: when the gate returns false (it has already written its own
-// response) the route stops before mutating and consulted the gate with the right
+// response) the route stops before mutating, and it consulted the gate with the right
 // label. The stub's 401 body carries no `meta`, so nothing here can regress
 // meta.challenge_url; the real gate's 401/challenge_url, stale-proof, OIDC and SAML
 // behaviour is tested in test_mfa_step_up.cpp.

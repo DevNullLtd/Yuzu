@@ -192,8 +192,8 @@ int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_at
 // Joins its std::thread on scope exit, after running `before_join` (used to roll back a
 // held lease so a worker blocked on that lease's row lock can finish). A failing REQUIRE
 // therefore never leaves a joinable std::thread behind (std::terminate) and never waits
-// out a lock_timeout. std::jthread is not available on Apple Clang's libc++, so this
-// stands in for it.
+// out a lock_timeout. std::jthread is not available on every supported toolchain (the
+// tree notes Apple Clang's libc++ lacks it), so this stands in for it.
 namespace {
 class ScopedJoin {
 public:
@@ -1523,7 +1523,7 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard under real "
     std::atomic<bool> done1{false}, done2{false};
     // ScopedJoin (above) joins on scope exit, so a live std::thread is never left
     // joinable when a REQUIRE throws (std::terminate); std::jthread would do the same
-    // but is not available on Apple Clang's libc++.
+    // but is not available on every supported toolchain.
     ScopedJoin t1{std::thread([&] {
         ok1 = store.unassign_role("user", "concadmin1", "Administrator").has_value();
         done1 = true;
