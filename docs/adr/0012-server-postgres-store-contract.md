@@ -199,3 +199,14 @@ itself, and the 264:16 ratio driving it, are unchanged by this fix). The differe
 this widening adds to already-tracked fire-and-forget audit-write sites (#950, #3185, #4007,
 #4526 -- pre-existing, not introduced here) is a separate, disclosed follow-up concern, not a
 reason to withhold or narrow this fix.
+
+## Update (2026-09-26) -- the cross-store query-owner seam exists
+
+Section 3 and its Consequences describe the query-owner seam as unbuilt until vuln-graph scoring.
+That is no longer accurate: `AppPerfRollup` (`app_perf_rollup.{hpp,cpp}`) is a dedicated query owner
+that takes one pool lease and issues schema-qualified SQL across two store schemas, and
+`RbacAdminAuthorityOwner` (`rbac_admin_authority_owner.{hpp,cpp}`, PR #4985) is one for the
+last-Administrator guard, which needs the `rbac_store` grants and the `auth.users` account state
+inside one transaction. The rule in section 3 is unchanged: per-store classes stay single-schema
+owners, cross-schema work lives in a query owner, and `RbacStore::unassign_role` delegates to the
+owner rather than issuing `auth` SQL itself.
