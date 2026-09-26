@@ -92,7 +92,7 @@ struct AuditRecord {
 /// 765bc7ec1): `unassign_role`'s last-admin guard now runs a same-transaction
 /// `rbac_store.principal_roles JOIN auth.users` (rbac_admin_authority_owner.cpp), which is
 /// safe ONLY because production always constructs both stores on the SAME
-/// PgPool/database (ADR-0006, server.cpp:4532,6047) — an `auth` schema that
+/// PgPool/database (ADR-0006, server.cpp) — an `auth` schema that
 /// does not exist in THIS harness's rbac database would make every
 /// `role_name=="Administrator"` unassign fail the lock query outright (a raw
 /// Postgres "relation does not exist" error, not the intended 409 refusal).

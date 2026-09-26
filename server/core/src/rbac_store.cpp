@@ -1980,7 +1980,7 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         return std::unexpected("cannot remove the last remaining Administrator role grant — "
                                "the fleet would be left with " +
                                std::string(kRbacLastAdminRefusalMarker));
-    if (!outcome.ok)
+    if (!outcome.ok || !outcome.new_gen)
         return std::unexpected(outcome.err.empty() ? "unassign_role failed" : outcome.err);
     apply_local_generation(*outcome.new_gen);
     return outcome.removed;

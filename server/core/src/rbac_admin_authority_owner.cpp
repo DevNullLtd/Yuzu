@@ -25,8 +25,8 @@ using rbac_sql::to_i64;
 
 // THE definition of "an authenticatable Administrator grant". The unassign guard
 // below locks and counts through this one fragment, so the LOCK set and the COUNT
-// set cannot drift apart; the enforcement toggle's caller-survives guard is
-// expected to reuse it rather than carry a second copy of this JOIN.
+// set cannot drift apart; the RBAC enable/disable toggle (A1) is expected to
+// reuse it rather than carry a second copy of this JOIN.
 constexpr std::string_view kAuthenticatableAdminGrantsFrom =
     "FROM rbac_store.principal_roles pr "
     "JOIN auth.users u ON u.username = pr.principal_id "
@@ -54,8 +54,8 @@ std::optional<std::vector<std::string>> lock_authenticatable_admin_grants(PGconn
 }
 
 // "SELECT count(*) " + kAuthenticatableAdminGrantsFrom
-// Lock-free. nullopt on a query error or an unexpected row count, with `err` set
-// from the connection.
+// Lock-free. nullopt on a query error or an unexpected row count; `err` is the
+// connection's error text (empty for an unexpected row count).
 std::optional<std::int64_t> count_authenticatable_admin_grants(PGconn* c, std::string& err) {
     const std::string sql =
         std::string("SELECT count(*) ") + std::string(kAuthenticatableAdminGrantsFrom);
@@ -80,7 +80,7 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // A2 last-Administrator guard ("A2 — Global human
         // role assignment/unassignment"). Scoped to role_name=="Administrator"
         // ONLY — every other unassign (including both existing engine-only
-        // callers, rest_api_v1.cpp:3274 and mcp_server.cpp:21915) stays a pure
+        // callers, the engine-principal unassign in rest_api_v1.cpp and mcp_server.cpp) stays a pure
         // DELETE with no extra behavior. Unconditional would be WRONG, not
         // just unnecessary: a fresh install holds ZERO Administrator
         // `principal_roles` rows until A2's own assign route bootstraps the
@@ -120,11 +120,11 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // because `RbacStore` and `AuthDB` are ALWAYS constructed
         // on the SAME PgPool/database in production — ONE `--postgres-dsn`,
         // ONE `pg_pool_` member, both stores built from it
-        // (server.cpp:4603,6118; ADR-0006) — so `auth.users` is guaranteed
+        // (server.cpp; ADR-0006) — so `auth.users` is guaranteed
         // reachable from this same transaction/connection, never a
         // cross-database call. A degraded/missing `auth` schema fails the
         // whole SELECT (the status check in `lock_authenticatable_admin_grants`),
-        // which aborts this transaction and returns `unexpected` — fail-closed
+        // which aborts this transaction (`ok=false` here, `unexpected` from RbacStore) — fail-closed
         // by construction, no separate degraded-vs-absent branch needed.
         //
         // Concurrency: lock the CANDIDATE Administrator rows with `FOR
@@ -236,9 +236,10 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         }
         // NOT closed by this recheck (disclosed, not claimed closed):
         //  (1) a pre-provisioned grant whose `auth.users` row is CREATED
-        //      concurrently: with no row to lock, the INSERT in
-        //      `AuthDB::upsert_user` (or `upsert_sso_identity`; `is_active`
-        //      defaults TRUE) can commit after this SELECT returns zero rows;
+        //      concurrently: with no row to lock, an INSERT
+        //      by an `AuthDB` writer such as `upsert_user`, `upsert_sso_identity` or
+        //      the first-admin seed (`is_active` defaults TRUE) can commit after this
+        //      SELECT returns zero rows;
         //  (2) deactivation of a SURVIVING counted Administrator between the
         //      recount below and this transaction's COMMIT (#4966: `remove_user`
         //      has no last-Administrator guard).
@@ -249,8 +250,9 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL, and
         // #4966's fix must honour this order (or use one shared
         // transaction-scoped advisory lock) rather than invert it. A lock
-        // wait here is bounded by the pool's `lock_timeout` (10 s by default, unless
-        // the DSN sets its own `options`); on timeout the statement errors and this
+        // wait here is bounded by the pool's `lock_timeout` (10 s by default; not
+        // injected when the DSN's `options` or `PGOPTIONS` is set, so the wait is then
+        // bounded only by that setting); on timeout the statement errors and this
         // transaction rolls back. REST answers 503; the MCP twin answers an
         // internal error with a retry hint.
         const bool removed_a_counted_admin =

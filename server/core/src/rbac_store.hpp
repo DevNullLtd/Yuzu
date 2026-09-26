@@ -275,7 +275,7 @@ public:
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
 
     /// The guard's transaction lives in `RbacAdminAuthorityOwner`
-    /// (rbac_admin_authority_owner.cpp), an ADR-0012 s3 query owner; this method
+    /// (rbac_admin_authority_owner.cpp), an ADR-0012 §3 query owner; this method
     /// delegates to it.
     ///
     /// A2 last-Administrator guard: when `role_name == "Administrator"`,
@@ -303,8 +303,10 @@ public:
     /// pre-provisioned grant, nor deactivation of a surviving Administrator
     /// between the recount and COMMIT (#4966). Every other
     /// role/principal_type combination — including both existing
-    /// engine-only callers (`rest_api_v1.cpp:3240`, `mcp_server.cpp:21789`)
-    /// — is unaffected: a pure idempotent DELETE, exactly as before. The
+    /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
+    /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as
+    /// before (an Administrator grant held by a non-user principal still runs the
+    /// candidate lock query but is never counted). The
     /// refusal's error string always contains `kRbacLastAdminRefusalMarker`
     /// (below) — callers that need to distinguish this business-rule
     /// refusal from a genuine store/query failure match on that constant

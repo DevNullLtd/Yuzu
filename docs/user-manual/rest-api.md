@@ -2609,7 +2609,8 @@ through this route, even to hand it to someone else first); `409` —
 with zero **authenticatable** Administrators — the guard counts a grant only
 when its `principal_id` names an active `auth.users` row, so a grant naming a
 nonexistent, deactivated, soft-deleted, or group-held (not creatable via this
-surface) principal is never counted as a surviving administrator; `503` — the
+surface) principal is never counted as a surviving administrator (the guard has
+known residual gaps, see "Fleet-Wide Role Assignment" in `rbac.md`); `503` — the
 RBAC store is unavailable (including when the admin gate itself cannot
 confirm durable authority — logged and audited as a `denied` row), a
 genuine store/query fault removing the grant, or (on an otherwise-successful

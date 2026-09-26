@@ -249,16 +249,19 @@ const std::vector<pg::PgMigration>& migrations() {
     // `is_active` *means* silently changes what the guard counts.
     //
     // The guard (`RbacAdminAuthorityOwner`, rbac_admin_authority_owner.cpp) also TAKES
-    // A ROW LOCK on one `auth.users` row: after its
-    // DELETE it runs `SELECT is_active FROM auth.users WHERE username = $1
-    // FOR UPDATE` for the deleted principal, so a concurrent reactivation
-    // (`reactivate_user`) cannot commit between that read and the guard's
-    // own COMMIT. Its lock order is `rbac_store.principal_roles` rows, then
-    // that one `auth.users` row, then `rbac_store.rbac_meta`. A change here
-    // (e.g. a last-Administrator guard on `remove_user`, #4966) that holds an
-    // `auth.users` row lock and then touches `principal_roles` or `rbac_meta`
-    // would invert it and can deadlock; use one shared transaction-scoped
-    // advisory lock instead of per-path row locks.
+    // A ROW LOCK on one `auth.users` row: for an Administrator unassign whose removed
+    // grant was not already among the rows it counted, it runs `SELECT is_active FROM
+    // auth.users WHERE username = $1 FOR UPDATE` for the deleted principal after its
+    // DELETE, so a concurrent reactivation (`reactivate_user`, a single autocommit
+    // UPDATE that just blocks on this lock) cannot commit between that read and the
+    // guard's own COMMIT. The lock order is documented in
+    // rbac_admin_authority_owner.hpp: `principal_roles` rows, then one `auth.users`
+    // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
+    // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
+    // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
+    // order, or use one shared transaction-scoped advisory lock, which only removes
+    // the inversion if EVERY participant, including that guard, takes it first in its
+    // own statement.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("

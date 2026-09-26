@@ -4,7 +4,7 @@
 /// Internal OWN-SCHEMA libpq helpers shared by `RbacStore` (rbac_store.cpp) and
 /// `RbacAdminAuthorityOwner` (rbac_admin_authority_owner.cpp). Moved verbatim out of
 /// rbac_store.cpp's anonymous namespaces so the ADR-0012 §3 query owner and the
-/// store use ONE definition of each — never a second copy. Not a public API. Cross-schema SQL
+/// store use ONE definition of each, never a second copy. Not a public API. Cross-schema SQL
 /// never belongs here: it lives in the query owner, in its own translation unit.
 
 #include "pg/pg_exec.hpp"
