@@ -4523,25 +4523,35 @@ heartbeat field surfacing how many lines were dropped this way: an
 binary reads it yet (planned for a later PR's heartbeat poller). A sink-level
 write/format failure (as opposed to an overrun) is tracked internally too —
 count plus the last 256 bytes of the failing message, in `LogHandoff`'s
-private `ErrorState`. Two accessors exist: `log_errors_total()`, exercised
-by this PR's own unit test; and `last_log_error_for_test()`, which despite
-its name is not currently called by any test or production code. Neither
-has a production/heartbeat consumer yet — the same later-PR heartbeat
-poller planned for `overrun_total()` above. The only production-visible
-signal today is a rate-limited (once per second) fallback line to stderr at
-the moment of failure, reproducing what spdlog's own default error handler
-always did before #4666 PR-2 installed this one. The line is written by a
-short-lived helper thread, never by the logging worker, so a blocked stderr
-(for example a full pipe to a stalled log collector) cannot stall log
-delivery; while one such write is stuck, further diagnostic lines are
-dropped, counted internally by `stderr_emits_dropped()` (likewise not yet
-surfaced anywhere). That fallback line is
-unlikely to be visible at all under a genuine Windows-service session
-(`--install-service`, no console): the agent attaches no stderr sink at
-all in that mode, log-file destination or not. If log lines appear to go
-missing under load with no error printed, check disk space and fd limits on
-the log destination first: `overrun_oldest` drops are silent in this
-release, with no counter or alert to point at them yet. There is no `--log-sync` flag or other escape
+private `ErrorState`. Three accessors read it: `log_errors_total()`
+(exercised by the unit tests), `last_log_error_for_test()` (despite its name,
+currently called by nothing), and `stderr_emits_dropped()` (below). None has a
+production/heartbeat consumer yet, the same later-PR heartbeat poller planned
+for `overrun_total()` above. The only production-visible signal today is a
+rate-limited (once per second) fallback line to stderr at the moment of
+failure, reproducing what spdlog's own default error handler always did
+before #4666 PR-2 installed this one. That line is written by a short-lived
+helper thread, never by the logging worker, using a plain write that holds no
+C-library lock, so a blocked stderr (for example a full pipe to a stalled log
+collector) cannot stall the worker through this diagnostic or hang a normal
+shutdown. While one such write is stuck, or if the helper thread cannot be
+created, further diagnostic lines are dropped and counted by
+`stderr_emits_dropped()`. This covers the diagnostic's own write only: when
+stdout or stderr is itself one of the agent's log sinks (a stdout sink when
+there is no `--log-file`; a stderr sink beside the file sink when `--log-file`
+is set outside a Windows service), a blocked stream still stalls the logging
+worker in that sink's own write and queued lines are dropped oldest-first
+(`overrun_oldest`), exactly as for any stuck sink; only the shutdown watchdog
+bounds that. The fallback line is unlikely to be visible at all under a
+genuine Windows-service session (`--install-service`, no console): the agent
+attaches no stderr sink at all in that mode, log-file destination or not. If
+log lines go missing under load with no error printed, check the consumer of
+the agent's stdout and stderr first (journald, the container log driver, a
+collector backlog; on Linux a thread stuck in a pipe write shows as
+`pipe_write` under `/proc/<pid>/task/*/wchan`), then disk space and fd limits
+on the log destination. Restarting the agent does not fix a stalled collector.
+`overrun_oldest` drops are silent in this release, with no counter or alert to
+point at them yet. There is no `--log-sync` flag or other escape
 hatch back to synchronous logging; this is unconditional for every build. A
 `--log-file` that cannot be opened still falls back to console-only logging
 exactly as before (`used_log_file_fallback()` prints the same kind of startup

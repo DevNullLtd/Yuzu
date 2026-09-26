@@ -33,14 +33,23 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 using namespace std::chrono_literals;
 using yuzu::agent::drain_log_bounded;
@@ -836,21 +845,48 @@ TEST_CASE("U10: two concurrent teardown() calls on a stably-owned object never r
 // throws (spdlog's backend_sink_it_ -> SPDLOG_LOGGER_CATCH -> err_handler_). If the
 // stderr diagnostic write were made on that thread, a blocked stderr (a full pipe to a
 // stalled collector) would stop the whole queue draining. The write is therefore made by
-// a detached emit thread, at most one in flight. The emit function is replaced with a
-// blocking stub through LogHandoff::set_stderr_emit_for_test() so the stall is
-// deterministic and identical on every platform (no real pipe, no fd redirection).
+// a detached emit thread, at most one write in flight. U11/U11b/U11c replace the emit
+// function with a blocking stub through LogHandoff::set_stderr_emit_for_test() so the
+// stall is deterministic and identical on every platform; U12 exercises the REAL write
+// against a genuinely blocked pipe (POSIX). SCOPE: these pin the handler's own write. A
+// console sink sharing the blocked fd still stalls the worker in its own write; that
+// case is unchanged by #5023 and not covered here.
 
 namespace {
 
 std::atomic<int> g_emit_entered{0};
 std::atomic<int> g_emit_finished{0};
 std::atomic<bool> g_emit_release{false};
+std::mutex g_emit_calls_mu;
+std::vector<std::pair<std::uint64_t, std::string>> g_emit_calls;
 
-void blocking_emit_stub(std::uint64_t, const std::string&) {
+void blocking_emit_stub(std::uint64_t count, const std::string& message) {
+    {
+        std::lock_guard<std::mutex> lk(g_emit_calls_mu);
+        g_emit_calls.emplace_back(count, message);
+    }
     g_emit_entered.fetch_add(1, std::memory_order_acq_rel);
     while (!g_emit_release.load(std::memory_order_acquire))
         std::this_thread::sleep_for(1ms);
     g_emit_finished.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void reset_emit_stub_state(bool released) {
+    g_emit_entered.store(0);
+    g_emit_finished.store(0);
+    g_emit_release.store(released);
+    std::lock_guard<std::mutex> lk(g_emit_calls_mu);
+    g_emit_calls.clear();
+}
+
+// Unblock the stub, wait for any emit thread to return, restore the real write and clear
+// the launch-fault seam. Runs on every exit path (GATE DISCIPLINE, see U10).
+void restore_emit_seams() {
+    g_emit_release.store(true, std::memory_order_release);
+    (void)yuzu::test::spin_until([] { return g_emit_finished.load() == g_emit_entered.load(); },
+                                 5s);
+    LogHandoff::set_stderr_emit_for_test(nullptr);
+    LogHandoff::set_emit_thread_fault_for_test(false);
 }
 
 // Throws for the payload "fail" only; captures every other message in delivery order.
@@ -882,9 +918,7 @@ private:
 TEST_CASE("U11: a stalled stderr diagnostic write does not stall log delivery; at most "
           "one emit is in flight and further diagnostics are dropped and counted",
           "[log_handoff]") {
-    g_emit_entered.store(0);
-    g_emit_finished.store(0);
-    g_emit_release.store(false);
+    reset_emit_stub_state(/*released=*/false);
 
     auto sink = std::make_shared<FailOnPayloadSink>();
     auto result = LogHandoff::create_with_sinks({sink});
@@ -897,16 +931,18 @@ TEST_CASE("U11: a stalled stderr diagnostic write does not stall log delivery; a
     // exit path, including a failed REQUIRE, the stub is unblocked first; otherwise the
     // handoff's teardown would find the worker stuck and hard_exit() the whole test binary
     // instead of reporting the failure.
-    yuzu::test::ScopeExit cleanup{[] {
-        g_emit_release.store(true, std::memory_order_release);
-        (void)yuzu::test::spin_until(
-            [] { return g_emit_finished.load() == g_emit_entered.load(); }, 5s);
-        LogHandoff::set_stderr_emit_for_test(nullptr);
-    }};
+    yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
 
     // 1. A sink failure runs the handler on the worker thread; the emit is now stuck.
     logger->info("fail");
     REQUIRE(yuzu::test::spin_until([] { return g_emit_entered.load() == 1; }, 5s));
+    {
+        // The line handed to the emit thread carries the right count and message.
+        std::lock_guard<std::mutex> lk(g_emit_calls_mu);
+        REQUIRE(g_emit_calls.size() == 1);
+        CHECK(g_emit_calls[0].first == 1);
+        CHECK(g_emit_calls[0].second.find("injected failure") != std::string::npos);
+    }
 
     // 2. The worker was NOT dragged into the stall: later messages are still delivered
     //    while the emit is blocked. (With the write made on the worker thread this is
@@ -929,13 +965,202 @@ TEST_CASE("U11: a stalled stderr diagnostic write does not stall log delivery; a
     CHECK(handoff->log_errors_total() == 2);
     CHECK(g_emit_entered.load() == 1);
 
-    // 4. Unblocking the stub clears the in-flight slot: a later failure emits again.
+    // 4. Unblocking the stub clears the in-flight slot: a later failure emits again. The
+    //    slot is cleared a moment AFTER the stub returns, so a failure landing in that gap
+    //    is dropped (and counted): retry rather than assume timing.
     g_emit_release.store(true, std::memory_order_release);
     REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() == 1; }, 5s));
+    bool emitted_again = false;
+    for (int attempt = 0; attempt < 5 && !emitted_again; ++attempt) {
+        std::this_thread::sleep_for(1100ms);
+        logger->info("fail");
+        emitted_again =
+            yuzu::test::spin_until([] { return g_emit_entered.load() == 2; }, 1500ms);
+    }
+    REQUIRE(emitted_again);
+    CHECK(handoff->stderr_emits_dropped() >= 1);
+    {
+        std::lock_guard<std::mutex> lk(g_emit_calls_mu);
+        REQUIRE(g_emit_calls.size() == 2);
+        // The second emit carries the error count at ITS failure, not the dropped one's.
+        CHECK(g_emit_calls[1].first == handoff->log_errors_total());
+    }
+
+    std::atomic<int> fired{0};
+    handoff->teardown_with_action_for_test(2s, [&] { fired.fetch_add(1); });
+    CHECK(fired.load() == 0);
+}
+
+TEST_CASE("U11b: teardown() completes while a stderr write is still stuck, and the stuck "
+          "emit thread outlives the LogHandoff safely",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/false);
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    LogHandoff::set_stderr_emit_for_test(&blocking_emit_stub);
+    yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
+
+    logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_entered.load() == 1; }, 5s));
+
+    // Teardown with the stderr write still stuck. The deadline action also unblocks the
+    // stub so a regression (teardown waiting on the emit, or the emit wedging the worker)
+    // fails the CHECK below instead of hard_exit()ing the binary.
+    std::atomic<int> fired{0};
+    handoff->teardown_with_action_for_test(2s, [&] {
+        fired.fetch_add(1);
+        g_emit_release.store(true, std::memory_order_release);
+    });
+    CHECK(fired.load() == 0);
+    CHECK(g_emit_finished.load() == 0); // the write is genuinely still stuck
+
+    // Destroy the LogHandoff (and with it the owner's reference to ErrorState) while the
+    // emit thread is still inside the write, THEN let the write return: the thread's own
+    // shared_ptr<ErrorState> must keep the flag it clears alive (ASan/TSan would flag a
+    // raw-pointer capture here).
+    logger.reset();
+    handoff.reset();
+    g_emit_release.store(true, std::memory_order_release);
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() == 1; }, 5s));
+}
+
+TEST_CASE("U11c: an emit thread the OS refuses drops the diagnostic, counts it, releases "
+          "the slot, and never disturbs delivery",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true); // the stub returns at once: no blocking here
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    LogHandoff::set_stderr_emit_for_test(&blocking_emit_stub);
+    LogHandoff::set_emit_thread_fault_for_test(true);
+    yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
+
+    logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->stderr_emits_dropped() == 1; }, 5s));
+    CHECK(handoff->log_errors_total() == 1);
+    CHECK(g_emit_entered.load() == 0); // no thread was ever started
+
+    logger->info("ok");
+    REQUIRE(yuzu::test::spin_until([&] { return sink->count() == 1; }, 5s));
+
+    // The slot was released by the failed launch, so the next due failure emits normally.
     std::this_thread::sleep_for(1100ms);
     logger->info("fail");
-    REQUIRE(yuzu::test::spin_until([] { return g_emit_entered.load() == 2; }, 5s));
-    CHECK(handoff->stderr_emits_dropped() == 1); // not dropped this time
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_entered.load() == 1; }, 5s));
+    CHECK(handoff->stderr_emits_dropped() == 1);
 
     handoff->teardown_with_action_for_test(2s, [] {});
 }
+
+#ifndef _WIN32
+// U12: the REAL stderr write against a genuinely blocked stderr. U11 replaces the write
+// with a stub, so on its own it cannot see two properties of the production path: that the
+// write holds no stdio (FILE) lock, and the line it produces. The first matters for
+// process exit: a thread stuck in fprintf(stderr) holds the stderr FILE lock, and a normal
+// exit() (libstdc++'s ios_base::Init dtor -> cerr.flush() -> fflush(stderr)) then waits
+// on it forever, with no watchdog left armed after teardown() returned. A raw write(2)
+// holds no lock. This test fails against a stdio implementation.
+namespace {
+
+std::string drain_pipe(int fd, std::chrono::milliseconds quiet) {
+    std::string out;
+    char buf[4096];
+    for (;;) {
+        pollfd pfd{fd, POLLIN, 0};
+        if (::poll(&pfd, 1, static_cast<int>(quiet.count())) <= 0)
+            break;
+        const ssize_t n = ::read(fd, buf, sizeof buf);
+        if (n <= 0)
+            break;
+        out.append(buf, static_cast<std::size_t>(n));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("U12: the real stderr write against a blocked stderr keeps delivery going, holds "
+          "no stdio lock, and writes the expected line",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true);
+    LogHandoff::set_stderr_emit_for_test(nullptr); // the REAL write
+
+    int pipefd[2];
+    REQUIRE(::pipe(pipefd) == 0);
+    // Fill the pipe so a write to it blocks: non-blocking fill until EAGAIN, then back.
+    REQUIRE(::fcntl(pipefd[1], F_SETFL, O_NONBLOCK) == 0);
+    {
+        char filler[512];
+        std::memset(filler, 'x', sizeof filler);
+        while (::write(pipefd[1], filler, sizeof filler) > 0) {
+        }
+    }
+    REQUIRE(::fcntl(pipefd[1], F_SETFL, 0) == 0);
+    const int saved_stderr = ::dup(STDERR_FILENO);
+    REQUIRE(saved_stderr >= 0);
+    REQUIRE(::dup2(pipefd[1], STDERR_FILENO) >= 0);
+    ::close(pipefd[1]);
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    std::atomic<bool> stop_prober{false};
+    std::atomic<int> probes{0};
+    std::thread prober;
+    std::string collected;
+    bool finished = false;
+    // Restores fd 2, drains the pipe (which releases a blocked emit and a blocked prober),
+    // and joins the prober. Idempotent; runs on every exit path.
+    auto finish = [&] {
+        if (finished)
+            return;
+        finished = true;
+        ::dup2(saved_stderr, STDERR_FILENO);
+        ::close(saved_stderr);
+        collected = drain_pipe(pipefd[0], 500ms);
+        stop_prober.store(true);
+        if (prober.joinable())
+            prober.join();
+        ::close(pipefd[0]);
+    };
+    yuzu::test::ScopeExit cleanup{[&] { finish(); }};
+
+    // Probe the stdio lock continuously: fflush(stderr) takes the stderr FILE lock, so it
+    // blocks for as long as any thread holds that lock across a blocked write.
+    prober = std::thread([&] {
+        while (!stop_prober.load()) {
+            std::fflush(stderr);
+            probes.fetch_add(1);
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+
+    logger->info("fail"); // the handler launches the emit thread; its write blocks
+    logger->info("ok-1");
+    logger->info("ok-2");
+    REQUIRE(yuzu::test::spin_until([&] { return sink->count() == 2; }, 5s));
+
+    // The emit is blocked by now (the pipe is already full), and the prober must still be
+    // running: no stdio lock is held across the blocked write.
+    std::this_thread::sleep_for(200ms);
+    const int probes_before = probes.load();
+    std::this_thread::sleep_for(300ms);
+    CHECK(probes.load() > probes_before + 10);
+
+    finish();
+    CHECK(collected.find("[*** LOG ERROR #1 ***] FailOnPayloadSink: injected failure\n") !=
+          std::string::npos);
+}
+#endif
