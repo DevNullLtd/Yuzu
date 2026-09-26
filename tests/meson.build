@@ -2359,6 +2359,17 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# update_source_trust's definition-column contract (content/definitions/update_source_trust.yaml):
+# row_kind must be the first result column and the generic field_1..field_10 sequence must match
+# the wire row update_source_trust_parsers.hpp emits across its three row shapes. Parses the YAML
+# directly -- catches a reordered or renamed column the C++ test's hard-coded literal cannot.
+test('update_source_trust definition columns',
+  _python3_test,
+  args: [files('test_update_source_trust_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Plugin README standard (docs/plugin-readme-standard.md): unit tests of the
 # generator's pure functions, then the tree gate — README-existence ratchet,
 # section contract, generated fences/index/nav/manifests byte-match the

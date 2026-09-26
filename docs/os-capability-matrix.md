@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(58).
+(63).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.

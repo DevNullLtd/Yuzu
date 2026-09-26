@@ -164,6 +164,7 @@ apt_keyring|/etc/apt/trusted.gpg.d/debian-archive-trixie-stable.asc|trusted_gpg_
 - Plugin: `agents/plugins/update_source_trust/src/update_source_trust_legs.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_linux_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_macos.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_parsers.hpp` · `agents/plugins/update_source_trust/src/update_source_trust_plugin.cpp` · `agents/plugins/update_source_trust/src/update_source_trust_win.cpp`
 - Definitions: `content/definitions/update_source_trust.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp`
-- Tests: `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
+- Tests: `tests/test_update_source_trust_definition.py` · `tests/unit/test_update_source_trust_linux_parsers.cpp` · `tests/unit/test_update_source_trust_local_dispatcher.cpp` · `tests/unit/test_update_source_trust_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/wave10-pr10.1d-update_source_trust.added.md`
 <!-- END GENERATED -->

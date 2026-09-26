@@ -348,7 +348,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/wave10-pr10.1d-update_source_trust.added.md"
+    ],
     "definitions": [
       "content/definitions/update_source_trust.yaml"
     ],
@@ -363,6 +365,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_update_source_trust_definition.py",
       "tests/unit/test_update_source_trust_linux_parsers.cpp",
       "tests/unit/test_update_source_trust_local_dispatcher.cpp",
       "tests/unit/test_update_source_trust_parsers.cpp"
