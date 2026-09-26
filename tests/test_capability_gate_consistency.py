@@ -101,6 +101,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
@@ -128,23 +129,21 @@ FRAGMENT_FILES = [
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
 # Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
+# Wave 8 PR8.1-b: +1 system_hardening (posture).
 # Wave 10 PR10.1-c: +2 pkg_inventory (managers/packages).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
 # 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
-# 2 (pkg_inventory, managers/packages) = 221.
-# This constant has been bumped independently on both sides of a merge several times
-# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
-# always the same: find the shared baseline both sides agree on and add EVERY side's new
-# plugin on top of it, never pick one side's total. Dev was at 219 here (209 baseline +
-# printing.clear_queue 1 + app_control 2 + platform_security 2 + browser_inventory 2 +
-# firmware_posture 1 + runtimes 2); this merge adds pkg_inventory's 2 rows (managers,
-# packages) on top: 219 + 2 = 221 — re-derived directly against the merged tree with this
-# script's own _PAIR_ONLY_RE over every FRAGMENT_FILES entry, not by trusting either
-# side's arithmetic.
-EXPECTED_TOTAL_ROWS = 221
+# 1 (system_hardening) + 2 (pkg_inventory, managers/packages) = 222.
+# This constant has been bumped independently on several sides of several merges
+# (PR #4719 and PR #4964 CI are the trail; #4721 tracks deriving it per fragment).
+# The rule is always the same: find the shared baseline all sides agree on and add
+# EVERY side's new plugin on top of it, never pick one side's total -- and re-derive
+# by RUNNING parse_fragment_gate_rows over FRAGMENT_FILES rather than trusting hand
+# arithmetic, which has drifted before (206, then 203, then repeatedly since).
+EXPECTED_TOTAL_ROWS = 222
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -189,6 +188,36 @@ def parse_content_pair_modes(content_root: Path) -> dict[tuple[str, str], list[s
             mode = approval.get("mode") or "auto"
             pair_modes.setdefault((plugin, str(action).lower()), []).append(mode)
     return pair_modes
+
+
+def non_string_column_values(doc: object, fallback_id: str) -> list[str]:
+    """`<definition id>.<column>: <repr>` for every non-string entry of the
+    `values` list of one definition document's result columns."""
+    if not isinstance(doc, dict):
+        return []
+    def_id = (doc.get("metadata") or {}).get("id", fallback_id)
+    result = (doc.get("spec") or {}).get("result")
+    columns = result.get("columns") if isinstance(result, dict) else None
+    return [
+        f"{def_id}.{col.get('name')}: {v!r}"
+        for col in columns or []
+        for v in col.get("values") or []
+        if not isinstance(v, str)
+    ]
+
+
+def find_non_string_column_values(content_root: Path) -> list[str]:
+    """Every `<definition id>.<column>: <repr>` whose `values` list holds a
+    non-string. YAML 1.1 reads an unquoted on/off/yes/no as a boolean, so such
+    a vocabulary token renders as True/False in every generated doc unless quoted.
+    """
+    bad: list[str] = []
+    for path in sorted(content_root.glob(CONTENT_GLOB)):
+        with path.open(encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+        for doc in docs:
+            bad.extend(non_string_column_values(doc, path.name))
+    return bad
 
 
 def parse_fragment_gate_rows(path: Path) -> list[tuple[str, str, str]]:
@@ -332,10 +361,39 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
             self.fail("\n" + format_gaps(mismatches, unexempt_missing))
 
 
+class TestDefinitionValueVocabularies(unittest.TestCase):
+    """Every `values:` entry of every shipped definition column is a string."""
+
+    def test_every_values_entry_is_a_string(self) -> None:
+        bad = find_non_string_column_values(REPO_ROOT)
+        self.assertFalse(
+            bad,
+            "non-string `values:` entries (quote on/off/yes/no so YAML keeps them strings):\n"
+            + "\n".join(bad),
+        )
+
+
 class TestFailureModesOnSyntheticData(unittest.TestCase):
-    """Proves `diff_gates` actually catches both drift shapes, using
-    fabricated data only — never a real fragment or content file.
+    """Proves `diff_gates` and the `values:` vocabulary scan actually catch
+    the drift shapes they guard, using fabricated data only — never a real
+    fragment or content file.
     """
+
+    def test_an_unquoted_on_off_values_entry_is_named(self) -> None:
+        # `yaml.safe_load` turns an unquoted on/off into a boolean: exactly the
+        # silent coercion the real-tree guard exists to catch.
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, on, off]}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), ["x.state: True", "x.state: False"])
+
+    def test_quoted_on_off_values_entries_pass(self) -> None:
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, 'on', 'off']}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), [])
 
     def test_stricter_content_than_catalogue_is_named(self) -> None:
         pair_modes = {("widget", "explode"): ["role-gated"]}

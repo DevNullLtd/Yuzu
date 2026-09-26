@@ -552,6 +552,7 @@ if build_agent
   subdir('agents/plugins/app_control')  # Wave 8 PR8.6
   subdir('agents/plugins/firmware_posture')  # Wave 8 PR8.4
   subdir('agents/plugins/platform_security')  # Wave 8 PR8.1-a1
+  subdir('agents/plugins/system_hardening')  # Wave 8 PR8.1-b
   subdir('agents/plugins/printing')  # Wave 9 PR9.1b
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a

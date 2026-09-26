@@ -1,7 +1,7 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same twenty-one capability-declaration spans the production site
+// composed from the same twenty-two capability-declaration spans the production site
 // composes, for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
@@ -9,7 +9,7 @@
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the twenty-one-span composition is the drift a shared seam exists to
+// copy of the twenty-two-span composition is the drift a shared seam exists to
 // remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.
@@ -40,6 +40,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "command_capability.hpp"
 
@@ -72,6 +73,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
     };

@@ -1619,6 +1619,56 @@ gaps closed:
   turns `503 draining`, so the fronting layer drains before the socket closes.
 The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
 
+**Decision (2026-09-26, #4943 + #4944 — the two whole-tier-eviction shapes).** Both were recorded by the
+WS-8 governance run as decisions to take before a second replica fronts a load balancer, because each can
+red every replica at once while the database still serves. Both are decided on one principle, already
+applied to the store rows above: **a shared-substrate condition must not drive per-replica eviction** —
+moving traffic to another replica of the same database cannot help, and taking the whole tier out of a
+fail-closed LB turns a degradation into an outage.
+
+- **#4943 — the probe is the connection refused first at `max_connections`.** Decided: the probe stays
+  pool-faithful and the *substrate* is sized and protected; no probe-only privilege, no 53300 special case.
+  (a) A reserved slot for the probe alone is rejected: it would connect as a different role from the pool,
+  which is precisely the false green the contract above forbids (probe ready while fresh pool connects are
+  refused). (b) A distinct non-gating reason for 53300 is rejected: libpq exposes no SQLSTATE for a
+  connection-phase failure (only message text, whose format depends on verbosity), so it would mean
+  matching localisable server messages — the emulation the freeze rule forbids. (c) The server's footprint
+  is static and small — `pool_size + 2` per replica (the pool is hard-capped, one leader-election
+  connection, one probe; no other connect site) — so `max_connections ≥ N × (pool_size + 2) +
+  superuser_reserved_connections + every other client` makes self-exhaustion impossible; the runbook
+  states that formula. (d) Foreign clients are kept out of the server's share with a Postgres mechanism that
+  keeps probe/pool fidelity: the shipped images set `reserved_connections` (default 40, env
+  `YUZU_PG_RESERVED_CONNECTIONS`, PG 16+) and grant `pg_use_reserved_connections` to the app role, so the
+  pool **and** the probe draw from the same reserve ahead of a backup job or an ad-hoc `psql` — the app is
+  privileged over other clients, not the probe over the pool. Both scripts refuse to boot if
+  `YUZU_PG_RESERVED_CONNECTIONS` reaches `max_connections − superuser_reserved_connections` (Gate 2 finding
+  #1, added in the same PR before merge) — that value would leave zero ordinary slots any non-privileged
+  client could ever use, not merely under load, which is a self-inflicted version of the exact failure this
+  decision closes. WS-9 scenario N reproduces both halves:
+  with every unreserved slot held by foreign sessions, a killed probe backend reconnects into the reserve
+  and `/readyz` stays 200; with the grant revoked the same kill leaves the probe refused and `/readyz` reads
+  `503 unreachable` — the failure the default prevents. Accepted residual: exhaustion by other *privileged*
+  clients reds a replica on its next probe reconnect, truthfully (its fresh pool connects fail too); in
+  steady state the probe holds its slot and reconnects only after a failure, so this is uncorrelated across
+  replicas outside a failover, during which every replica is red by design anyway.
+- **#4944 — Postgres overload flaps every replica together.** Decided: **no server-side hysteresis**; the
+  rule stays 2 s query deadline / 2 consecutive failures / 15 s stale / one success recovers, and the LB's
+  `healthy_threshold` is the anti-flap lever, with recommended values in the runbook (`interval 5 s,
+  unhealthy 2, healthy 3`: eviction needs ≥ 10 s continuously red, so a single stall never evicts;
+  re-admission needs ≥ 15 s continuously green, so a marginal database does not re-enter and drop out
+  every few seconds, which is what turns slowness into a reconnect storm). The considered alternative — a
+  query *timeout* as a "slow, not unreachable" class that does not strike and is caught only by the 15 s
+  stale backstop — moves the threshold (about 6 s → 15 s) without adding hysteresis: sustained overload
+  still reds and still flaps, and frozen-primary detection slows from ~11 s to 15 s. A second knob set on
+  the server would stack on the LB's (the Q5 decision that the constants are not flags stands). Sustained
+  overload taking the tier red is accepted as **truthful**: a one-row, no-table `SELECT` that misses a 2 s
+  deadline twice in four seconds means the database cannot serve real operator requests within their
+  deadlines either (session validate plus an audit write on nearly every request), and a frozen backend is
+  indistinguishable from it client-side without more emulation. Operators are told to check their LB's
+  all-unhealthy behaviour (route-anyway vs fail-closed) in the runbook now rather than waiting for the P2
+  BYO-LB document. WS-9 scenarios L (CPU-starved primary under load: red while starved, back within one
+  probe of lifting the limit) and M (a 3 s stall never reds) demonstrate the chosen behaviour.
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are
