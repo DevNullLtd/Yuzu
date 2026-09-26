@@ -447,6 +447,15 @@ TEST_CASE("policy evaluator: InstructionStore DB error on dispatch is distinct f
     auto result = ev.evaluate_now(pid);
     CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
     CHECK(h.dispatch_calls == 0); // never reached dispatch_fn — failed resolving the definition
+    // gov Gate 8 (#4981 PR-1, security-guardian): lock the genericized message
+    // itself, not just has_value() — this is the same
+    // kInstructionStoreDbErrorPrefix-tagged failure the fix for the earlier
+    // BLOCKING finding closed (kickoff_check now runs dispatch_instruction's
+    // error through genericize_db_error before wrapping it), so a future
+    // regression re-threading the raw "db_error: store not open" string
+    // through to a caller must fail this exact assertion, not just the
+    // has_value() check above.
+    CHECK(result.error() == "kickoff_check degraded for " + pid + ": service unavailable");
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
