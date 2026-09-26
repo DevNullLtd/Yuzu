@@ -142,8 +142,12 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // row lock until it commits/rolls back, so the second re-evaluates
         // the count against the first's now-durable delete. The LOCK set
         // and the COUNT set below both go through the identical JOIN (shared
-        // as `kAuthenticatableAdminGrantsFrom`), so the lock always covers
-        // exactly the rows the count depends on.
+        // as `kAuthenticatableAdminGrantsFrom`), so they use one predicate and
+        // cannot drift apart. That is a shared predicate, not a shared snapshot:
+        // under READ COMMITTED an account can become active between the lock and
+        // the count and then be counted without having been locked (which only
+        // ever raises the count), and one deactivated in between is the residual
+        // listed below.
         // Doomgoose external review, PR #4985 (governance ledger a2-p7-doomgoose-1):
         // the lock query's own result set is the ONLY correct membership test
         // for "was the row being deleted itself one of the counted rows" — a
