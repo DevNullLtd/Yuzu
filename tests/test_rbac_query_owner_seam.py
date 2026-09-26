@@ -26,7 +26,16 @@ STORE = "server/core/src/rbac_store.cpp"
 OWNER = "server/core/src/rbac_admin_authority_owner.cpp"
 FRAGMENT = "kAuthenticatableAdminGrantsFrom"
 FOREIGN = re.compile(r"\bauth\.[A-Za-z_]+", re.IGNORECASE)
-DEFINITION = re.compile(r"\bconstexpr\b[^;=]*\b" + FRAGMENT + r"\s*=")
+DEFINITION = re.compile(
+    r"\b(?:constexpr|const)\b[^;=]*\b" + FRAGMENT + r"\s*=|#\s*define\s+" + FRAGMENT + r"\b"
+)
+# A character literal, so a C++14 digit separator (5'000) is not mistaken for one: an unmatched
+# apostrophe is skipped alone. Scanning to the next apostrophe instead inverts string/code phase
+# for the rest of the file and can hide an `auth.` literal.
+CHAR_LIT = re.compile(
+    r"'(?:\\(?:x[0-9A-Fa-f]+|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{1,3}|.)|[^\\'\n])'"
+)
+STORE_PREFIX = "server/core/src/rbac_store"
 
 
 def tokenize(src: str):
@@ -72,10 +81,8 @@ def tokenize(src: str):
             i = j + 1
             code_start = i
         elif c == "'":
-            j = i + 1
-            while j < n and src[j] != "'":
-                j += 2 if src[j] == "\\" else 1
-            i = j + 1
+            m = CHAR_LIT.match(src, i)
+            i = m.end() if m else i + 1
         else:
             i += 1
     flush(n)
@@ -83,7 +90,28 @@ def tokenize(src: str):
 
 
 def literals(src: str):
-    return [t for kind, t in tokenize(src) if kind == "string"]
+    """String literals, with adjacent literals (separated only by whitespace) concatenated."""
+    out, prev_string = [], False
+    for kind, t in tokenize(src):
+        if kind == "string":
+            if prev_string and out:
+                out[-1] += t
+            else:
+                out.append(t)
+            prev_string = True
+        elif t.strip():
+            prev_string = False
+    return out
+
+
+def foreign_match(lit: str):
+    """First auth-schema reference in a literal, also seen through escaped quotes/whitespace."""
+    m = FOREIGN.search(lit)
+    if m:
+        return m.group(0)
+    tidy = re.sub(r"\s*\.\s*", ".", re.sub(r'[\\"]', "", lit))
+    m = FOREIGN.search(tidy)
+    return m.group(0) if m else None
 
 
 def code(src: str) -> str:
@@ -108,6 +136,29 @@ def _selfcheck() -> None:
         raise SystemExit("selfcheck: a comment leaked into the literal set")
     if FOREIGN.search(code(sample)):
         raise SystemExit("selfcheck: auth. leaked into the code (non-literal) stream")
+    # Each construct below must NOT stop the scan from finding the `auth.` literal after it.
+    # These fail if the char-literal branch, string-escape handling or raw-string handling
+    # is removed or reverts to scanning to the next apostrophe.
+    must_still_find = {
+        "digit separator": "constexpr int a = 5'000;\nconst char* s = \"SELECT 1 FROM auth.users\";\n",
+        "digit separators": "constexpr long a = 1'000'000;\nconst char* s = \"FROM auth.users\";\n",
+        "quote char literal": "char q = '\"';\nconst char* s = \"FROM auth.users\";\n",
+        "escaped quote char literal": "char q = '\\\"';\nconst char* s = \"FROM auth.users\";\n",
+        "escaped quote in string": 'const char* a = "x\\" y";\nconst char* s = "FROM auth.users";\n',
+        "raw string with a quote and //": 'const char* a = R"sql(a " b // c)sql"; const char* s = "FROM auth.users";\n',
+        "adjacent literals": 'const char* s = "FROM au" "th.users";\n',
+        "escaped-quote schema": 'const char* s = "FROM \\"auth\\".users";\n',
+    }
+    for name, text in must_still_find.items():
+        if not any(foreign_match(l) for l in literals(text)):
+            raise SystemExit(f"selfcheck: the scan lost an auth. literal after: {name}")
+    for text in ('const char* a = "docs are fine";\n// "auth.users" in a comment\n',):
+        if any(foreign_match(l) for l in literals(text)):
+            raise SystemExit("selfcheck: a comment or clean literal was reported")
+    for text in ("#define " + FRAGMENT + " \"FROM x\"\n",
+                 "static const char* " + FRAGMENT + " = \"FROM x\";\n"):
+        if not DEFINITION.search(code(text)):
+            raise SystemExit("selfcheck: an alternative definition form was not counted")
     d = 'constexpr std::string_view ' + FRAGMENT + ' =\n    "FROM x";\n'
     if len(DEFINITION.findall(code(d))) != 1:
         raise SystemExit("selfcheck: definition pattern failed to match a definition")
@@ -122,19 +173,22 @@ def main() -> int:
     _selfcheck()
     failures = []
 
-    store = (REPO_ROOT / STORE).read_text(encoding="utf-8", errors="replace")
-    for lit in literals(store):
-        m = FOREIGN.search(lit)
-        if m:
-            failures.append(
-                f"{STORE}: string literal references the auth schema ({m.group(0)!r}); "
-                f"cross-schema SQL belongs in {OWNER} (ADR-0012 s3)"
-            )
-
     files = subprocess.run(
         ["git", "ls-files", "--", "server/core/src"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
     ).stdout.splitlines()
+    store_files = [f for f in files if f.startswith(STORE_PREFIX) and f.endswith((".cpp", ".hpp"))]
+    if STORE not in store_files:
+        failures.append(f"{STORE} is not tracked; the seam scan has nothing to check")
+    for rel in store_files:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        for lit in literals(text):
+            hit = foreign_match(lit)
+            if hit:
+                failures.append(
+                    f"{rel}: string literal references the auth schema ({hit!r}); "
+                    f"cross-schema SQL belongs in {OWNER} (ADR-0012 s3)"
+                )
     defs = []
     for rel in files:
         if not rel.endswith((".cpp", ".hpp", ".h", ".cc")):
@@ -151,7 +205,8 @@ def main() -> int:
         print("FAIL: the RBAC cross-schema query-owner seam regressed (ADR-0012 s3):")
         print("\n".join("  " + f for f in failures))
         return 1
-    print(f"OK: no auth. SQL in {STORE}; {FRAGMENT} defined once, in {OWNER}")
+    print(f"OK: no auth. SQL in {len(store_files)} rbac_store* file(s); "
+          f"{FRAGMENT} defined once, in {OWNER}")
     return 0
 
 
