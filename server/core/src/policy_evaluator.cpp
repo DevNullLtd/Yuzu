@@ -419,7 +419,20 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     if (!*frag_res || (*frag_res)->check_instruction.empty())
         return "";
     const PolicyFragment& frag = **frag_res;
-    auto targets = resolve_targets(p);
+    // #4981 PR-1 adversarial-review MEDIUM fix: distinguish "the policy's
+    // scope genuinely matched nobody" from "the scope evaluation itself
+    // degraded/aborted" (the same distinction `remediate()`'s
+    // `degrade_reason` already makes below) — without this, a
+    // PresenceDegraded/StoreDegraded abort collapsed to an empty target
+    // list here, and evaluate_now() surfaced it as a false REST 409
+    // "matches no agents" instead of the 503 every other degraded read on
+    // this path already gets (see the ADR-0036 comment on the fragment-read
+    // degrade a few lines above, which this exact defect class exists to
+    // close).
+    std::string degrade_reason;
+    auto targets = resolve_targets(p, &degrade_reason);
+    if (!degrade_reason.empty())
+        return std::unexpected("scope evaluation degraded: " + degrade_reason);
     if (targets.empty())
         return "";
 
@@ -666,6 +679,16 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                           : "could not determine the policy's scope (" + degrade_reason +
                                 ") — remediation target resolution aborted, not evaluated as "
                                 "empty";
+            // #4981 PR-1 adversarial-review MEDIUM fix: a degraded scope
+            // evaluation is an infrastructure fault, not an operator denial —
+            // route this the same way every other degraded read in this
+            // function already does (out.degraded = true -> 503/"error",
+            // not 400/"denied"). Without this, the message above correctly
+            // NAMED the degradation but the REST route still answered
+            // 400 audited as "denied", exactly the false-classification
+            // class ADR-0036 exists to close.
+            if (!degrade_reason.empty())
+                out.degraded = true;
             return out;
         }
     }

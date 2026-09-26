@@ -1330,19 +1330,28 @@ TEST_CASE("policy evaluator: a scope-expression policy's target resolution repor
 
     PolicyEvaluator ev(d);
     auto result = ev.evaluate_now(*pid);
-    REQUIRE(result.has_value()); // never crashes; kickoff_check's empty-targets
-                                 // early-return is a clean "", not an error
-    CHECK(result->empty());
+    // #4981 PR-1 adversarial-review MEDIUM fix: a degraded scope evaluation
+    // is NOT a clean "no check instruction / matches no agents" empty-string
+    // result — kickoff_check now distinguishes "genuinely empty scope" from
+    // "scope evaluation aborted" and returns std::unexpected for the latter,
+    // which the REST /evaluate route maps to 503 (previously this collapsed
+    // to a false 409).
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("presence_degraded") != std::string::npos);
     // Never proceeded with a wrong/partial target set — no dispatch fired.
     CHECK(h.dispatch_calls == 0);
     CHECK(metrics.counter("yuzu_scope_eval_degraded_total", {{"reason", "presence_degraded"}})
               .value() == 1);
 
     // remediate()'s refusal message (B6) names the actual degradation rather
-    // than claiming a genuine empty-scope result.
+    // than claiming a genuine empty-scope result, AND (adversarial-review
+    // MEDIUM fix) sets `degraded = true` so the REST /remediate route maps
+    // this to 503/audit "error" rather than 400/audit "denied" — a degraded
+    // scope evaluation is an infrastructure fault, not an operator denial.
     auto remediation = ev.remediate(*pid, {"some-agent"});
     REQUIRE_FALSE(remediation.error.empty());
     CHECK(remediation.error.find("presence_degraded") != std::string::npos);
+    CHECK(remediation.degraded);
 
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);

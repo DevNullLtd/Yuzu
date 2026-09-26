@@ -11,16 +11,25 @@
  * coverage, not a move of pre-existing tests.
  */
 
+#include "agent_registry.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "policy_admin_routes.hpp"
+#include "policy_evaluator.hpp"
 #include "policy_store.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -180,4 +189,119 @@ scope: "tags.env == 'production'"
     REQUIRE(h.audit_calls.size() >= 2);
     CHECK(h.audit_calls[0].action == "policy.disable");
     CHECK(h.audit_calls[1].action == "policy.enable");
+}
+
+// #4981 PR-1 adversarial-review MEDIUM fix (independently found by both Kimi
+// and Codex): a scope-evaluation abort (e.g. a presence-store outage) was
+// being collapsed by PolicyEvaluator::resolve_targets into an ordinary empty
+// target list, so these two ROUTES answered as if nothing had gone wrong —
+// /evaluate as a clean 409 "matches no agents", /remediate as a 400 audited
+// "denied" (a false claim that the OPERATOR was refused, when the real cause
+// is an infrastructure degradation). Both must now answer 503, audited
+// "error" — the same posture every OTHER degraded read on these two routes
+// already has (see the precedent this fix follows in policy_evaluator.cpp).
+// This is the route-level proof; test_policy_evaluator.cpp's own presence-
+// degraded test proves the same fix at the PolicyEvaluator unit level.
+TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
+          "evaluation is reported as 503/error, never 409/denied",
+          "[pg][policy][admin][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore ps{pool};
+    REQUIRE(ps.is_open());
+
+    // Degraded presence store — same double-PG-template fault-injection
+    // recipe as test_policy_evaluator.cpp's "reports presence_degraded
+    // rather than silently proceeding as empty-scope" test: a second,
+    // independent Postgres database whose endpoints table is held under an
+    // ACCESS EXCLUSIVE lock by a second connection, with a short
+    // lock_timeout so AgentRegistry::evaluate_scope's presence read fails
+    // deterministically rather than racing a real timeout.
+    static yuzu::test::PgTestTemplate presence_tpl{
+        "policyadminpresence", [](const std::string& dsn) {
+            yuzu::server::pg::PgPool p{{.conninfo = dsn, .size = 1}};
+            OfflineEndpointStore s{p};
+            if (!s.is_open())
+                throw std::runtime_error("presence template: failed to migrate");
+        }};
+    YUZU_REQUIRE_PG_DB_TPL(presence_db, presence_tpl);
+    yuzu::server::pg::PgPool short_lock_pool{
+        {.conninfo = presence_db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(presence_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // A scope-expression policy (no management groups) with BOTH a check and
+    // a fix instruction — resolve_targets aborts before dispatch_instruction
+    // is ever reached on either path, so neither instruction needs a real
+    // InstructionStore entry to exercise this specific abort.
+    auto fid = ps.create_fragment(
+        "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: Degraded Route "
+        "Fragment\ndescription: check+fix\nspec:\n  check:\n    instruction: test.check\n"
+        "    compliance: \"result.hostname != ''\"\n  fix:\n    instruction: test.fix\n");
+    REQUIRE(fid.has_value());
+    auto pid = ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: "
+                                "Degraded Route Policy\ndescription: policy\nfragment: " +
+                                *fid + "\nscope: \"ostype == 'linux'\"\n");
+    REQUIRE(pid.has_value());
+
+    PolicyEvaluator::Deps d;
+    d.policy_store = &ps;
+    d.registry = &registry;
+    d.metrics = &metrics;
+    PolicyEvaluator evaluator(d);
+
+    std::vector<AuditCall> audit_calls;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "tester";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [&audit_calls](const httplib::Request&, const std::string& action,
+                                   const std::string& result, const std::string& target_type,
+                                   const std::string& target_id, const std::string& detail) -> bool {
+        audit_calls.push_back({action, result, target_type, target_id, detail});
+        return true;
+    };
+    auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                      const nlohmann::json&) {};
+
+    PolicyAdminRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &evaluator, &metrics);
+
+    auto eval_res = sink.Post("/api/policies/" + *pid + "/evaluate", "");
+    REQUIRE(eval_res);
+    CHECK(eval_res->status == 503);
+    REQUIRE(!audit_calls.empty());
+    CHECK(audit_calls.back().action == "policy.evaluate");
+    CHECK(audit_calls.back().result == "error");
+
+    auto remediate_res =
+        sink.Post("/api/policies/" + *pid + "/remediate", R"({"agent_ids":["some-agent"]})");
+    REQUIRE(remediate_res);
+    CHECK(remediate_res->status == 503);
+    REQUIRE(!audit_calls.empty());
+    CHECK(audit_calls.back().action == "policy.remediate");
+    CHECK(audit_calls.back().result == "error");
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 }

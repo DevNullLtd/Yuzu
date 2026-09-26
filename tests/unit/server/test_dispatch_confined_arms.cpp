@@ -640,6 +640,33 @@ TEST_CASE("resolve_scope_targets: a PresenceDegraded registry evaluation aborts 
     CHECK(*result.abort_reason == ScopeAbortReason::PresenceDegraded);
 }
 
+TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as "
+          "unresolvable, matched absent",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1 adversarial-review LOW fix (independently found by both
+    // Kimi and Codex): the other four evaluator error Kinds each get a
+    // dedicated ladder-level test proving resolve_scope_targets relays them
+    // correctly; Unresolvable had only the pairwise vocabulary-agreement
+    // test below, which pins the STRING COMPOSITION (to_string(Kind) vs
+    // to_string(to_abort_reason(Kind))), not the MAPPING's correctness — a
+    // mapping bug that preserved the composition (e.g. swapping two Kinds
+    // and their strings together) would slip past it silently. This test
+    // closes that gap the same way the sibling cases do.
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "unresolvable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
+}
+
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
           "[server][dispatch][scope]") {
     // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and

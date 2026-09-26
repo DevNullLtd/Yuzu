@@ -123,11 +123,14 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// HA WS-5 governance hardening (Gate 3 sre finding, 2026-09-22):
-    /// `query_live_ids`/`remove_if_session` are fail-soft by design (see
-    /// their own doc comments — a read failure degrades to local-only
-    /// visibility, never a wrong dispatch), but fail-soft must not mean
-    /// fail-INVISIBLE now that this store is load-bearing for cross-replica
-    /// scope-evaluation correctness. Set ONCE during single-threaded
+    /// `remove_if_session` is fail-soft by design (see its own doc comment —
+    /// a read failure degrades to local-only visibility, never a wrong
+    /// dispatch). `query_live_ids` is NO LONGER fail-soft as of #4981 PR-1
+    /// (see this file's own header banner) — a read failure is now a typed
+    /// `std::unexpected`, never a silently-empty vector. Either way,
+    /// fail-soft/fail-closed must not mean fail-INVISIBLE now that this
+    /// store is load-bearing for cross-replica scope-evaluation correctness.
+    /// Set ONCE during single-threaded
     /// startup, before serving threads read it without synchronisation —
     /// same idiom as `AppPerfDailyStore::set_metrics` and its siblings. Null
     /// (the default, e.g. unit tests / pre-WS-5 callers) disables emission.
