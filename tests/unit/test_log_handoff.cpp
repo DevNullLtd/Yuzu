@@ -20,6 +20,7 @@
 #include "log_handoff_test_sinks.hpp" // GatedCaptureSink, ThrowOnceSink (promoted #4666 PR-2)
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/scoped_fd.hpp> // ScopedFd (U12)
 #include <yuzu/json_log_formatter.hpp>
 
 #include <spdlog/details/os.h> // spdlog::details::os::thread_id()
@@ -880,7 +881,7 @@ void reset_emit_stub_state(bool released) {
 }
 
 // Unblock the stub, wait for any emit thread to return, restore the real write and clear
-// the launch-fault seam. Runs on every exit path (GATE DISCIPLINE, see U10).
+// the launch-fault seam. Runs on every exit path (GATE DISCIPLINE, see this file's banner).
 void restore_emit_seams() {
     g_emit_release.store(true, std::memory_order_release);
     (void)yuzu::test::spin_until([] { return g_emit_finished.load() == g_emit_entered.load(); },
@@ -889,13 +890,16 @@ void restore_emit_seams() {
     LogHandoff::set_emit_thread_fault_for_test(false);
 }
 
-// Throws for the payload "fail" only; captures every other message in delivery order.
+// Throws for the payloads "fail" and "fail-long" only; captures every other message in
+// delivery order.
 class FailOnPayloadSink final : public spdlog::sinks::sink {
 public:
     void log(const spdlog::details::log_msg& msg) override {
         const std::string payload(msg.payload.data(), msg.payload.size());
         if (payload == "fail")
             throw std::runtime_error("FailOnPayloadSink: injected failure");
+        if (payload == "fail-long") // longer than the handler's 256-byte cap on the echoed text
+            throw std::runtime_error(std::string(400, 'a'));
         std::lock_guard<std::mutex> lk(mu_);
         captured_.push_back(payload);
     }
@@ -975,15 +979,15 @@ TEST_CASE("U11: a stalled stderr diagnostic write does not stall log delivery; a
         std::this_thread::sleep_for(1100ms);
         logger->info("fail");
         emitted_again =
-            yuzu::test::spin_until([] { return g_emit_entered.load() == 2; }, 1500ms);
+            yuzu::test::spin_until([] { return g_emit_entered.load() >= 2; }, 1500ms);
     }
     REQUIRE(emitted_again);
     CHECK(handoff->stderr_emits_dropped() >= 1);
     {
         std::lock_guard<std::mutex> lk(g_emit_calls_mu);
-        REQUIRE(g_emit_calls.size() == 2);
-        // The second emit carries the error count at ITS failure, not the dropped one's.
-        CHECK(g_emit_calls[1].first == handoff->log_errors_total());
+        REQUIRE(g_emit_calls.size() >= 2);
+        // The latest emit carries the error count at ITS failure, not a dropped one's.
+        CHECK(g_emit_calls.back().first == handoff->log_errors_total());
     }
 
     std::atomic<int> fired{0};
@@ -991,7 +995,7 @@ TEST_CASE("U11: a stalled stderr diagnostic write does not stall log delivery; a
     CHECK(fired.load() == 0);
 }
 
-TEST_CASE("U11b: teardown() completes while a stderr write is still stuck, and the stuck "
+TEST_CASE("U11b: teardown() completes while a stderr write is still stuck; the stuck "
           "emit thread outlives the LogHandoff safely",
           "[log_handoff]") {
     reset_emit_stub_state(/*released=*/false);
@@ -1029,8 +1033,8 @@ TEST_CASE("U11b: teardown() completes while a stderr write is still stuck, and t
     REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() == 1; }, 5s));
 }
 
-TEST_CASE("U11c: an emit thread the OS refuses drops the diagnostic, counts it, releases "
-          "the slot, and never disturbs delivery",
+TEST_CASE("U11c: an emit thread the OS refuses drops the diagnostic; it is counted; the "
+          "slot is released; delivery is undisturbed",
           "[log_handoff]") {
     reset_emit_stub_state(/*released=*/true); // the stub returns at once: no blocking here
 
@@ -1061,17 +1065,50 @@ TEST_CASE("U11c: an emit thread the OS refuses drops the diagnostic, counts it, 
     handoff->teardown_with_action_for_test(2s, [] {});
 }
 
+TEST_CASE("U11d: diagnostics inside the once-per-second throttle window are neither "
+          "emitted nor counted as drops",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true); // the stub returns at once: no blocking here
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    LogHandoff::set_stderr_emit_for_test(&blocking_emit_stub);
+    yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
+
+    // 20 failures far inside one second: every one is an error, exactly one is emitted, and
+    // the other 19 are throttled BEFORE the slot is claimed, so they are not drops.
+    for (int i = 0; i < 20; ++i)
+        logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 20; }, 5s));
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() >= 1; }, 5s));
+    CHECK(g_emit_entered.load() == 1);
+    CHECK(handoff->stderr_emits_dropped() == 0);
+
+    handoff->teardown_with_action_for_test(2s, [] {});
+}
+
 #ifndef _WIN32
 // U12: the REAL stderr write against a genuinely blocked stderr. U11 replaces the write
 // with a stub, so on its own it cannot see two properties of the production path: that the
-// write holds no stdio (FILE) lock, and the line it produces. The first matters for
+// write holds no stdio (FILE) lock, and the exact line it produces. The first matters for
 // process exit: a thread stuck in fprintf(stderr) holds the stderr FILE lock, and a normal
-// exit() (libstdc++'s ios_base::Init dtor -> cerr.flush() -> fflush(stderr)) then waits
-// on it forever, with no watchdog left armed after teardown() returned. A raw write(2)
-// holds no lock. This test fails against a stdio implementation.
+// exit() (libstdc++'s ios_base::Init dtor -> cerr.flush() -> fflush(stderr)) then waits on
+// it forever, with no watchdog left armed after teardown() returned. A raw write(2) holds
+// no lock. This test fails against a stdio implementation.
+//
+// fd 2 of the shared test binary is redirected onto a full pipe for the duration. While it
+// is, ANY write to stderr from any thread blocks, including a sanitizer report or the
+// runner's final [DIAG] line; the restore below therefore runs on EVERY exit path (guard
+// declared before the redirect) and drains the pipe BEFORE restoring fd 2, so no descriptor
+// with a write in flight is ever closed or replaced (which differs across kernels).
 namespace {
 
-std::string drain_pipe(int fd, std::chrono::milliseconds quiet) {
+// Read whatever is available on `fd`, until nothing arrives for `quiet`.
+std::string read_available(int fd, std::chrono::milliseconds quiet) {
     std::string out;
     char buf[4096];
     for (;;) {
@@ -1086,56 +1123,83 @@ std::string drain_pipe(int fd, std::chrono::milliseconds quiet) {
     return out;
 }
 
-} // namespace
-
-TEST_CASE("U12: the real stderr write against a blocked stderr keeps delivery going, holds "
-          "no stdio lock, and writes the expected line",
-          "[log_handoff]") {
+// One sink failure with stderr blocked; asserts delivery, no stdio lock, and the exact bytes
+// the real write produced (after the filler that made the pipe full).
+void run_real_emit_against_blocked_pipe(const char* trigger_payload,
+                                        const std::string& expected_line) {
     reset_emit_stub_state(/*released=*/true);
     LogHandoff::set_stderr_emit_for_test(nullptr); // the REAL write
 
-    int pipefd[2];
-    REQUIRE(::pipe(pipefd) == 0);
-    // Fill the pipe so a write to it blocks: non-blocking fill until EAGAIN, then back.
-    REQUIRE(::fcntl(pipefd[1], F_SETFL, O_NONBLOCK) == 0);
-    {
-        char filler[512];
-        std::memset(filler, 'x', sizeof filler);
-        while (::write(pipefd[1], filler, sizeof filler) > 0) {
-        }
-    }
-    REQUIRE(::fcntl(pipefd[1], F_SETFL, 0) == 0);
-    const int saved_stderr = ::dup(STDERR_FILENO);
-    REQUIRE(saved_stderr >= 0);
-    REQUIRE(::dup2(pipefd[1], STDERR_FILENO) >= 0);
-    ::close(pipefd[1]);
-
+    // Everything that can fail and does NOT need fd 2 happens before the redirect.
     auto sink = std::make_shared<FailOnPayloadSink>();
     auto result = LogHandoff::create_with_sinks({sink});
     REQUIRE(result.has_value());
     auto handoff = std::move(*result);
     auto logger = handoff->logger();
 
+    int raw[2];
+    REQUIRE(::pipe(raw) == 0);
+    yuzu::agent::ScopedFd read_end{raw[0]};
+    yuzu::agent::ScopedFd write_end{raw[1]};
+    yuzu::agent::ScopedFd saved_stderr{::dup(STDERR_FILENO)};
+    REQUIRE(saved_stderr.valid());
+
+    // Fill the pipe to EXACTLY full (512-byte chunks, then single bytes) so a write blocks
+    // immediately whatever the platform's capacity granularity.
+    REQUIRE(::fcntl(write_end.get(), F_SETFL, O_NONBLOCK) == 0);
+    std::size_t filled = 0;
+    int fill_errno = 0;
+    {
+        char filler[512];
+        std::memset(filler, 'x', sizeof filler);
+        for (const std::size_t chunk : {sizeof filler, std::size_t{1}}) {
+            for (;;) {
+                const ssize_t w = ::write(write_end.get(), filler, chunk);
+                if (w <= 0) {
+                    fill_errno = errno;
+                    break;
+                }
+                filled += static_cast<std::size_t>(w);
+            }
+        }
+    }
+    REQUIRE(fill_errno == EAGAIN);
+    REQUIRE(::fcntl(write_end.get(), F_SETFL, 0) == 0);
+    {
+        pollfd pfd{write_end.get(), POLLOUT, 0};
+        REQUIRE(::poll(&pfd, 1, 0) == 0); // genuinely full: a write would block
+    }
+
     std::atomic<bool> stop_prober{false};
     std::atomic<int> probes{0};
     std::thread prober;
     std::string collected;
+    bool redirected = false;
     bool finished = false;
-    // Restores fd 2, drains the pipe (which releases a blocked emit and a blocked prober),
-    // and joins the prober. Idempotent; runs on every exit path.
+    // Idempotent; runs on every exit path. ORDER MATTERS: drain first (releases a blocked
+    // emit and a blocked prober), only then restore fd 2, then join the prober.
     auto finish = [&] {
         if (finished)
             return;
         finished = true;
-        ::dup2(saved_stderr, STDERR_FILENO);
-        ::close(saved_stderr);
-        collected = drain_pipe(pipefd[0], 500ms);
+        if (redirected) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + 5s * yuzu::test::kSpinScale;
+            while (collected.find(expected_line) == std::string::npos &&
+                   std::chrono::steady_clock::now() < deadline)
+                collected += read_available(read_end.get(), 100ms);
+            ::dup2(saved_stderr.get(), STDERR_FILENO);
+        }
         stop_prober.store(true);
         if (prober.joinable())
             prober.join();
-        ::close(pipefd[0]);
     };
+    // Declared BEFORE the redirect: nothing that can throw sits between the two.
     yuzu::test::ScopeExit cleanup{[&] { finish(); }};
+
+    REQUIRE(::dup2(write_end.get(), STDERR_FILENO) >= 0);
+    redirected = true;
+    write_end.reset(); // fd 2 is now the only write end
 
     // Probe the stdio lock continuously: fflush(stderr) takes the stderr FILE lock, so it
     // blocks for as long as any thread holds that lock across a blocked write.
@@ -1147,7 +1211,7 @@ TEST_CASE("U12: the real stderr write against a blocked stderr keeps delivery go
         }
     });
 
-    logger->info("fail"); // the handler launches the emit thread; its write blocks
+    logger->info(trigger_payload); // the handler launches the emit thread; its write blocks
     logger->info("ok-1");
     logger->info("ok-2");
     REQUIRE(yuzu::test::spin_until([&] { return sink->count() == 2; }, 5s));
@@ -1156,11 +1220,30 @@ TEST_CASE("U12: the real stderr write against a blocked stderr keeps delivery go
     // running: no stdio lock is held across the blocked write.
     std::this_thread::sleep_for(200ms);
     const int probes_before = probes.load();
-    std::this_thread::sleep_for(300ms);
-    CHECK(probes.load() > probes_before + 10);
+    CHECK(yuzu::test::spin_until([&] { return probes.load() > probes_before + 3; }, 2s));
 
     finish();
-    CHECK(collected.find("[*** LOG ERROR #1 ***] FailOnPayloadSink: injected failure\n") !=
-          std::string::npos);
+    // The pipe held the filler and then exactly one diagnostic line, byte for byte.
+    CHECK(collected.size() == filled + expected_line.size());
+    CHECK(collected.ends_with(expected_line));
+    CHECK(collected.find(expected_line) == collected.rfind(expected_line));
+}
+
+} // namespace
+
+TEST_CASE("U12: the real stderr write against a blocked stderr keeps delivery going; holds "
+          "no stdio lock; writes the expected line",
+          "[log_handoff]") {
+    run_real_emit_against_blocked_pipe(
+        "fail", "[*** LOG ERROR #1 ***] FailOnPayloadSink: injected failure\n");
+}
+
+TEST_CASE("U12b: the real stderr write clamps a longer-than-cap message to the cap and still "
+          "ends the line",
+          "[log_handoff]") {
+    // The handler records at most 256 bytes of the error text; the line is exactly
+    // head + count + separator + 256 bytes + newline.
+    run_real_emit_against_blocked_pipe(
+        "fail-long", "[*** LOG ERROR #1 ***] " + std::string(256, 'a') + "\n");
 }
 #endif

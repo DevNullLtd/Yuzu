@@ -4532,31 +4532,44 @@ rate-limited (once per second) fallback line to stderr at the moment of
 failure, reproducing what spdlog's own default error handler always did
 before #4666 PR-2 installed this one. That line is written by a short-lived
 helper thread, never by the logging worker, using a plain write that holds no
-C-library lock, so a blocked stderr (for example a full pipe to a stalled log
-collector) cannot stall the worker through this diagnostic or hang a normal
-shutdown. While one such write is stuck, or if the helper thread cannot be
-created, further diagnostic lines are dropped and counted by
-`stderr_emits_dropped()`. This covers the diagnostic's own write only: when
-stdout or stderr is itself one of the agent's log sinks (a stdout sink when
-there is no `--log-file`; a stderr sink beside the file sink when `--log-file`
-is set outside a Windows service), a blocked stream still stalls the logging
-worker in that sink's own write and queued lines are dropped oldest-first
-(`overrun_oldest`), exactly as for any stuck sink; only the shutdown watchdog
-bounds that. The fallback line is unlikely to be visible at all under a
-genuine Windows-service session (`--install-service`, no console): the agent
-attaches no stderr sink at all in that mode, log-file destination or not. If
-log lines go missing under load with no error printed, check the consumer of
-the agent's stdout and stderr first (journald, the container log driver, a
-collector backlog; on Linux a thread stuck in a pipe write shows as
-`pipe_write` under `/proc/<pid>/task/*/wchan`), then disk space and fd limits
-on the log destination. Restarting the agent does not fix a stalled collector.
+C-library lock. A stderr that is blocked when a sink fails can therefore no
+longer stall the worker through this diagnostic, and a stuck helper cannot
+hang a normal shutdown (verified on Linux). While one such write is stuck, the
+diagnostics that follow are dropped and counted by `stderr_emits_dropped()`; if
+the helper thread cannot be created, that one diagnostic is dropped and
+counted and the next one retries. The fallback line is unlikely to be visible
+at all under a genuine Windows-service session (`--install-service`, no
+console): the agent has no valid standard error handle there and attaches no
+stderr sink.
+
+**This covers the diagnostic's own write only, and on the shipped
+configurations that is a narrow gain.** When stdout or stderr is itself one of
+the agent's log sinks, a blocked stream still stalls the logging worker in that
+sink's own write and queued lines are dropped oldest-first (`overrun_oldest`),
+exactly as for any stuck sink; only the shutdown watchdog bounds that, and only
+at shutdown. That is the case for the shipped systemd unit and the container
+images (no `--log-file`, so a stdout sink), for `--log-file` outside a Windows
+service (a stderr sink beside the file sink), and for an unopenable
+`--log-file` (which falls back to a stdout sink). In those setups a stalled log
+collector still stalls log delivery. There is no `--log-sync` flag or other
+escape hatch back to synchronous logging; this is unconditional for every
+build. A `--log-file` that cannot be opened still falls back to console-only
+logging exactly as before (`used_log_file_fallback()` prints the same kind of
+startup diagnostic), except the console sink is now async too, not synchronous
+as it was pre-#4666.
+
+**If log lines go missing under load with no error printed (#5023).** Check the
+consumer of the agent's stdout and stderr first (journald, the container log
+driver, a collector backlog): a stalled one stalls delivery as described above,
+and restarting the agent does not fix it. As root,
+`ls -l /proc/<pid>/fd/1 /proc/<pid>/fd/2` shows whether each is a pipe
+(containers) or a socket (journald under the shipped unit), and
+`grep . /proc/<pid>/task/*/wchan` shows a logging thread parked in the write.
+The symbol depends on the kernel (`pipe_write` or `anon_pipe_write` for a
+pipe, `sock_alloc_send_pskb` for a socket), and for an unprivileged user those
+files read `0`. Then check disk space and fd limits on the log destination.
 `overrun_oldest` drops are silent in this release, with no counter or alert to
-point at them yet. There is no `--log-sync` flag or other escape
-hatch back to synchronous logging; this is unconditional for every build. A
-`--log-file` that cannot be opened still falls back to console-only logging
-exactly as before (`used_log_file_fallback()` prints the same kind of startup
-diagnostic), except the console sink is now async too, not synchronous as it
-was pre-#4666.
+point at them yet.
 
 **Stopping a wedged agent (Linux/macOS).** `SIGTERM`/`SIGINT` (`systemctl stop`,
 Ctrl-C) triggers a graceful agent stop — plugin shutdown, thread joins, store
