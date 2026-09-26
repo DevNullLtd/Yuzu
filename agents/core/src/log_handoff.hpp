@@ -66,12 +66,16 @@
 /// last-message buffer is guarded by a plain std::mutex, NOT a lock-free/single-writer
 /// scheme (that was a specification bug in an earlier draft, caught by the final
 /// review -- verify against ErrorState below, not against a stale comment elsewhere).
-/// STDERR FALLBACK (governance hardening round): the handler now also formats and
-/// writes a rate-limited (1/sec) diagnostic line to stderr, mirroring what spdlog's own
-/// default error handler always did before this one replaced it -- see the handler's
-/// own comment in log_handoff.cpp for the full rationale and its lock-vs-I/O boundary
-/// (the mutex above guards only the in-memory ErrorState fields; the stderr write
-/// itself happens outside it).
+/// STDERR FALLBACK (governance hardening round, #5023): the handler also emits a
+/// rate-limited (1/sec) diagnostic line to stderr, mirroring what spdlog's own default
+/// error handler always did before this one replaced it. The write is NEVER made on the
+/// thread that entered the handler: for a sink throw that thread is the async logger's
+/// one worker, and a blocked stderr (a full pipe to a stalled collector) would stop the
+/// whole queue draining. It is made by a short-lived detached thread, at most one in
+/// flight (ErrorState::emit_in_flight); while one is stuck, further diagnostic lines are
+/// dropped and counted (stderr_emits_dropped()). The diagnostic degrades, delivery does
+/// not. The mutex above guards only the in-memory ErrorState fields. See the handler's
+/// own comment in log_handoff.cpp for the full rationale.
 ///
 /// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent -- a second SEQUENTIAL
 /// call (or the destructor firing after an explicit call already returned) is a no-op. A second
@@ -579,6 +583,12 @@ public:
     /// throw, or a producer-side formatter/allocation exception, or "pool gone").
     [[nodiscard]] std::uint64_t log_errors_total() const;
 
+    /// Cumulative count of stderr diagnostic lines the handler DROPPED because an earlier
+    /// one was still in flight (i.e. stderr is blocked) or because the emit thread could
+    /// not be created (#5023). Zero in a healthy process. Like log_errors_total(), no
+    /// production consumer reads it yet (see #5024).
+    [[nodiscard]] std::uint64_t stderr_emits_dropped() const;
+
     /// The most recent error message the handler observed, truncated to 256 bytes.
     /// Test/diagnostic accessor -- not surfaced on the heartbeat (PR-3's job, if ever).
     [[nodiscard]] std::string last_log_error_for_test() const;
@@ -609,6 +619,15 @@ public:
     /// into a later, unrelated test. Production callers never set this.
     static void set_construction_fault_for_test(bool fail) noexcept;
 
+    /// The function the handler's detached emit thread calls to write the diagnostic line
+    /// (count, message). Default (nullptr) is the real stderr write.
+    using StderrEmitFn = void (*)(std::uint64_t count, const std::string& message);
+
+    /// Test-only seam (U11): replaces the stderr write so a test can make it block and
+    /// assert log delivery continues (#5023). Read once per emit, when the emit thread is
+    /// launched. Production callers never set this; pass nullptr to restore the default.
+    static void set_stderr_emit_for_test(StderrEmitFn fn) noexcept;
+
 private:
     struct ErrorState {
         mutable std::mutex mu;
@@ -621,6 +640,13 @@ private:
         // default handler doesn't silently drop an operator-visible signal that
         // existed before this primitive was wired into production (#4666 PR-2).
         std::chrono::steady_clock::time_point last_emit{};
+        // #5023: true from the moment the handler launches the detached stderr-emit thread
+        // until that thread's write returns. At most one emit thread exists at a time, so a
+        // stuck stderr costs one blocked thread, never a growing number. Atomics, not
+        // guarded by `mu`: the emit thread must never take `mu` (it would re-couple a stuck
+        // write to the lock the accessors use).
+        std::atomic<bool> emit_in_flight{false};
+        std::atomic<std::uint64_t> emits_dropped{0};
     };
 
     LogHandoff() = default;
@@ -690,6 +716,7 @@ private:
     std::string log_file_fallback_reason_;
 
     static inline std::atomic<bool> construction_fault_for_test_{false};
+    static inline std::atomic<StderrEmitFn> stderr_emit_for_test_{nullptr};
 };
 
 /// Pre-abort breadcrumb helper (plan 1.8). See the file banner's own paragraph for the

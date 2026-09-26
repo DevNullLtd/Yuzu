@@ -4530,7 +4530,12 @@ has a production/heartbeat consumer yet — the same later-PR heartbeat
 poller planned for `overrun_total()` above. The only production-visible
 signal today is a rate-limited (once per second) fallback line to stderr at
 the moment of failure, reproducing what spdlog's own default error handler
-always did before #4666 PR-2 installed this one. That fallback line is
+always did before #4666 PR-2 installed this one. The line is written by a
+short-lived helper thread, never by the logging worker, so a blocked stderr
+(for example a full pipe to a stalled log collector) cannot stall log
+delivery; while one such write is stuck, further diagnostic lines are
+dropped, counted internally by `stderr_emits_dropped()` (likewise not yet
+surfaced anywhere). That fallback line is
 unlikely to be visible at all under a genuine Windows-service session
 (`--install-service`, no console): the agent attaches no stderr sink at
 all in that mode, log-file destination or not. If log lines appear to go
