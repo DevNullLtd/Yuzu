@@ -1885,8 +1885,9 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         snap.last_seen = std::chrono::steady_clock::now();
 
         // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
-        // deduped here); TarCorruptionAuditGate dedups, and a write that failed or
-        // was skipped is retried on the next heartbeat.
+        // deduped here); TarCorruptionAuditGate dedups; a candidate skipped
+        // because the gate's slot was busy retries on the next heartbeat, a
+        // failed write after the 60 s degraded window.
         if (corruption_sink_) {
             const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
             const auto ql = snap.status_tags.find(kTarTagQuarantineLast);

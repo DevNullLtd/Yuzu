@@ -1109,13 +1109,18 @@ public:
     // into the plugin's heartbeat KV keys. The agent bridges `heartbeat.*` keys
     // into `yuzu.plugin.tar.*` heartbeat tags. Runs at init and at the top of
     // every collect_slow tick, so a crash between the quarantine and the publish,
-    // or a failed storage_set, is replayed rather than lost. The counter is
-    // monotonic per agent and the ledger is never overwritten when it exists but
-    // is unreadable (storage_get returns "" for absent AND read-failure). The two
-    // windows where the fact is lost are a crash between the quarantine rename
-    // and the fresh DB's config write inside TarDatabase::open(), and that config
-    // write failing (logged by open(); db_health|quarantined still shows for this
-    // process).
+    // or a failed storage_set, is replayed rather than lost. The ledger is never
+    // overwritten when it exists but is unreadable (storage_get returns "" for
+    // absent AND read-failure). Known host-layer gap: storage_exists reports a
+    // READ FAILURE as absent (KvStore::exists folds closed-handle/prepare/step
+    // failures into false and agent.cpp maps that to not-found, against
+    // plugin.h's negative-on-error contract), so a read fault on the ledger
+    // probe followed by a successful write in the same tick restarts the count
+    // at 1 — the count is monotonic per agent except for that fault; tracked as
+    // a follow-up (KvStore::exists tri-state). The two windows where the fact is
+    // lost are a crash between the quarantine rename and the fresh DB's config
+    // write inside TarDatabase::open(), and that config write failing (logged by
+    // open(); db_health|quarantined still shows for this process).
     void reconcile_db_health_publish(yuzu::PluginContext& pctx) {
         if (!db_ || !db_->is_open())
             return;
@@ -1134,7 +1139,9 @@ public:
         // One atomic ledger record `<count>:<epoch>:<basename>` in a private,
         // non-bridged key holds the truth; the two published keys are derived
         // from it by idempotent sets. A failed publish therefore replays the
-        // same computation on the next tick instead of re-counting.
+        // same computation on the next tick instead of re-counting. The
+        // identity key is withheld until the matching total is durable, so a
+        // torn publish never pairs a stale total with a newer identity.
         constexpr std::string_view kLedgerKey = "db_health.ledger";
         int64_t count = 0;
         std::string ledger_identity;
@@ -1159,17 +1166,21 @@ public:
                 return;
             }
         }
-        bool published = true;
         const auto publish = [&](std::string_view key, const std::string& value) {
             if (pctx.storage_exists(key) && pctx.storage_get(key) == value)
-                return;
-            if (!pctx.storage_set(key, value))
-                published = false;
+                return true;
+            return pctx.storage_set(key, value);
         };
-        publish(kTotalKey, std::to_string(count));
-        publish(kLastKey, want);
-        if (!published)
-            spdlog::warn("TAR: failed to publish db quarantine heartbeat keys; will retry");
+        // The identity is published only once the matching total is durable:
+        // publishing kLastKey after a failed kTotalKey write would let the KV
+        // hold a stale total paired with a newer identity.
+        if (!publish(kTotalKey, std::to_string(count))) {
+            spdlog::warn("TAR: failed to publish db quarantine total; will retry "
+                        "(identity withheld)");
+            return;
+        }
+        if (!publish(kLastKey, want))
+            spdlog::warn("TAR: failed to publish db quarantine identity; will retry");
     }
 
 private:
@@ -1559,6 +1570,11 @@ private:
             bool nstat_primary = nstat_client_ && nstat_client_->running() &&
                                  nstat_client_->system_wide() && !nstat_client_->stalled();
 
+            // #1846 M2: a failed nstat lifecycle insert this tick must win over
+            // a later successful poll-leg write when the tcp source's single
+            // terminal health token is recorded below (tcp_tick_status).
+            bool nstat_insert_failed = false;
+
             // HIGH-3: maps a batch of drained lifecycle events into
             // NetworkEvent rows, prepends anything held over from a prior
             // failed insert (mirrors pending_stream_evs_/pending_module_evs_
@@ -1606,6 +1622,7 @@ private:
                         spdlog::error("TAR: nstat tcp lifecycle insert failed — re-queuing "
                                       "{} events for the next tick",
                                       typed.size());
+                        nstat_insert_failed = true;
                         pending_nstat_evs_ = std::move(typed);
                         if (pending_nstat_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
@@ -1721,12 +1738,15 @@ private:
                 spdlog::error("TAR: network {} — nothing persisted, next tick re-diffs", tok);
                 ctx.write_output(typed.empty() ? "error|network state_save_failed"
                                                : "error|network insert failed");
-                note_health("tcp", tok);
+                // A failed nstat lifecycle insert earlier this tick takes
+                // precedence over this leg's own outcome, so it is never
+                // silently overwritten (#1846 M2).
+                note_health("tcp", yuzu::tar::tcp_tick_status(nstat_insert_failed, tok));
                 return 1;
             }
             nstat_tcp_primary_prev_ = nstat_primary;
             total_events += static_cast<int>(typed.size());
-            note_health("tcp", "events_recorded");
+            note_health("tcp", yuzu::tar::tcp_tick_status(nstat_insert_failed, "events_recorded"));
         } else if (nstat_client_) {
             note_health("tcp", "source_disabled");
             // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat

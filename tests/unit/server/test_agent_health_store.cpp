@@ -43,6 +43,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -2126,24 +2127,67 @@ TEST_CASE("TarCorruptionAuditGate: overlapping calls hold one in-flight slot gat
     gate.mark_logged("c", "3:h");
 }
 
+TEST_CASE("TarCorruptionAuditGate::Reservation: a throw between reservation and "
+          "completion releases the slot",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+
+    REQUIRE(gate.should_log("a", "1:f"));
+    try {
+        TarCorruptionAuditGate::Reservation r(gate);
+        throw std::runtime_error("boom");
+    } catch (...) {
+    }
+    // The unwind completed the reservation as failed(): degraded window open,
+    // no lookup admitted for a different agent yet.
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("b", "2:g")); // proves the slot was released, not stranded
+
+    {
+        TarCorruptionAuditGate::Reservation r(gate);
+        r.logged("b", "2:g");
+    }
+    // A committed reservation opens no degraded window: admitted immediately.
+    CHECK(gate.should_log("c", "3:h"));
+}
+
 TEST_CASE("TarCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
           "[health_store][tar][corruption][gate]") {
     using yuzu::server::detail::TarCorruptionAuditGate;
     int lookups = 0;
-    TarCorruptionAuditGate gate([&](const std::string&) {
-        ++lookups;
-        return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
-    });
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
     // One past the 65,536 cap: exactly one entry is evicted, never a wholesale clear.
     constexpr int kAgents = 65537;
     for (int i = 0; i < kAgents; ++i)
         gate.mark_logged("agent-" + std::to_string(i), "1:f");
-    // The single evicted entry is admitted (order-independent) and holds the in-flight
-    // slot, so every other agent is answered by the map with no lookup.
+    // The single evicted entry is admitted (order-independent). Release the
+    // slot (and clear the degraded window) after every admission so each of
+    // the 65,537 probes actually reaches the map instead of being rejected
+    // by a held in-flight slot before the map is even consulted — with a
+    // stranded slot, admitted==1/lookups==1 would hold vacuously even if the
+    // map itself were wrong (e.g. a clear() regression, which now admits
+    // 65,536+ instead).
     int admitted = 0;
-    for (int i = 0; i < kAgents; ++i)
-        if (gate.should_log("agent-" + std::to_string(i), "1:f"))
+    for (int i = 0; i < kAgents; ++i) {
+        if (gate.should_log("agent-" + std::to_string(i), "1:f")) {
             ++admitted;
+            gate.mark_failed();
+            clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+        }
+    }
     CHECK(admitted == 1);
     CHECK(lookups == 1);
 }
@@ -2202,11 +2246,13 @@ TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink compos
     store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
         if (!gate.should_log(a, q))
             return;
+        // Mirrors server.cpp's sink shape: a Reservation, not raw mark_logged/mark_failed.
+        TarCorruptionAuditGate::Reservation res(gate);
         if (log_ok) {
             rows.push_back(encode_tar_corruption_detail(t, q));
-            gate.mark_logged(a, q);
+            res.logged(a, q);
         } else {
-            gate.mark_failed();
+            res.failed();
         }
     });
     const auto beat = [&] {

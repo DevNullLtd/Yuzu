@@ -12,9 +12,10 @@
  * `tar.db.corruption_quarantined` audit row for the agent. Net effect: exactly
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
- * the same agent can add a second row for the same identity), and a failed or
- * skipped write is retried after the degraded window (the pair is only marked
- * once the row is durable).
+ * the same agent can add a second row for the same identity); a failed write is
+ * retried after the degraded window and a candidate skipped because the slot
+ * was busy on the next heartbeat (the pair is only marked once the row is
+ * durable).
  *
  * The identity is agent-asserted and only shape-validated, so the gate also
  * bounds a rotating identity: at most one row per agent per
@@ -27,9 +28,12 @@
  *
  * Reservation contract: a true from should_log() reserves the gate's single
  * in-flight slot; the caller completes it with exactly one of mark_logged()
- * (row durable) or mark_failed() (write failed). While the slot is held every
- * other should_log() returns false (retried on a later heartbeat), so at most
- * one audit-store call is in flight gate-wide.
+ * (row durable) or mark_failed() (write failed) -- or, more safely, via the
+ * nested Reservation RAII type, whose destructor completes an abandoned
+ * reservation as failed() so a throw between the reservation and the write
+ * cannot strand the slot. While the slot is held every other should_log()
+ * returns false (retried on a later heartbeat), so at most one audit-store
+ * call is in flight gate-wide.
  *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
@@ -163,7 +167,7 @@ public:
         std::lock_guard lock(mu_);
         if (!latest) {
             in_flight_ = false;
-            degraded_until_ = now + kTarCorruptionAuditDegradedRetry;
+            degraded_until_ = now_s_() + kTarCorruptionAuditDegradedRetry;
             return false; // no write, not marked -> retried after the window
         }
         if (*latest && **latest == quarantine) {
@@ -173,6 +177,37 @@ public:
         }
         return true; // slot stays held for the caller's write
     }
+
+    /// RAII completion token for a should_log() that returned true. Construct
+    /// one immediately after the true return, then complete it with exactly
+    /// one of logged() (row durable) or failed() (write failed). If neither
+    /// runs — including a throw unwinding through the reservation's scope —
+    /// the destructor completes it as failed(), so an exception between the
+    /// reservation and the write can never strand the in-flight slot (which
+    /// would otherwise wedge should_log() false for every agent forever).
+    class Reservation {
+    public:
+        explicit Reservation(TarCorruptionAuditGate& gate) noexcept : gate_(&gate) {}
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        Reservation(Reservation&&) = delete;
+        Reservation& operator=(Reservation&&) = delete;
+        ~Reservation() {
+            if (gate_)
+                gate_->mark_failed();
+        }
+        void logged(const std::string& agent_id, const std::string& quarantine) {
+            gate_->mark_logged(agent_id, quarantine);
+            gate_ = nullptr;
+        }
+        void failed() {
+            gate_->mark_failed();
+            gate_ = nullptr;
+        }
+
+    private:
+        TarCorruptionAuditGate* gate_;
+    };
 
     void mark_logged(const std::string& agent_id, const std::string& quarantine) {
         std::lock_guard lock(mu_);

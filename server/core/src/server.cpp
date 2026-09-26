@@ -5141,6 +5141,9 @@ public:
                         return;
                     if (!gate->should_log(agent_id, quarantine))
                         return;
+                    // Reservation completes the slot even if AuditEvent construction
+                    // or audit_store_->log() throws (log() is not noexcept).
+                    detail::TarCorruptionAuditGate::Reservation res(*gate);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -5153,9 +5156,9 @@ public:
                     ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
-                        gate->mark_logged(agent_id, quarantine);
+                        res.logged(agent_id, quarantine);
                     else
-                        gate->mark_failed();
+                        res.failed();
                 });
             }
 

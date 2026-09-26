@@ -29,6 +29,16 @@ namespace yuzu::tar {
            token == "state_save_failed";
 }
 
+/// The tcp source's single terminal per-tick health token, with failure
+/// precedence: a failed nstat lifecycle insert earlier in the tick must not
+/// be silently overwritten by a later successful poll-leg write in the same
+/// tick (#1846 M2) -- an insert failure means events were lost even when the
+/// poll's own baseline/diff commit succeeds.
+[[nodiscard]] constexpr std::string_view tcp_tick_status(bool nstat_insert_failed,
+                                                         std::string_view poll_status) noexcept {
+    return nstat_insert_failed ? std::string_view{"insert_failed"} : poll_status;
+}
+
 struct SourceHealth {
     std::string last_status;
     int consecutive_failures{0};

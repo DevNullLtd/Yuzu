@@ -3,7 +3,8 @@
   `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, which a new
   generic plugin heartbeat-tag bridge forwards as `yuzu.plugin.tar.*` tags. The
   server exposes `yuzu_fleet_tar_db_corruption_agents` and
-  `yuzu_fleet_plugin_init_failed{plugin}`, writes one `tar.db.corruption_quarantined`
-  audit row per quarantine (deduplicated against the audit store), and a new
-  `yuzu.plugins_failed` heartbeat tag distinguishes a plugin that failed init from
-  one that is not installed.
+  `yuzu_fleet_plugin_init_failed{plugin}`, writes a `tar.db.corruption_quarantined`
+  audit row per (agent, quarantine identity), deduplicated against the audit store
+  and rate-limited per agent per server process, and a new `yuzu.plugins_failed`
+  heartbeat tag distinguishes a plugin that failed init from one that is not
+  installed.

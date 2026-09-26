@@ -400,8 +400,12 @@ publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic) and
 `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin storage, which the
 agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
 `yuzu.plugin.tar.db_quarantine_last`. The server exposes
-`yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes one
-`tar.db.corruption_quarantined` audit row per quarantine. A plugin that failed to
+`yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes a
+`tar.db.corruption_quarantined` audit row per (agent, quarantine identity),
+deduplicated against the audit store and bounded to one row per agent per 10
+minutes per server process (intermediate quarantines inside that window collapse
+to the newest identity; another HA node can add a second row for the same
+identity) — see the audit-log reference. A plugin that failed to
 initialise (including TAR when the corrupt file cannot be moved aside) is reported
 in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". The plugin keeps its

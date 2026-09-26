@@ -83,3 +83,10 @@ TEST_CASE("source health: three config lines per registry source, in registry or
     }
     CHECK(seen);
 }
+
+TEST_CASE("tcp_tick_status: a failed nstat lifecycle insert wins over the poll leg's own outcome",
+          "[tar][health]") {
+    CHECK(tcp_tick_status(true, "events_recorded") == "insert_failed");
+    CHECK(tcp_tick_status(true, "state_save_failed") == "insert_failed");
+    CHECK(tcp_tick_status(false, "events_recorded") == "events_recorded");
+}

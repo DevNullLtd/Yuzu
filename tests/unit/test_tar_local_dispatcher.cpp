@@ -240,6 +240,70 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
         CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"2"});
     }
 
+    SECTION("a torn `total` publish withholds the identity: never a stale total with a newer last") {
+        const auto quarantine_basenames = [&] {
+            std::vector<std::string> names;
+            for (const auto& e : fs::directory_iterator(dir_guard.path)) {
+                const auto n = e.path().filename().string();
+                if (n.rfind("tar.db.corrupt-", 0) == 0)
+                    names.push_back(n);
+            }
+            return names;
+        };
+        const auto corrupt_db = [&] {
+            std::ofstream bad(dir_guard.path / "tar.db", std::ios::binary | std::ios::trunc);
+            bad << std::string(8192, 'X');
+        };
+        const auto init_shutdown = [&] {
+            yuzu::agent::StandalonePluginContext ctx("tar", {{"agent.data_dir", dir_guard.path.string()}},
+                                                     &*kv);
+            REQUIRE(desc->init(ctx.get()) == 0);
+            desc->shutdown(ctx.get());
+        };
+
+        // First quarantine publishes cleanly.
+        corrupt_db();
+        init_shutdown();
+        auto names = quarantine_basenames();
+        REQUIRE(names.size() == 1);
+        const auto first_last = kv->get("tar", "heartbeat.db_quarantine_last");
+        REQUIRE(first_last.has_value());
+        CHECK(first_last->ends_with(":" + names[0]));
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
+
+        // Block only the `total` key on the kv table (INSERT and UPDATE).
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open((dir_guard.path / "kv_store.db").string().c_str(), &owner.db) ==
+                SQLITE_OK);
+        const auto exec = [&](const char* sql) {
+            return sqlite3_exec(owner.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+        };
+        REQUIRE(exec("CREATE TRIGGER block_total_ins BEFORE INSERT ON kv_store "
+                     "WHEN NEW.key = 'heartbeat.db_corruption_total' "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+        REQUIRE(exec("CREATE TRIGGER block_total_upd BEFORE UPDATE ON kv_store "
+                     "WHEN NEW.key = 'heartbeat.db_corruption_total' "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+        // Second quarantine: the ledger advances but `total` cannot publish, so
+        // `last` must be withheld too -- never a stale total paired with a
+        // newer identity.
+        corrupt_db();
+        init_shutdown();
+        names = quarantine_basenames();
+        REQUIRE(names.size() == 2);
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"1"});
+        CHECK(kv->get("tar", "heartbeat.db_quarantine_last") == first_last); // identity withheld
+
+        REQUIRE(exec("DROP TRIGGER block_total_ins"));
+        REQUIRE(exec("DROP TRIGGER block_total_upd"));
+        init_shutdown();
+        CHECK(kv->get("tar", "heartbeat.db_corruption_total") == std::optional<std::string>{"2"});
+        const auto second_last = kv->get("tar", "heartbeat.db_quarantine_last");
+        REQUIRE(second_last.has_value());
+        CHECK(second_last->ends_with(":" + names[1]));
+    }
+
     SECTION("clean boot -> db_health|ok|0") {
         yuzu::agent::StandalonePluginContext ctx("tar", {{"agent.data_dir", dir_guard.path.string()}}, &*kv);
         REQUIRE(desc->init(ctx.get()) == 0);
