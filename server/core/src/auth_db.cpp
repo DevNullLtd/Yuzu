@@ -233,8 +233,9 @@ const std::vector<pg::PgMigration>& migrations() {
     //
     // EXTERNAL cross-schema reader of `users.is_active` (routed-concerns
     // access-control table, "A2 global human role assignment" row):
-    // `RbacStore::unassign_role`'s last-Administrator guard (rbac_store.cpp)
-    // runs `rbac_store.principal_roles JOIN auth.users ... WHERE
+    // `RbacStore::unassign_role`'s last-Administrator guard
+    // (`RbacAdminAuthorityOwner`, rbac_admin_authority_owner.cpp) runs
+    // `rbac_store.principal_roles JOIN auth.users ... WHERE
     // u.is_active` in its OWN transaction, on the assumption this column
     // keeps its name and its "not soft-deleted / deactivated" meaning — the
     // precondition every LOCAL PASSWORD login path filters on (lockout via
@@ -247,7 +248,8 @@ const std::vector<pg::PgMigration>& migrations() {
     // gap. A rename fails the guard closed (SQL error); a change to what
     // `is_active` *means* silently changes what the guard counts.
     //
-    // The guard also TAKES A ROW LOCK on one `auth.users` row: after its
+    // The guard (`RbacAdminAuthorityOwner`, rbac_admin_authority_owner.cpp) also TAKES
+    // A ROW LOCK on one `auth.users` row: after its
     // DELETE it runs `SELECT is_active FROM auth.users WHERE username = $1
     // FOR UPDATE` for the deleted principal, so a concurrent reactivation
     // (`reactivate_user`) cannot commit between that read and the guard's

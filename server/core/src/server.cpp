@@ -1915,7 +1915,7 @@ public:
         // full-pipeline review on 765bc7ec1) — how often an operator's
         // unassign attempt was refused because it would leave the fleet
         // with zero authenticatable Administrators (RbacStore::
-        // unassign_role's guard, rbac_store.cpp). Zero-seeded per transport
+        // unassign_role's guard, rbac_admin_authority_owner.cpp). Zero-seeded per transport
         // so an idle server carries both closed series from boot.
         metrics_.describe("yuzu_server_rbac_last_admin_guard_refused_total",
                           "RBAC role-unassign requests refused by the last-remaining-"

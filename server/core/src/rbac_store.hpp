@@ -274,6 +274,10 @@ public:
 
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
 
+    /// The guard's transaction lives in `RbacAdminAuthorityOwner`
+    /// (rbac_admin_authority_owner.cpp), an ADR-0012 s3 query owner; this method
+    /// delegates to it.
+    ///
     /// A2 last-Administrator guard: when `role_name == "Administrator"`,
     /// refuses (and rolls back) a delete that would leave ZERO
     /// `principal_roles` rows naming `role_name = 'Administrator'` AND
@@ -282,7 +286,7 @@ public:
     /// JOINs `auth.users` (`u.username = pr.principal_id AND u.is_active`)
     /// so a pre-provisioned grant on a nonexistent username, or a
     /// deactivated/(soft-)deleted account, never counts as a "surviving"
-    /// administrator — see the `.cpp` for the full reasoning (this is safe
+    /// administrator — see rbac_admin_authority_owner.cpp for the full reasoning (this is safe
     /// only because `RbacStore` and `AuthDB` always share one PgPool in
     /// production, ADR-0006). Also matches
     /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly on
