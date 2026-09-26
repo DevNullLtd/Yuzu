@@ -2140,9 +2140,9 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         // (e.g. `AuthDB::reactivate_user`) after the lock query. If that principal
         // is the fleet's ONLY real Administrator, trusting the snapshot alone would
         // evaluate `removed_a_counted_admin` false and skip the recount below,
-        // removing a grant the principal can already use: the local password login
-        // query in AuthDB filters `is_active = TRUE`, and this transaction's DELETE
-        // is invisible to the admin gate until it commits.
+        // removing a grant the principal can already begin to use: `AuthDB::get_user`
+        // filters `is_active = TRUE` (necessary for login, not sufficient), and this
+        // transaction's DELETE is invisible to the admin gate until it commits.
         // Close this with a fresh recheck of the SPECIFIC deleted principal's
         // `auth.users` row, run after the DELETE in the same transaction, with
         // FOR UPDATE. Under READ COMMITTED a reactivation that already committed
@@ -2168,19 +2168,23 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         }
         // NOT closed by this recheck (disclosed, not claimed closed):
         //  (1) a pre-provisioned grant whose `auth.users` row is CREATED
-        //      concurrently: with no row to lock, `create_user`'s INSERT
-        //      (`is_active` defaults TRUE) can commit after this SELECT returns
-        //      zero rows;
+        //      concurrently: with no row to lock, the INSERT in
+        //      `AuthDB::upsert_user` (or `upsert_sso_identity`; `is_active`
+        //      defaults TRUE) can commit after this SELECT returns zero rows;
         //  (2) deactivation of a SURVIVING counted Administrator between the
         //      recount below and this transaction's COMMIT (#4966: `remove_user`
         //      has no last-Administrator guard).
-        // Lock order established here: `principal_roles` rows first, then this one
-        // `auth.users` row. A path that holds an `auth.users` row lock and then
-        // waits on `principal_roles` would deadlock against it. auth_db.cpp has no
-        // `principal_roles` SQL, and #4966's fix must honour this order (or use one
-        // shared transaction-scoped advisory lock) rather than invert it. A lock
-        // wait here is bounded by the pool's `lock_timeout`; on timeout the
-        // statement errors, this transaction rolls back and the caller sees 503.
+        // Lock order in this transaction: `principal_roles` rows, then this one
+        // `auth.users` row, then the `rbac_meta` `write_generation` row (taken by
+        // `bump_generation_in_txn` at the end). A path that holds an `auth.users`
+        // row lock and then waits on `principal_roles` or `rbac_meta` would deadlock
+        // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL, and
+        // #4966's fix must honour this order (or use one shared
+        // transaction-scoped advisory lock) rather than invert it. A lock
+        // wait here is bounded by the pool's `lock_timeout` (10 s by default, unless
+        // the DSN sets its own `options`); on timeout the statement errors and this
+        // transaction rolls back. REST answers 503; the MCP twin answers an
+        // internal error with a retry hint.
         const bool removed_a_counted_admin =
             removed && principal_type == "user" &&
             (locked_admin_principal_ids.count(principal_id) > 0 || reactivated_since_lock);

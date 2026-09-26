@@ -1219,6 +1219,10 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
+    // If a REQUIRE below throws while the worker is blocked, this jthread's
+    // destructor joins BEFORE lease_a is released (it is declared after it), and the
+    // worker's statement errors out at the pool's lock_timeout (10 s by default), so
+    // a failure surfaces late rather than hanging.
     std::jthread unassign_thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
@@ -1230,6 +1234,8 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     // The unassign has passed its lock query (ghostadmin's COMMITTED row is still
     // inactive, so it is not counted) and its DELETE, and is now blocked in the
     // recheck on connection A's row lock. Separate probe connection, never lease_a.
+    // The location is inferred by elimination: no other statement in the
+    // unassign can wait on that one row lock.
     REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
     CHECK_FALSE(b_done.load());
 
@@ -1242,6 +1248,93 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     CHECK_FALSE(b_ok.load());
     CHECK(is_rbac_last_admin_refusal(b_error));
     // Refused => rolled back => the grant survives.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+    // Not asserted here: the two cases the guard does NOT close (an auth.users row
+    // created concurrently for a pre-provisioned grant, and deactivation of a
+    // surviving Administrator, #4966). Pinning a known hole would have to be
+    // inverted when #4966 lands.
+}
+
+// Complement of the test above: the in-flight reactivation ROLLS BACK, so the
+// recheck re-reads the unchanged inactive row and the removal must go through.
+// Guards against over-refusal after the wait.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for an "
+          "in-flight reactivation that rolls back and then SUCCEEDS "
+          "(FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_removed{false};
+    std::atomic<bool> b_ok{false};
+    std::jthread unassign_thread([&] {
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (res)
+            b_removed = *res;
+        b_done = true;
+    });
+
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    CHECK(b_ok.load());
+    CHECK(b_removed.load());
+    CHECK(store.get_principal_roles("user", "ghostadmin").empty());
+}
+
+// The lock-wait bound: when the reactivation stays in flight longer than the
+// pool's lock_timeout, the recheck errors, the transaction rolls back (the DELETE
+// is undone), and the failure is NOT a last-Administrator refusal (callers map it
+// to 503 / an MCP internal error with a retry hint, never to the 409 refusal).
+// A second store on a pool with a 300 ms lock_timeout keeps the test fast; the
+// call is synchronous (the statement times out on its own), so no thread is needed.
+TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
+          "fault and rolls the DELETE back (FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    PgPool short_pool{{.conninfo = auth_db.dsn(), .size = 2, .lock_timeout_ms = 300}};
+    REQUIRE(short_pool.valid());
+    RbacStore short_store{short_pool};
+    REQUIRE(short_store.is_open());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    auto res = short_store.unassign_role("user", "ghostadmin", "Administrator");
+    REQUIRE_FALSE(res.has_value());
+    CHECK_FALSE(is_rbac_last_admin_refusal(res.error()));
+    // Pin the cause: Postgres reports "canceling statement due to lock timeout".
+    CHECK(res.error().find("lock timeout") != std::string::npos);
+
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+    // The timed-out transaction rolled back: the grant is still there.
     CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
 }
 

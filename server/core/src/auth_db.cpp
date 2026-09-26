@@ -246,6 +246,17 @@ const std::vector<pg::PgMigration>& migrations() {
     // local-account-only-check note (#4966) for the resulting guard-coverage
     // gap. A rename fails the guard closed (SQL error); a change to what
     // `is_active` *means* silently changes what the guard counts.
+    //
+    // The guard also TAKES A ROW LOCK on one `auth.users` row: after its
+    // DELETE it runs `SELECT is_active FROM auth.users WHERE username = $1
+    // FOR UPDATE` for the deleted principal, so a concurrent reactivation
+    // (`reactivate_user`) cannot commit between that read and the guard's
+    // own COMMIT. Its lock order is `rbac_store.principal_roles` rows, then
+    // that one `auth.users` row, then `rbac_store.rbac_meta`. A change here
+    // (e.g. a last-Administrator guard on `remove_user`, #4966) that holds an
+    // `auth.users` row lock and then touches `principal_roles` or `rbac_meta`
+    // would invert it and can deadlock; use one shared transaction-scoped
+    // advisory lock instead of per-path row locks.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("

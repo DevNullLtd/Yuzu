@@ -291,9 +291,13 @@ public:
     /// deliberately NOT `principal_type IN ('user', 'group')`. The count
     /// runs INSIDE the same transaction as the delete, under a
     /// `FOR UPDATE OF pr` row lock on the candidate `principal_roles` rows
-    /// (never locking `auth.users`), so two concurrent unassigns racing to
-    /// remove the last two Administrator grants serialize instead of both
-    /// observing "1 remaining" and both committing. Every other
+    /// (the candidate `auth.users` rows are never locked; only the deleted
+    /// principal's own row is, by the post-DELETE recheck), so two concurrent
+    /// unassigns racing to remove the last two Administrator grants serialize
+    /// instead of both observing "1 remaining" and both committing. The
+    /// guard does NOT cover an `auth.users` row created concurrently for a
+    /// pre-provisioned grant, nor deactivation of a surviving Administrator
+    /// between the recount and COMMIT (#4966). Every other
     /// role/principal_type combination — including both existing
     /// engine-only callers (`rest_api_v1.cpp:3240`, `mcp_server.cpp:21789`)
     /// — is unaffected: a pure idempotent DELETE, exactly as before. The

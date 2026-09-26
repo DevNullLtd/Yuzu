@@ -9,8 +9,10 @@
   anyone — enforced inside the same transaction as the removal, and scoped to accounts
   that are actually active in `auth.users` so a grant naming a nonexistent,
   deactivated, or deleted username is never counted as a survivor. The guard also
-  counts the removed principal's existing account when it is reactivated
-  concurrently; a concurrently created account, or a concurrently deactivated
-  surviving Administrator, remain outside it (tracked at #4966).
+  holds against a concurrent reactivation of the removed principal's existing
+  account. Two races remain outside it: an account created concurrently for a
+  pre-provisioned grant (not tracked), and a surviving Administrator's account
+  deactivated concurrently (the account-deactivation path has no
+  last-Administrator guard, tracked at #4966).
   `ITServiceOwner` and any custom/unknown role are rejected uniformly (no role-catalog
   oracle); pre-provisioning a role ahead of a user's first login is allowed.
