@@ -1088,7 +1088,7 @@ TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a DEACTIVATED "
 // Doomgoose external review, PR #4985 (IMPORTANT finding #1, TOCTOU): the
 // `locked_admin_principal_ids` snapshot above is taken BEFORE the DELETE, and
 // the candidate `auth.users` rows are deliberately left unlocked by this guard
-// (see the Concurrency note on `unassign_role` in rbac_store.cpp) — so a
+// (see the Concurrency note in rbac_admin_authority_owner.cpp) — so a
 // principal that is a ghost/deactivated Administrator grant at lock time (and
 // therefore excluded from the locked/counted set) can be reactivated by a
 // FULLY INDEPENDENT, concurrent transaction (`AuthDB::reactivate_user`) in the
@@ -1486,7 +1486,7 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     const int lease_a_pid = PQbackendPID(lease_a.get());
     REQUIRE(lease_a_pid > 0);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
-    // Mirrors the production lock statement exactly (rbac_store.cpp) —
+    // Mirrors the production lock statement exactly (rbac_admin_authority_owner.cpp) —
     // governance BLOCKING #1 re-verification: the JOIN must not weaken this
     // deterministic interleaving proof.
     REQUIRE(pg::exec_params(lease_a.get(),
@@ -1578,7 +1578,7 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
     const int lease_a_pid = PQbackendPID(lease_a.get());
     REQUIRE(lease_a_pid > 0);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
-    // Mirrors the production lock statement exactly (rbac_store.cpp) — locks
+    // Mirrors the production lock statement exactly (rbac_admin_authority_owner.cpp) — locks
     // BOTH candidate rows, so the background unassign below has no
     // unlocked row left to race past.
     REQUIRE(pg::exec_params(lease_a.get(),

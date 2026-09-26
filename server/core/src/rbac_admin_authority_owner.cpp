@@ -7,7 +7,10 @@
 
 #include <libpq-fe.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -18,6 +21,51 @@ using rbac_sql::bump_generation_in_txn;
 using rbac_sql::kWriteTimeout;
 using rbac_sql::text_col;
 using rbac_sql::to_bool;
+using rbac_sql::to_i64;
+
+// THE definition of "an authenticatable Administrator grant". The unassign guard
+// below locks and counts through this one fragment, so the LOCK set and the COUNT
+// set cannot drift apart; the enforcement toggle's caller-survives guard is
+// expected to reuse it rather than carry a second copy of this JOIN.
+constexpr std::string_view kAuthenticatableAdminGrantsFrom =
+    "FROM rbac_store.principal_roles pr "
+    "JOIN auth.users u ON u.username = pr.principal_id "
+    "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
+    "AND u.is_active";
+
+// "SELECT pr.principal_id " + kAuthenticatableAdminGrantsFrom + " FOR UPDATE OF pr"
+// Returns the principal_ids of the rows ACTUALLY LOCKED (nullopt on query error,
+// with `err` set from the connection). The unassign guard uses the result as the
+// membership test for "was the row being deleted itself one of the counted rows".
+std::optional<std::vector<std::string>> lock_authenticatable_admin_grants(PGconn* c,
+                                                                          std::string& err) {
+    const std::string sql = std::string("SELECT pr.principal_id ") +
+                            std::string(kAuthenticatableAdminGrantsFrom) + " FOR UPDATE OF pr";
+    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<size_t>(PQntuples(r.get())));
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        ids.push_back(text_col(r.get(), i, 0));
+    return ids;
+}
+
+// "SELECT count(*) " + kAuthenticatableAdminGrantsFrom
+// Lock-free. nullopt on a query error or an unexpected row count, with `err` set
+// from the connection.
+std::optional<std::int64_t> count_authenticatable_admin_grants(PGconn* c, std::string& err) {
+    const std::string sql =
+        std::string("SELECT count(*) ") + std::string(kAuthenticatableAdminGrantsFrom);
+    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    return to_i64(PQgetvalue(r.get(), 0, 0));
+}
 } // namespace
 
 RbacAdminAuthorityOwner::UnassignOutcome
@@ -75,9 +123,9 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // (server.cpp:4603,6118; ADR-0006) — so `auth.users` is guaranteed
         // reachable from this same transaction/connection, never a
         // cross-database call. A degraded/missing `auth` schema fails the
-        // whole SELECT (PGRES_TUPLES_OK check below), which aborts this
-        // transaction and returns `unexpected` — fail-closed by
-        // construction, no separate degraded-vs-absent branch needed.
+        // whole SELECT (the status check in `lock_authenticatable_admin_grants`),
+        // which aborts this transaction and returns `unexpected` — fail-closed
+        // by construction, no separate degraded-vs-absent branch needed.
         //
         // Concurrency: lock the CANDIDATE Administrator rows with `FOR
         // UPDATE OF pr` (the `principal_roles` alias only — never lock the
@@ -93,8 +141,9 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // `FOR UPDATE OF pr` blocks the second transaction on the first's
         // row lock until it commits/rolls back, so the second re-evaluates
         // the count against the first's now-durable delete. The LOCK set
-        // and the COUNT set below both go through the identical JOIN, so
-        // the lock always covers exactly the rows the count depends on.
+        // and the COUNT set below both go through the identical JOIN (shared
+        // as `kAuthenticatableAdminGrantsFrom`), so the lock always covers
+        // exactly the rows the count depends on.
         // Doomgoose external review, PR #4985 (governance ledger a2-p7-doomgoose-1):
         // the lock query's own result set is the ONLY correct membership test
         // for "was the row being deleted itself one of the counted rows" — a
@@ -120,21 +169,13 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // principal's own row; that comment lists what remains open.)
         std::unordered_set<std::string> locked_admin_principal_ids;
         if (role_name == "Administrator") {
-            pg::PgResult lock_rows = pg::exec_params(
-                c,
-                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
-                "JOIN auth.users u ON u.username = pr.principal_id "
-                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
-                "AND u.is_active "
-                "FOR UPDATE OF pr",
-                std::vector<std::string>{});
-            if (lock_rows.status() != PGRES_TUPLES_OK) {
-                err = PQerrorMessage(c);
+            std::string lock_err;
+            const auto locked = lock_authenticatable_admin_grants(c, lock_err);
+            if (!locked) {
+                err = lock_err;
                 return false;
             }
-            for (int i = 0; i < PQntuples(lock_rows.get()); ++i) {
-                locked_admin_principal_ids.insert(text_col(lock_rows.get(), i, 0));
-            }
+            locked_admin_principal_ids.insert(locked->begin(), locked->end());
         }
 
         pg::PgResult r = pg::exec_params(
@@ -216,18 +257,13 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
             removed && principal_type == "user" &&
             (locked_admin_principal_ids.count(principal_id) > 0 || reactivated_since_lock);
         if (role_name == "Administrator" && removed_a_counted_admin) {
-            pg::PgResult remaining = pg::exec_params(
-                c,
-                "SELECT count(*) FROM rbac_store.principal_roles pr "
-                "JOIN auth.users u ON u.username = pr.principal_id "
-                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
-                "AND u.is_active",
-                std::vector<std::string>{});
-            if (remaining.status() != PGRES_TUPLES_OK || PQntuples(remaining.get()) != 1) {
-                err = PQerrorMessage(c);
+            std::string count_err;
+            const auto remaining = count_authenticatable_admin_grants(c, count_err);
+            if (!remaining) {
+                err = count_err;
                 return false;
             }
-            if (std::string(PQgetvalue(remaining.get(), 0, 0)) == "0") {
+            if (*remaining == 0) {
                 last_admin_reject = true;
                 return false; // aborts the transaction — the DELETE above rolls back
             }

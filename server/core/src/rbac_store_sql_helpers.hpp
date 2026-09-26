@@ -1,10 +1,11 @@
 #pragma once
 
 /// @file rbac_store_sql_helpers.hpp
-/// Internal libpq helpers shared by `RbacStore` (rbac_store.cpp) and
+/// Internal OWN-SCHEMA libpq helpers shared by `RbacStore` (rbac_store.cpp) and
 /// `RbacAdminAuthorityOwner` (rbac_admin_authority_owner.cpp). Moved verbatim out of
 /// rbac_store.cpp's anonymous namespaces so the ADR-0012 §3 query owner and the
-/// store use ONE definition of each — never a second copy. Not a public API.
+/// store use ONE definition of each — never a second copy. Not a public API. Cross-schema SQL
+/// never belongs here: it lives in the query owner, in its own translation unit.
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
@@ -22,6 +23,11 @@ namespace yuzu::server::rbac_sql {
 
 inline constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
+inline std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
 inline std::uint64_t to_u64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;

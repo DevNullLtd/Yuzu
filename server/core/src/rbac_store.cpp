@@ -193,11 +193,7 @@ std::int64_t now_ms() {
         .count();
 }
 
-std::int64_t to_i64(const char* s) {
-    if (s == nullptr || s[0] == '\0')
-        return 0;
-    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
-}
+using rbac_sql::to_i64;  // defined in rbac_store_sql_helpers.hpp
 using rbac_sql::to_u64;  // defined in rbac_store_sql_helpers.hpp
 using rbac_sql::to_bool; // defined in rbac_store_sql_helpers.hpp
 

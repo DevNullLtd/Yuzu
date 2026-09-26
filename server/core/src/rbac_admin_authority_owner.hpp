@@ -5,7 +5,9 @@
 /// "authenticatable Administrator" logic across `rbac_store` and `auth`. Today it
 /// hosts the A2 last-Administrator guard (`RbacStore::unassign_role` delegates
 /// here); enforcement-toggle and regime-authority operations are expected to be
-/// added to this class later. It borrows the pool and issues schema-qualified SQL
+/// added to this class later. The fragment that defines "an authenticatable
+/// Administrator grant" lives ONLY in rbac_admin_authority_owner.cpp, so every
+/// consumer shares one copy. It borrows the pool and issues schema-qualified SQL
 /// on ONE lease: bounded acquire, no nested acquire, no external work inside a
 /// transaction.
 ///

@@ -90,7 +90,7 @@ struct AuditRecord {
 /// RbacStore co-located on AuthDbPg's own pool/database, NOT RbacStorePg's
 /// separate ephemeral one (governance BLOCKING #1, full-pipeline review on
 /// 765bc7ec1): `unassign_role`'s last-admin guard now runs a same-transaction
-/// `rbac_store.principal_roles JOIN auth.users` (rbac_store.cpp), which is
+/// `rbac_store.principal_roles JOIN auth.users` (rbac_admin_authority_owner.cpp), which is
 /// safe ONLY because production always constructs both stores on the SAME
 /// PgPool/database (ADR-0006, server.cpp:4532,6047) — an `auth` schema that
 /// does not exist in THIS harness's rbac database would make every
