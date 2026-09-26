@@ -371,11 +371,12 @@ constexpr std::size_t kLogErrorMaxMessage = 256;
 // default_stderr_emit itself allocates nothing (the caller's copy of the line and the
 // thread's creation can fail; the launch site handles that). The line is formatted into
 // a fixed stack buffer and written with a single write(2) in the normal case (a loop
-// resumes after EINTR or a short write), which for a pipe is atomic up to PIPE_BUF. A
-// write that fails or makes no progress is abandoned: this is best effort. With SIGPIPE
-// at its default disposition, which the agent does not change, a write to a pipe whose
-// reader has gone raises SIGPIPE before any error is seen, exactly as the fprintf this
-// replaced did.
+// resumes after EINTR or a short write; the Windows leg is one WriteFile), which for a
+// pipe is atomic up to PIPE_BUF. A write that fails or makes no progress is abandoned:
+// this is best effort. The agent does not change SIGPIPE's disposition (a bare launch
+// leaves it at the default, a systemd service inherits "ignored"), so a write to a pipe
+// whose reader has gone either raises SIGPIPE or fails with EPIPE here, exactly as the
+// fprintf this replaced did.
 void default_stderr_emit(std::uint64_t count, const std::string& message) {
     constexpr std::string_view kHead = "[*** LOG ERROR #";
     constexpr std::string_view kMid = " ***] ";
@@ -497,7 +498,7 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             // "[*** LOG ERROR #N ***] [date] [logger-name] msg" to stderr, rate-limited
             // to once per second, for as long as the process runs. Before #4666 PR-2
             // wired LogHandoff into production, that default handler was the live one
-            // -- so a sink-level write failure (disk full, EMFILE, a broken pipe) was
+            // -- so a sink-level write failure (disk full, EMFILE) was
             // always visible on stderr (reaching journald on the shipped Linux path).
             // Recording ONLY into ErrorState -- readable via log_errors_total()/
             // last_log_error_for_test(), but not read by any PRODUCTION consumer today
@@ -533,18 +534,20 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             // does NOT isolate log delivery from a blocked stderr or stdout when that
             // stream is ALSO one of this logger's sinks: create() adds a stderr sink
             // beside the file sink outside a Windows service, and a stdout sink when
-            // there is no usable --log-file (none given, or it could not be opened). A
-            // blocked console fd then stalls the worker inside that sink's own write,
-            // exactly as any stuck sink does. That stall is a BLOCK, not a throw: on POSIX
-            // the vendored spdlog console sink ignores a failed write and never reaches
-            // this handler; on Windows its WriteFile failure does throw, but a write that
-            // is blocked has not failed. stalled_for() exposes the stall but no shipped
-            // code reads it, and only teardown()'s watchdog bounds it, at shutdown. So the
-            // fix matters where the handler is reached with stderr NOT being a sink, or
-            // from a producer thread: on shipped configurations that is mainly the
-            // producer-thread triggers (an allocation or formatting failure, logging
-            // through a retained logger after teardown), a Windows console-sink write
-            // failure, and embedders that build their own sink list.
+            // there is no usable log file (none configured, or it could not be opened; a
+            // Windows service always derives one). A blocked console fd then stalls the
+            // worker inside that sink's own write, exactly as any stuck sink does. That
+            // stall is a BLOCK, and it never reaches this handler: the console sinks
+            // create() installs are spdlog's colour sinks (ansicolor on POSIX, wincolor on
+            // Windows), and both discard the result of a failed write. Only the non-colour
+            // stdout_sink throws on a Windows WriteFile failure, and create() never builds
+            // it. stalled_for() exposes the stall but no shipped code reads it, and only
+            // teardown()'s watchdog bounds it, at shutdown. So the fix matters where the
+            // handler is reached with stderr NOT being a sink, or from a producer thread:
+            // on shipped configurations that is the file sink's own failure (the rotating
+            // file sink throws), the producer-thread triggers (an allocation or
+            // formatting failure, logging through a retained logger after teardown), and
+            // embedders that build their own sink list.
             //
             // Cost: a permanently blocked stderr strands exactly one thread, blocked in
             // write(2) holding no lock, until process exit; the slot is not re-claimed

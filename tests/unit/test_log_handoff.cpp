@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -846,10 +847,10 @@ TEST_CASE("U10: two concurrent teardown() calls on a stably-owned object never r
 // throws (spdlog's backend_sink_it_ -> SPDLOG_LOGGER_CATCH -> err_handler_). If the
 // stderr diagnostic write were made on that thread, a blocked stderr (a full pipe to a
 // stalled collector) would stop the whole queue draining. The write is therefore made by
-// a detached emit thread, at most one write in flight. U11/U11b/U11c replace the emit
-// function with a blocking stub through LogHandoff::set_stderr_emit_for_test() so the
-// stall is deterministic and identical on every platform; U12 exercises the REAL write
-// against a genuinely blocked pipe (POSIX). SCOPE: these pin the handler's own write. A
+// a detached emit thread, at most one write in flight. The U11 family (U11 to U11e) replaces
+// the emit function with a stub through LogHandoff::set_stderr_emit_for_test() so the
+// stall is deterministic and identical on every platform; the U12 family (U12 to U12d)
+// exercises the REAL write against a real pipe (POSIX). SCOPE: these pin the handler's own write. A
 // console sink sharing the blocked fd still stalls the worker in its own write; that
 // case is unchanged by #5023 and not covered here.
 
@@ -1080,13 +1081,55 @@ TEST_CASE("U11d: diagnostics inside the once-per-second throttle window are neit
     yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
 
     // 20 failures far inside one second: every one is an error, exactly one is emitted, and
-    // the other 19 are throttled BEFORE the slot is claimed, so they are not drops.
+    // the other 19 are throttled BEFORE the slot is claimed, so they are not drops. If the
+    // worker was descheduled for over a second the window legitimately reopens, so one more
+    // emit is allowed per whole second that elapsed.
+    const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 20; ++i)
         logger->info("fail");
     REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 20; }, 5s));
+    const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
     REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() >= 1; }, 5s));
-    CHECK(g_emit_entered.load() == 1);
+    CHECK(g_emit_entered.load() >= 1);
+    CHECK(g_emit_entered.load() <= 1 + elapsed_s);
     CHECK(handoff->stderr_emits_dropped() == 0);
+
+    handoff->teardown_with_action_for_test(2s, [] {});
+}
+
+namespace {
+void throwing_emit_stub(std::uint64_t count, const std::string& message) {
+    {
+        std::lock_guard<std::mutex> lk(g_emit_calls_mu);
+        g_emit_calls.emplace_back(count, message);
+    }
+    g_emit_entered.fetch_add(1, std::memory_order_acq_rel);
+    g_emit_finished.fetch_add(1, std::memory_order_acq_rel);
+    throw std::runtime_error("throwing_emit_stub");
+}
+} // namespace
+
+TEST_CASE("U11e: an emit function that throws neither ends the process nor strands the slot",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true);
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    LogHandoff::set_stderr_emit_for_test(&throwing_emit_stub);
+    yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
+
+    logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_finished.load() == 1; }, 5s));
+    std::this_thread::sleep_for(1100ms); // past the throttle: the next diagnostic is due
+    logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([] { return g_emit_entered.load() == 2; }, 5s));
+    CHECK(handoff->stderr_emits_dropped() == 0); // the throw released the slot both times
 
     handoff->teardown_with_action_for_test(2s, [] {});
 }
@@ -1104,7 +1147,7 @@ TEST_CASE("U11d: diagnostics inside the once-per-second throttle window are neit
 // is, ANY write to stderr from any thread blocks, including a sanitizer report or the
 // runner's final [DIAG] line; the restore below therefore runs on EVERY exit path (guard
 // declared before the redirect) and drains the pipe BEFORE restoring fd 2, so no descriptor
-// with a write in flight is ever closed or replaced (which differs across kernels).
+// with a write in flight is ever closed or replaced.
 namespace {
 
 // Read whatever is available on `fd`, until nothing arrives for `quiet`.
@@ -1194,11 +1237,13 @@ void run_real_emit_against_blocked_pipe(const char* trigger_payload,
         if (prober.joinable())
             prober.join();
     };
-    // Declared BEFORE the redirect: nothing that can throw sits between the two.
+    // Declared BEFORE the redirect, and `redirected` is set BEFORE the dup2 (restoring from
+    // saved_stderr is harmless if fd 2 was never replaced), so nothing that can throw leaves
+    // fd 2 redirected without the guard knowing.
     yuzu::test::ScopeExit cleanup{[&] { finish(); }};
 
-    REQUIRE(::dup2(write_end.get(), STDERR_FILENO) >= 0);
     redirected = true;
+    REQUIRE(::dup2(write_end.get(), STDERR_FILENO) >= 0);
     write_end.reset(); // fd 2 is now the only write end
 
     // Probe the stdio lock continuously: fflush(stderr) takes the stderr FILE lock, so it
@@ -1224,6 +1269,9 @@ void run_real_emit_against_blocked_pipe(const char* trigger_payload,
 
     finish();
     // The pipe held the filler and then exactly one diagnostic line, byte for byte.
+    INFO("captured after the filler: [" << (collected.size() > filled ? collected.substr(filled)
+                                                                       : std::string{})
+                                         << "]");
     CHECK(collected.size() == filled + expected_line.size());
     CHECK(collected.ends_with(expected_line));
     CHECK(collected.find(expected_line) == collected.rfind(expected_line));
@@ -1245,5 +1293,97 @@ TEST_CASE("U12b: the real stderr write clamps a longer-than-cap message to the c
     // head + count + separator + 256 bytes + newline.
     run_real_emit_against_blocked_pipe(
         "fail-long", "[*** LOG ERROR #1 ***] " + std::string(256, 'a') + "\n");
+}
+TEST_CASE("U12c: the real stderr write gives up on an unwritable stderr and releases the slot",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true);
+    LogHandoff::set_stderr_emit_for_test(nullptr); // the REAL write
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    int raw[2];
+    REQUIRE(::pipe(raw) == 0);
+    yuzu::agent::ScopedFd read_end{raw[0]};
+    yuzu::agent::ScopedFd write_end{raw[1]};
+    yuzu::agent::ScopedFd saved_stderr{::dup(STDERR_FILENO)};
+    REQUIRE(saved_stderr.valid());
+    read_end.reset(); // no reader: a write fails with EPIPE (and raises SIGPIPE unless ignored)
+
+    struct sigaction ign{};
+    struct sigaction old{};
+    ign.sa_handler = SIG_IGN;
+    ::sigemptyset(&ign.sa_mask);
+    REQUIRE(::sigaction(SIGPIPE, &ign, &old) == 0);
+    bool redirected = false;
+    // Restores fd 2 first (which also lets a write that never gave up complete), then SIGPIPE.
+    yuzu::test::ScopeExit cleanup{[&] {
+        if (redirected)
+            ::dup2(saved_stderr.get(), STDERR_FILENO);
+        ::sigaction(SIGPIPE, &old, nullptr);
+    }};
+    redirected = true;
+    REQUIRE(::dup2(write_end.get(), STDERR_FILENO) >= 0);
+    write_end.reset();
+
+    logger->info("fail"); // the emit thread's write fails at once
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 1; }, 5s));
+    std::this_thread::sleep_for(1100ms); // past the throttle: the next diagnostic is due
+    logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 2; }, 5s));
+    // A write that gave up released the slot, so the second diagnostic was not dropped.
+    CHECK(handoff->stderr_emits_dropped() == 0);
+}
+
+TEST_CASE("U12d: two real diagnostics through a capture pipe: a multi-digit count and the "
+          "second line's own text",
+          "[log_handoff]") {
+    reset_emit_stub_state(/*released=*/true);
+    LogHandoff::set_stderr_emit_for_test(nullptr); // the REAL write
+
+    auto sink = std::make_shared<FailOnPayloadSink>();
+    auto result = LogHandoff::create_with_sinks({sink});
+    REQUIRE(result.has_value());
+    auto handoff = std::move(*result);
+    auto logger = handoff->logger();
+
+    int raw[2];
+    REQUIRE(::pipe(raw) == 0);
+    yuzu::agent::ScopedFd read_end{raw[0]};
+    yuzu::agent::ScopedFd write_end{raw[1]};
+    yuzu::agent::ScopedFd saved_stderr{::dup(STDERR_FILENO)};
+    REQUIRE(saved_stderr.valid());
+    bool redirected = false;
+    auto restore = [&] {
+        if (redirected)
+            ::dup2(saved_stderr.get(), STDERR_FILENO);
+        redirected = false;
+    };
+    yuzu::test::ScopeExit cleanup{[&] { restore(); }};
+    redirected = true;
+    REQUIRE(::dup2(write_end.get(), STDERR_FILENO) >= 0);
+    write_end.reset();
+
+    // Failure #1 emits at once; #2..#12 fall inside the same throttle window; after the
+    // window, failure #13 is due again and carries its OWN (capped) text and count.
+    for (int i = 0; i < 12; ++i)
+        logger->info("fail");
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 12; }, 5s));
+    std::this_thread::sleep_for(1100ms);
+    logger->info("fail-long");
+    REQUIRE(yuzu::test::spin_until([&] { return handoff->log_errors_total() == 13; }, 5s));
+
+    const std::string first = "[*** LOG ERROR #1 ***] FailOnPayloadSink: injected failure\n";
+    const std::string second = "[*** LOG ERROR #13 ***] " + std::string(256, 'a') + "\n";
+    std::string collected;
+    const auto deadline = std::chrono::steady_clock::now() + 5s * yuzu::test::kSpinScale;
+    while (collected.size() < first.size() + second.size() &&
+           std::chrono::steady_clock::now() < deadline)
+        collected += read_available(read_end.get(), 100ms);
+    restore();
+    CHECK(collected == first + second);
 }
 #endif

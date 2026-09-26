@@ -78,8 +78,8 @@
 /// hang a normal exit(). SCOPE: this closes the DIAGNOSTIC's write only. It does not
 /// isolate delivery from a blocked stderr/stdout that is ALSO one of this logger's sinks
 /// (create() adds a stderr sink beside the file sink outside a Windows service, and a
-/// stdout sink when there is no usable --log-file, i.e. none given or it could not be
-/// opened): that stall is in the sink's own write, unchanged, exposed by stalled_for()
+/// stdout sink when there is no usable log file, i.e. none configured or it could not be
+/// opened; a Windows service always derives one): that stall is in the sink's own write, unchanged, exposed by stalled_for()
 /// (no shipped code reads it) and bounded only at shutdown by teardown()'s watchdog. The
 /// mutex above guards only the in-memory ErrorState fields. See the handler's own comment
 /// in log_handoff.cpp for the full rationale.
@@ -632,7 +632,7 @@ public:
     /// (count, message). Default (nullptr) is the real stderr write.
     using StderrEmitFn = void (*)(std::uint64_t count, const std::string& message);
 
-    /// Test-only seam (U11, U11b, U11c): replaces the stderr write so a test can make it
+    /// Test-only seam (the U11 family): replaces the stderr write so a test can make it
     /// block and assert log delivery continues (#5023). Read once per emit, when the emit
     /// thread is launched. PROCESS-WIDE and NOT auto-reset (unlike
     /// set_construction_fault_for_test): the setter must restore nullptr, ideally via a
