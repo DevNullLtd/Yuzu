@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -187,6 +188,34 @@ int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_at
     }
     return 0;
 }
+
+// Joins its std::thread on scope exit, after running `before_join` (used to roll back a
+// held lease so a worker blocked on that lease's row lock can finish). A failing REQUIRE
+// therefore never leaves a joinable std::thread behind (std::terminate) and never waits
+// out a lock_timeout. std::jthread is not available on Apple Clang's libc++, so this
+// stands in for it.
+class ScopedJoin {
+public:
+    explicit ScopedJoin(std::thread t, std::function<void()> before_join = {})
+        : t_(std::move(t)), before_join_(std::move(before_join)) {}
+    ScopedJoin(const ScopedJoin&) = delete;
+    ScopedJoin& operator=(const ScopedJoin&) = delete;
+    ~ScopedJoin() {
+        if (t_.joinable()) {
+            if (before_join_)
+                before_join_();
+            t_.join();
+        }
+    }
+    void join() {
+        if (t_.joinable())
+            t_.join();
+    }
+
+private:
+    std::thread t_;
+    std::function<void()> before_join_;
+};
 
 TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
           "(#3623, governance unhappy-path fix)",
@@ -1143,14 +1172,14 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard REFUSES when "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
-    std::jthread unassign_thread([&] {
+    ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
         if (!res)
             b_error = res.error();
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     // Prove a real blocked-then-unblocked interleaving (Doomgoose external
     // review, PR #4985 IMPORTANT #6) — separate probe connection, never
@@ -1219,17 +1248,16 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
-    // If a REQUIRE below throws while the worker is blocked, this jthread's
-    // destructor joins BEFORE lease_a is released (it is declared after it), and the
-    // worker's statement errors out at the pool's lock_timeout (10 s by default), so
-    // a failure surfaces late rather than hanging.
-    std::jthread unassign_thread([&] {
+    // If a REQUIRE below throws while the worker is blocked, ScopedJoin rolls back
+    // lease_a before joining, which releases the row lock the worker waits on, so the
+    // failure surfaces immediately instead of after the pool's lock_timeout.
+    ScopedJoin unassign_thread{std::thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
         if (!res)
             b_error = res.error();
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     // The unassign has passed its lock query (ghostadmin's COMMITTED row is still
     // inactive, so it is not counted) and its DELETE, and is now blocked in the
@@ -1280,13 +1308,13 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for an "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_removed{false};
     std::atomic<bool> b_ok{false};
-    std::jthread unassign_thread([&] {
+    ScopedJoin unassign_thread{std::thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
         if (res)
             b_removed = *res;
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
     CHECK_FALSE(b_done.load());
@@ -1328,13 +1356,13 @@ TEST_CASE("RbacStore: unassign_role's guard WAITS for an in-flight reactivation 
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::atomic<bool> b_removed{false};
-    std::jthread unassign_thread([&] {
+    ScopedJoin unassign_thread{std::thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
         if (res)
             b_removed = *res;
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
     CHECK_FALSE(b_done.load());
@@ -1491,19 +1519,17 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard under real "
 
     std::atomic<bool> ok1{false}, ok2{false};
     std::atomic<bool> done1{false}, done2{false};
-    // std::jthread (C++23), not std::thread + a hand-rolled join-guard
-    // struct: its destructor joins unconditionally, so there is no window
-    // where a live thread is unguarded (e.g. `t2`'s constructor throwing
-    // between `t1`'s spawn and a guard's construction would otherwise call
-    // std::terminate() when `t1` unwinds joinable — governance NICE finding).
-    std::jthread t1([&] {
+    // ScopedJoin (above) joins on scope exit, so a live std::thread is never left
+    // joinable when a REQUIRE throws (std::terminate); std::jthread would do the same
+    // but is not available on Apple Clang's libc++.
+    ScopedJoin t1{std::thread([&] {
         ok1 = store.unassign_role("user", "concadmin1", "Administrator").has_value();
         done1 = true;
-    });
-    std::jthread t2([&] {
+    })};
+    ScopedJoin t2{std::thread([&] {
         ok2 = store.unassign_role("user", "concadmin2", "Administrator").has_value();
         done2 = true;
-    });
+    })};
     t1.join();
     t2.join();
     CHECK(done1.load());
@@ -1562,23 +1588,22 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
-    // std::jthread (C++23), not std::thread + a hand-rolled join-guard
-    // struct — its destructor joins unconditionally, so a REQUIRE failure
-    // anywhere below (before the explicit .join() call further down) can
-    // never leave this thread live-and-unguarded (governance NICE finding).
+    // ScopedJoin (above) joins on scope exit, so a REQUIRE failure anywhere below
+    // (before the explicit .join() call further down) can never leave this thread
+    // live-and-unguarded (governance NICE finding); it also rolls back lease_a first.
     // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
     // `unassign_thread` blocks on connection A's row lock for at most
     // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
     // indefinitely, so this test's worst case is bounded even if connection
     // A's own COMMIT below never ran (e.g. a REQUIRE above it failed).
-    std::jthread unassign_thread([&] {
+    ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "raceadmin2", "Administrator");
         b_ok = res.has_value();
         if (!res)
             b_error = res.error();
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     // Prove a real blocked-then-unblocked interleaving, not a lucky race:
     // poll pg_stat_activity for the background thread's own backend
@@ -1663,14 +1688,14 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
     std::atomic<bool> b_done{false};
     std::atomic<bool> b_ok{false};
     std::string b_error;
-    std::jthread unassign_thread([&] {
+    ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "killadmin2", "Administrator");
         b_ok = res.has_value();
         if (!res)
             b_error = res.error();
         b_done = true;
-    });
+    }), [&] { lease_a.reset(); }};
 
     // Find the background thread's own backend, blocked on connection A's
     // lock — never assume which pool slot it landed on. Poll pg_stat_activity

@@ -57,6 +57,7 @@
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
+#include "mfa_step_up.hpp"          // StepUpFn — the step-up seam the REST routes call
 #include "rbac_admin_predicate.hpp" // kRbacAdminGateUnavailableAuditReason
 #include "rbac_assignable_roles.hpp"
 #include "rbac_store.hpp"
@@ -155,6 +156,12 @@ struct RbacRoleHarness {
     bool audit_allow{true};
 
     std::vector<AuditRecord> audit_log;
+    // MFA step-up seam. Unset = permissive, the default for every test. A test sets it
+    // to stand in for a failed or stale step-up: the route contract under test is that
+    // a gate returning false has already written its own response and the route stops
+    // before mutating. `step_up_actions` records every action label the routes passed.
+    yuzu::server::StepUpFn step_up;
+    std::vector<std::string> step_up_actions;
 
     // Live registry (not nullptr) — governance follow-up (full-pipeline
     // round on 765bc7ec1, item 3): the last-admin-guard-refused metric's
@@ -235,7 +242,12 @@ struct RbacRoleHarness {
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
                             /*command_dispatch_fn=*/{},
-                            /*step_up_fn=*/{}, // no MFA gate in this harness (mirrors token tests)
+                            /*step_up_fn=*/
+                            [this](const httplib::Request& req, httplib::Response& res,
+                                   const auth::Session& session, const std::string& action) -> bool {
+                                step_up_actions.push_back(action);
+                                return !step_up || step_up(req, res, session, action);
+                            },
                             /*guardian_push_fn=*/{},
                             /*dex_perf_fn=*/{},
                             /*network_api=*/{},
@@ -1040,6 +1052,125 @@ TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
     CHECK(found);
 }
 
+// ── REST: the MFA step-up gate (Doomgoose external review, PR #4985 round 3) —
+// the OpenAPI 401 text says "MFA step-up required (stale/absent proof)". The harness
+// used to pass no step-up gate at all, so that claim had no test. These prove the
+// ROUTE contract only: when the gate returns false (it has already written its own
+// 401, including meta.challenge_url, which the real gate owns and tests where it
+// lives) the route stops before mutating and consulted the gate with the right label.
+TEST_CASE("REST assign: a failing MFA step-up gate stops the route with its "
+          "own 401 before any mutation",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+                   const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"code":401,"message":"step-up required"}})",
+                        "application/json");
+        return false;
+    };
+
+    auto res = h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.rbac->get_principal_roles("user", "jane").empty());
+    REQUIRE(h.step_up_actions.size() == 1);
+    CHECK(h.step_up_actions[0] == "POST /api/v1/rbac/roles/{name}/assignments");
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.action == "rbac.role.assigned" && a.result == "success"));
+}
+
+TEST_CASE("REST unassign: a failing MFA step-up gate stops the route with its "
+          "own 401 before any mutation",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})")
+                ->status == 201);
+    REQUIRE(h.rbac->get_principal_roles("user", "jane").size() == 1);
+    h.step_up_actions.clear();
+    h.audit_log.clear();
+
+    h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+                   const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"code":401,"message":"step-up required"}})",
+                        "application/json");
+        return false;
+    };
+
+    auto res = h.unassign_rest("Operator", "jane");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
+    REQUIRE(h.step_up_actions.size() == 1);
+    CHECK(h.step_up_actions[0] ==
+          "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}");
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE((a.action == "rbac.role.unassigned" && a.result == "success"));
+}
+
+// ── REST/MCP unassign: the admin gate's own kUnavailable outcome (Doomgoose round-3
+// coverage gap: the shape-identical assign tests above were the only ones). ───────
+
+TEST_CASE("REST unassign: the admin gate's own kUnavailable outcome (RBAC-on, "
+          "genuinely degraded store) is 503 with an audited denial",
+          "[pg][rest][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.unassign_rest("Operator", "jane");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.unassigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacAdminGateUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP unassign_rbac_role: the admin gate's own kUnavailable outcome "
+          "(RBAC-on, genuinely degraded store) is kInternalError with an "
+          "audited denial",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.unassigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacAdminGateUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
+}
+
 // ── REST: assign_role store-fault classification (Doomgoose external
 // review, PR #4985 IMPORTANT finding #3) — a genuine store/query fault on
 // assign_role must map to 503, never the 400 a genuine client-input
@@ -1152,6 +1283,7 @@ TEST_CASE("MCP assign_rbac_role/unassign_rbac_role: happy path, RBAC-off "
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("\"error\"") == std::string::npos);
+    CHECK(res->body.find("audit_persisted") == std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "jane").size() == 1);
 
     auto un = h.mcp_call_tool_approved("unassign_rbac_role",
@@ -1159,6 +1291,7 @@ TEST_CASE("MCP assign_rbac_role/unassign_rbac_role: happy path, RBAC-off "
     REQUIRE(un);
     CHECK(un->status == 200);
     CHECK(un->body.find("\"unassigned\":true") != std::string::npos);
+    CHECK(un->body.find("audit_persisted") == std::string::npos);
     CHECK(h.rbac->get_principal_roles("user", "jane").empty());
 }
 
@@ -1501,6 +1634,29 @@ TEST_CASE("MCP: assign_rbac_role / unassign_rbac_role are advertised in "
     REQUIRE(res);
     CHECK(res->body.find("\"assign_rbac_role\"") != std::string::npos);
     CHECK(res->body.find("\"unassign_rbac_role\"") != std::string::npos);
+}
+
+TEST_CASE("MCP: assign_rbac_role / unassign_rbac_role output schemas do not document "
+          "audit_persisted (they fail closed on a dropped audit and never return a "
+          "success payload carrying it)",
+          "[pg][mcp][rbac][a2][integration]") {
+    RbacRoleHarness h;
+    auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("tools"));
+    int seen = 0;
+    for (const auto& t : body["result"]["tools"]) {
+        const std::string name = t.value("name", "");
+        if (name != "assign_rbac_role" && name != "unassign_rbac_role")
+            continue;
+        ++seen;
+        REQUIRE(t.contains("outputSchema"));
+        CHECK(t["outputSchema"].dump().find("audit_persisted") == std::string::npos);
+    }
+    CHECK(seen == 2);
 }
 
 // ── rbac_assignable_roles.hpp <-> assign_rbac_role's MCP schema enum sync
