@@ -453,7 +453,19 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // too, the same way the degraded-fragment-read path above does.
     auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets);
     if (!dispatch_result)
-        return std::unexpected(dispatch_result.error());
+        // gov Gate 8 (#4981 PR-1 fix-round re-review, security-guardian HIGH):
+        // dispatch_result.error() can carry a raw PQerrorMessage() (via
+        // InstructionStore::get_definition's kInstructionStoreDbErrorPrefix
+        // path) on a genuine backend failure — genericize at the source, the
+        // same way remediate()'s own dispatch_instruction call already does
+        // (this file, ~line 770, Gate 3 ARCH-1). This route's callers
+        // (evaluate_now -> policy_admin_routes.cpp's /evaluate) now echo this
+        // string verbatim into the REST response body AND the audit row as of
+        // this same fix round, which is what turned the prior latent leak
+        // into a live one.
+        return std::unexpected(
+            yuzu::server::genericize_db_error("PolicyEvaluator::kickoff_check dispatch",
+                                              dispatch_result.error()));
     if (dispatch_result->execution_id.empty())
         return "";
     const std::string& execid = dispatch_result->execution_id;

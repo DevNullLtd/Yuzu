@@ -3159,7 +3159,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058) DOES audit, `result=error` detail `degraded` — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
@@ -3850,8 +3850,12 @@ specific underlying cause (e.g. "policy store not wired", "degraded policy read
 for \<id>", "dispatch claim failed for \<id>: \<reason>", or "kickoff_check
 degraded for \<id>: scope evaluation degraded: \<reason>") — it is not a fixed
 literal, so do not pattern-match an exact string; treat any 503 on this route as
-safe to retry. A transient failure of any of these kinds is never reported as a
-409 (a genuine "matches no agents" result is distinguished from "could not
+safe to retry. One case is deliberately generic rather than specific: a genuine
+InstructionStore DB/lease failure reports as "...service unavailable" rather
+than the raw database error text, which can carry connection/schema detail —
+the raw text is logged server-side instead. A transient failure of any of
+these kinds is never reported as a 409 (a genuine "matches no agents" result
+is distinguished from "could not
 determine whether it matches").
 
 **Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above

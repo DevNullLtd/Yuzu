@@ -329,13 +329,14 @@ document both tokens explicitly).
 **What changed.** Both routes previously classified a degraded scope evaluation — a `from_result_set:`
 reference whose owning set was deleted by a concurrent operation, or a presence-store outage during a
 fleet-wide scope check — as an ordinary "no agents matched" or "request rejected" outcome:
-`/evaluate` returned a clean `409`, and `/remediate` returned a `400` audited as an operator `denied`.
-Neither was true — the check could not actually be evaluated. Both routes now answer `503` for this
-case, audited as `error`, with the response `message` (and audit detail) carrying the specific
-underlying cause rather than a generic string.
+`/evaluate` returned a clean `409`, and `/remediate` (when `agent_ids` is supplied) returned a `400`
+audited as an operator `denied`. Neither was true — the check could not actually be evaluated. Both
+routes now answer `503` for this case, audited as `error`, with the response `message` (and audit
+detail) carrying the specific underlying cause rather than a generic string.
 
-**Who this affects.** Any automation that treats `409` from `/evaluate` or `400` from `/remediate` as
-terminal, or that logs either code as an operator denial. A `503` from either route is safe to retry
+**Who this affects.** Any automation that treats `409` from `/evaluate` or `400` from `/remediate`
+(with `agent_ids`) as terminal, or that logs either code as an operator denial. A `503` from either
+route is safe to retry
 once the underlying condition (a concurrent result-set delete, a presence-store hiccup) clears —
 typically within seconds.
 

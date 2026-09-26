@@ -458,26 +458,30 @@ TEST_CASE("HA WS-5: evaluate_scope_local SUCCEEDS with local-only matches under 
     auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
     REQUIRE(parsed.has_value());
 
-    // The primary, presence-consulting entry point aborts under this exact
-    // degradation...
-    auto fleet_matched = registry.evaluate_scope(*parsed, nullptr);
-    REQUIRE_FALSE(fleet_matched.has_value());
-    CHECK(fleet_matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
-
-    // ...but evaluate_scope_local NEVER consults presence at all, so it
-    // succeeds with the local match regardless — this is the regression-
-    // prevention property the three Guardian push call sites depend on: a
+    // evaluate_scope_local NEVER consults presence at all, so it succeeds
+    // with the local match regardless — this is the regression-prevention
+    // property the three Guardian push call sites depend on: a
     // presence-store outage must never periodically disarm a scoped rule.
     //
-    // #4981 PR-1 (gov Gate 5, chaos-injector UP-12): success alone doesn't
-    // distinguish "never consults presence" from "consults it, gets an
-    // error, and silently ignores the result" — both look identical from
-    // the return value. OfflineEndpointStore isn't a mockable interface, so
-    // prove it by TIMING instead: the table is held under an ACCESS
-    // EXCLUSIVE lock with only a 100ms `lock_timeout_ms` on the store's
-    // pool, so any attempted query would block for up to that long before
-    // failing. A call that returns in a small fraction of that window never
-    // reached the lock at all.
+    // #4981 PR-1 (gov Gate 5 chaos-injector UP-12, gov Gate 8 quality-
+    // engineer re-verify): success alone doesn't distinguish "never
+    // consults presence" from "consults it, gets an error, and silently
+    // ignores the result" — both look identical from the return value.
+    // OfflineEndpointStore isn't a mockable interface, so prove it by
+    // TIMING instead: the table is held under an ACCESS EXCLUSIVE lock with
+    // only a 100ms `lock_timeout_ms` on the store's pool, so any attempted
+    // query would block for up to that long before failing. A call that
+    // returns in a small fraction of that window never reached the lock at
+    // all — but ONLY if the presence cache is genuinely cold at this point:
+    // `AgentRegistry::live_presence()` negative-caches a failed read for
+    // `kPresenceCacheTtl` (3s), so calling this AFTER a fleet-wide
+    // `evaluate_scope` (below) would measure a cache HIT regardless of
+    // whether evaluate_scope_local's implementation is correct — an
+    // empirically-confirmed false-green the first version of this test
+    // shipped with (a mutation injecting the exact "consults presence and
+    // discards the error" bug into evaluate_scope_local passed unchanged).
+    // This call MUST run first, against the registry's still-epoch,
+    // never-yet-populated cache, for the timing bound to mean anything.
     const auto t0 = std::chrono::steady_clock::now();
     auto local_matched = registry.evaluate_scope_local(*parsed, nullptr);
     const auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -485,6 +489,14 @@ TEST_CASE("HA WS-5: evaluate_scope_local SUCCEEDS with local-only matches under 
     REQUIRE(local_matched->size() == 1);
     CHECK((*local_matched)[0] == "local-agent");
     CHECK(elapsed < std::chrono::milliseconds(50));
+
+    // The primary, presence-consulting entry point aborts under this exact
+    // degradation — checked second and deliberately, now that the timing
+    // proof above no longer depends on running before this call warms the
+    // cache.
+    auto fleet_matched = registry.evaluate_scope(*parsed, nullptr);
+    REQUIRE_FALSE(fleet_matched.has_value());
+    CHECK(fleet_matched.error().kind == ScopeEvalError::Kind::PresenceDegraded);
 
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
