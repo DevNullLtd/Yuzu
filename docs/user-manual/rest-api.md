@@ -3840,19 +3840,22 @@ verdicts appear a few seconds later.
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
 policy is already in flight. **Response (503):** either the policy evaluator
-isn't wired ("policy evaluation not available"), a genuine internal store
-failure occurred while reading the policy or fragment, recording the dispatch
-claim, or (ADR-0058) resolving the check instruction against InstructionStore
-("policy store degraded" / "policy evaluation degraded"), **or (#4981 PR-1) the
-policy's scope expression could not be evaluated** — a result-set reference
-that failed its ownership check due to a race with a concurrent delete, or a
-presence-store degradation on a cross-replica scope — reported as "scope
-evaluation degraded: \<reason>". A transient failure of any of these kinds is
-safe to retry and is never reported as a 409 (a genuine "matches no agents"
-result is distinguished from "could not determine whether it matches").
+isn't wired, a genuine internal store failure occurred while reading the policy
+or fragment, recording the dispatch claim, or (ADR-0058) resolving the check
+instruction against InstructionStore, **or (#4981 PR-1) the policy's scope
+expression could not be evaluated** — a result-set reference that failed its
+ownership check due to a race with a concurrent delete, or a presence-store
+degradation on a cross-replica scope. The response's `message` field carries the
+specific underlying cause (e.g. "policy store not wired", "degraded policy read
+for \<id>", "dispatch claim failed for \<id>: \<reason>", or "kickoff_check
+degraded for \<id>: scope evaluation degraded: \<reason>") — it is not a fixed
+literal, so do not pattern-match an exact string; treat any 503 on this route as
+safe to retry. A transient failure of any of these kinds is never reported as a
+409 (a genuine "matches no agents" result is distinguished from "could not
+determine whether it matches").
 
 **Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above
-(`result=error`, detail `degraded`).
+(`result=error`, detail = the same specific cause string as the response `message`).
 
 ---
 

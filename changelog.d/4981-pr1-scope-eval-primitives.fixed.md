@@ -1,3 +1,10 @@
+- **Breaking — `POST /api/policies/{id}/evaluate` and `POST /api/policies/{id}/remediate`
+  (when `agent_ids` is supplied) can now answer `503` in cases that previously answered a
+  false-clean `409` ("matches no agents") or a false-denial `400` (#4981 PR-1).** Automation
+  polling either route that treats `409`/`400` as terminal, or that otherwise assumes these
+  routes never fail on infrastructure grounds, should treat the new `503` as retryable and
+  distinct from a genuine "no agents matched"/"request rejected" outcome. See the upgrade note
+  in `docs/user-manual/server-admin.md`.
 - **Closed a TOCTOU fail-open in `from_result_set:` scope dispatch, and made a presence-store
   outage a fail-closed abort instead of a silently-narrowed match.** `ResultSetStore::member_set_owned`
   is now a single, snapshot-consistent statement — a result set deleted (explicit delete or the
