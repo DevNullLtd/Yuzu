@@ -2653,6 +2653,15 @@ test('no conn-less libpq escape references',
   timeout: 30,
 )
 
+# ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL lives only in the
+# query owner, and its one shared SQL fragment has exactly one definition (PR #4985).
+test('rbac cross-schema query-owner seam',
+  _python3_test,
+  args: [files('test_rbac_query_owner_seam.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #4665 lockstep: the #4606-pinned format_arm_committed_line shape
 # (tests/unit/fixtures/spark/arm_committed_line.json) still parses through the #3990
 # driver's own T2_RE, and the driver's evidence regexes still refuse a forged rule-id/Spark-key
