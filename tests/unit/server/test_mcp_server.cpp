@@ -8386,6 +8386,71 @@ TEST_CASE("MCP C8: a non-service session still reaches list_agents "
     CHECK_FALSE(body.contains("error"));
 }
 
+// #4980: create_result_set_from_inventory_query's kToolSecurity row uses the
+// default 2-element form ({"Inventory", "Write"}, see the row's own comment a
+// few hundred lines above in mcp_server.cpp), which defaults `service_scope`
+// to ServiceScopeClass::denied — the SAME classification list_agents uses
+// above. This test empirically PROVES the C8 structural gate (mcp_server.cpp,
+// "C8: Generic tier + approval checks via kToolSecurity") intercepts a
+// service-scoped caller for THIS tool specifically, before the handler's own
+// fleet_read_fn_ admit-and-confine call ever runs — fleet_read_fn_for_test is
+// wired to fail the test outright if it is invoked, so this is not just an
+// error-code assertion, it is a proof of non-reachability. This closes the
+// verification step of #4980 (filed off an earlier governance review, #4307):
+// on the code as it stands on this branch, MCP was ALREADY safe — the
+// "admitted-and-confined here rather than hard-denied" gap the issue and
+// docs/user-manual/mcp.md described only ever existed on the REST twin (fixed
+// separately in this same change), never on MCP. Keep this test permanently
+// as the regression proof for that finding.
+TEST_CASE("MCP C8: create_result_set_from_inventory_query is denied for a "
+          "service-scoped token before fleet_read_fn_ ever runs (#4980)",
+          "[mcp][integration][security][service_scope][result-sets]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
+    // A captured bool, not a Catch2 FAIL() inside the lambda: the dispatcher
+    // likely wraps tool bodies in a catch(...) boundary, which would silently
+    // swallow an in-lambda FAIL() and turn a real regression into a quiet
+    // pass. The reached flag is checked on the test thread after the call
+    // returns, matching this file's own established idiom (see e.g.
+    // `last_scoped_agent` a few hundred lines above). McpTestServer::call()
+    // invokes the handler synchronously on the test thread (no cross-thread
+    // hazard here), so the swallowed-assertion risk above is the reason for
+    // this idiom, not a thread-safety one.
+    bool fleet_read_fn_reached = false;
+    ts.fleet_read_fn_for_test = [&fleet_read_fn_reached](
+                                    const httplib::Request&, httplib::Response&,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = {}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":50,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    // The actual proof of non-reachability: C8 must short-circuit BEFORE the
+    // handler's own fleet_read_fn_ admit-and-confine call ever runs.
+    CHECK_FALSE(fleet_read_fn_reached);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "mcp.create_result_set_from_inventory_query|denied")
+            saw_denied = true;
+        CHECK(a != "mcp.create_result_set_from_inventory_query|success");
+    }
+    CHECK(saw_denied);
+
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Inventory:Write"}, {"path_class", "mcp"}})
+              .value() == 1.0);
+}
+
 // ── list_pending_approvals / get_pending_approval_count (#2146 A2-R4) ────────
 // Previously untested at the MCP dispatch layer beyond the tools/list
 // outputSchema spot-check — every other "approval"-tagged test in this file

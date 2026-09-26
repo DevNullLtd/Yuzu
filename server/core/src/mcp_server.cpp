@@ -1018,11 +1018,9 @@ static const ToolDef kTools[] = {
      "conditions against every agent's stored inventory server-side; membership is every "
      "match, optionally narrowed to an owned parent set's CURRENT members. Requires "
      "Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same "
-     "securable as query_installed_software). Unlike every other result-set tool in this "
-     "family, a service-scoped API token is admitted and confined here, not denied outright "
-     "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
-     "the minting token's username, so a service token can mint a set the minter's other "
-     "credentials can later read back. If any candidate inventory record was excluded for "
+     "securable as query_installed_software). Service-scoped API tokens are denied "
+     "outright, same as every other result-set tool in this family (#4980). If any "
+     "candidate inventory record was excluded for "
      "nesting past the JSON depth guard (the exclusion check runs before condition matching, "
      "so a record's plugin/fields need not relate to the query's conditions to trigger it), "
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
@@ -3600,14 +3598,21 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // (Gate 2 BLOCKING fix, #2146 Batch B2 review) -- a REAL per-agent
     // confinement mechanism (authz::in_scope narrows candidate inventory
     // records before evaluation), matching its REST twin exactly. Still the
-    // default `denied` ServiceScopeClass, NOT `confined`: fleet_read_fn's
-    // own service-scope branch admits-and-confines a service-scoped caller
-    // rather than hard-denying it the way this tool's 8 non-dispatch
-    // siblings' deny_fleet_wide_service_scoped call does -- since the
-    // created result set is still owner-scoped to the minting token, that
-    // asymmetry is a real cross-service-reach gap, tracked in #4307, not
-    // resolved by this classification. The kToolSecurity OPERATION here is
-    // deliberately "Write", NOT "Read", even though the
+    // default `denied` ServiceScopeClass, NOT `confined` -- and unlike the
+    // REST twin (fixed by #4980), that default was ALREADY the correct,
+    // enforced posture on MCP: `denied` means a service-scoped token never
+    // reaches this tool's handler -- and therefore never reaches
+    // fleet_read_fn_ -- at all, refused outright by the generic C8 gate
+    // before the handler body runs (matching `list_result_sets` above; see
+    // that row's comment). An earlier revision of this comment (#2146 Batch
+    // B2 Gate 4 fold-in) claimed fleet_read_fn's admit-and-confine branch was
+    // reachable by a service-scoped caller here, a real cross-service-reach
+    // gap "tracked in #4307" -- that claim was incorrect for MCP from the
+    // moment it was written (C8's default-deny landed weeks earlier, #2298
+    // PR 3 §3c) and was never actually true; #4980 traced and empirically
+    // disproved it (`test_mcp_server.cpp`'s "MCP C8: ... before fleet_read_fn_
+    // ever runs" case) and fixed the REST-only gap it correctly identified.
+    // The kToolSecurity OPERATION here is deliberately "Write", NOT "Read", even though the
     // real RBAC gate the handler calls is Inventory:Read -- these are two
     // independent things (kToolSecurity's operation feeds tier_allows/
     // requires_approval/readOnlyHint-coherence; the handler's own perm_fn

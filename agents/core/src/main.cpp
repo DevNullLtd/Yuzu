@@ -22,9 +22,10 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include "service_win.hpp" // #1822: Windows SCM ServiceMain/control-handler dispatcher
 
 #include <CLI/CLI.hpp>
-#include <spdlog/sinks/rotating_file_sink.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
+#include "agent_log_options.hpp"
+#include "agent_log_wiring.hpp"
+#include "log_handoff.hpp"
 
 #include <atomic>
 #include <csignal>
@@ -150,6 +151,18 @@ static void log_quietly(const char* what) noexcept {
     }
 }
 
+/// Same firewall as log_quietly() above, info level: used by on_signal's barriered
+/// call sites (the watcher callback, the Windows g_agent_mu block) now that logging
+/// is async and no longer safe to attempt inside the signal handler itself (#4666
+/// PR-2 -- see R-PRODUCER in the callers below).
+static void log_info_quietly(const char* what) noexcept {
+    try {
+        spdlog::info("{}", what);
+    } catch (...) {
+        // Nothing to do, and nowhere to say it. A logger must never kill the agent.
+    }
+}
+
 static void on_signal_hard_exit(int sig) {
     (void)sig;
     // See hard_exit.hpp for why TerminateProcess (not ::_exit()) on Windows,
@@ -166,7 +179,6 @@ static void on_signal(int sig) {
     const int saved_errno = errno;
 
     // Only async-signal-safe calls allowed here — and now that is actually true.
-    const char msg[] = "Received signal, shutting down...\n";
     (void)sig;
 
     // ── SECOND SIGNAL => ESCALATE. BOTH PLATFORMS, AND BEFORE ANY LOCK. ──────────────
@@ -215,6 +227,7 @@ static void on_signal(int sig) {
         // it still does not log, for the same blocking-pipe reason this handler doesn't. A
         // wedged stop is diagnosed from the supervisor's log, the absence of "Yuzu agent
         // stopped", and usually also the process's own exit code (4 = the deadline fired,
+        // 5 = the log hand-off teardown deadline or a teardown failure — see log_handoff.hpp,
         // vs. this handler's exit 1, vs. F3's exit 3) — "usually", not reliably: a genuinely
         // wedged stop can trigger BOTH this handler (an operator sending a second signal) AND
         // the watchdog above for the SAME wedge, and whichever one's exit call the kernel
@@ -231,7 +244,6 @@ static void on_signal(int sig) {
     }
 
 #ifdef _WIN32
-    _write(2, msg, sizeof(msg) - 1);
     // Windows: the CRT dispatches this on a freshly created ORDINARY thread, not in a real
     // signal context, so the teardown may run inline and a mutex is legal here (it would not
     // be on POSIX — that is the entire reason for the self-pipe below).
@@ -255,8 +267,10 @@ static void on_signal(int sig) {
     // park this thread indefinitely, and the second signal is what rescues the operator.
     {
         std::lock_guard<std::mutex> lock(g_agent_mu);
-        if (auto* a = g_agent.load(std::memory_order_acquire))
+        if (auto* a = g_agent.load(std::memory_order_acquire)) {
+            log_info_quietly("Received signal, shutting down...");
             a->stop();
+        }
     }
 #else
     // ── THE PIPE BYTE GOES FIRST. THE LOG IS NEVER ALLOWED TO GATE THE TEARDOWN. ──────
@@ -275,7 +289,6 @@ static void on_signal(int sig) {
         (void)n; // EAGAIN on a full pipe just means a shutdown is already pending — which is
                  // exactly what we wanted.
     }
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1); // best-effort; may block, harmlessly now
 #endif
     errno = saved_errno;
 }
@@ -639,39 +652,73 @@ int main(int argc, char* argv[]) {
         cfg.log_level = "trace";
     }
 
-    // Configure logging — stderr + optional rotating file
+    // Configure logging — async hand-off (#4666 PR-2), replacing the previous
+    // synchronous spdlog setup that could wedge process shutdown on a blocked log
+    // destination (reproduced empirically: a 4KiB-constrained stderr pipe under
+    // SIGTERM left the pre-fix agent alive past 8s and requiring SIGKILL).
     spdlog::set_level(spdlog::level::from_str(log_level));
+
+    // AgentLogCli::service_mode is caller-resolved (agent_log_options.hpp's own doc
+    // comment: "pass `_WIN32 && cli_service_mode`") -- `service_mode` here is
+    // unconditionally declared (Windows-meaningful only, main.cpp's --service flag
+    // above), so on a non-Windows build it must be pinned to false rather than
+    // forwarded raw, or a stray `--service` on Linux would silently flip the log
+    // sink to file-only and invent a default log path that main.cpp's pre-#4666
+    // behaviour never did outside `#ifdef _WIN32`.
+    const yuzu::agent::AgentLogCli log_cli{
+        .log_file = log_file,
+        .log_max_size = log_max_size,
+        .log_max_files = log_max_files,
 #ifdef _WIN32
-    if (service_mode && log_file.empty()) {
-        // No console under the SCM -- without --log-file the agent would log to
-        // nowhere. Default alongside persistent state.
-        log_file = (cfg.data_dir / "yuzu-agent.log").string();
-    }
+        .service_mode = service_mode,
+#else
+        .service_mode = false,
 #endif
-    if (!log_file.empty()) {
-        try {
-            std::vector<spdlog::sink_ptr> sinks;
-            sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-                log_file, log_max_size, log_max_files));
-#ifdef _WIN32
-            if (!service_mode)
-#endif
-                sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
-            auto logger = std::make_shared<spdlog::logger>("", sinks.begin(), sinks.end());
-            logger->set_level(spdlog::level::from_str(log_level));
-            spdlog::set_default_logger(logger);
-        } catch (const std::exception& e) {
-            // A missing/unwritable log directory must not crash the process before
-            // the SCM dispatcher connects (the same failure class #1822 fixes: an
-            // uncaught exception here would silently reproduce error 1053).
-            std::cerr << "Failed to open log file '" << log_file << "': " << e.what()
-                      << " — falling back to the default logger\n";
-        }
+        .data_dir = cfg.data_dir,
+    };
+    const auto log_opts = yuzu::agent::make_log_handoff_options(log_cli);
+
+    auto created_log_handoff = yuzu::agent::LogHandoff::create(log_opts);
+    if (!created_log_handoff) {
+        std::cerr << "cannot start the log hand-off thread: " << created_log_handoff.error()
+                  << "\n";
+        return EXIT_FAILURE;
     }
-    if (log_format == "json") {
-        spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("agent"));
-    } else {
-        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
+    // SINGLE OWNER, SINGLE TEARDOWN CALLER — main() only, via log_epilogue's
+    // destructor below. Declared here, before `agent` and before the Windows
+    // service early-return, so R-EPILOGUE's declaration-order guarantee covers
+    // EVERY return path in this function. Never add an explicit teardown() call,
+    // and never call teardown() from the watcher callback, a signal handler, a
+    // watchdog action, or any hard_exit() path — see log_handoff.hpp's
+    // THREAD-SAFETY CONTRACT (destructor-as-winner use-after-free) and
+    // agent_log_wiring.hpp's R-LOGGER rule. Every new non-main log call this file
+    // adds must run inside a barrier main() already waits on before this epilogue
+    // (the watcher join, or the g_agent_mu critical section) — see R-PRODUCER.
+    std::unique_ptr<yuzu::agent::LogHandoff> log_handoff = std::move(*created_log_handoff);
+    yuzu::agent::LogHandoffEpilogue log_epilogue{*log_handoff};
+
+    if (!yuzu::agent::install_log_handoff_in_this_image(
+            *log_handoff, spdlog::level::from_str(log_level), log_format == "json")) {
+        std::cerr << "cannot install the log hand-off logger\n";
+        return EXIT_FAILURE; // log_epilogue's destructor still tears down cleanly here
+    }
+    if (log_handoff->used_log_file_fallback()) {
+        // Format the RESOLVED path (log_opts.log_file), not the raw CLI log_file string:
+        // for a Windows service using its implicit default (no --log-file given), the
+        // default is resolved only into log_opts by make_log_handoff_options() above —
+        // the CLI-local log_file stays empty, and formatting it here printed a
+        // diagnostic naming no path at all, on exactly the configuration where an
+        // operator has no other way to learn which path to fix (adversarial-review
+        // finding, governance-hardening round). used_log_file_fallback() is true only
+        // when create() actually attempted a file open, so log_opts.log_file is
+        // guaranteed set here.
+        const std::string attempted_path =
+            log_opts.log_file ? log_opts.log_file->string() : log_file;
+        std::cerr << "Failed to open log file '" << attempted_path << "': "
+                  << log_handoff->log_file_fallback_reason()
+                  << " — logging to console only\n";
+        spdlog::warn("Failed to open log file '{}': {} — logging to console only", attempted_path,
+                     log_handoff->log_file_fallback_reason());
     }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
@@ -735,6 +782,7 @@ int main(int argc, char* argv[]) {
             auto* a = g_agent.load(std::memory_order_acquire);
             if (!a)
                 return false; // not published yet — keep waiting, do not consume the watcher
+            log_info_quietly("Received signal, shutting down...");
             a->stop();        // ordinary thread: safe to lock, join, malloc, log
             return true;
         },
@@ -850,6 +898,11 @@ int main(int argc, char* argv[]) {
         [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
 
     agent->run();
+    // R-EXCEPTION (#4666 PR-2, accepted, out of scope): on this platform's toolchain
+    // (GCC) an exception escaping run() above can reach std::terminate() without
+    // unwinding -- main() has no top-level try/catch, so neither log_epilogue's
+    // destructor nor ~Agent would run in that case. Pre-existing property of this
+    // function, not introduced or fixed here.
 
     // ── THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM ──────────────────────────────
     // From here on nothing can act on a signal: the watcher is about to be joined and
@@ -927,7 +980,12 @@ int main(int argc, char* argv[]) {
                 yuzu::agent::kOrphanDrainGrace)) {
             // Firewalled: a logging exception here must never skip hard_exit()
             // below - same rationale as log_quietly() elsewhere in this file
-            // (Sol rung-7.6 review finding 2).
+            // (Sol rung-7.6 review finding 2). The #4666 PR-2 drain_log_bounded()
+            // call below shares this SAME try/catch, not a separate one -
+            // drain_log_bounded() is not declared noexcept (log_handoff.hpp), so
+            // leaving it outside this firewall would let an exception there skip
+            // hard_exit() entirely (caught in review; service_win.cpp's equivalent
+            // F3 site hit and fixed the identical hazard independently).
             try {
                 // "Guardian I/O worker(s)" until PR-A (#2012/#3840): n is now a
                 // SUM (guardian_active_io_workers()'s own doc comment) of
@@ -940,6 +998,10 @@ int main(int argc, char* argv[]) {
                                  "after shutdown - forcing process exit rather than race "
                                  "static/DSO teardown against them",
                                  n, yuzu::agent::kOrphanDrainGrace.count());
+                // Best-effort bounded attempt to land the critical() line above
+                // before hard_exit() below throws the rest of the log queue away —
+                // not a delivery guarantee (#4666 PR-2).
+                yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
             } catch (...) {
             }
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)

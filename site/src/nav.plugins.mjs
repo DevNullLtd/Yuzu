@@ -55,6 +55,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/software_actions/README', slug: 'plugins/software_actions', title: 'software_actions' },
   { file: 'agents/plugins/status/README', slug: 'plugins/status', title: 'status' },
   { file: 'agents/plugins/storage/README', slug: 'plugins/storage', title: 'storage' },
+  { file: 'agents/plugins/system_hardening/README', slug: 'plugins/system_hardening', title: 'system_hardening' },
   { file: 'agents/plugins/tags/README', slug: 'plugins/tags', title: 'tags' },
   { file: 'agents/plugins/tar/README', slug: 'plugins/tar', title: 'tar' },
   { file: 'agents/plugins/users/README', slug: 'plugins/users', title: 'users' },
