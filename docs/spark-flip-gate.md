@@ -1697,6 +1697,52 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   impact, exposure and severity codes are defined under "Severity - DERIVE it, do not choose it"
   in `.claude/skills/governance/SKILL.md`.
 
+**#4704** (File worker / Registry sweeper: a blocked log sink stalls the mechanism thread - on
+Registry while holding `mu_`; found by #4658's governance run)
+- Detection signal: none dedicated, before or after the fix. Before: a stalled sink on the
+  Registry sweeper showed only as `arm()`/`disarm()` latency on the registry type (the
+  `SparkEngine` per-type lock queued behind the mechanism's `mu_`), with `stats()` still live, so
+  `yuzu.spark_mechs` and every counter read healthy. After: the stall is confined to the sweeper's
+  own loop; a re-arm or establishment report it owes waits for the sink, `stop()`'s join waits for
+  it, and nothing else does. No alert ships and the fleet series cannot see a sink stall on either
+  mechanism; the agent log itself is what is stalled.
+- Operator action: none specific to Yuzu. Find and clear the sink stall (a reader-less stderr
+  pipe under journald/Docker, a full or hung log volume, a stuck rotation); a restart is bounded
+  by the 20 s `ShutdownDeadlineGuard` ending in `hard_exit(4)` if the sink is still blocked.
+- Compensating control: `prefer_spark_` is false in production, so no rule is armed through
+  Spark and the Registry sweeper serves no watches; its failure branch needs a pass to throw
+  (allocation failure) with something due, which an observe-only engine with no watches never
+  has. The pre-fix window in a shipped build was therefore effectively zero; at the F14 flip it
+  would have opened at every runtime-inert episode, which is why this gated the flip.
+- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, open,
+  not yet merged - `<sha>`/`<date>` filled at merge).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
+  File's shipped #4658 shape, not the shared-async-primitive option. `sweeper_main()` now
+  captures a value `PassOutcome` (failure count, backoff ms, flipped-inert, recovered) under
+  `mu_`, releases the lock on the branch's existing unlock, and writes the line through a
+  static noexcept `log_pass_outcome()` - content, level and the 1/2/4/8 gate byte-identical to
+  the lines it replaces. Verified red-then-green on DGRHP (MSVC 19.44): three new cases park the
+  sweeper inside the sink on each of the three lines (`PfStallLogger`'s `on_hit` blocking on a
+  test gate) and require `set_registry_test_controls_for_test()` - a bare `lock_guard(mu_)`
+  taker - to complete while the sweeper is still parked (`hits() == 0` at that point, since the
+  sink counts only after the parked call returns); moving `log_pass_outcome(po)` above
+  either `lk.unlock()` makes the matching case(s) fail at the 2 s wait (red run recorded in the
+  PR). The pre-existing sre6-1 case (`#2012 PR-B1`) still pins the counters, backoff and inert
+  flip/clear. One deliberate consequence of the mirrored shape: a throwing log write on the
+  sweeper now loses that line instead of terminating the agent (the lines sat outside the pass's
+  catch before). Residual, not fixed here: Registry's per-key `warn` lines in
+  `fail_backend_locked()`, `resolve_probe_locked()` and `park_lost_locked()` are still written
+  under `mu_` (a different shape, outside the ruling) - #4999. R5.7 (g)(4), the operator manual's
+  "Diagnosing an inert File worker or Registry sweeper" and section 7 above corrected from "the
+  two mechanisms are not the same shape" to the shared shape.
+- Owner: fixed ahead of PR-5 by the author of the #4704 fix, not deferred to the PR-5 (F14 flip)
+  author.
+- Milestone: #4704 itself; PR #5004.
+- Revisit trigger: fired, and resolved for the three sweeper pass-outcome lines. **Not
+  risk-accepted** - nothing here is accepted; the shared worker-loop stall stays a disclosed
+  limit under R5.7 (g)(4), and the residual sites are #4999's to close. Severity as the #4658
+  ledger recorded the runtime half (`UP-2b-blocked-sink-runtime-stall`): SHOULD for the #4658
+  merge; HIGH and blocking at the F14 flip had it stayed open, per section 7's precondition.
+
 **Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
 Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half (fixed by PR
@@ -1922,16 +1968,30 @@ not re-reconciled on recovery) must be fixed or closed first; see its section 5 
 per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
 detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
 the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
-on the section 5 query. #4704 (a blocked log sink stalls the File worker or, worse, the Registry
-sweeper's `mu_`) must be fixed or accepted as a limit before the flip as well, since the flip is
-what makes these mechanism workers live.**
+on the section 5 query. #4704 (a blocked log sink stalled the Registry sweeper WHILE IT HELD
+`mu_`, so `arm()`/`disarm()` on that mechanism stalled with it; File's equivalent lines were
+already off-lock) is FIXED (PR #5004, open - `<sha>` filled at merge): both mechanisms now write their pass-outcome
+lines off-lock, see the section 5 entry. What remains is the shared, disclosed limit that a
+stalled sink stalls the worker's own loop, bounded only on shutdown (R5.7 (g)(4)) - plus the
+residual per-key warn sites named in #4999 (Registry) and #5002 (File, untracked mirror,
+filed post-#4704), both currently gated by the same `prefer_spark_=false` compensating
+control and likely superseded once #4666's async log hand-off is wired in as the process's
+default logger (its own PR-2 is already a blocking F14 precondition here for unrelated
+reasons).**
 
-Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
-slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
-gives the Spark drain worker a live caller), and orphan attribution under outbox rejection or an
-agent crash between enqueue and send. The related findings are ledgered in
-`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (`4606-up1` through `4606-up6`,
-`4606-sre-no-removal-plan` and the Gate 8 findings `4606-g8-*`).
+Two fault-injection scenarios designed at that governance run are not yet run. Their tracking,
+stated precisely: the slow or blocked log sink with Spark live (the drain worker once
+`prefer_spark` gives it a live caller) is #4666's own acceptance criterion (its rig scenario:
+stderr on a reader-less FIFO plus a rotation stall under a 500-rule `full_sync`); the same stall
+on the live legacy path is recorded here (per `4606-g8-s19`) but is not yet an acceptance
+criterion of any open issue; orphan attribution under outbox rejection or an agent crash between
+enqueue and send is `4606-up6-compound-orphan-attribution`, linked to #4606 at pass 15 of
+`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (the benchmark-side classifier
+belongs to that campaign). The mechanism-worker case those two do not cover, the Registry sweeper
+parked inside the sink on one of its own pass-outcome lines, is pinned by #4704's unit tests
+(`[spark][mechanism][windows][logofflock]`, `tests/unit/test_spark_mechanism.cpp`), which prove a
+`mu_` taker completes while the sweeper is parked. The related findings stay ledgered under
+`4606-up1` through `4606-up6`, `4606-sre-no-removal-plan` and the Gate 8 findings `4606-g8-*`.
 
 1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruled 2026-09-02 per
    §3 row 8). Runs
