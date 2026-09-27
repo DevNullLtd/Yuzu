@@ -10497,12 +10497,18 @@ TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a mono
     rt->set_io_executor_fail_launch_for_test(false);
     CHECK(rt->disarm_retained() == 1); // still 1, not 2
 
-    // Now let it succeed: the count must return to 0.
+    // Now let it succeed: the count must return to 0. The backend's disarm
+    // count reaches 1 before the runtime has processed the completion and
+    // released the claim, so wait for the count itself - as the scheduler
+    // case below does - rather than asserting it the moment the call lands.
     REQUIRE(rt->redrive_retained_disarms() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
-    CHECK(rt->disarm_retained() == 0);
-    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+    CHECK(yuzu::test::spin_until([&] { return rt->disarm_retained() == 0; },
+                                 std::chrono::seconds(10)));
+    CHECK(yuzu::test::spin_until(
+        [&] { return rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0; },
+        std::chrono::seconds(10)));
 }
 
 TEST_CASE("up-5 (#4221): the convergence lane's priority loop redrives a retained disarm "
