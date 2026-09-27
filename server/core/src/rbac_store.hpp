@@ -273,9 +273,52 @@ public:
                                                                  const std::string& role_name);
 
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
-    std::expected<void, std::string> unassign_role(const std::string& principal_type,
-                                                   const std::string& principal_id,
-                                                   const std::string& role_name);
+
+    /// The guard's transaction lives in `RbacAdminAuthorityOwner`
+    /// (rbac_admin_authority_owner.cpp), an ADR-0012 §3 query owner; this method
+    /// delegates to it.
+    ///
+    /// A2 last-Administrator guard: when `role_name == "Administrator"`,
+    /// refuses (and rolls back) a delete that would leave ZERO
+    /// `principal_roles` rows naming `role_name = 'Administrator'` AND
+    /// `principal_type = 'user'` for a genuinely AUTHENTICATABLE
+    /// administrator — deliberately NOT a bare grant-row count. The guard
+    /// JOINs `auth.users` (`u.username = pr.principal_id AND u.is_active`)
+    /// so a pre-provisioned grant on a nonexistent username, or a
+    /// deactivated/(soft-)deleted account, never counts as a "surviving"
+    /// administrator — see rbac_admin_authority_owner.cpp for the full reasoning (this is safe
+    /// only because `RbacStore` and `AuthDB` always share one PgPool in
+    /// production, ADR-0006). Also matches
+    /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly on
+    /// the `principal_type` axis — it never resolves a group-held
+    /// Administrator row either (a documented A2 scope exclusion),
+    /// deliberately NOT `principal_type IN ('user', 'group')`. The count
+    /// runs INSIDE the same transaction as the delete, under a
+    /// `FOR UPDATE OF pr` row lock on the candidate `principal_roles` rows
+    /// (the candidate `auth.users` rows are never locked; only the deleted
+    /// principal's own row is, by the post-DELETE recheck), so two concurrent
+    /// unassigns racing to remove the last two Administrator grants serialize
+    /// instead of both observing "1 remaining" and both committing. The
+    /// guard does NOT cover an `auth.users` row created concurrently for a
+    /// pre-provisioned grant, nor deactivation of a surviving Administrator
+    /// between the recount and COMMIT (#4966). Every other
+    /// role/principal_type combination — including both existing
+    /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
+    /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as
+    /// before (an Administrator grant held by a non-user principal still runs the
+    /// candidate lock query but is never counted). The
+    /// refusal's error string always contains `kRbacLastAdminRefusalMarker`
+    /// (below) — callers that need to distinguish this business-rule
+    /// refusal from a genuine store/query failure match on that constant
+    /// rather than inventing their own substring.
+    ///
+    /// Returns `true` iff a row was actually removed (idempotent — an
+    /// unassign of a role the principal never held returns `false`, not an
+    /// error) — surfaced so a caller's audit trail can distinguish an actual
+    /// revoke from a no-op, rather than auditing both identically.
+    std::expected<bool, std::string> unassign_role(const std::string& principal_type,
+                                                    const std::string& principal_id,
+                                                    const std::string& role_name);
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
@@ -532,18 +575,55 @@ private:
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
-/// Three-way, AUDIT-FACING classification of RBAC enforcement state (A3, the
-/// Periodic Access Review export, SOC 2 CC6.2) — strictly more granular than
-/// `rbac_enforcement_in_effect`'s plain enforced/not-enforced boolean, which
-/// deliberately conflates "genuinely enabled" with "degraded view, deny by
-/// default" (both gate DENY, so the boolean is right for authorization). An
-/// auditor reading an evidence export needs the distinction: a `kDegraded`
-/// stamp says "we could not confirm the state, gates denied defensively" —
-/// NOT "an administrator turned RBAC on".
+/// Three-way classification of RBAC enforcement state — strictly more
+/// granular than `rbac_enforcement_in_effect`'s plain enforced/not-enforced
+/// boolean, which deliberately conflates "genuinely enabled" with "degraded
+/// view, deny by default" (both gate DENY, so the boolean is right for
+/// authorization).
 ///
-/// This is a READ-ONLY label for export/evidence surfaces — never an
-/// authorization decision. A caller deciding whether to admit/deny a request
-/// MUST keep using `rbac_enforcement_in_effect()` directly, never this enum.
+/// THE TEST for whether a NEW use of this label is permitted: does it change
+/// the SET OF INPUTS THAT ADMIT a request? If yes — forbidden. Use
+/// `rbac_enforcement_in_effect()`'s boolean directly; the admit/deny outcome
+/// must always equal what that boolean alone gives (see the documented
+/// equivalence below). If no — the use only stamps an audit label, or picks
+/// between two outcomes that are BOTH already non-admitting — it is
+/// permitted, subject to two further conditions: (1) a SINGLE snapshot read
+/// per logical decision (call `rbac_enforcement_label()` exactly once and
+/// branch on that one result — never decompose into this call plus a
+/// separate `rbac_enforcement_in_effect()` call, or two calls to this
+/// function, "to satisfy the letter" of a narrower use: the underlying view
+/// can self-heal between calls — a healthy pool's next refresh clears a
+/// stale cache — so two calls can observe two different states across one
+/// logical decision); (2) a `security-guardian` review, via this file's
+/// routed-concerns row (`.claude/routed-concerns-access-control.md`, the A2
+/// row's trigger list names this enum/function explicitly) — adding a new
+/// consumer is a security decision, not a routine edit, and that row is
+/// where consumers satisfying this test are tracked, not a hardcoded count
+/// in this comment.
+///
+/// PRIMARY use: an AUDIT-FACING label for export/evidence surfaces
+/// (`access_review_model.cpp`, A3, the Periodic Access Review export, SOC 2
+/// CC6.2). An auditor reading an evidence export needs the distinction a
+/// bare boolean erases: a `kDegraded` stamp says "we could not confirm the
+/// state, gates denied defensively" — NOT "an administrator turned RBAC on".
+///
+/// WORKED EXAMPLE of a sanctioned non-export use, satisfying the test above:
+/// `rbac_admin_predicate.hpp`'s `is_rbac_administrator` (Doomgoose external
+/// review, PR #4985 IMPORTANT #2, reconciled with A3 above at merge time —
+/// both PRs independently built this identical shape against this branch's
+/// own primitives before either merged). It reads the label TWICE from one
+/// snapshot: once to pick which authority source to consult (`!= kDisabled`
+/// — this IS the same routing decision `rbac_enforcement_in_effect()`'s own
+/// boolean makes, by the documented equivalence below, so it changes nothing
+/// about which inputs admit), and once — only after that source's own row
+/// lookup has already found no matching grant, i.e. only on an
+/// already-non-admitting path — to choose WHICH non-admitting failure to
+/// return: a retryable `kUnavailable` (503) for `kDegraded`, versus a
+/// terminal `kDenied` (403) otherwise. It was previously conflating those
+/// two "no row" cases and returning a terminal 403 for a transient store
+/// hiccup, exactly the failure mode this enum exists to let a caller avoid.
+/// Neither read ever returns `kAdmin` by itself — an actual grant/role match
+/// is still required on every path.
 enum class RbacEnforcementLabel {
     kEnabled,  ///< store open, `is_rbac_enabled() == true`.
     kDisabled, ///< store open, `is_rbac_enabled() == false`, view FRESH — the
@@ -565,7 +645,12 @@ enum class RbacEnforcementLabel {
 /// `is_rbac_enabled()` short-circuits before `rbac_enabled_view_degraded()`
 /// is ever consulted, exactly like `rbac_enforcement_in_effect()` itself;
 /// gates still deny either way, so this is the same fail-closed answer, just
-/// a less granular label for that one case.
+/// a less granular label for that one case. `is_rbac_administrator` inherits
+/// this asymmetry unchanged (a cached-enabled+stale RBAC-off admin still
+/// gets a definitive `kDenied`, never `kUnavailable`) — this is the
+/// platform's existing accepted fail-closed posture for that direction
+/// (#2703 addressed the cached-*disabled* direction only), not a new gap
+/// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
 /// "enabled" | "disabled" | "degraded" — the wire/DB string form of
@@ -587,6 +672,57 @@ enum class RbacEnforcementLabel {
         return "degraded";
     }
     return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
+}
+
+/// The fixed marker substring `RbacStore::unassign_role`'s error string
+/// always contains when refusing the A2 last-Administrator guard (see that
+/// method's doc comment). The REST route (POST/DELETE
+/// `/api/v1/rbac/roles/{name}/assignments`) and its MCP twin both match
+/// against this ONE constant — via `is_rbac_last_admin_refusal` below — to
+/// distinguish the business-rule refusal (409/Conflict-class) from a genuine
+/// store/query failure (503/Transient-class). EXTEND this, never invent a
+/// second copy of the wording to match against.
+inline constexpr std::string_view kRbacLastAdminRefusalMarker = "zero administrators";
+
+/// True iff `msg` (an `unassign_role` error string) is the last-Administrator
+/// refusal above, rather than a genuine store/query failure.
+[[nodiscard]] inline bool is_rbac_last_admin_refusal(const std::string& msg) noexcept {
+    return msg.find(kRbacLastAdminRefusalMarker) != std::string::npos;
+}
+
+/// True iff `msg` (an `RbacStore::assign_role` error string) is a genuine
+/// CLIENT-facing validation rejection — one of `validate_assignment`'s own
+/// messages, or `assign_role`'s own built-in-system-role rejection (F1) —
+/// rather than a store/query fault (`"database not open"`, a raw
+/// `PQerrorMessage` string, or the ambiguous `"assign_role failed"`
+/// fallback). Doomgoose external review, PR #4985 IMPORTANT finding #3: both
+/// the REST and MCP `assign_rbac_role` twins previously mapped EVERY
+/// `!assign_role(...)` outcome to a 400/`kInvalidParams` client error
+/// unconditionally — a genuine store fault (a dropped connection, a Postgres
+/// error) was misreported as "your input was rejected" rather than the
+/// retryable 503/`kInternalError` it actually is.
+///
+/// ALLOWLIST, not a denylist, by design: an unrecognized FUTURE error string
+/// from `assign_role` (one this list has not been updated for) defaults to
+/// the SAFER "store fault, retryable" classification rather than silently
+/// masquerading as a permanent client rejection. EXTEND this allowlist
+/// whenever `validate_assignment`/`assign_role` grows a new genuine
+/// client-validation message — match the FIXED, non-interpolated wording
+/// only, never a caller-controlled substring (`role_name`/`principal_id` are
+/// interpolated into several of these messages).
+///
+/// Scoped to `assign_role` only — `unassign_role`'s error vocabulary is
+/// different (no `validate_assignment` call) and is already correctly
+/// classified via `is_rbac_last_admin_refusal` above; do not reuse this
+/// helper for unassign's errors.
+[[nodiscard]] inline bool rbac_assign_error_is_client_fault(std::string_view msg) noexcept {
+    return msg.find("reserved 'engine:' namespace may only be assigned under") !=
+               std::string_view::npos ||
+           msg.find("unrecognized principal_type '") != std::string_view::npos ||
+           msg.find("must be in the reserved 'engine:<slug>' namespace") !=
+               std::string_view::npos ||
+           msg.find("cannot be granted the admin/full-access role") != std::string_view::npos ||
+           msg.find("cannot be granted a built-in system role") != std::string_view::npos;
 }
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
