@@ -389,6 +389,12 @@ public:
         RootChangedTwice,      ///< CrlPublisher: the root changed on both attempts — giving up
         Busy,                  ///< the process-local `publish_mu_` was held past `local_wait`
         Exception,             ///< CrlPublisher: the build/signing step threw
+        kCount,                ///< sentinel only — NOT a real reason; must stay last. Ties
+                               ///< `kPublishFailReasonLabels`'s size to this enum's cardinality
+                               ///< at compile time (governance #4828-#4832 follow-up) so a future
+                               ///< 12th value that forgets to extend the label array fails the
+                               ///< build instead of an unchecked out-of-bounds `operator[]` read
+                               ///< at first occurrence.
     };
 
     /// Compact labels for `PublishFailReason`, in enum-declaration order. Drives both a metrics
@@ -400,14 +406,23 @@ public:
         "insert_or_commit_failed", "key_load",         "root_changed_twice",
         "busy",                  "exception",
     };
+    static_assert(kPublishFailReasonLabels.size() ==
+                      static_cast<std::size_t>(PublishFailReason::kCount),
+                  "kPublishFailReasonLabels must have exactly one entry per PublishFailReason "
+                  "value (excluding the kCount sentinel) — extend both in the same change");
 
     /// `publish_next_crl`'s error type: `kind` drives retry/skip control flow (unchanged since HA
     /// WS-6 6.1 — callers must keep branching on it, not on `reason`); `reason` is the finer
-    /// #4830 cause, compiler-enforced at every `unexpected(...)` site rather than a defaulted
-    /// out-pointer a future branch could silently forget to set.
+    /// #4830 cause. A 2-arg constructor (rather than relying on aggregate init) makes an
+    /// incomplete `PublishFailure{kind}` a genuine compile error — aggregate init would otherwise
+    /// silently value-initialize `reason` to `PublishFailReason::NoConnection` (enum value 0) on
+    /// any future call site that forgets to supply it, mislabeling a real failure's Prometheus
+    /// cause and audit detail.
     struct PublishFailure {
         PublishError kind;
         PublishFailReason reason;
+
+        constexpr PublishFailure(PublishError k, PublishFailReason r) : kind(k), reason(r) {}
     };
 
     /// Upper bound on waiting for the CRL table lock, applied per transaction with

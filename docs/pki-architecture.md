@@ -235,7 +235,10 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   (see the script's own CORRECTNESS NOTE); a recipe targeting the publish transaction specifically is
   a disclosed follow-up (#5032). Its async-durability case confirms the `YUZU_PG_DURABILITY=async` toggle is
   real and reachable but does not live-exercise the asynchronously-replicated-commit-loss residual
-  described above — that residual is asserted by this paragraph, not by a live repro.
+  described above — that residual is asserted by this paragraph, not by a live repro. The
+  connection-reset case's own final self-heal-coverage assertion timed out once at 60s (after three
+  real script bugs preceding it were fixed) and has not yet been root-caused — a disclosed follow-up,
+  #5031, tracked alongside #5032 in `docs/ha-delivery-matrix.md`'s WS-6 row.
 
 **curl examples:**
 

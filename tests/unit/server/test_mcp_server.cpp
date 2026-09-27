@@ -30126,8 +30126,16 @@ TEST_CASE("MCP B5: import_ca_chain full approval-ticket round-trip reaches impor
                      std::string("ca.subordinate.imported|success")) != ts.audit_log.end());
     // #4829: the MCP import-chain tool previously wrote NO ca.crl.published row at all —
     // the MCP twin of the REST/dashboard import-chain handlers' own addition.
-    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
-                     std::string("ca.crl.published|success")) != ts.audit_log.end());
+    auto crl_published_it = std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                                       std::string("ca.crl.published|success"));
+    CHECK(crl_published_it != ts.audit_log.end());
+    // #4830: the reason= detail token must be present too, symmetric with the REST/dashboard
+    // twins' own audit-detail assertions — audit_log/audit_details are parallel (index-aligned).
+    REQUIRE(crl_published_it != ts.audit_log.end());
+    const auto crl_published_idx =
+        static_cast<std::size_t>(crl_published_it - ts.audit_log.begin());
+    REQUIRE(crl_published_idx < ts.audit_details.size());
+    CHECK(ts.audit_details[crl_published_idx].find("reason=import_chain") != std::string::npos);
     REQUIRE(body["result"].contains("structuredContent"));
     CHECK(body["result"]["structuredContent"] == payload);
 }
