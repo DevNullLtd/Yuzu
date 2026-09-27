@@ -570,6 +570,18 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
+  **Root cause confirmed and fixed (#4660, added 2026-09-27)** - the full account; the three
+  later #4660 notes in this document point here. The overshoot was the gauge, not the worker
+  count: the old admission shape (`fetch_add(1)`, then compare, then roll back on reject) let
+  `active_workers()` read above the cap - one over per concurrently rejected launch, cap+1 in
+  the #4279 sample - for the instant between a rejected launch's increment and its own
+  rollback, and no ninth worker ever ran; the same window could also reject a concurrent launch
+  while a slot was free. `SparkDetachedLane::launch()` now admits via a
+  `compare_exchange_weak` loop that raises `active` from cur to cur+1 only while cur is below
+  cap, so the gauge can never be observed above a fixed cap. The #4660 cases in
+  `tests/unit/test_spark_detached_call.cpp` pin that bound and the CAS's behaviour under
+  contention. On the Windows rig (real MSVC) the storm test failed 8/100 before the fix and
+  passed 200/200 after. #4279 itself stays open for its other, unrelated bullets.
 - **NEW (added 2026-09-14, discovered during rung 9c PR-5a's own cs-103 tombstone-reachability
   investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary (non-firewall) pop loop
   (`guardian_spark_runtime.cpp:580-601`) pops every claim in `finished` on outcome presence and
@@ -630,6 +642,10 @@ flip, with a red-first test each:
   generation-wide liveness bound" already requires - K-bound does not widen
   #4279's exposure in any way. No code fix landed in this PR for #4279; it
   stays open, P2, tracked independently.
+  **Root cause confirmed and fixed (#4660, added 2026-09-27)**: the sampled overshoot was the
+  admission gauge, not real over-cap load (full account: the #4660 note on
+  §3a's 'NEW (added 2026-09-13)' #4279 bullet above). The diagnostic storm test's `CHECK(max_active <= kTestLaneCap)` bound stays exact by
+  design (see that test's own comment). K-bound's disposition above is unaffected.
 - **NEW precondition for the F14 flip (added 2026-09-18, PR #4529 review
   finding): K-eligibility's drain-time linearization must become a named flip
   criterion, not stay implicit in a design-doc note.** `can_advance()` reads
@@ -1452,11 +1468,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     establishment probe, so a watch retired while `Pending` keeps its `probe_lane_` slot until
     the real `OpenServiceW` call returns - sustained watch/unwatch churn faster than the
     `retiring_` reap window, combined with backend latency exceeding it, can starve new
-    admissions. **Corroborated empirically, not just theoretically**, by this same session's
-    real-hardware verification: File's sibling mechanism, sharing the identical
-    `SparkDetachedLane` admission primitive, was observed exceeding its configured lane cap by
-    one under real storm load (`max_active=9 > kTestLaneCap=8`, 1-in-~10 real-hardware runs -
-    see #4279's corresponding note) - raising this above "spec says it can't happen."; (e)
+    admissions. **Corrected 2026-09-27 (#4660)**: this item previously claimed empirical
+    corroboration from File, Service's sibling mechanism, which shares the same `SparkDetachedLane`
+    admission primitive and was observed exceeding its lane cap by one under real storm load
+    (`max_active=9 > kTestLaneCap=8`, 1-in-~10 real-hardware runs). #4660 showed that reading
+    was the admission gauge counting a transiently rejected launch, not real over-cap load (full
+    account: the #4660 note on §3a's 'NEW (added 2026-09-13)' #4279 bullet), so it does not
+    corroborate this item, which rests on the static reading alone. (e)
     **NEW, added to #4218 2026-09-12**: `CloseServiceHandle`'s own hang potential is disclosed
     but unverified, not yet measured or given a synthetic-storm test - same LRPC transport as
     `OpenServiceW`, governance found no evidence it cannot hang under a wedged SCM, and four
@@ -1480,7 +1498,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   fetch-add-then-compare-then-rollback, no obvious TOCTOU) and Astra's independent derivation
   both point the same direction but neither confirms it; the issue's own words are the accurate
   ones - "root cause undetermined... not confirmed either way." Either way, not a reopening of the
-  original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
+  original hazard.
+  **Root cause confirmed and fixed (#4660, added 2026-09-27)**: it was the transient
+  admission-counter artifact after all (full account: the #4660 note on
+  §3a's 'NEW (added 2026-09-13)' #4279 bullet). **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
   ruling 14(c)'s own rationale, since the K-bound/wedge classification logic actually lives
   in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at
   PR-2 in the first place. **PR-2 has since merged** (PR #4318, `a27ec4549baa`,

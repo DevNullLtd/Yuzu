@@ -8454,6 +8454,11 @@ TEST_CASE("File spark (real mechanism): a shared-ancestor storm keeps concurrent
         std::this_thread::sleep_for(10ms);
     }
     INFO("max observed probe_workers_active=" << max_active << " (test cap=" << kTestLaneCap << ")");
+    // This bound is exact by design, not cap+1: a rejected probe launch used
+    // to make probe_workers_active read above the cap for a moment (the old
+    // fetch_add-then-check admission in SparkDetachedLane), fixed by CAS
+    // admission (#4660, tests/unit/test_spark_detached_call.cpp). A cap+1
+    // tolerance here would hide a genuine off-by-one admission bug.
     CHECK(max_active <= kTestLaneCap);
     CHECK(file_debug_counters_for_test(*raw)->probe_admission_rejected > 0); // the storm genuinely
                                                                              // pressured the lane

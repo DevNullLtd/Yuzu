@@ -8,11 +8,16 @@
 // defect an earlier "launch_forget" design had), exactly-once delivery,
 // the tightened F3-timing property (the lane/F3 counter stays nonzero
 // until the WORKER's own disposal work fully completes, not merely until
-// it decides not to publish), no-UAF on early handle destruction, and the
-// Guardian-backend_op_deadline compile-time tripwire pattern.
+// it decides not to publish), no-UAF on early handle destruction, the
+// Guardian-backend_op_deadline compile-time tripwire pattern, and (#4660)
+// CAS admission: under sustained concurrent pressure at a fixed cap,
+// active_workers() never reads above that cap; a launch that loses a CAS
+// race while a slot is free retries rather than being rejected; and racers
+// contending for the last free slot admit exactly one.
 //
 // This file is also this primitive's TSan checkpoint (shared mutable state
-// across threads) - full [spark] tag, zero races. An ASan+UBSan run was
+// across threads) - full [spark] tag, zero races (the three #4660 cases
+// postdate that run and have not yet run under TSan). An ASan+UBSan run was
 // also attempted (governance finding, PR-A round 2 - correcting an earlier
 // overclaim here) but is blocked on this box by a pre-existing, unrelated
 // protobuf/abseil static-initialization false-positive that reproduces for
@@ -33,8 +38,10 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
@@ -859,4 +866,266 @@ TEST_CASE("F3: two independent lanes sharing one counter add and subtract correc
     gate_b.release();
     REQUIRE(spin_until([&] { return f3->load() == 0; }, 5s));
     CHECK(lane_b->active_workers() == 0);
+}
+
+namespace {
+// compare_exchange-based max/min helpers - no Catch2 macro runs on a hammer
+// thread (they write a process-global line-info object; pattern at
+// test_kv_store.cpp:433), and there is no std::atomic::fetch_max in C++23.
+void update_max(std::atomic<std::size_t>& slot, std::size_t v) {
+    std::size_t cur = slot.load(std::memory_order_relaxed);
+    while (v > cur && !slot.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+void update_min(std::atomic<std::size_t>& slot, std::size_t v) {
+    std::size_t cur = slot.load(std::memory_order_relaxed);
+    while (v < cur && !slot.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+// Runs `racer(i, start)` on `n` threads. Each racer does its own setup, then
+// calls start(), which parks it at a shared start line until all n have
+// arrived, so what follows start() runs as close to simultaneously as the
+// scheduler allows. The start line yields rather than pure-spinning, so a CI
+// box with fewer cores than racers still schedules the test thread promptly.
+// Every racer is joined before this returns, on every exit path; a racer
+// still parked when an exception unwinds is released first, so the join
+// cannot hang. A racer must call start() exactly once and must not throw
+// (one that skips start() hangs this helper; one that throws terminates the
+// binary), and no Catch2 macro may run inside it (see above).
+template <typename Racer>
+void run_racers(std::size_t n, const Racer& racer) {
+    std::atomic<std::size_t> arrived{0};
+    std::atomic<bool> go{false};
+    const auto start = [&arrived, &go] {
+        arrived.fetch_add(1, std::memory_order_acq_rel);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    yuzu::test::ScopeExit join_all{[&] {
+        go.store(true, std::memory_order_release);
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }};
+    for (std::size_t i = 0; i < n; ++i)
+        threads.emplace_back([&racer, &start, i] { racer(i, start); });
+    while (arrived.load(std::memory_order_acquire) < n)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+}
+} // namespace
+
+// ── #4660: CAS admission's cap-bound invariant under sustained pressure ───
+TEST_CASE("launch: a rejection storm at the cap never lets active_workers() read above it (#4660)",
+          "[spark][detachedcall]") {
+    constexpr std::size_t kCap = 2;
+    constexpr std::size_t kHammerThreads = 4;
+    constexpr std::size_t kItersPerThread = 100'000;
+
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, kCap);
+    auto gate = std::make_shared<Gate>();
+    // Declared right after `gate` so a parked worker is unparked on every
+    // exit path, including a failing REQUIRE mid-test.
+    yuzu::test::ScopeExit release_gate{[&] { gate->release(); }};
+
+    // Fill the lane to the cap with parked workers - every hammer-thread
+    // launch below then lands on an already-full lane and must be Rejected
+    // without ever nudging `active` past kCap.
+    std::vector<DetachedCall<int>> calls;
+    for (std::size_t i = 0; i < kCap; ++i) {
+        auto res = lane.launch([gate]() -> int {
+            gate->wait();
+            return 1;
+        });
+        REQUIRE(res.status == DetachedLaunch::Launched);
+        calls.emplace_back(std::move(*res.call));
+    }
+    REQUIRE(lane.active_workers() == kCap); // admission increments synchronously - no spin needed
+
+    std::atomic<std::size_t> max_seen{kCap};
+    std::atomic<std::size_t> min_seen{kCap};
+    std::atomic<std::size_t> not_rejected{0}; // hammer launches that returned anything but Rejected
+
+    std::vector<std::thread> hammer_threads;
+    struct JoinGuard {
+        std::vector<std::thread>& threads;
+        ~JoinGuard() {
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    } join_guard{hammer_threads};
+
+    for (std::size_t t = 0; t < kHammerThreads; ++t) {
+        hammer_threads.emplace_back([&lane, &max_seen, &min_seen, &not_rejected] {
+            for (std::size_t i = 0; i < kItersPerThread; ++i) {
+                auto r = lane.launch([]() -> int { return 0; });
+                if (r.status != DetachedLaunch::Rejected)
+                    not_rejected.fetch_add(1, std::memory_order_relaxed);
+                const auto a = lane.active_workers();
+                update_max(max_seen, a);
+                update_min(min_seen, a);
+            }
+        });
+    }
+    for (auto& t : hammer_threads)
+        t.join();
+
+    // Property: can false-pass (a CAS regression to fetch_add is only caught
+    // when a sampler lands in the transient overshoot window), never
+    // false-fail (with the CAS, `active` is exactly kCap for the whole
+    // storm - the parked workers above hold every slot throughout).
+    //
+    // MUTATION-TESTED: with the pre-#4660 fetch_add(1)-then-check-then-
+    // fetch_sub shape temporarily restored, 20/20 runs of the loop below went
+    // red (observed max_seen=5 against kCap=2); with the CAS restored, 0/100
+    // (the same loop with `seq 1 100`):
+    // clang-format off
+    //   for i in $(seq 1 20); do build-macos/tests/yuzu_agent_tests "*rejection storm at the cap*" >/dev/null 2>&1 || echo RED $i; done
+    // clang-format on
+    CHECK(not_rejected.load() == 0);
+    CHECK(max_seen.load() == kCap);
+    CHECK(min_seen.load() == kCap);
+    CHECK(lane.rejected_total() == kHammerThreads * kItersPerThread);
+
+    gate->release();
+    calls.clear();
+    REQUIRE(spin_until([&] { return lane.active_workers() == 0 && f3->load() == 0; }, 5s));
+}
+
+// ── #4660: the admission CAS itself under contention ───────────────────────
+// The storm case above holds the lane full, so every hammer launch returns at
+// the cap check and the CAS never runs contended. The two cases below aim the
+// contention at the CAS: the first catches a CAS that gives up after losing a
+// race (a spurious rejection), the second a check-then-increment that is not
+// one atomic step (over-admission). Both assert counts, so neither can
+// false-fail; how often a regression is caught depends on how often racers
+// actually collide, which each case's MUTATION-TESTED note records.
+
+TEST_CASE("launch: concurrent launches are never rejected while every launcher has a free slot (#4660)",
+          "[spark][detachedcall]") {
+    constexpr std::size_t kRacers = 8;
+    constexpr std::size_t kItersPerRacer = 20'000;
+
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    // cap == racer count, and the LaunchFailed seam rolls each admission back
+    // before launch() returns, so a racer never holds a slot while it loads
+    // `active`: it can see at most kRacers-1 other admissions, which always
+    // leaves it a free slot. A correct CAS therefore never rejects here. The
+    // seam also means no worker thread is ever spawned, so the loop runs at
+    // full speed and the racers collide on `active` constantly.
+    SparkDetachedLane lane(f3, kRacers);
+    lane.set_fail_launch_for_test(true);
+
+    std::array<std::size_t, kRacers> not_launch_failed{}; // one slot per racer, read after the join
+    run_racers(kRacers, [&](std::size_t r, const auto& start) {
+        start();
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < kItersPerRacer; ++i) {
+            if (lane.launch([]() -> int { return 0; }).status != DetachedLaunch::LaunchFailed)
+                ++n;
+        }
+        not_launch_failed[r] = n;
+    });
+
+    std::size_t total_not_launch_failed = 0;
+    for (const auto n : not_launch_failed)
+        total_not_launch_failed += n;
+    // MUTATION-TESTED: with the CAS made single-shot (a lost race rejects),
+    // 20/20 runs of the loop below went red (first red run: 108487 of 160000
+    // launches rejected); with the pre-#4660 fetch_add shape or a non-atomic
+    // load/check/fetch_add, 0/20 - those are the other two cases' targets.
+    // With the CAS restored, 0/100 (the same loop with `seq 1 100`):
+    // clang-format off
+    //   for i in $(seq 1 20); do build-macos/tests/yuzu_agent_tests "*never rejected while every launcher*" >/dev/null 2>&1 || echo RED $i; done
+    // clang-format on
+    CHECK(total_not_launch_failed == 0);
+    CHECK(lane.rejected_total() == 0);
+    CHECK(lane.launch_failed_total() == kRacers * kItersPerRacer);
+    CHECK(lane.active_workers() == 0); // every admission was rolled back before its launch() returned
+    CHECK(f3->load() == 0);
+}
+
+TEST_CASE("launch: racers contending for the last free slot admit exactly one per round (#4660)",
+          "[spark][detachedcall]") {
+    constexpr std::size_t kRacers = 8;
+    constexpr std::size_t kRounds = 200;
+
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkDetachedLane lane(f3, 1);
+    auto gate = std::make_shared<Gate>();
+    // Declared right after `gate` so every parked worker is unparked on every
+    // exit path, including a failing REQUIRE mid-test.
+    yuzu::test::ScopeExit release_gate{[&] { gate->release(); }};
+
+    // Every round's winner stays parked until the end, and each round raises
+    // the cap to one above the parked count, so each round opens exactly one
+    // free slot with no drain in between. A correct CAS admits exactly one
+    // racer per round; a check-then-increment that is not one atomic step
+    // lets through every racer that read the same `active`.
+    std::vector<DetachedCall<int>> parked;
+    std::size_t rounds_not_one = 0;    // rounds whose Launched count was not exactly 1
+    std::size_t rounds_over_cap = 0;   // rounds where a racer read active_workers() above the cap
+    std::size_t unexpected_status = 0; // launches that were neither Launched nor Rejected
+
+    for (std::size_t round_no = 0; round_no < kRounds; ++round_no) {
+        const std::size_t round_cap = lane.active_workers() + 1;
+        lane.set_cap_for_test(round_cap);
+
+        std::array<std::optional<DetachedLaunch>, kRacers> status{};
+        std::array<std::optional<DetachedCall<int>>, kRacers> won{};
+        std::atomic<std::size_t> round_max{0};
+        run_racers(kRacers, [&](std::size_t r, const auto& start) {
+            // Built before the start line, so the race is launch() alone and
+            // not also this shared_ptr copy's refcount traffic.
+            auto fn = [gate]() -> int {
+                gate->wait();
+                return 1;
+            };
+            start();
+            auto res = lane.launch(std::move(fn));
+            update_max(round_max, lane.active_workers());
+            status[r] = res.status;
+            if (res.status == DetachedLaunch::Launched)
+                won[r].emplace(std::move(*res.call));
+        });
+
+        std::size_t launched = 0;
+        for (std::size_t r = 0; r < kRacers; ++r) {
+            if (status[r] == DetachedLaunch::Launched) {
+                ++launched;
+                parked.push_back(std::move(*won[r]));
+            } else if (status[r] != DetachedLaunch::Rejected) {
+                ++unexpected_status;
+            }
+        }
+        if (launched != 1)
+            ++rounds_not_one;
+        if (round_max.load() > round_cap)
+            ++rounds_over_cap;
+    }
+
+    // MUTATION-TESTED: with a non-atomic load/check/fetch_add admission, 20/20
+    // runs of the loop below went red (first red run: 25 of 200 rounds
+    // admitted more than one racer); with the pre-#4660 fetch_add shape, 20/20
+    // red on rounds_over_cap alone (its transient over-cap gauge reading); with a
+    // single-shot CAS, 0/20 - the previous case's target. With the CAS
+    // restored, 0/100 (the same loop with `seq 1 100`):
+    // clang-format off
+    //   for i in $(seq 1 20); do build-macos/tests/yuzu_agent_tests "*last free slot*" >/dev/null 2>&1 || echo RED $i; done
+    // clang-format on
+    CHECK(unexpected_status == 0);
+    CHECK(rounds_not_one == 0);
+    CHECK(rounds_over_cap == 0);
+    CHECK(parked.size() == kRounds);
+    CHECK(lane.active_workers() == parked.size());
+    CHECK(lane.rejected_total() == kRounds * (kRacers - 1));
+
+    gate->release();
+    parked.clear();
+    REQUIRE(spin_until([&] { return lane.active_workers() == 0 && f3->load() == 0; }, 5s));
 }

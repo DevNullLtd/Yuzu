@@ -719,16 +719,34 @@ public:
         using P = detached_detail::Payload<T, DFn>;
 
         // Phase 1: admission. fn_in is NOT touched anywhere in this phase -
-        // see the header comment. active.fetch_add(1)+1 > cap -> Rejected,
-        // rolled back, fn_in returned unconsumed.
-        const std::size_t prev = state_->active.fetch_add(1, std::memory_order_acq_rel);
-        if (prev + 1 > state_->cap.load(std::memory_order_acquire)) {
-            state_->active.fetch_sub(1, std::memory_order_acq_rel);
-            state_->rejected_total.fetch_add(1, std::memory_order_relaxed);
-            Result r;
-            r.status = DetachedLaunch::Rejected;
-            r.fn.emplace(std::forward<Fn>(fn_in));
-            return r;
+        // see the header comment. Admission is a compare_exchange_weak loop
+        // (#4660): `active` is raised only from cur to cur+1 while cur < cap,
+        // so under a fixed cap it can never be observed above that cap - a
+        // rejected launch never touches `active` at all. `cap` is re-read on
+        // every iteration, so a live set_cap_for_test() takes effect at the
+        // next check (a launch already past its check is unaffected). A failed
+        // CAS reloads `cur` and retries, whether another thread changed
+        // `active` or the weak CAS failed spuriously; the loop leaves only by
+        // admitting or by rejecting at the cap check, so losing a race never
+        // turns into a rejection while a slot is free. This replaces an
+        // earlier fetch_add(1)-then-check-then-fetch_sub shape whose two
+        // consequences are now closed: the gauge could read above the cap
+        // (one over per concurrently rejected launch) between a rejected
+        // launch's increment and its own rollback, and a concurrent launch
+        // landing in that same window could be rejected even though a slot
+        // was free.
+        std::size_t cur = state_->active.load(std::memory_order_acquire);
+        for (;;) {
+            if (cur >= state_->cap.load(std::memory_order_acquire)) {
+                state_->rejected_total.fetch_add(1, std::memory_order_relaxed);
+                Result r;
+                r.status = DetachedLaunch::Rejected;
+                r.fn.emplace(std::forward<Fn>(fn_in));
+                return r;
+            }
+            if (state_->active.compare_exchange_weak(
+                    cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
         }
         if (state_->f3_counter)
             state_->f3_counter->fetch_add(1, std::memory_order_acq_rel);
@@ -875,7 +893,11 @@ public:
     }
 
     /// This LANE's own outstanding-worker count (mirrors the shared F3
-    /// counter's contribution from this lane specifically). Lock-free.
+    /// counter's contribution from this lane specifically). Lock-free. Under
+    /// a cap fixed for the lane's lifetime, CAS admission (#4660) guarantees
+    /// this never reads above that cap - see set_cap_for_test()'s doc
+    /// comment for why a cap changed while the lane is in use carries no
+    /// such guarantee.
     [[nodiscard]] std::size_t active_workers() const noexcept {
         return state_->active.load(std::memory_order_acquire);
     }
@@ -893,6 +915,12 @@ public:
     /// - a deliberate, well-defined configuration (the cap-rejection
     /// regression test uses it to force Rejected deterministically, without
     /// needing a real concurrent saturating worker), not clamped up to 1.
+    /// Lowering the cap does not evict running workers, and a launch already
+    /// in flight may still admit against the old cap, so active_workers() may
+    /// exceed the NEW cap until workers drain - the never-above-cap bound
+    /// documented on active_workers() holds for a cap fixed over the lane's
+    /// lifetime, which every production lane has; it is not a guarantee
+    /// about a cap that changes while the lane is in use.
     void set_cap_for_test(std::size_t cap) noexcept {
         state_->cap.store(cap, std::memory_order_relaxed);
     }
