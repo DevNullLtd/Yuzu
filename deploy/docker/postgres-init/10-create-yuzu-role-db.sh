@@ -22,10 +22,32 @@
 #                     POSTGRES_PASSWORD. There is deliberately no fallback
 #                     to the superuser password: a leaked app DSN must never
 #                     disclose superuser credentials (PR #1334 review, S1).
+#   YUZU_PG_RESERVED_CONNECTIONS
+#                     Connection slots reserved for the app role, ahead of
+#                     every other client (HA WS-8, #4943; default: 40, 0 =
+#                     none). The app role is granted
+#                     pg_use_reserved_connections (PG 16+) so its pool AND
+#                     its /readyz probe draw from that reserve — a backup
+#                     job or an ad-hoc psql session can then never take the
+#                     slot the probe needs to reconnect, which would red a
+#                     replica on a database that still serves. On the
+#                     single-node image the number is applied with ALTER
+#                     SYSTEM (takes effect when the entrypoint restarts the
+#                     server after initdb); under Patroni (PATRONI_SCOPE
+#                     set) the entrypoint renders it into the bootstrap
+#                     parameters instead, because Patroni owns
+#                     postgresql.conf and warns on ALTER SYSTEM overrides.
+#                     Size it at N_servers x (--postgres-pool-size + 2).
 set -euo pipefail
 
 YUZU_DB_USER="${YUZU_DB_USER:-yuzu}"
 YUZU_DB_NAME="${YUZU_DB_NAME:-yuzu}"
+YUZU_PG_RESERVED_CONNECTIONS="${YUZU_PG_RESERVED_CONNECTIONS:-40}"
+if ! [[ "${YUZU_PG_RESERVED_CONNECTIONS}" =~ ^[0-9]{1,6}$ ]]; then
+    echo "yuzu-postgres init: ERROR — YUZU_PG_RESERVED_CONNECTIONS must be a non-negative integer" >&2
+    echo "  (got '${YUZU_PG_RESERVED_CONNECTIONS}')." >&2
+    exit 1
+fi
 
 # ── Credential / identity guards (S1 + S4) ───────────────────────────────
 if [[ -z "${YUZU_DB_PASSWORD:-}" ]]; then
@@ -119,4 +141,61 @@ CREATE EXTENSION IF NOT EXISTS vector;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 EOSQL
 
-echo "yuzu-postgres init: role '${YUZU_DB_USER}' + database '${YUZU_DB_NAME}' ready (pgvector installed)"
+# ── Reserved connection slots for the app role (HA WS-8, #4943) ──────────
+# pg_use_reserved_connections + reserved_connections exist from PG 16. The
+# GRANT is what makes the reserve reach the app: it applies to every session
+# the role opens — the server's pool and its /readyz probe alike — so the
+# probe's reconnect is never refused ahead of a pool connect (the probe must
+# see exactly what a fresh pool connection sees; a probe-only privilege
+# would report ready while pool connects fail). On an older server the grant
+# would fail, so it is skipped with a notice rather than aborting initdb.
+# The setting itself is postmaster-context (server start): ALTER SYSTEM here
+# lands in postgresql.auto.conf and takes effect when the upstream entrypoint
+# restarts the server after initdb. Under Patroni the entrypoint owns the
+# parameter (see the header), so only the GRANT runs here.
+server_version_num=$(psql -At -v ON_ERROR_STOP=1 \
+    --username "${POSTGRES_USER}" --dbname postgres -c "SHOW server_version_num")
+if (( server_version_num >= 160000 )); then
+    psql -v ON_ERROR_STOP=1 -v yuzu_user="${YUZU_DB_USER}" \
+         --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'
+SELECT format('GRANT pg_use_reserved_connections TO %I', :'yuzu_user')
+\gexec
+EOSQL
+    if [[ -z "${PATRONI_SCOPE:-}" ]]; then
+        # Bound the reserve against the LIVE cluster (an operator may have passed
+        # their own -c max_connections=... to `docker run`, so the check reads it
+        # back rather than assuming the image default). reserved_connections is a
+        # hard carve-out on Postgres: set it at or past max_connections minus
+        # superuser_reserved_connections and NO ordinary (non-privileged) client —
+        # a backup job, Grafana's DSN, an operator's own psql — can ever connect
+        # again, not merely under load (security-guardian, Gate 2 finding #1).
+        max_conn=$(psql -At -v ON_ERROR_STOP=1             --username "${POSTGRES_USER}" --dbname postgres -c "SHOW max_connections")
+        su_reserved=$(psql -At -v ON_ERROR_STOP=1             --username "${POSTGRES_USER}" --dbname postgres -c "SHOW superuser_reserved_connections")
+        ordinary_floor=$(( max_conn - su_reserved ))
+        if (( YUZU_PG_RESERVED_CONNECTIONS >= ordinary_floor )); then
+            echo "yuzu-postgres init: ERROR — YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS}" >&2
+            echo "  is >= max_connections(${max_conn}) - superuser_reserved_connections(${su_reserved}) = ${ordinary_floor}." >&2
+            echo "  That leaves ZERO connection slots any ordinary (non-privileged) client can ever use —" >&2
+            echo "  not merely under load. Lower YUZU_PG_RESERVED_CONNECTIONS or raise max_connections." >&2
+            echo "  NOTE: the role/database above already exist on this data directory now — restarting" >&2
+            echo "  this same container with a corrected value will NOT re-run this script (initdb-once)" >&2
+            echo "  and will silently start WITHOUT the fix applied. Either wipe this data volume and" >&2
+            echo "  start fresh, or apply reserved_connections/the GRANT by hand per the 'Existing" >&2
+            echo "  databases' steps in docs/user-manual/server-admin.md." >&2
+            exit 1
+        fi
+        psql -v ON_ERROR_STOP=1 -v n="${YUZU_PG_RESERVED_CONNECTIONS}" \
+             --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'
+SELECT format('ALTER SYSTEM SET reserved_connections = %s', :'n'::int)
+\gexec
+EOSQL
+        reserved_note="reserved_connections=${YUZU_PG_RESERVED_CONNECTIONS} (applied at server start)"
+    else
+        reserved_note="reserved_connections rendered by the Patroni entrypoint"
+    fi
+    reserved_note="${reserved_note}; ${YUZU_DB_USER} granted pg_use_reserved_connections"
+else
+    reserved_note="server_version_num=${server_version_num} < 160000: no reserved_connections support, skipped"
+fi
+
+echo "yuzu-postgres init: role '${YUZU_DB_USER}' + database '${YUZU_DB_NAME}' ready (pgvector installed; ${reserved_note})"

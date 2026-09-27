@@ -5,10 +5,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 
@@ -19,6 +22,7 @@
 using yuzu::server::OfflineEndpoint;
 using yuzu::server::OfflineEndpointStore;
 using yuzu::server::PresenceIdentity;
+using yuzu::server::PresenceReadError;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -54,6 +58,15 @@ const PresenceIdentity* find_presence(const std::vector<PresenceIdentity>& v,
         if (e.agent_id == id)
             return &e;
     return nullptr;
+}
+
+// #4981 PR-1 (Finding B1): query_live_ids now returns std::expected — this
+// unwraps the healthy-path result for the pre-existing tests below, which all
+// exercise a live/reachable store and only ever cared about the row set.
+std::vector<PresenceIdentity> live_ids_ok(OfflineEndpointStore& s, std::chrono::seconds ttl) {
+    auto r = s.query_live_ids(ttl);
+    REQUIRE(r.has_value());
+    return *r;
 }
 
 } // namespace
@@ -164,7 +177,7 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
     SECTION("query_live_ids returns identity fields for a recent row") {
         REQUIRE(store.upsert("agent-p1", "host-p1", "linux", t, 0, "1.0.0", "x86_64",
                              "sess-1"));
-        auto rows = store.query_live_ids(std::chrono::hours(1));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
         const auto* p = find_presence(rows, "agent-p1");
         REQUIRE(p != nullptr);
         CHECK(p->hostname == "host-p1");
@@ -180,7 +193,7 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         // exactly the #3715 precedent (never the replica's own clock, and
         // here not even the client-supplied last_heartbeat_ms).
         REQUIRE(store.upsert("agent-freshseen", "h", "linux", t - 86'400'000, 0, "", "", ""));
-        auto rows = store.query_live_ids(std::chrono::seconds(60));
+        auto rows = live_ids_ok(store, std::chrono::seconds(60));
         CHECK(find_presence(rows, "agent-freshseen") != nullptr);
     }
 
@@ -188,28 +201,28 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         // A ttl of 0 means "nothing is live" (last_seen_at is authored at
         // upsert time, strictly before the read's now()).
         REQUIRE(store.upsert("agent-stale", "h", "linux", t, 0, "", "", "sess-x"));
-        auto rows = store.query_live_ids(std::chrono::seconds(0));
+        auto rows = live_ids_ok(store, std::chrono::seconds(0));
         CHECK(find_presence(rows, "agent-stale") == nullptr);
     }
 
     SECTION("remove_if_session no-ops on a session mismatch") {
         REQUIRE(store.upsert("agent-guard", "h", "linux", t, 0, "", "", "sess-real"));
         CHECK_FALSE(store.remove_if_session("agent-guard", "sess-stale"));
-        auto rows = store.query_live_ids(std::chrono::hours(1));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
         CHECK(find_presence(rows, "agent-guard") != nullptr); // row survives
     }
 
     SECTION("remove_if_session deletes on a session match") {
         REQUIRE(store.upsert("agent-guard2", "h", "linux", t, 0, "", "", "sess-real2"));
         CHECK(store.remove_if_session("agent-guard2", "sess-real2"));
-        auto rows = store.query_live_ids(std::chrono::hours(1));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
         CHECK(find_presence(rows, "agent-guard2") == nullptr);
     }
 
     SECTION("remove_if_session rejects an empty session_id — never a bare agent_id delete") {
         REQUIRE(store.upsert("agent-guard3", "h", "linux", t, 0, "", "", "sess-real3"));
         CHECK_FALSE(store.remove_if_session("agent-guard3", ""));
-        auto rows = store.query_live_ids(std::chrono::hours(1));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
         CHECK(find_presence(rows, "agent-guard3") != nullptr);
     }
 
@@ -221,7 +234,7 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         // waits out the TTL instead, which is always safe.
         REQUIRE(store.upsert("agent-raced", "h", "linux", t, 0, "", "", ""));
         CHECK_FALSE(store.remove_if_session("agent-raced", ""));
-        auto rows = store.query_live_ids(std::chrono::hours(1));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
         CHECK(find_presence(rows, "agent-raced") != nullptr);
     }
 }
@@ -249,4 +262,95 @@ TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][
     REQUIRE(pool.valid());
     OfflineEndpointStore store{pool};
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ = true
+
+    // #4981 PR-1 (Finding B1): a store that never opened reports
+    // PresenceReadError::StoreUnavailable on query_live_ids, never a silent
+    // empty vector — the SAME "cannot answer" surface a live-but-degraded
+    // read produces below.
+    auto r = store.query_live_ids(std::chrono::hours(1));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == PresenceReadError::StoreUnavailable);
+}
+
+// #4981 PR-1 (Finding B1): query_live_ids's typed failure surface. Genuine
+// backend failure (DbError, deterministic lock-timeout fault injection — the
+// established pattern in this repo, see test_result_set_store.cpp) and the
+// new row-cap truncation case (Truncated).
+TEST_CASE("OfflineEndpointStore query_live_ids reports DbError on a genuine query failure, "
+          "not a silent empty vector",
+          "[pg][offline]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.query_live_ids(std::chrono::hours(1));
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == PresenceReadError::DbError);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.query_live_ids(std::chrono::hours(1));
+    REQUIRE(recovered.has_value());
+}
+
+TEST_CASE("OfflineEndpointStore query_live_ids reports Truncated past kQueryRowCap, "
+          "succeeds normally exactly at the cap",
+          "[pg][offline][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+    SECTION("exactly kQueryRowCap rows: succeeds, no Truncated") {
+        std::string sql =
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            std::to_string(OfflineEndpointStore::kQueryRowCap) + ") g";
+        PgResult ins{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(ins.ok());
+
+        auto r = store.query_live_ids(std::chrono::hours(1));
+        REQUIRE(r.has_value());
+        CHECK(r->size() == static_cast<std::size_t>(OfflineEndpointStore::kQueryRowCap));
+        CHECK(metrics
+                  .counter("yuzu_server_agent_presence_store_failed_total",
+                           {{"op", "query_live_ids"}, {"reason", "truncated"}})
+                  .value() == 0);
+    }
+
+    SECTION("kQueryRowCap + 1 rows: Truncated, never a silently-partial vector") {
+        std::string sql =
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            std::to_string(OfflineEndpointStore::kQueryRowCap + 1) + ") g";
+        PgResult ins{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(ins.ok());
+
+        auto r = store.query_live_ids(std::chrono::hours(1));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PresenceReadError::Truncated);
+        CHECK(metrics
+                  .counter("yuzu_server_agent_presence_store_failed_total",
+                           {{"op", "query_live_ids"}, {"reason", "truncated"}})
+                  .value() == 1);
+    }
 }

@@ -1,0 +1,35 @@
+Tree: tests/unit/fixtures/wave10/browser_policy/linux/ (tree.manifest, MATERIALIZED AT RUNTIME by
+tests/unit/test_browser_policy_parsers.cpp into a yuzu_test_browser_policy_ temp root).
+Package: P2b-1 (browser_policy Linux leg), workstream ws-10.2b, 2026-09-21.
+
+Manifest format: one `<relative-path><TAB><payload>` line per file; payload is `T:<text>` (escapes
+\n \t \\), `B:<base64>` or `L:<symlink target>`; lines starting with `#` are comments. The fixtures are
+multi-line JSON, so they live in the manifest rather than as tracked files (one materializer scheme,
+defined and unit-tested by the test TU).
+
+== etc/opt/chrome/policies/managed/chrome_managed.json ==
+status: SYNTHETIC -- not a real capture (Alex sign-off 2026-09-21; Phase-0 decision 2 waives the
+        real-capture rule for Chrome and Firefox only -- neither browser is installed on the capture
+        hosts available to this run).
+schema source: Chrome Enterprise policy file format (top-level JSON object, one key per policy):
+        https://www.chromium.org/administrators/linux-quick-start/
+        https://chromeenterprise.google/policies/
+content: eight documented policy names covering every JSON value type the mapper models except real/null
+        (bool, int, string, list, dict).
+carries the header comment `SYNTHETIC -- not a real capture (Alex sign-off 2026-09-21)` (an em dash in
+the file); asserted by test_browser_policy_parsers.cpp.
+
+== etc/opt/chrome/policies/recommended/chrome_recommended.json ==
+status: SYNTHETIC -- not a real capture (Alex sign-off 2026-09-21). Same schema source as above.
+carries the same header comment.
+
+== etc/opt/edge/policies/managed/edge_managed.json ==
+status: RECONSTRUCTION -- hand-written from Microsoft's documented Edge policy names and Linux policy
+        location (/etc/opt/edge/policies/managed), not captured from a host. The Edge sign-off does NOT
+        extend to a synthetic capture: a real Edge capture comes from the-rig session in the
+        Windows follow-up PR (registry) and ws-10.2a (user-data files).
+doc: https://learn.microsoft.com/deployedge/microsoft-edge-policies
+carries a header comment naming RECONSTRUCTION and the doc above.
+
+Chromium (/etc/chromium/policies/managed) is exercised by inline hand-written JSON in the test TU
+(RECONSTRUCTION), not by a fixture file.

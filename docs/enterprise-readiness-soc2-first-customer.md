@@ -77,6 +77,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 ### Evidence
 
 - SSO configuration records, role assignment exports, access review sign-offs, and sampled auth logs.
+- **RBAC enforcement-state changes (A1):** every `PUT /api/v1/rbac/enforcement` / `set_rbac_enforcement` toggle attempt either persists an attributable `rbac.enforcement_changed` row (`docs/user-manual/audit-log.md`) naming the caller, the before/after state, and the post-transition administrator count, or fails **closed** rather than silently succeeding unaudited (REST `503`; MCP `audit_persisted:false`) — the `yuzu_server_rbac_enforcement_enabled` gauge transition serves as an independent trace of the same event during that window. A **refused** attempt — whether it is denied structurally BEFORE the admin gate ever runs (a service-scoped token or an engine session, both refused unconditionally) or denied by the gate/store-level guard itself after clearing those structural checks (not a durable Administrator, the caller-authority/regime check, or the destination-survival check) — is ALSO captured as a `denied` row with cause, not silently dropped — exactly the lockout-risk-relevant evidence this section exists to promote. The `yuzu_server_rbac_enforcement_enabled` gauge plus the threshold-free `YuzuRbacEnforcementChanged` alert and its direction-aware `YuzuRbacEnforcementDisabled` warning-severity companion (`docs/prometheus/yuzu-alerts.yml`) give a real-time, cross-replica-convergent signal independent of the audit log for the same event.
 
 **Addendum — the access-review export was readable by any authenticated user on a
 default install until #2376 (CC6.2/CC6.1).** Recorded here because this section cites
@@ -155,6 +156,32 @@ default-deny makes redundant are scheduled for Phase 2 consolidation, not
 retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
 closed route inventory:
 `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+
+**Addendum — `POST /api/v1/result-sets/from-inventory-query` service-scope
+regression, closed (CC6.1/CC6.3, #4980, 2026-09-25).** The addendum above's
+closed route inventory (row 25) correctly reported this route's
+service-scope gap as closed on 2026-08-18 — that closure was real. An
+unrelated confinement fix on 2026-09-12 (`606b9ec72`, closing a real
+management-group scoping gap on this same route) replaced the route's
+`require_permission` gate with the ADR-0017 `fleet_read_fn` admit-then-filter
+chokepoint, whose service-scope branch admits-and-confines a service-scoped
+caller UNDER RBAC-ON rather than denying it outright (it still hard-403s
+under RBAC-off, same as `require_permission`) — silently reopening the
+cross-service-reach class the flip had closed, on this one route, in
+RBAC-enabled deployments only. #4980 closed it again with a dedicated
+`deny_fleet_wide_service_scoped` call that no longer depends on which
+underlying gate this route uses, matching the route's 8 non-dispatch
+siblings. **For any assessment covering the period 2026-09-12 through
+#4980's merge, on a deployment with RBAC enabled, treat this one route as
+NOT covered by the flip's confinement guarantee above** — a service-scoped
+token holding `Inventory:Read` could, during that window, mint a result
+set that its minting principal's other tokens/session could then read
+back (owner-scoping keys on the minting principal's identity, not the
+token's own service tag). RBAC-off deployments (the default) were never
+exposed by this regression. No other route in the closed inventory is
+affected; this is a single-route regression-and-fix, not a reopening of
+the flip's broader closure. Correction also recorded in the route
+inventory doc itself.
 
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —

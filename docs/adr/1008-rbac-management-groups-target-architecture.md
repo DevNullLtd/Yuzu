@@ -195,6 +195,45 @@ cross-store transactional check, and the audit event described above have no cod
 them yet, precisely because no enable path exists -- they are binding on whatever implements D2,
 not a claim about current behavior.
 
+**Delivery note (A1, 2026-09).** The `#388` non-conformance above is now CLOSED for the enable
+path: `PUT /api/v1/rbac/enforcement` + the `set_rbac_enforcement` MCP tool ship an atomic,
+same-transaction, row-locked enable/disable toggle (`RbacStore::set_rbac_enforcement`), and
+`set_rbac_enabled` now returns `std::expected<void, std::string>` (kept as a deliberately
+UNGUARDED seed/test primitive for the ~70 existing test call sites that need it, never called
+from a route or MCP handler). The cross-store transactional check this decision calls for is
+built: the guard runs inside `RbacStore`'s own transaction, over the SAME row-locked
+`principal_roles JOIN auth.users` set (`FOR UPDATE OF pr`) `unassign_role`'s (D3's) own
+last-Administrator guard takes -- one shared fragment, not two copies -- closing exactly the
+race this section's Gate-4 finding describes for the checked-Administrator-account case. Three
+narrow, deliberate deviations from the literal decision text above, each with its own tracked
+follow-up rather than silently left unstated:
+
+1. **No self-grant bootstrap.** The shipped guard is *caller-inclusive* (the transition is
+   refused unless the CALLER would remain a durable administrator under the destination regime)
+   rather than *self-granting* (minting a fresh Administrator grant for an `admin`-session
+   caller who lacks one). A caller who fails the guard is refused with a remediation naming the
+   exact assignment call (`assign_rbac_role` / `POST .../roles/Administrator/assignments`) rather
+   than having standing authority minted on their behalf. This is a stricter posture than D2's
+   self-grant branch, not a weaker one -- it never mints authority nobody asked for -- but it is
+   a genuine deviation from the literal text above; the self-grant branch (and the fresh
+   staleness/precondition hazards Gate-5 raised against it) is not built.
+2. **No `auth.users` row lock under the toggle's own transaction.** D2's "same transaction, same
+   isolation" requirement is satisfied for the `principal_roles` side (the `FOR UPDATE OF pr`
+   lock above); the disable direction's `auth.users.role='admin'` read is a single, lock-free
+   snapshot, matching `unassign_role`'s own no-lock parity with `auth.users` (locking it would
+   serialize unrelated logins/role-changes). The residual -- a concurrent deactivation/demotion
+   of the checked account landing between the read and the toggle's commit -- is the SAME ongoing
+   case D2's own "cannot produce zero active Administrators... not only at enable time" clause
+   flags, tracked as [#4966](https://github.com/Tr3kkR/Yuzu/issues/4966) and Priority C item 4.1
+   (a joint-transaction primitive), not closed by this delivery.
+3. **MFA step-up is the existing `require_mfa_step_up` policy, not a fresh, uniform proof.** The
+   REST route calls `step_up_fn` exactly where A2's role-assignment route does; the MCP tool
+   carries no step-up call at all (supervised-tier approval instead). Because `api_token`/
+   `mcp_token` sessions are exempt from `require_mfa_step_up` (token issuance is treated as the
+   step-up moment) and approval is an authorization control, not an MFA proof, the toggle is not
+   uniformly MFA-gated across every principal class today -- tracked as Priority C item 4.1 ("MFA
+   step-up design for admin actions"), not a defect introduced by this delivery.
+
 ### D3 -- One assignment chokepoint for every principal type and scope; deny at assignment level is a decided, not silent, extension of the frozen lattice
 
 **The decision is one write CHOKEPOINT, not one table.** Every role assignment or revocation --

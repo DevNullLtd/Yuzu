@@ -798,7 +798,19 @@ bool AgentRegistry::has_any_reachable() const {
     // all_ids()/evaluate_scope() already share, so this costs nothing beyond
     // has_any()'s own lock in the common (non-empty) case above, and at most
     // one cached-or-fresh presence read otherwise.
-    return !live_presence().empty();
+    //
+    // #4981 PR-1 (Finding B5): a DEGRADED presence read is treated as
+    // "reachable" (true), not "unreachable". Returning false here is what
+    // fires command_routes.cpp's/server.cpp's pre-dispatch "no agent
+    // connected" 503 BEFORE evaluate_scope() ever runs — a confusingly wrong
+    // diagnosis for a presence-store outage. Letting the request proceed
+    // means the ladder reaches evaluate_scope(), which produces the SPECIFIC
+    // `Kind::PresenceDegraded` abort reason instead. With zero local agents
+    // this function's answer makes no difference to whether a Broadcast
+    // actually reaches anyone (it reaches nobody either way) — this change
+    // only affects which error surfaces, never widens actual reach.
+    auto presence = live_presence();
+    return !presence || !presence->empty();
 }
 
 std::string AgentRegistry::display_name(const std::string& agent_id) const {
@@ -988,6 +1000,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // network_diag
         {"network_diag.listening", "List listening TCP ports"},
         {"network_diag.connections", "List established TCP connections"},
+        // browser_policy
+        {"browser_policy.policies",
+         "List enterprise-managed Chrome/Chromium/Edge browser policies (Linux JSON policy "
+         "files; Windows and macOS legs planned)"},
         // msi_packages
         {"msi_packages.list", "List installed packages (Windows MSI / macOS pkgutil receipts)"},
         {"msi_packages.product_codes",
@@ -1002,6 +1018,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // system_hardening
+        {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
@@ -1455,7 +1473,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     // a configured one (the production default — see live_presence()'s own
     // doc comment for why this is NOT gated behind an HA-only signal) costs
     // at most one cached-or-fresh read, never a bare per-call round trip.
-    std::vector<PresenceIdentity> presence = live_presence();
+    //
+    // #4981 PR-1: this method's signature/contract predates the typed
+    // PresenceReadError split and stays a plain vector — a degraded read
+    // degrades to local-only visibility (byte-identical to the pre-#4981
+    // "empty on error" behavior), never a hard failure. `evaluate_scope`
+    // (below) is the ONE consumer that needs the typed distinction, because
+    // only it makes a dispatch/enforce decision a silently-narrowed fleet
+    // view can invert under a NOT combinator; this method's callers
+    // (confined_broadcast's sink, an empty-scope Guardian push) are already
+    // tracked separately for the same weakness (#5007) and are not widened
+    // here.
+    std::vector<PresenceIdentity> presence = live_presence().value_or(std::vector<PresenceIdentity>{});
 
     std::lock_guard lock(mu_);
     std::vector<std::string> ids;
@@ -1490,14 +1519,17 @@ void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono:
     presence_ttl_ = ttl;
 }
 
-std::vector<PresenceIdentity> AgentRegistry::live_presence() const {
+std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
     if (!presence_store_)
-        return {};
+        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
-    // cached copy.
+    // cached copy. #4981 PR-1 B2: a degraded read is cached and served back
+    // for the SAME window a success would be — negative-caching a failure,
+    // not just a success — so a sustained outage pays exactly one real query
+    // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
         presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
         presence_cache_at_ = now;
@@ -1584,15 +1616,16 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
 // (id extraction, not a prefix-suffix walk) and from_result_set: has no
 // synthetic interplay worth encoding.
 
-std::optional<std::vector<std::string>>
-AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                              std::string_view principal) const {
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                                   const CustomPropertiesStore* props_store,
+                                   ResultSetStore* rs_store, std::string_view principal,
+                                   ScopePopulation population) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
     // store query per agent while holding mu_ (review finding F). The owner join
     // in member_set_owned is the authorization gate: a set `principal` does not
-    // own yields an empty membership and therefore never matches, so an operator
+    // own now ABORTS the whole evaluation (#4981 PR-1 A1/A3), so an operator
     // cannot target another operator's set by id (review finding B1). Aliases
     // are not resolved here; callers that accept aliases pre-resolve them.
     std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
@@ -1606,12 +1639,12 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         // NOT combinator that INVERTS to "matches every agent" — a
         // fleet-wide match reachable without any DB error at all. The
         // original guard lived inside `if (rs_store)`, so the callers that
-        // pass NO store (e.g. the Guardian push paths) skipped it entirely
-        // and silently evaluated the atom false — exactly the inversion
-        // hazard, and for a Guardian rule that arms an enforcing guard, a
-        // fleet-wide arm. Abort rather than silently no-match. NARROW by
-        // construction: a scope with no from_result_set: atom is completely
-        // unaffected.
+        // pass NO store (e.g. the Guardian push paths — now
+        // evaluate_scope_local) skipped it entirely and silently evaluated
+        // the atom false — exactly the inversion hazard, and for a Guardian
+        // rule that arms an enforcing guard, a fleet-wide arm. Abort rather
+        // than silently no-match. NARROW by construction: a scope with no
+        // from_result_set: atom is completely unaffected.
         std::vector<std::string> refs;
         collect_result_set_ids(expr, refs);
         if (!refs.empty() && (rs_store == nullptr || principal.empty())) {
@@ -1620,7 +1653,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                           rs_store == nullptr ? "no ResultSetStore is wired to resolve it"
                                               : "no principal was supplied to owner-resolve "
                                                 "against");
-            return std::nullopt;
+            return std::unexpected(ScopeEvalError{
+                rs_store == nullptr ? ScopeEvalError::Kind::Unresolvable
+                                    : ScopeEvalError::Kind::PrincipalUnresolved,
+                {}});
         }
         if (rs_store && !principal.empty()) {
             const std::string owner(principal);
@@ -1629,23 +1665,43 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
                 if (!mem) {
-                    // ADR-0036 fail-closed contract: a Postgres error mid-preload
-                    // ABORTS the whole evaluation — never proceed with a partial
-                    // membership map. Under a NOT combinator, an atom missing from
-                    // rs_members would resolve "" (no match) and INVERT to "matches
-                    // every agent" — the concrete fleet-wide fail-open this guards
-                    // against (a degraded/transient DB blip must never silently
-                    // expand a scope to the entire fleet).
-                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded for "
+                    // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
+                    // statement query now type-distinguishes a genuine DB
+                    // error (StoreDegraded) from the set being absent/expired
+                    // or not owned by `principal` (both collapse to
+                    // OwnerCheckFailed — a caller must never be able to tell
+                    // "doesn't exist" from "exists but isn't yours", the same
+                    // oracle-safety contract rest_api_v1.cpp's load_owned
+                    // already maintains). EITHER WAY this ABORTS the whole
+                    // evaluation — never proceed with a partial membership
+                    // map: under a NOT combinator, an atom missing from
+                    // rs_members would resolve "" (no match) and INVERT to
+                    // "matches every agent", the fleet-wide fail-open this
+                    // guards against (this is Finding A's TOCTOU regression
+                    // test: a set deleted between a caller's own pre-dispatch
+                    // ownership gate and this preload used to surface here as
+                    // a SUCCESSFUL empty membership, not an error).
+                    const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
+                                                    mem.error() == ResultSetError::NotOwner;
+                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
                                   "result-set '{}' (owner={}) — aborting scope evaluation",
-                                  rsid, owner);
-                    return std::nullopt;
+                                  owner_check_failed ? "owner-check failed" : "degraded", rsid,
+                                  owner);
+                    return std::unexpected(
+                        ScopeEvalError{owner_check_failed ? ScopeEvalError::Kind::OwnerCheckFailed
+                                                          : ScopeEvalError::Kind::StoreDegraded,
+                                      rsid});
                 }
-                // Touch only sets we actually own (non-empty owned membership): keeps
-                // a set actively used as scope from being GC'd mid-investigation
-                // (review finding I), and never extends another operator's set TTL.
-                if (!mem->empty())
-                    rs_store->touch(rsid);
+                // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
+                // owned-but-empty set is now a real, distinguishable success
+                // case (A1), not indistinguishable from not-owned, so it
+                // deserves the same "keep it alive while actively used as
+                // scope" treatment a non-empty owned set gets (review finding
+                // I). Never extends another operator's set TTL (member_set_owned
+                // already failed the whole evaluation for that case above). A
+                // touch racing a concurrent GC sweep is a harmless no-op (an
+                // UPDATE affecting 0 rows).
+                rs_store->touch(rsid);
                 rs_members.emplace(rsid, std::move(*mem));
             }
         }
@@ -1675,13 +1731,13 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "
                               "CustomPropertiesStore is wired to resolve it — aborting scope "
                               "evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
             }
             auto preload = props_store->get_values_for_keys(prop_keys);
             if (!preload) {
                 spdlog::error("AgentRegistry::evaluate_scope: get_values_for_keys degraded — "
                               "aborting scope evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
             }
             props_values = std::move(*preload);
         }
@@ -1715,7 +1771,7 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
             if (!preload) {
                 spdlog::error("AgentRegistry::evaluate_scope: tag preload degraded — aborting "
                               "scope evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
             }
             tag_values = std::move(*preload);
         }
@@ -1727,7 +1783,22 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     // session for; local always wins. Cached (live_presence(),
     // kPresenceCacheTtl) so the policy-evaluator's N-policies-per-tick
     // sweep issues one Postgres read per cache window, not N.
-    std::vector<PresenceIdentity> presence_rows = live_presence();
+    //
+    // #4981 PR-1 (Finding B4): `ScopePopulation::LocalOnly`
+    // (evaluate_scope_local) skips this call ENTIRELY — never even a
+    // pointer-check cost — which is what guarantees that entry point can
+    // never fail with Kind::PresenceDegraded. `Fleet` (evaluate_scope) is the
+    // ONLY population that can abort here.
+    std::vector<PresenceIdentity> presence_rows;
+    if (population == ScopePopulation::Fleet) {
+        auto presence_result = live_presence();
+        if (!presence_result) {
+            spdlog::error("AgentRegistry::evaluate_scope: live_presence degraded — aborting "
+                          "scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, {}});
+        }
+        presence_rows = std::move(*presence_result);
+    }
 
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
@@ -1744,7 +1815,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         // The catalog cross-check test does NOT exercise that second copy —
         // a new scope-kind branch added HERE without also updating THAT one
         // silently under-matches presence-only (cross-replica) agents, with
-        // no test failure to catch it. Update both together.
+        // no test failure to catch it. Update both together. #4981 PR-1: this
+        // LOCAL loop runs for BOTH populations unchanged — only the
+        // presence-merge loop below is gated to ScopePopulation::Fleet, since
+        // `presence_rows` is always empty for LocalOnly.
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
             // from_result_set:<id> — composable-scope membership (capability
@@ -1861,12 +1935,34 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     return matched;
 }
 
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
+                              std::string_view principal) const {
+    return evaluate_scope_impl(expr, tag_store, props_store, rs_store, principal,
+                               ScopePopulation::Fleet);
+}
+
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                                    const CustomPropertiesStore* props_store) const {
+    // #4981 PR-1 (Finding B4): no ResultSetStore, no principal, LocalOnly
+    // population — this can never return Kind::PresenceDegraded (presence is
+    // never consulted) and can never return Kind::OwnerCheckFailed (no
+    // from_result_set: atom can resolve here regardless — an rs_store-null
+    // call site collects the same Unresolvable abort evaluate_scope would
+    // give a no-store caller).
+    return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
+                               /*principal=*/{}, ScopePopulation::LocalOnly);
+}
+
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
     static const std::vector<ScopeKindInfo> catalog = {
         {"from_result_set:<id>", "from_result_set:<id>", "from_result_set:rs_01H8X3ZQK7YB2",
          "Owner-checked membership of a previously-saved result set (composable "
-         "scope, docs/scope-walking-design.md). A set the caller does not own "
-         "resolves to no match."},
+         "scope, docs/scope-walking-design.md). A set the caller does not own, "
+         "or that no longer exists, aborts the whole dispatch (#4981 PR-1) — it "
+         "no longer silently resolves to no match."},
         {"ostype", "ostype <op> <value>", R"(ostype == "windows")",
          "Agent-reported OS family (windows/linux/darwin)."},
         {"hostname", "hostname <op> <value>", R"(hostname LIKE "WIN-%")",

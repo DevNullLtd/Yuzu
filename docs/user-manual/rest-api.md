@@ -300,12 +300,14 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
+| any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
+| any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **27 rows** in the table overall. Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **23 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **31 rows** in the table overall (A2 added `rbac_role_assignment`, and A1 `rbac_enforcement`, both unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **27 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -2494,6 +2496,220 @@ Check whether the current user has a specific permission.
 
 ---
 
+#### `POST /api/v1/rbac/roles/{name}/assignments`
+
+Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
+`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a
+human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
+`docs/user-manual/rbac.md` for the full narrative (key constraints, examples,
+and why this is a separate surface from `POST /api/v1/rbac/check`'s
+`perm_fn`-gated siblings above).
+
+**Permission:** Gated on a dedicated `is_rbac_administrator` check — a
+**durable** Administrator role held by the caller, re-read fresh from the
+store (never the session's cached role or a JIT `POST /api/v1/elevate`
+elevation) — **instead of**, not in addition to, an ordinary RBAC-securable
+permission check — plus MFA step-up. A service-scoped API token, an engine
+session, and an MCP-tier bearer token of ANY tier (including `supervised`)
+are all structurally denied before any store read — an MCP-tiered credential
+must use the `assign_rbac_role` MCP tool instead, which carries its own
+supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
+
+**Request body:**
+
+```json
+{ "principal_type": "user", "principal_id": "jane.doe" }
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `principal_type` | string | Yes | Must be `"user"` — group-scoped fleet-wide assignment is not supported yet. |
+| `principal_id` | string | Yes | The target username. Charset-constrained (alphanumeric + `._-`, 1–64 chars) — same set the `DELETE` twin's URL-path segment is limited to. A username with no existing `auth.users` row is accepted (pre-provisioning). |
+
+**Response (201):**
+
+```json
+{
+  "data": {
+    "assigned": true,
+    "principal_type": "user",
+    "principal_id": "jane.doe",
+    "role": "Operator",
+    "target_provisioned": "true"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`target_provisioned` is a **three-state string** (`"true"` / `"false"` /
+`"unknown"`), never a bare boolean: `"true"` means `principal_id` has an
+`auth.users` row that is currently **active** (can authenticate right now),
+`"false"` means it does not — either a genuine pre-provisioned grant (no
+account has ever existed at this username) or a grant landing on a
+currently-deactivated account; the two are not distinguished by this field
+— and `"unknown"` means the `AuthDB` read itself degraded and could not
+confirm either way — the third state exists specifically so a degraded read
+is never misreported as "no active account."
+
+**Errors:** `400` — invalid JSON, a non-object top-level body (e.g. a JSON
+array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
+field present with the wrong JSON type (degrades to "missing"/"invalid",
+never an uncaught exception), `principal_type` other than `"user"`, a
+malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+(`ITServiceOwner` and a genuinely unknown/custom role name return the
+identical client-facing message — no role-catalog oracle; the specific
+reason is audited server-side only; use `POST
+/api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead), or the
+store rejects the grant for a genuine client-validation reason (a malformed
+or reserved-namespace `principal_id`) — this branch is defensive and not
+reachable via this route today, since `principal_type` is hardcoded `"user"`
+and `principal_id` has already passed the same charset check the DELETE
+route enforces, but stays classified 400 (not 503) for if that ever
+changes; `401` — not authenticated, or MFA
+step-up not satisfied; `403` — the caller does not hold a durable
+Administrator role, does not hold authority under the regime that is durably
+true right now, is a service-scoped/engine session, or presented an
+MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
+instead); `503` — the RBAC or `AuthDB` store is unavailable (including when
+the admin gate itself cannot confirm durable authority — now logged and
+audited as a `denied` row, not silently invisible), a genuine store/query
+fault while writing the grant (as opposed to a client-validation rejection,
+which stays `400` — classified via an allow-list of known validation-error
+shapes, never a denylist, so an unrecognized future error defaults to the
+safer `503`), the defense-in-depth role lookup finding an already-validated
+role name missing from the store (a tampered/hand-edited store — a
+store-integrity fault, never a client error), or (on an otherwise-successful
+assignment) its audit row could not persist — treat the grant as unconfirmed
+and reconcile via a read. The "does not hold authority under the regime..."
+refusal (A1) has TWO distinct causes, not one: a cross-replica
+cache-staleness re-check (the durable-Administrator check above reads a
+replica-local cached view that can lag a real commit), and a SEPARATE,
+structural exclusion — a genuine SAML-authenticated Administrator has no
+`auth.users` row at all (SAML does not sync to `auth.users`, unlike OIDC's
+`provision_sso_identity`), so the fresh check's `auth.users`-joined authority
+set never contains them, and this route is refused unconditionally
+regardless of any staleness. This is a real, fail-safe (over-restrictive,
+never permissive) side effect, not a bug — see
+[#4966](https://github.com/Tr3kkR/Yuzu/issues/4966), which also tracks the
+identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned` — see
+`docs/user-manual/audit-log.md`.
+
+---
+
+#### `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}`
+
+Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
+unassigning a role the principal did not hold still returns success.
+
+**Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
+above (including the MCP-tier-token structural denial), plus MFA step-up.
+
+**Response:**
+
+```json
+{ "data": { "unassigned": true }, "meta": { "api_version": "v1" } }
+```
+
+**Errors:** `401` — not authenticated, or MFA step-up not satisfied; `403` —
+the caller does not hold a durable Administrator role, does not hold
+authority under the regime that is durably true right now (A1: same fresh
+re-check as the `POST` route above, including its SAML #4966 structural
+exclusion), is a service-scoped/engine session, presented an MCP-tier bearer
+token of any tier (use the `unassign_rbac_role` MCP tool instead), or
+(`{name}=="Administrator"` only) is attempting to remove their **own**
+Administrator assignment (self-lockout
+guard — a caller can never revoke their own standing Administrator authority
+through this route, even to hand it to someone else first); `409` —
+(`{name}=="Administrator"` only) removing this grant would leave the fleet
+with zero **authenticatable** Administrators (here: an active `auth.users` row,
+which is necessary for login but not sufficient) — the guard counts a grant only
+when its `principal_id` names an active `auth.users` row, so a grant naming a
+nonexistent, deactivated, soft-deleted, or group-held (not creatable via this
+surface) principal is never counted as a surviving administrator (the guard has
+known residual gaps, see "Fleet-Wide Role Assignment" in `rbac.md`); `503` — the
+RBAC store is unavailable (including when the admin gate itself cannot
+confirm durable authority — logged and audited as a `denied` row), a
+genuine store/query fault removing the grant, or (on an otherwise-successful
+unassignment) its audit row could not persist — treat the removal as
+unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
+
+MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
+`docs/user-manual/mcp.md`.
+
+---
+
+#### `PUT /api/v1/rbac/enforcement`
+
+Enable or disable RBAC enforcement fleet-wide (durable; every replica
+converges within ~1s of the write). See "Enabling RBAC" in
+`docs/user-manual/rbac.md` for the full narrative (the caller-survives rule,
+the recommended onboarding order, and the SSO/break-glass note).
+
+**Permission:** Same dedicated `is_rbac_administrator` check as the two
+routes above, plus MFA step-up — except an `api_token`/`mcp_token` bearer
+session, which is exempt from step-up entirely (`mfa_step_up.cpp`), the same
+accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
+notes for the equivalent case. A service-scoped API token and an engine
+session are both structurally denied before any store read.
+
+**Request body:**
+
+```json
+{ "enabled": true }
+```
+
+`enabled` must be a genuine JSON boolean — the strings `"true"`/`"false"`
+and the numbers `0`/`1` are rejected, never coerced.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "previous_enabled": false,
+    "changed": true,
+    "post_transition_administrators": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`post_transition_administrators` reports, after enabling, the number of
+fleet-wide `Administrator` grants held by currently-active local accounts;
+after disabling, the number of active local accounts holding the `admin`
+role. Requesting the current state is idempotent: `changed` is `false` and
+neither the guard nor a write runs.
+
+**Errors:** `400` — invalid/missing JSON body, or `enabled` missing or not a
+JSON boolean; `401` — MFA step-up not satisfied (see the exemption above);
+`403` — the caller does not hold a durable Administrator role, is a
+service-scoped/engine session, carries a non-empty `mcp_tier` bearer token
+(denied before the admin check even runs; REST has no
+tier/approval concept to legitimize a tiered bearer token the way MCP's own
+dispatch guard does), or (on a real transition) does not hold
+authority under the regime that is durably true **right now** — enabling
+requires the caller's own local `admin` role, disabling requires the
+caller's own fleet-wide `Administrator` grant (this closes a cross-replica
+cache-staleness gap in the admin gate itself: the same requirement the
+outer check is *supposed* to enforce, re-verified fresh under the row lock
+this route itself holds) — the response's `remediation` field names the
+exact follow-up call; `409` — the caller would not remain a durable
+administrator after the switch (enabling: no fleet-wide `Administrator`
+grant; disabling: local account role is not `admin`) — the response's
+`remediation` field names the exact follow-up call; `503` — the RBAC or
+`AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
+audit row could not persist — treat the change as unconfirmed and reconcile
+via `GET /api/v1/me`. Audited `rbac.enforcement_changed` — see
+`docs/user-manual/audit-log.md`.
+
+There is no `GET` twin: read the current state via `GET /api/v1/me`
+(`rbac_enabled`) or this route's own response.
+
+MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
+
+---
+
 ### Tags
 
 Tags are key-value pairs assigned to agents for categorization, scoping, and compliance tracking. Four structured categories are enforced: `role`, `environment`, `location`, and `service`. Custom keys are also supported.
@@ -3154,12 +3370,12 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
 | `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
-| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
+| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058) DOES audit, `result=error` detail `degraded` — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
@@ -3840,14 +4056,26 @@ verdicts appear a few seconds later.
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
 policy is already in flight. **Response (503):** either the policy evaluator
-isn't wired ("policy evaluation not available"), or a genuine internal store
-failure occurred while reading the policy or fragment, recording the dispatch
-claim, or (ADR-0058) resolving the check instruction against InstructionStore
-("policy store degraded" / "policy evaluation degraded") — a transient failure
-of this kind is safe to retry and is never reported as a 409.
+isn't wired, a genuine internal store failure occurred while reading the policy
+or fragment, recording the dispatch claim, or (ADR-0058) resolving the check
+instruction against InstructionStore, **or (#4981 PR-1) the policy's scope
+expression could not be evaluated** — a result-set reference that failed its
+ownership check due to a race with a concurrent delete, or a presence-store
+degradation on a cross-replica scope. The response's `message` field carries the
+specific underlying cause (e.g. "policy store not wired", "degraded policy read
+for \<id>", "dispatch claim failed for \<id>: \<reason>", or "kickoff_check
+degraded for \<id>: scope evaluation degraded: \<reason>") — it is not a fixed
+literal, so do not pattern-match an exact string; treat any 503 on this route as
+safe to retry. One case is deliberately generic rather than specific: a genuine
+InstructionStore DB/lease failure reports as "...service unavailable" rather
+than the raw database error text, which can carry connection/schema detail —
+the raw text is logged server-side instead. A transient failure of any of
+these kinds is never reported as a 409 (a genuine "matches no agents" result
+is distinguished from "could not
+determine whether it matches").
 
 **Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above
-(`result=error`, detail `degraded`).
+(`result=error`, detail = the same specific cause string as the response `message`).
 
 ---
 
@@ -3901,7 +4129,16 @@ not available"), or a genuine internal store failure occurred while resolving
 the policy or its remediation targets, including (ADR-0058) InstructionStore
 resolving the fix instruction ("policy store degraded" / "policy store
 unavailable") — safe to retry, and distinguished from the 400/409 business
-rejections above.
+rejections above. **When `agent_ids` is supplied** (#4981 PR-1), a 503 is also
+returned if the policy's own scope expression — used to confirm each requested
+agent is actually in-scope before remediating it — could not be evaluated (the
+same result-set-ownership-race or presence-degradation causes as `/evaluate`
+above); the message is `"could not determine the policy's scope (\<reason>) —
+remediation target resolution aborted, not evaluated as empty"`, distinguishing
+this from the ordinary 409 "no in-scope agents" case where the scope evaluated
+fine and genuinely excluded the requested agents. This path does not apply when
+`agent_ids` is omitted (the "remediate every non-compliant agent" case reads
+compliance status directly, not the scope expression).
 
 **Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
 is a store degrade, never a business rejection).
@@ -6018,15 +6255,19 @@ route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
-result-set siblings, a service-scoped token is admitted and confined here,
-not denied outright** - see the "Result Sets" section below for the exact
-gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
-result-set row it creates is only readable/mutable by its own creator
-through the routes below, which — like their HTMX dashboard twins — also
-deny a service-scoped token outright: `session->username` is the *minting*
-principal's identity, not the token's own service tag, so without this a
-service token could reach any other token the same minter held.
+/api/v1/inventory/software` rather than `Execution:Execute`. **A
+service-scoped token is denied outright here too (#4980)**, same as its
+result-set siblings — before #4980, under RBAC-on, this route
+admitted-and-confined a service-scoped token via `fleet_read_fn` instead of
+denying it, a tracked cross-service-reach gap (`#4307`); `fleet_read_fn`
+still hard-denied a service-scoped token under RBAC-off (the default), same
+as the `require_permission` gate it briefly replaced (see the "Result Sets"
+section below for the full history). The owner-scoped result-set row it creates is only
+readable/mutable by its own creator through the routes below, which — like
+their HTMX dashboard twins — also deny a service-scoped token outright:
+`session->username` is the *minting* principal's identity, not the token's
+own service tag, so without this a service token could reach any other
+token the same minter held.
 
 #### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
 
@@ -6296,7 +6537,7 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
 
 **JSON nesting depth bound (json-dump-depth-guard fix), all four producers plus re-eval.** `nlohmann::json::dump()` is unboundedly recursive; the [MCP transport's 32-level guard](../mcp-server.md) (#2437) checked only the live `/mcp/` request body, leaving a gap on REST. `POST /api/v1/result-sets`, `/from-inventory-query`, `/from-tar-query`, and `/from-instruction-result` now reject (`400 RESULT_SET_BAD_REQUEST`) a request body nesting deeper than 32 levels before it is parsed, reusing the same `kMcpMaxJsonDepth` constant MCP enforces so the two surfaces cannot drift apart. `POST /api/v1/result-sets/{id}/re-eval` applies the same check to the row's **stored** `source_payload` before parsing it, since the table is shared with MCP's `reevaluate_result_set` and a row poisoned by any write path (including one predating this fix) would otherwise be re-dumped on a later read. **Heal on reject (#4493).** This specific re-eval attempt still fails with `400 RESULT_SET_BAD_REQUEST`, but the route now also discards the poisoned `source_payload` in place (status-agnostic - `materialized` and `failed` rows are healed too, not just `pending`) before returning, so every subsequent read of the row is safe instead of re-detecting the same poison forever; the row's `status` and members are never touched. The response body says "...and has been discarded..." only when the heal write actually committed - a rare heal-write failure returns a differently-worded `400` and leaves the row unchanged for the next retry.
 
-**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; all 9 of the remaining tools/routes are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` joined them in #4980**: both gate via the admit-then-filter `fleet_read_fn`/`fleet_read_fn_` chokepoint for scope confinement, but a service-scoped token is now hard-denied structurally BEFORE that chokepoint ever runs on either transport — MCP already enforced this via its C8 generic-tier gate's structural `ServiceScopeClass::denied` default (empirically verified during #4980, never actually reachable there); the REST route lacked the equivalent and gated purely via `fleet_read_fn`, whose service-scope branch admits-and-confines a service-scoped token rather than denying it outright — since the created result set is still owner-scoped to the minting token's principal, a service token could mint a set the minter's other tokens/session could then read. This REST-side gap was originally tracked as #4307 and is closed by #4980's `deny_fleet_wide_service_scoped` call on the route, matching its 8 siblings.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -10540,13 +10781,14 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the last two bullets, the JIT-elevation routes, use a 300s window instead when that flag is `0` or less):
+The following endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes near the end of this list use a 300s window instead when that flag is `0` or less):
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
-- `POST /api/v1/tokens/{id}/rotate` (rotate an API token)
-- `POST /api/v1/tokens/{id}/confirm` (confirm an API-token rotation)
+- `POST /api/v1/tokens/{id}/rotate` (rotate an API token — runs on every call, including an idempotent re-serve)
+- `POST /api/v1/tokens/{id}/confirm` (confirm an API token rotation)
 - `DELETE /api/v1/sessions` (admin force-logout another user)
+- `POST /api/v1/users/{name}/unlock` (clear a user's account-lockout counter — parity with `DELETE /api/v1/sessions`)
 - `POST /api/v1/software-packages` (upload software package)
 - `POST /api/v1/software-deployments/{id}/start` (start deployment)
 - `POST /api/v1/guaranteed-state/rules` (create Guardian rule)
@@ -10563,7 +10805,8 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
-- `POST /api/v1/users/{username}/unlock` (clear an account lockout)
+- `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
+- `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
 - `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)
 - `POST /api/v1/elevate` (activate a JIT admin elevation)
 

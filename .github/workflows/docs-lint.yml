@@ -74,6 +74,13 @@ jobs:
       - name: No conn-less libpq escape references (#1611)
         run: python3 tests/test_no_connless_pq_escape.py
 
+      # PR #4985 / ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL
+      # lives only in RbacAdminAuthorityOwner (never rbac_store.cpp), and its shared SQL
+      # fragment kAuthenticatableAdminGrantsFrom has exactly one definition. Also
+      # registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
+        run: python3 tests/test_rbac_query_owner_seam.py
+
       # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
       # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
       # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered

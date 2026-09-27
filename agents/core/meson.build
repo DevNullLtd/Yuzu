@@ -117,7 +117,9 @@ yuzu_agent_core_dep = declare_dependency(
   ],
 )
 
-executable(
+# Named (not a bare executable() call) so tests/meson.build can `depends:` on the real
+# agent binary for the #4666 PR-2 multi-image / blocked-sink-harness fixtures.
+yuzu_agent_exe = executable(
   'yuzu-agent',
   files('src/main.cpp', 'src/service_win.cpp'),
   include_directories: [

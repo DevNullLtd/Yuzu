@@ -18,8 +18,11 @@
  * policy_store.hpp's header comment on why collect stays per-replica).
  */
 
+#include "agent_registry.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
@@ -28,6 +31,8 @@
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
@@ -442,6 +447,15 @@ TEST_CASE("policy evaluator: InstructionStore DB error on dispatch is distinct f
     auto result = ev.evaluate_now(pid);
     CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
     CHECK(h.dispatch_calls == 0); // never reached dispatch_fn — failed resolving the definition
+    // gov Gate 8 (#4981 PR-1, security-guardian): lock the genericized message
+    // itself, not just has_value() — this is the same
+    // kInstructionStoreDbErrorPrefix-tagged failure the fix for the earlier
+    // BLOCKING finding closed (kickoff_check now runs dispatch_instruction's
+    // error through genericize_db_error before wrapping it), so a future
+    // regression re-threading the raw "db_error: store not open" string
+    // through to a caller must fail this exact assertion, not just the
+    // has_value() check above.
+    CHECK(result.error() == "kickoff_check degraded for " + pid + ": service unavailable");
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
@@ -1249,4 +1263,105 @@ TEST_CASE("policy evaluator: an unset should_stop claims every due policy, "
     ev.tick(true);
 
     CHECK(h.dispatch_calls == 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 (Finding B, B6): a scope-expression policy's target resolution
+// bypasses the dispatch ladder entirely — PolicyEvaluator::resolve_targets is
+// the ONE place that owns its own observability for a degraded
+// AgentRegistry::evaluate_scope. Confirms a degraded-presence scenario makes
+// target resolution return empty (never crashes, never proceeds with a
+// wrong/partial target set) AND increments yuzu_scope_eval_degraded_total
+// with reason=presence_degraded.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::EventBus;
+
+yuzu::test::PgTestTemplate policy_presence_tpl{"policyevalpresence", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("policyevalpresence template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("policy evaluator: a scope-expression policy's target resolution reports "
+          "presence_degraded rather than silently proceeding as empty-scope",
+          "[pg][policy][evaluator][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+
+    // A SECOND Postgres database (own template) for the degraded presence
+    // store — deliberately separate from the policy/response/mgmt-group pool
+    // above so locking its table can't interfere with PolicyStore's own
+    // reads on this same test.
+    YUZU_REQUIRE_PG_DB_TPL(presence_db, policy_presence_tpl);
+    PgPool short_lock_pool{
+        {.conninfo = presence_db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+
+    PgConn locker{PQconnectdb(presence_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // A scope-expression policy (no management groups) — the branch that
+    // reaches d_.registry->evaluate_scope inside resolve_targets. Defines a
+    // fix_instruction so remediate() below reaches its own resolve_targets
+    // call rather than short-circuiting on "no remediation pathway".
+    auto fid = h.ps.create_fragment("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
+                                    "spec:\n  check:\n    instruction: test.check\n"
+                                    "    compliance: \"result.hostname != ''\"\n"
+                                    "  fix:\n    instruction: test.fix\n");
+    REQUIRE(fid.has_value());
+    auto pid = h.ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n"
+                                  "spec:\n  fragment: " +
+                                  *fid + "\n  scope: ostype == \"linux\"\n");
+    REQUIRE(pid.has_value());
+
+    auto d = h.deps();
+    d.registry = &registry;
+    d.metrics = &metrics;
+
+    PolicyEvaluator ev(d);
+    auto result = ev.evaluate_now(*pid);
+    // #4981 PR-1 adversarial-review MEDIUM fix: a degraded scope evaluation
+    // is NOT a clean "no check instruction / matches no agents" empty-string
+    // result — kickoff_check now distinguishes "genuinely empty scope" from
+    // "scope evaluation aborted" and returns std::unexpected for the latter,
+    // which the REST /evaluate route maps to 503 (previously this collapsed
+    // to a false 409).
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("presence_degraded") != std::string::npos);
+    // Never proceeded with a wrong/partial target set — no dispatch fired.
+    CHECK(h.dispatch_calls == 0);
+    CHECK(metrics.counter("yuzu_scope_eval_degraded_total", {{"reason", "presence_degraded"}})
+              .value() == 1);
+
+    // remediate()'s refusal message (B6) names the actual degradation rather
+    // than claiming a genuine empty-scope result, AND (adversarial-review
+    // MEDIUM fix) sets `degraded = true` so the REST /remediate route maps
+    // this to 503/audit "error" rather than 400/audit "denied" — a degraded
+    // scope evaluation is an infrastructure fault, not an operator denial.
+    auto remediation = ev.remediate(*pid, {"some-agent"});
+    REQUIRE_FALSE(remediation.error.empty());
+    CHECK(remediation.error.find("presence_degraded") != std::string::npos);
+    CHECK(remediation.degraded);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 }

@@ -12,6 +12,7 @@
  */
 
 #include "agent_registry.hpp"
+#include "custom_properties_store.hpp"
 #include "event_bus.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -101,10 +102,21 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
         CHECK_FALSE(has(*matched, "agent-lin")); // not a broadcast
     }
 
-    SECTION("a non-owner targets nothing — IDOR blocked (review B1)") {
+    SECTION("a non-owner ABORTS the whole evaluation — IDOR blocked (review B1, "
+            "#4981 PR-1 A3: no longer a silent empty match)") {
+        // Pre-#4981 this resolved to a SUCCESSFUL empty match (member_set_owned's
+        // plain owner-filtered JOIN produced zero rows for a foreign id,
+        // indistinguishable from "owned, zero members") — which under a NOT
+        // combinator elsewhere would invert to "matches every agent" with no DB
+        // error required (the same TOCTOU-adjacent fail-open Finding A closes).
+        // A3 collapses NotOwner into ScopeEvalError::Kind::OwnerCheckFailed so a
+        // caller can never distinguish "doesn't exist" from "exists but isn't
+        // yours" — the SAME oracle-safety contract this test's old empty-match
+        // behavior was trying (imperfectly) to preserve.
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "bob");
-        REQUIRE(matched.has_value());
-        CHECK(matched->empty());
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+        CHECK(matched.error().detail == set->id);
     }
 
     SECTION("empty principal (untracked raw-dispatch path) ABORTS, never silently "
@@ -113,17 +125,20 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
         // NOT combinator elsewhere would invert to "matches every agent" purely
         // from a missing principal, no DB error required. A real rs_store is
         // wired here but there is no principal to owner-resolve against, so
-        // evaluate_scope must abort (nullopt), not degrade to "0 matched".
+        // evaluate_scope must abort, not degrade to "0 matched".
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::PrincipalUnresolved);
     }
 
-    SECTION("an unknown result-set id resolves to nothing — fail-closed, not match-all (UP-14)") {
+    SECTION("an unknown result-set id ABORTS — fail-closed, not match-all (UP-14, "
+            "#4981 PR-1 A3: no longer a silent empty match)") {
         auto e2 = yuzu::scope::parse("from_result_set:rs_does_not_exist");
         REQUIRE(e2.has_value());
         auto matched = registry.evaluate_scope(*e2, nullptr, nullptr, &store, "alice");
-        REQUIRE(matched.has_value());
-        CHECK(matched->empty());
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+        CHECK(matched.error().detail == "rs_does_not_exist");
     }
 }
 
@@ -282,10 +297,11 @@ TEST_CASE("evaluate_scope: a degraded result-set store ABORTS — never expands 
         // The regression this test exists to catch: pre-fix, a degraded
         // preload silently produced an EMPTY (but present) membership map,
         // so `matched` would come back holding EVERY registered agent under
-        // the NOT combinator. Post-fix, degrade is type-distinguishable —
-        // std::nullopt — so a caller can never mistake this for "0 matches"
-        // or, worse, silently dispatch to `*matched` at all.
+        // the NOT combinator. Post-fix, degrade is type-distinguishable — an
+        // error, never an empty vector — so a caller can never mistake this
+        // for "0 matches" or, worse, silently dispatch to `*matched` at all.
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::StoreDegraded);
     }
 
     SECTION("the plain (non-NOT) form also aborts, never a false empty match") {
@@ -293,6 +309,7 @@ TEST_CASE("evaluate_scope: a degraded result-set store ABORTS — never expands 
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::StoreDegraded);
     }
 }
 
@@ -338,6 +355,7 @@ TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inv
         // empty. Pre-B2 this would have silently matched BOTH agents.
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::PrincipalUnresolved);
     }
 
     SECTION("the plain (non-NOT) form also aborts, never a false empty match") {
@@ -345,6 +363,7 @@ TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inv
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::PrincipalUnresolved);
     }
 
     SECTION("a scope WITHOUT a from_result_set: atom is completely unaffected by an "
@@ -386,6 +405,7 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::Unresolvable);
     }
 
     SECTION("the plain (non-NOT) form also aborts") {
@@ -393,6 +413,7 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::Unresolvable);
     }
 
     SECTION("an atom buried under a combinator still aborts (the collector walks "
@@ -401,6 +422,7 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::Unresolvable);
     }
 
     SECTION("null store with a NON-empty principal still aborts (branch-message combo)") {
@@ -408,6 +430,7 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "alice");
         REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::Unresolvable);
     }
 
     SECTION("a scope with NO from_result_set atom is unaffected — null store stays "
@@ -494,4 +517,207 @@ TEST_CASE("gate_scope_dispatch: absent/foreign refs ABORT, owned refs proceed",
         CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "alice", &store, failing) ==
               ScopeDispatchGate::AbortDbDegraded);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 Finding A: the TOCTOU race this whole file's "gate_scope_dispatch:
+// absent/foreign refs ABORT" test above does NOT cover — the gate is an EARLY
+// forensic pass (scope_yaml.hpp's A2 doc comment); the BINDING check is
+// evaluate_scope's own member_set_owned preload, which can observe a
+// DIFFERENT, later database state. A set that PASSES gate_scope_dispatch can
+// still be deleted (explicit delete_set, OR a raw DELETE standing in for a
+// gc_sweep pass) before evaluate_scope's own read runs.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("evaluate_scope: a result set deleted AFTER gate_scope_dispatch already returned "
+          "Proceed still ABORTS OwnerCheckFailed at evaluate_scope, NEVER a fleet-wide "
+          "match (#4981 PR-1 Finding A TOCTOU regression)",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+
+    SECTION("deleted via the real delete_set path, bare form") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        REQUIRE(store.delete_set(set->id).has_value());
+
+        auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+        CHECK(matched.error().detail == set->id);
+    }
+
+    SECTION("deleted via the real delete_set path, NOT combinator — the concrete "
+            "fleet-wide fail-open shape this fix closes") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        REQUIRE(store.delete_set(set->id).has_value());
+
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        // The regression: pre-#4981, member_set_owned's plain owner-filtered
+        // JOIN against the now-gone row produced a SUCCESSFUL empty
+        // membership, and NOT inverted that to "matches every agent" —
+        // BOTH agent-win and agent-lin. Post-fix this is an ABORT, matching
+        // neither.
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+    }
+
+    SECTION("deleted via a raw DELETE (standing in for a gc_sweep pass), bare form") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        {
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            std::string sql = "DELETE FROM result_set_store.result_sets WHERE id = '" + set->id +
+                              "'";
+            PgResult r{PQexec(conn.get(), sql.c_str())};
+            REQUIRE(r.ok());
+        }
+
+        auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+    }
+
+    SECTION("deleted via a raw DELETE (gc_sweep stand-in), NOT combinator") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        {
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            std::string sql = "DELETE FROM result_set_store.result_sets WHERE id = '" + set->id +
+                              "'";
+            PgResult r{PQexec(conn.get(), sql.c_str())};
+            REQUIRE(r.ok());
+        }
+
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+    }
+
+    SECTION("compound expression — a deleted result-set atom ANDed with a resolvable "
+            "props.<key> atom still aborts OwnerCheckFailed as a whole, never a "
+            "partial or fleet-wide match (#4981 PR-1 Finding A, compound-atom coverage)") {
+        auto set = store.create_materialized(cr, {"agent-win"});
+        REQUIRE(set.has_value());
+        std::vector<std::string> failing;
+        REQUIRE(gate_scope_dispatch("from_result_set:" + set->id, "alice", &store, failing) ==
+                ScopeDispatchGate::Proceed);
+        REQUIRE(store.delete_set(set->id).has_value());
+
+        // Shares the pool/db with `store` above; CustomPropertiesStore migrates
+        // its own schema on construction regardless of which store's template
+        // built this database (see test_props_scope_authz.cpp's identical use).
+        CustomPropertiesStore props_store(pool);
+        REQUIRE(props_store.is_open());
+        REQUIRE(props_store.set_property("agent-win", "role", "web").has_value());
+
+        auto expr = yuzu::scope::parse(R"(props.role == "web" AND from_result_set:)" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched =
+            registry.evaluate_scope(*expr, /*tag_store=*/nullptr, &props_store, &store, "alice");
+        // The props.<key> atom resolves cleanly on its own (agent-win has
+        // role=web) — only the from_result_set: atom is broken by the TOCTOU
+        // delete. A resolver that evaluates atoms independently and merges by
+        // AND could produce a PARTIAL match (agent-win, from the props half)
+        // instead of aborting the whole expression; that is still a fail-open
+        // relative to the "never a fleet/partial match on a broken ref" contract.
+        REQUIRE_FALSE(matched.has_value());
+        CHECK(matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+        CHECK(matched.error().detail == set->id);
+    }
+}
+
+// #4981 PR-1 (Finding A/A4): evaluate_scope now touches (extends the TTL of)
+// ANY owned result-set reference, empty or not — the pre-#4981 code only
+// touched a non-empty owned membership, because an owned-but-empty result was
+// indistinguishable from not-owned (touching it risked extending an id that
+// might actually belong to someone else). A1 makes owned-empty a real,
+// distinguishable success, so it now gets the same "keep alive while actively
+// used as scope" treatment (review finding I) a non-empty owned set already
+// got.
+TEST_CASE("evaluate_scope: touches an owned-but-EMPTY result set used as scope "
+          "(#4981 PR-1 A4 — was previously NOT touched)",
+          "[pg][scope][result_set][ttl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto empty_owned = store.create_materialized(cr, {}); // owned, ZERO members
+    REQUIRE(empty_owned.has_value());
+    const int64_t orig_ttl = empty_owned->ttl_at;
+
+    // Force a real observable delta so a touch is detectable even if the
+    // whole test runs inside one wall-clock second (touch extends to
+    // max(ttl_at, now + kDefaultTtlSeconds) — see ResultSetStore::touch's own
+    // doc comment): backdate ttl_at via a raw UPDATE, staying above
+    // created_at so the schema's `CHECK (ttl_at >= created_at)` still holds
+    // (ttl_at starts at created_at + kDefaultTtlSeconds == +3600; back off by
+    // less than that).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        std::string sql = "UPDATE result_set_store.result_sets SET ttl_at = ttl_at - 1000 "
+                          "WHERE id = '" +
+                          empty_owned->id + "'";
+        PgResult r{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(r.ok());
+    }
+
+    auto expr = yuzu::scope::parse("from_result_set:" + empty_owned->id);
+    REQUIRE(expr.has_value());
+    auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+    REQUIRE(matched.has_value()); // owned-empty is a real success (A1)
+    CHECK(matched->empty());
+
+    auto after = store.get(empty_owned->id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->ttl_at > orig_ttl - 1000); // touched: TTL extended back up
 }
