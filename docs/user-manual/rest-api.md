@@ -301,12 +301,13 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
+| any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **30 rows** in the table overall (A2 added `rbac_role_assignment`, unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **26 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **31 rows** in the table overall (A2 added `rbac_role_assignment`, and A1 `rbac_enforcement`, both unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **27 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -2566,7 +2567,8 @@ and `principal_id` has already passed the same charset check the DELETE
 route enforces, but stays classified 400 (not 503) for if that ever
 changes; `401` — not authenticated, or MFA
 step-up not satisfied; `403` — the caller does not hold a durable
-Administrator role, is a service-scoped/engine session, or presented an
+Administrator role, does not hold authority under the regime that is durably
+true right now, is a service-scoped/engine session, or presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
 instead); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
@@ -2578,7 +2580,18 @@ safer `503`), the defense-in-depth role lookup finding an already-validated
 role name missing from the store (a tampered/hand-edited store — a
 store-integrity fault, never a client error), or (on an otherwise-successful
 assignment) its audit row could not persist — treat the grant as unconfirmed
-and reconcile via a read. Audited `rbac.role.assigned` — see
+and reconcile via a read. The "does not hold authority under the regime..."
+refusal (A1) has TWO distinct causes, not one: a cross-replica
+cache-staleness re-check (the durable-Administrator check above reads a
+replica-local cached view that can lag a real commit), and a SEPARATE,
+structural exclusion — a genuine SAML-authenticated Administrator has no
+`auth.users` row at all (SAML does not sync to `auth.users`, unlike OIDC's
+`provision_sso_identity`), so the fresh check's `auth.users`-joined authority
+set never contains them, and this route is refused unconditionally
+regardless of any staleness. This is a real, fail-safe (over-restrictive,
+never permissive) side effect, not a bug — see
+[#4966](https://github.com/Tr3kkR/Yuzu/issues/4966), which also tracks the
+identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned` — see
 `docs/user-manual/audit-log.md`.
 
 ---
@@ -2598,9 +2611,11 @@ above (including the MCP-tier-token structural denial), plus MFA step-up.
 ```
 
 **Errors:** `401` — not authenticated, or MFA step-up not satisfied; `403` —
-the caller does not hold a durable Administrator role, is a
-service-scoped/engine session, presented an MCP-tier bearer token of any tier
-(use the `unassign_rbac_role` MCP tool instead), or
+the caller does not hold a durable Administrator role, does not hold
+authority under the regime that is durably true right now (A1: same fresh
+re-check as the `POST` route above, including its SAML #4966 structural
+exclusion), is a service-scoped/engine session, presented an MCP-tier bearer
+token of any tier (use the `unassign_rbac_role` MCP tool instead), or
 (`{name}=="Administrator"` only) is attempting to remove their **own**
 Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
@@ -2620,6 +2635,78 @@ unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 `docs/user-manual/mcp.md`.
+
+---
+
+#### `PUT /api/v1/rbac/enforcement`
+
+Enable or disable RBAC enforcement fleet-wide (durable; every replica
+converges within ~1s of the write). See "Enabling RBAC" in
+`docs/user-manual/rbac.md` for the full narrative (the caller-survives rule,
+the recommended onboarding order, and the SSO/break-glass note).
+
+**Permission:** Same dedicated `is_rbac_administrator` check as the two
+routes above, plus MFA step-up — except an `api_token`/`mcp_token` bearer
+session, which is exempt from step-up entirely (`mfa_step_up.cpp`), the same
+accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
+notes for the equivalent case. A service-scoped API token and an engine
+session are both structurally denied before any store read.
+
+**Request body:**
+
+```json
+{ "enabled": true }
+```
+
+`enabled` must be a genuine JSON boolean — the strings `"true"`/`"false"`
+and the numbers `0`/`1` are rejected, never coerced.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "enabled": true,
+    "previous_enabled": false,
+    "changed": true,
+    "post_transition_administrators": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`post_transition_administrators` reports, after enabling, the number of
+fleet-wide `Administrator` grants held by currently-active local accounts;
+after disabling, the number of active local accounts holding the `admin`
+role. Requesting the current state is idempotent: `changed` is `false` and
+neither the guard nor a write runs.
+
+**Errors:** `400` — invalid/missing JSON body, or `enabled` missing or not a
+JSON boolean; `401` — MFA step-up not satisfied (see the exemption above);
+`403` — the caller does not hold a durable Administrator role, is a
+service-scoped/engine session, carries a non-empty `mcp_tier` bearer token
+(denied before the admin check even runs; REST has no
+tier/approval concept to legitimize a tiered bearer token the way MCP's own
+dispatch guard does), or (on a real transition) does not hold
+authority under the regime that is durably true **right now** — enabling
+requires the caller's own local `admin` role, disabling requires the
+caller's own fleet-wide `Administrator` grant (this closes a cross-replica
+cache-staleness gap in the admin gate itself: the same requirement the
+outer check is *supposed* to enforce, re-verified fresh under the row lock
+this route itself holds) — the response's `remediation` field names the
+exact follow-up call; `409` — the caller would not remain a durable
+administrator after the switch (enabling: no fleet-wide `Administrator`
+grant; disabling: local account role is not `admin`) — the response's
+`remediation` field names the exact follow-up call; `503` — the RBAC or
+`AuthDB` store is unavailable, or (on an otherwise-successful toggle) its
+audit row could not persist — treat the change as unconfirmed and reconcile
+via `GET /api/v1/me`. Audited `rbac.enforcement_changed` — see
+`docs/user-manual/audit-log.md`.
+
+There is no `GET` twin: read the current state via `GET /api/v1/me`
+(`rbac_enabled`) or this route's own response.
+
+MCP twin: `set_rbac_enforcement` — see `docs/user-manual/mcp.md`.
 
 ---
 

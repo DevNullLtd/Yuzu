@@ -988,6 +988,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // network_diag
         {"network_diag.listening", "List listening TCP ports"},
         {"network_diag.connections", "List established TCP connections"},
+        // browser_policy
+        {"browser_policy.policies",
+         "List enterprise-managed Chrome/Chromium/Edge browser policies (Linux JSON policy "
+         "files; Windows and macOS legs planned)"},
         // msi_packages
         {"msi_packages.list", "List installed packages (Windows MSI / macOS pkgutil receipts)"},
         {"msi_packages.product_codes",

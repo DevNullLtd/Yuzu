@@ -56,6 +56,7 @@ tus=(
     agents/plugins/power_health/src/power_health_plugin.cpp
     agents/plugins/autoruns/src/autoruns_win.cpp
     agents/plugins/peripherals/src/peripherals_win.cpp
+    agents/plugins/browser_policy/src/browser_policy_win.cpp
     agents/plugins/pkg_inventory/src/pkg_inventory_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp

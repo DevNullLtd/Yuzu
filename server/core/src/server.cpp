@@ -183,6 +183,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
@@ -1968,6 +1969,32 @@ public:
             "kRbacGenerationRefreshMs. Per-process, per-replica - not fleet-wide.",
             "gauge");
         metrics_.gauge("yuzu_server_rbac_breaker_open");
+        // A1 (RBAC enforcement enable/disable toggle). Described + zero-seeded
+        // up front, same rationale as the block above.
+        metrics_.describe(
+            "yuzu_server_rbac_enforcement_enabled",
+            "This replica's CACHED view of the durable rbac_enabled flag "
+            "(RbacStore::rbac_enabled_) - published at store construction, on "
+            "every set_rbac_enabled/set_rbac_enforcement call, and on this "
+            "replica's own generation refresh. Cross-replica convergence is "
+            "bounded by the ~1s generation refresh; a fleet-wide view is "
+            "min()/max() across replicas.",
+            "gauge");
+        metrics_.gauge("yuzu_server_rbac_enforcement_enabled");
+        metrics_.describe(
+            "yuzu_server_rbac_enforcement_toggle_total",
+            "Business outcomes of PUT /api/v1/rbac/enforcement and its MCP twin "
+            "set_rbac_enforcement, by transport (rest/mcp) and result "
+            "(applied/unchanged/refused/failed). refused is an operator hitting "
+            "the caller-survives guard (RbacStore::set_rbac_enforcement) - not a "
+            "store fault; failed is a store/txn failure and correlates with "
+            "yuzu_server_rbac_read_degrade_total. Zero-seeded for all 8 series "
+            "so an idle server carries every dimension from boot.",
+            "counter");
+        for (const auto transport : {"rest", "mcp"})
+            for (const auto result : {"applied", "unchanged", "refused", "failed"})
+                metrics_.counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", transport}, {"result", result}});
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
@@ -19974,6 +20001,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
+        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
         yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),

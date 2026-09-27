@@ -169,6 +169,12 @@ constexpr ExpectedResolution kExpected[] = {
     // shares this literal prefix once past the role-name path segment.
     {"POST",   "/api/v1/rbac/roles/Operator/assignments",              4u * 1024, false, "rbac_role_assignment"},
     {"DELETE", "/api/v1/rbac/roles/Operator/assignments/alice",        4u * 1024, false, "rbac_role_assignment"},
+    // body_cap_policy.hpp rbac_enforcement row — A1 enforcement toggle
+    // (rest_api_v1.cpp). Body is {"enabled": true}. A segment-boundary
+    // probe (not a literal prefix match) proves "enforcement-evil" does NOT
+    // inherit this row and falls to the catch-all instead.
+    {"PUT",    "/api/v1/rbac/enforcement",                             1u * 1024, false, "rbac_enforcement"},
+    {"PUT",    "/api/v1/rbac/enforcement-evil",                        4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -203,6 +209,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "instruction_yaml",
     "hardware",
     "rbac_role_assignment",
+    "rbac_enforcement",
     "default",
 };
 
@@ -344,8 +351,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // secret plane) + hardware(1: the Hardware CI list/record/sync REST v1
     // twin, governance Gate 2) + rbac_role_assignment(1: A2 global human
     // role assignment, .claude/plans/rbac-industry-leading-DELIVERY-PLAN.md
-    // §2) + default(1).
-    CHECK(std::size(kBodyCapTable) == 30);
+    // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
+    // default(1).
+    CHECK(std::size(kBodyCapTable) == 31);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
