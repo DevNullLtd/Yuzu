@@ -19214,9 +19214,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     crl_ok = publish_crl_fn().has_value();
                 audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
                                     "Security", serial,
-                                    crl_ok ? ""
-                                           : "CRL build/record failed after revocation; CRL may "
-                                             "be stale") &&
+                                    crl_ok ? "reason=revoke"
+                                           : "reason=revoke CRL build/record failed after "
+                                             "revocation; CRL may be stale") &&
                            audit_ok;
                 nlohmann::json payload_j = {{"revoked", true},
                                             {"serial_hex", serial},
@@ -21305,7 +21305,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     result = "failure";
                     break;
                 }
-                const bool audit_ok =
+                bool audit_ok =
                     audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
                 if (!ok) {
                     // StoreError is a genuine server-side persistence fault (matches
@@ -21328,6 +21328,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Re-publish the CRL so it's signed under the new issuing cert's
                 // identity - same follow-up REST performs after a successful import.
                 const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+                // #4829: was previously unaudited - the MCP twin of the REST/dashboard
+                // import-chain handlers' own ca.crl.published addition.
+                audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                    "Security", "root",
+                                    crl_ok ? "reason=import_chain"
+                                           : "reason=import_chain CRL build/record failed after "
+                                             "import; public CRL may be stale under the new "
+                                             "issuer") &&
+                           audit_ok;
                 nlohmann::json payload_j = {
                     {"imported", true}, {"mode", "subordinate"}, {"crl_republished", crl_ok}};
                 if (!audit_ok)

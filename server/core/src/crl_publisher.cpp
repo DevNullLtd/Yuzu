@@ -153,7 +153,13 @@ std::optional<std::vector<std::uint8_t>> CrlPublisher::publish(bool background, 
             if (background && rec.error().kind == CaStore::PublishError::Busy) {
                 if (skipped)
                     *skipped = true;
-                return std::nullopt; // a skip is not a failure — no counter, no audit
+                // #4830: debug, not silent (diagnosability) and not warn/error (this is expected,
+                // bounded contention with an operator publish, not a failure — no counter, no
+                // audit; a persistent Busy would instead show up as repeated freshness_tick()
+                // retries, which its own info log on eventual success already covers).
+                spdlog::debug("PKI: freshness-pass CRL publish skipped — another publish is "
+                              "already running in this process");
+                return std::nullopt;
             }
             if (rec.error().kind == CaStore::PublishError::RootChanged && attempt == 1) {
                 spdlog::info(
@@ -221,6 +227,12 @@ void CrlPublisher::freshness_tick(std::chrono::steady_clock::time_point now_stea
         return;
     const auto decision = decide_freshness_tick();
     if (decision.check_degraded) {
+        // #4830: a CHECK failure, not a publish failure — no publish was even attempted, so this
+        // must stay a separate counter from both yuzu_server_ca_crl_publish_failures_total and
+        // its _reason_total sibling (see the describe() comment in server.cpp).
+        if (d_.metrics)
+            d_.metrics->counter("yuzu_server_ca_unpublished_revocation_check_failures_total")
+                .increment();
         // Throttle: a persistent read failure retries once a minute, not every 15s tick.
         retry_after_ = now_steady + std::chrono::minutes(1);
         return;

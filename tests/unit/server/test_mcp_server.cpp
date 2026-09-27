@@ -30124,6 +30124,10 @@ TEST_CASE("MCP B5: import_ca_chain full approval-ticket round-trip reaches impor
     CHECK(ts.audit_log.back() == "mcp.import_ca_chain|success");
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
                      std::string("ca.subordinate.imported|success")) != ts.audit_log.end());
+    // #4829: the MCP import-chain tool previously wrote NO ca.crl.published row at all —
+    // the MCP twin of the REST/dashboard import-chain handlers' own addition.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.crl.published|success")) != ts.audit_log.end());
     REQUIRE(body["result"].contains("structuredContent"));
     CHECK(body["result"]["structuredContent"] == payload);
 }

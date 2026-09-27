@@ -2815,6 +2815,33 @@ public:
                           "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
         (void)metrics_.counter("yuzu_server_ca_crl_publish_failures_total");
+        // #4830: the bare counter above can't tell a bad CA key apart from a lock timeout or a
+        // lost COMMIT ack. `reason` is CaStore::PublishFailReason's label
+        // (kPublishFailReasonLabels, ca_store.hpp) — a closed, compiler-enforced set, so this
+        // loop and every increment site (crl_publisher.cpp) can never drift apart. Additive: the
+        // bare counter above stays the alert source (docs/prometheus/yuzu-alerts.yml keys off
+        // it unchanged); this is the triage breakdown.
+        metrics_.describe("yuzu_server_ca_crl_publish_failure_reason_total",
+                          "Internal-CA CRL (re)publish failures broken down by cause (#4830) - "
+                          "see docs/user-manual/metrics.md for the label vocabulary. Sibling to "
+                          "yuzu_server_ca_crl_publish_failures_total, which stays the unlabelled "
+                          "alert source.",
+                          "counter");
+        for (const auto& reason_label : CaStore::kPublishFailReasonLabels)
+            metrics_.counter("yuzu_server_ca_crl_publish_failure_reason_total",
+                             {{"reason", std::string(reason_label)}});
+        // #4830: has_unpublished_revocations()'s own read failing is a CHECK failure, not a
+        // publish failure — no publish was even attempted, so it must not feed either counter
+        // above (a reader conflating the two would wrongly conclude CRLs are failing to
+        // publish). A sustained non-zero rate means the freshness pass's self-heal is silently
+        // disabled (crl_publisher.cpp's freshness_tick() backs off 1 minute per occurrence
+        // rather than retrying every 15s tick).
+        metrics_.describe("yuzu_server_ca_unpublished_revocation_check_failures_total",
+                          "The freshness pass's has_unpublished_revocations() read failed (#4830) "
+                          "- the CRL self-heal check was skipped, not that a publish failed. A "
+                          "sustained non-zero rate means self-heal is effectively disabled.",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_unpublished_revocation_check_failures_total");
         metrics_.describe("yuzu_server_ca_reissue_blocked_total",
                           "Agent CSR re-issuance refused because a revoked, non-expired cert "
                           "already exists for that identity (sign_agent_csr's revocation-bypass "

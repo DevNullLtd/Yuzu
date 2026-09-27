@@ -183,12 +183,26 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   lock for everyone else. Within one server process, concurrent publishes take a
   local lock first, so at most one pool connection waits on the table lock; any
   other publish (operator, import or startup) that cannot get the local lock
-  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not);
-  the operator-revoke paths additionally return `crl_republished:false` and write a
-  `ca.crl.published` failure audit. The import-chain, boot and freshness paths
-  write no `ca.crl.published` audit row, success or failure (#4829). A failure of
-  the freshness pass's own unpublished-revocation *check* is not a publish failure:
-  it is logged (warn, at most once a minute) and not counted (#4830). Repeated
+  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not) and
+  the finer-grained, reason-labelled `yuzu_server_ca_crl_publish_failure_reason_total{reason}`
+  sibling (#4830 — a bounded, closed cause set: `key_load`, `root_read_failed`,
+  `no_connection`, `lock_timeout`, `number_read_failed`, `degraded_revoked_read`,
+  `build_failed`, `insert_or_commit_failed`, `root_changed_twice`, `busy`,
+  `exception` — see `docs/user-manual/metrics.md`). **Every CRL publish now writes
+  a `ca.crl.published` audit row, success or failure (#4829)** — the two
+  operator-triggered paths (revoke, import-chain, each on REST/MCP/dashboard as
+  applicable) carry the caller's own request context and a `reason=` token
+  (`revoke` or `import_chain`); the three paths with no live request — startup,
+  the freshness re-publish, and the count-compare self-heal — are audited by
+  `CrlPublisher` itself under a `principal=system` row with `reason=startup`,
+  `reason=freshness`, or `reason=self_heal` respectively, so a self-heal that
+  resolves an earlier revoke-triggered failure row leaves its own
+  `result=success reason=self_heal` row as the resolution. A failure of the
+  freshness pass's own unpublished-revocation *check* is not a publish failure:
+  it is logged (warn, at most once a minute), not counted against either publish
+  counter, and instead increments the separate
+  `yuzu_server_ca_unpublished_revocation_check_failures_total` (#4830) — a
+  sustained non-zero rate means self-heal is effectively disabled. Repeated
   subordinate-CA imports can make publishes fail with "CA root changed" (logged
   distinctly; admin-only) until the imports stop.
 - **Self-heal.** Each CRL row records how many revoked certs it was built from
