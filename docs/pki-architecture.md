@@ -230,10 +230,12 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
   a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
   `scripts/ha/ha-crl-publish-failover.sh` (WS-9, #4832) exercises the deterministic-lost-ack and
-  connection-reset cases live against a real Patroni cluster; its async-durability case confirms the
-  `YUZU_PG_DURABILITY=async` toggle is real and reachable but does not live-exercise the
-  asynchronously-replicated-commit-loss residual described above — that residual is asserted by this
-  paragraph, not by a live repro.
+  connection-reset cases live against a real Patroni cluster — but its deterministic-lost-ack case
+  catches the REVOCATION's own commit ack, not `publish_next_crl`'s CRL-publish transaction itself
+  (see the script's own CORRECTNESS NOTE); a recipe targeting the publish transaction specifically is
+  a disclosed follow-up (#5032). Its async-durability case confirms the `YUZU_PG_DURABILITY=async` toggle is
+  real and reachable but does not live-exercise the asynchronously-replicated-commit-loss residual
+  described above — that residual is asserted by this paragraph, not by a live repro.
 
 **curl examples:**
 

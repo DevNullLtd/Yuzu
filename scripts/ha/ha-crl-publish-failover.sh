@@ -9,14 +9,32 @@
 #   1. deterministic lost ack   pause BOTH standbys (so no sync ack can ever
 #      arrive under YUZU_PG_DURABILITY=sync2 + YUZU_PG_SYNC_STRICT=true —
 #      strict mode blocks rather than degrading to async), fire a revoke,
-#      poll pg_stat_activity for the publish transaction's backend to reach
-#      wait_event='SyncRep' (the transaction has ALREADY LOCALLY COMMITTED at
-#      that point), pg_terminate_backend it — reproducing exactly the "lost
-#      COMMIT acknowledgement" ca_store.cpp's publish_next_crl comment
-#      describes, not a rollback — unpause, switch the primary over, and
-#      assert no crlNumber reuse + eventual serial coverage via self-heal.
-#      (Simpler and more deterministic than pausing only the one designated
-#      sync standby: Patroni can reassign the synchronous role to the other
+#      poll pg_stat_activity for ANY backend to reach wait_event='SyncRep'
+#      (the transaction has ALREADY LOCALLY COMMITTED at that point),
+#      pg_terminate_backend it, unpause, switch the primary over, and assert
+#      no crlNumber reuse + eventual serial coverage via self-heal.
+#
+#      CORRECTNESS NOTE (Fable diff review, 2026-09-27): the SyncRep-waiting
+#      backend this recipe actually catches is the REVOCATION's own UPDATE
+#      commit (ca_store.cpp's revoke() — a separate autocommit statement
+#      revoke_core issues BEFORE calling publish_crl_fn), not
+#      CaStore::publish_next_crl's own transaction — revoke_core commits the
+#      revocation first, so publish_next_crl is never even entered while the
+#      revocation's ack is still outstanding. What this case has verified is
+#      "a locally-committed-but-unacknowledged REVOCATION survives a
+#      switchover and self-heal republishes it" — a real, useful,
+#      independently load-bearing result, but NOT #4832 AC1's literal "no
+#      crlNumber reuse under a lost ack of the CRL PUBLISH transaction
+#      itself" — no CRL publish transaction's ack was ever lost in this
+#      recipe, since query_revoked_on always sees the already-committed
+#      revocation and no publish attempt racing a SyncRep wait was observed.
+#      A recipe that targets the CRL-publish transaction specifically (join
+#      pg_locks for the ShareRowExclusiveLock holder on ca_crl_versions,
+#      which stays held through SyncRepWaitForLSN) is filed as a follow-up —
+#      #5032.
+#      (Pausing both standbys rather than the one designated sync standby is
+#      still the right simplification for whichever transaction this ends up
+#      targeting: Patroni can reassign the synchronous role to the other
 #      standby within one loop_wait, racing the pg_terminate_backend poll —
 #      pausing both removes that race entirely, since no reassignment target
 #      exists either way. See "DEVIATION" comment at run_case1 below.)
@@ -44,9 +62,11 @@
 #   - Case 1: PASSES CLEANLY and REPRODUCIBLY (3 of 4 runs after the design
 #     settled; 1 run reported its own INCONCLUSIVE per Fable's instruction
 #     above rather than a false pass — a real, disclosed non-determinism in
-#     the SyncRep-wait recipe, not a script bug). This is the load-bearing
-#     assertion #4832 exists to make (AC1: no crlNumber reuse across a
-#     switchover under a real lost ack) and it has been observed to hold.
+#     the SyncRep-wait recipe, not a script bug). Per the CORRECTNESS NOTE
+#     above, this proves "a lost-ack REVOCATION survives a switchover, no
+#     crlNumber reuse, self-heal covers it" — real and useful, but the
+#     narrower "lost ack of the CRL PUBLISH transaction itself" (AC1's
+#     literal wording) remains UNVERIFIED live; tracked as a follow-up, #5032.
 #   - Case 2: the first 4 of 5 assertions (lock acquisition confirmed via
 #     pg_locks, the queued backend killed pre-lock, crl_republished:false
 #     reported honestly, no crlNumber gap) now PASS RELIABLY after the
@@ -370,10 +390,10 @@ run_case1() {
         kill -KILL "$revoke_pid" 2>/dev/null; wait "$revoke_pid" 2>/dev/null || true
         return
     fi
-    pass "case1: backend pid=${pid} reached wait_event='SyncRep' (its transaction has already committed locally — Postgres is only waiting on the ack)"
+    pass "case1: backend pid=${pid} reached wait_event='SyncRep' (its transaction has already committed locally — Postgres is only waiting on the ack; per the header's CORRECTNESS NOTE, this is the revocation's own commit, not necessarily the CRL-publish transaction)"
 
     supersql "$PRIMARY" "SELECT pg_terminate_backend(${pid})" >/dev/null
-    pass "case1: terminated the SyncRep-waiting backend (reproduces the lost COMMIT acknowledgement)"
+    pass "case1: terminated the SyncRep-waiting backend (reproduces a lost COMMIT acknowledgement on the revocation's own commit)"
 
     for n in "${NODES[@]}"; do [[ "$n" != "$PRIMARY" ]] && docker unpause "$n" >/dev/null; done
     wait_full_health "$PRIMARY" 2 >/dev/null || fail "case1: standbys did not rejoin as streaming after unpause"

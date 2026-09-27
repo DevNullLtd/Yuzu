@@ -10346,6 +10346,17 @@ public:
         if (offload_secret_codec_)
             offload_secret_codec_->set_audit_hook({});
         offload_secret_codec_.reset();
+        // CrlPublisher (HA WS-6 CRL follow-ups) borrows auth_key_provider_, audit_store_
+        // AND ca_store_ by raw pointer (its Deps struct) — reset it HERE, before any of
+        // those three, per the exact ordering discipline the RuntimeConfigStore comment
+        // above already states: every borrower of auth_key_provider_ must be reset before
+        // auth_key_provider_ itself, never left to dangle across the interval to this
+        // struct's own member-destruction order. Unreachable today only because every
+        // caller (health thread joined above, web thread joined above, boot pre-publish
+        // on main) is provably dead by this point — not because the ordering would
+        // otherwise be safe. ca_store_ itself resets later, below; that's fine, this only
+        // needs to run before auth_key_provider_/audit_store_.
+        crl_publisher_.reset();
         auth_key_provider_.reset();
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
@@ -20110,6 +20121,12 @@ private:
     // inlined in publish_crl()/the freshness tick — see crl_publisher.hpp's header banner. The
     // former crl_freshness_retry_after_ backoff member moved inside it (CrlPublisher::retry_after_)
     // since it paces freshness_tick(), which moved there too.
+    //
+    // Its Deps struct borrows ca_store_/audit_store_/auth_key_provider_.get() by raw pointer, so
+    // it is reset() in stop() BEFORE any of those three — same ordering discipline as
+    // RuntimeConfigStore/*SecretCodec above (see that comment for the external-review precedent
+    // this rule exists because of). Member-destruction order alone is NOT the safety net here;
+    // stop()'s explicit reset() is.
     std::unique_ptr<CrlPublisher> crl_publisher_;
     DefaultCertSet default_cert_set_;
     bool default_certs_failed_{false};
