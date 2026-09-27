@@ -69,6 +69,16 @@ history:
     written before #4658 landed on this branch, narrowed the check to Registry-only and
     contradicted them — caught and fixed in adversarial review before merge, see the counter
     rule's `pass_failed` fix too).
+  - 2026-09-XX - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
+    failed`, `failing persistently`, `pass recovered`) now use File's `PassOutcome` /
+    `log_pass_outcome()` shape and are written after `mu_` is released (they ran under `mu_`
+    before, stalling `arm()`/`disarm()` on a blocked sink). (g)(4)'s blocked-sink bullet
+    rewritten from "the two mechanisms are not the same shape" to the shared shape, with
+    Registry's remaining under-`mu_` per-key warn sites named as the residual (#4999); (g)(3)'s
+    deadline-stamp bullet gains the matching clause. The operator manual's "Diagnosing an inert
+    File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
+    gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
+    fixed. PR #5004 (open, not yet merged), full `/governance` (Spark row).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -1418,7 +1428,8 @@ further recorded limits.
    - Deadline stamp. File stamps the deadline in `note_pass_outcome_locked()`, before the pass's
      off-lock tail (the log line and `FilePassWork` destruction), so it can already be stale when
      the wait is computed; `wait_timeout_locked()` treats a passed deadline as retry-due-now.
-     Registry starts its backoff wait after its tail.
+     Registry starts its backoff wait after its tail (since #4704 the same tail as File's: the
+     pass-outcome line, then `SweepWork` destruction).
    - Completion passes. A File pass run for a real IOCP completion counts toward the three
      failures and is never throttled or absorbed; a successful one ends the episode.
    - Clearing `inert`. File clears it on the first successful pass with no equivalent of
@@ -1449,18 +1460,31 @@ further recorded limits.
    - Known limit: a blocked or slow log sink stalls the mechanism's own worker thread while it
      runs, for as long as the sink blocks; only agent shutdown is bounded (the 20 s
      `ShutdownDeadlineGuard`, `kShutdownDeadlineGrace`, armed in `AgentImpl::stop()` and in
-     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). The two
-     mechanisms are not the same shape: File's `log_pass_outcome()` runs OFF `mu_`
-     (`spark_file.cpp:3297`/`:3352`, after `lk.unlock()`), so a stalled sink there stalls only
-     IOCP draining and the worker join in `stop()` - `arm()`/`disarm()`/`stats()` keep working.
-     Registry's equivalent lines run WHILE `mu_` IS HELD: the recovery log
-     (`spark_registry.cpp:1895`) is released at `:1901` on the recovery path, and the failure and
-     inert-transition logs (`:1912`, `:1916`) are released at `:1919` on the failure path - two
-     different unlock points, neither reached from the other branch in the same pass. Either way
-     a stalled sink there stalls every other caller of
-     `mu_` (`arm()`, `disarm()`, `apply_test_controls()`) too, not only this worker's own
-     draining. Tracked as its own issue, #4704 (not folded into this design record's own
-     acceptance, since it needs a fix decision of its own).
+     `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). Since #4704 the
+     two mechanisms share one shape for their pass-outcome lines (`pass failed`, `failing
+     persistently`, `pass recovered`): each is written OFF `mu_`, after the pass's bookkeeping
+     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2928-2943`), called
+     after `lk.unlock()` at `:3303-3304` and `:3358-3359`. Registry: its own `PassOutcome` /
+     `log_pass_outcome()` (`spark_registry.cpp:1888-1903`), called after the `lk.unlock()` on
+     each of `sweeper_main()`'s two branches (recovery, and failure with the inert transition).
+     Before #4704 those three Registry lines ran while `mu_` was held, so a stalled sink there
+     also stalled every other `mu_` caller (`arm()`, `disarm()`, `apply_test_controls()`), a
+     strictly worse consequence than File's; the fix mirrored File's shape, not a shared async
+     primitive (ruled 2026-09-24). What a stalled sink still stalls, on either mechanism, is
+     that worker's own loop (File: IOCP draining; Registry: the next sweeper pass and any
+     re-arm or establishment report it owes) and the worker join in `stop()`;
+     `arm()`/`disarm()`/`stats()` keep working for a stall on one of the three pass-outcome
+     lines above. Registry's per-key `warn` lines (`fail_backend_locked()`,
+     `resolve_probe_locked()`, `park_lost_locked()`) are still written under `mu_`; they were
+     outside #4704's ruled scope and are tracked as #4999 (amended post-filing to correct a
+     stale citation and add `publish_locked()`'s own two sites, 5 total). File has its own
+     analogous per-key sites still under its own lock (e.g.
+     `defer_backend_retry_locked()`/`fail_backend_locked()` reached from `watch_incarnation()`),
+     tracked separately as #5002. Both issues are currently E6-capped by the same
+     `prefer_spark_=false` compensating control and are likely superseded once #4666's async log
+     hand-off is wired in as the process's default logger (#4666's own PR-2, already a blocking
+     F14 precondition here for unrelated reasons) - re-check whether either issue's fix is still
+     needed once that lands, rather than assuming per-site surgery is still required.
 5. The `pass_failed`, `pass_failures_consecutive` and `pass_backoff_ms` counters are readable only
    through the test seam (`file_debug_counters_for_test`, Windows only). The operator-visible
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
