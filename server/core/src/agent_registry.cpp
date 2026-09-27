@@ -1007,11 +1007,21 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
         {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags, Windows audit categories (read-only)"},
         {"local_security_policy.sudoers", "Report parsed sudoers content: defaults, aliases, includes and user specs (Linux/macOS, read-only)"},
+        // system_hardening
+        {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
         {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
+        // pkg_inventory
+        {"pkg_inventory.managers",
+         "List package managers present on the host with manager-level config facts "
+         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
+         "macOS only today, Linux and Windows report unsupported)"},
+        {"pkg_inventory.packages",
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
+         "today; the Linux package roster is owned by installed_apps)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture

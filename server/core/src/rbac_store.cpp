@@ -6,7 +6,9 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rbac_admin_authority_owner.hpp"
 #include "rbac_generation_rules.hpp"
+#include "rbac_store_sql_helpers.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -37,7 +39,7 @@ constexpr const char* kStoreName = "rbac_store";
 // callers; writes get a slightly wider budget. Backfill runs single-threaded at
 // construction before serving, so a wide deadline is fine.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
-constexpr std::chrono::milliseconds kWriteTimeout{4000};
+using rbac_sql::kWriteTimeout; // defined in rbac_store_sql_helpers.hpp
 // Availability hardening (governance re-review, #2703 Gate 7 — Fable-reviewed
 // merge slice, item 1 commit A). The hot authz path (`maybe_refresh_generation`,
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
@@ -191,17 +193,9 @@ std::int64_t now_ms() {
         .count();
 }
 
-std::int64_t to_i64(const char* s) {
-    if (s == nullptr || s[0] == '\0')
-        return 0;
-    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
-}
-std::uint64_t to_u64(const char* s) {
-    if (s == nullptr || s[0] == '\0')
-        return 0;
-    return static_cast<std::uint64_t>(std::strtoull(s, nullptr, 10));
-}
-bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
+using rbac_sql::to_i64;  // defined in rbac_store_sql_helpers.hpp
+using rbac_sql::to_u64;  // defined in rbac_store_sql_helpers.hpp
+using rbac_sql::to_bool; // defined in rbac_store_sql_helpers.hpp
 
 /// Strict canonical-boolean parser for `rbac_meta.value` (rbac_enabled):
 /// unlike `to_bool` above (the loose native-PG-boolean-text convention —
@@ -220,12 +214,7 @@ std::optional<bool> parse_canonical_bool(std::string_view s) {
     return std::nullopt;
 }
 
-std::string text_col(PGresult* res, int row, int col) {
-    if (PQgetisnull(res, row, col))
-        return {};
-    return std::string(PQgetvalue(res, row, col),
-                       static_cast<std::size_t>(PQgetlength(res, row, col)));
-}
+using rbac_sql::text_col; // defined in rbac_store_sql_helpers.hpp
 
 // sanitize_utf8_strict scrubs invalid UTF-8 to U+FFFD but keeps embedded NUL (a
 // valid ASCII byte). PostgreSQL TEXT cannot store a NUL and libpq's text-format
@@ -1375,20 +1364,8 @@ void RbacStore::breaker_note_result(bool success) const {
 }
 
 namespace {
-// Bump `write_generation` inside an already-open txn on `c`; return the new
-// value, or nullopt on any error. The mutation and this bump commit atomically
-// (ADR-0041: the durable counter advances in the SAME txn as the write).
-std::optional<std::uint64_t> bump_generation_in_txn(PGconn* c) {
-    pg::PgResult r = pg::exec_params(
-        c,
-        "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('write_generation','1') "
-        "ON CONFLICT (key) DO UPDATE SET value = "
-        "(rbac_store.rbac_meta.value::bigint + 1)::text RETURNING value::bigint",
-        std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
-        return std::nullopt;
-    return to_u64(PQgetvalue(r.get(), 0, 0));
-}
+// Defined in rbac_store_sql_helpers.hpp (shared with RbacAdminAuthorityOwner).
+using rbac_sql::bump_generation_in_txn;
 } // namespace
 
 // ── Global toggle ────────────────────────────────────────────────────────────
@@ -1453,26 +1430,50 @@ void RbacStore::set_rbac_enabled(bool enabled) {
     apply_local_generation(*new_gen);
 }
 
-bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
-    // Permit the full-fleet fallback (return false) ONLY for a store that is
+RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept {
+    // THE single derivation of enforcement state from the 3 raw accessors —
+    // rbac_enforcement_in_effect() below is now a one-line PROJECTION of
+    // THIS function's result (security-guardian re-review, PR #4985 merge
+    // reconciliation: the two were previously two independently-written
+    // function bodies kept in sync by a "keep any future change... in sync
+    // here" comment alone — a real risk once this label became load-bearing
+    // for is_rbac_administrator's own RBAC-on/off branch routing, not just
+    // an export string. Delegating makes "the two can never silently drift
+    // apart" true by CONSTRUCTION instead of by convention).
+    //
+    // Permit the fresh-disabled outcome (kDisabled) ONLY for a store that is
     // loaded, explicitly disabled, AND whose disabled view is currently
-    // FRESH. Null / load-failed (!is_open()) fail CLOSED — see the header
-    // for the #1498 rationale.
+    // FRESH. Null / load-failed (!is_open()) fails CLOSED (kDegraded) — see
+    // the header for the #1498 rationale.
     if (!store || !store->is_open())
-        return true;
+        return RbacEnforcementLabel::kDegraded;
     if (store->is_rbac_enabled())
-        return true;
+        return RbacEnforcementLabel::kEnabled;
     // adversarial-review round (#2703): is_rbac_enabled()==false is not, on
     // its own, proof RBAC is genuinely disabled — maybe_refresh_generation()
     // (just invoked by the call above) deliberately never touches a stale
     // cached rbac_enabled_ on a failed refresh, so a replica that has never
     // itself observed a remote enable stays cached false indefinitely
-    // through an outage. Treat a degraded view (the refresh did not land)
-    // the same as "enabled" here — the one place this distinction is
+    // through an outage. A degraded view (the refresh did not land) reads as
+    // kDegraded here, never kDisabled — the one place this distinction is
     // security-relevant, unlike the raw is_rbac_enabled() accessor other
     // (non-confinement) callers use.
-    return store->rbac_enabled_view_degraded();
+    //
+    // (cpp-safety re-review, PR #4985 fix round, corrected by a security-
+    // guardian follow-up pass: `noexcept` here is honest only to the same
+    // degree as `is_rbac_enabled()`/`rbac_enabled_view_degraded()` not
+    // throwing in practice — `is_open()` IS itself `noexcept`, those two are
+    // not. Not a new risk this delegation introduces.)
+    return store->rbac_enabled_view_degraded() ? RbacEnforcementLabel::kDegraded
+                                                : RbacEnforcementLabel::kDisabled;
 }
+
+bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
+    return rbac_enforcement_label(store) != RbacEnforcementLabel::kDisabled;
+}
+
+// to_string(RbacEnforcementLabel) is constexpr and header-inline (rbac_store.hpp) —
+// matches every other enum-to-string mapper in this codebase.
 
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
@@ -1968,30 +1969,23 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
     return {};
 }
 
-std::expected<void, std::string> RbacStore::unassign_role(const std::string& principal_type,
-                                                          const std::string& principal_id,
-                                                          const std::string& role_name) {
+std::expected<bool, std::string> RbacStore::unassign_role(const std::string& principal_type,
+                                                           const std::string& principal_id,
+                                                           const std::string& role_name) {
     if (!open_)
         return std::unexpected("database not open");
-    std::optional<std::uint64_t> new_gen;
-    std::string err;
-    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult r = pg::exec_params(
-            c,
-            "DELETE FROM rbac_store.principal_roles WHERE principal_type = $1 AND principal_id = $2 "
-            "AND role_name = $3",
-            std::vector<std::string>{principal_type, principal_id, role_name});
-        if (r.status() != PGRES_COMMAND_OK) {
-            err = PQerrorMessage(c);
-            return false;
-        }
-        new_gen = bump_generation_in_txn(c);
-        return new_gen.has_value();
-    });
-    if (!ok)
-        return std::unexpected(err.empty() ? "unassign_role failed" : err);
-    apply_local_generation(*new_gen);
-    return {};
+    const RbacAdminAuthorityOwner::UnassignOutcome outcome =
+        RbacAdminAuthorityOwner{pool_}.unassign_role(principal_type, principal_id, role_name);
+    if (outcome.last_admin_reject)
+        return std::unexpected("cannot remove the last remaining Administrator role grant — "
+                               "the fleet would be left with " +
+                               std::string(kRbacLastAdminRefusalMarker));
+    // `!outcome.new_gen` is unreachable while the owner's lambda returns
+    // `new_gen.has_value()`; it guards the dereference below if that ever changes.
+    if (!outcome.ok || !outcome.new_gen)
+        return std::unexpected(outcome.err.empty() ? "unassign_role failed" : outcome.err);
+    apply_local_generation(*outcome.new_gen);
+    return outcome.removed;
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────

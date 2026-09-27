@@ -126,12 +126,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | other | 74 | 13 | 61 |
 | **Total** | **284** | **81** | **203** |
 
-Registered `/api/vN/*` routes: 237. OpenAPI `paths` entries: 236. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 179.
+Registered `/api/vN/*` routes: 239. OpenAPI `paths` entries: 238. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 181.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 203.
 
 <!-- END GENERATED -->
-
 
 ## See also
 

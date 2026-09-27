@@ -120,10 +120,24 @@ AccRevShared& acc_rev_shared() {
 // constructor's seed_defaults() re-seeds the system roles on an empty
 // table, so this reproduces the same fully-fresh-RBAC-state-per-test
 // guarantee the old per-harness SQLite file gave. rbac_store.securable_types
-// /operations/rbac_meta are static seed data no test mutates, so they're
-// deliberately left alone (mirrors public.schema_meta below). public
-// .schema_meta is deliberately untouched — the clone stays migrated, so the
-// per-harness store ctors find the schema current and skip migration.
+// /operations are static seed data no test mutates, so they're deliberately
+// left alone (mirrors public.schema_meta below). public.schema_meta is
+// deliberately untouched — the clone stays migrated, so the per-harness
+// store ctors find the schema current and skip migration.
+//
+// rbac_store.rbac_meta's `rbac_enabled` row is NOT static — a test that
+// calls RbacStore::set_rbac_enabled(true) (governance round 3 SHOULD-3,
+// the genuinely-ENABLED rbac_enforcement route test) durably flips it, and
+// TRUNCATE above never reaches rbac_meta (it isn't in that list, and
+// row_meta is a key/value table shared with write_generation/backfill
+// markers, not something to TRUNCATE wholesale). Reset the ONE key tests
+// actually toggle back to the fresh-install default explicitly, in its own
+// statement (PQexecParams is single-command-only, so this cannot ride the
+// TRUNCATE above) — every harness's freshly-constructed RbacStore reads
+// this durable row at its own first refresh, so this single UPDATE is
+// sufficient; no generation bump is needed (there is no PRE-EXISTING
+// in-process RbacStore instance whose cache this must invalidate — each
+// harness constructs its own).
 void acc_rev_reset() {
     auto lease = acc_rev_shared().pool->acquire();
     REQUIRE(lease);
@@ -137,6 +151,13 @@ void acc_rev_reset() {
         std::vector<std::string>{});
     INFO("[acc_rev_reset] " << PQresultErrorMessage(trunc.get()));
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+
+    auto reset_enabled = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE rbac_store.rbac_meta SET value = 'false' WHERE key = 'rbac_enabled'",
+        std::vector<std::string>{});
+    INFO("[acc_rev_reset:rbac_enabled] " << PQresultErrorMessage(reset_enabled.get()));
+    REQUIRE(reset_enabled.status() == PGRES_COMMAND_OK);
 }
 
 struct AuditRecord {
@@ -838,7 +859,10 @@ TEST_CASE("export: format classifier — json|csv 200, anything else 400",
     auto csv_res = h.sink.Get("/api/v1/access-reviews/export?format=csv");
     REQUIRE(csv_res);
     CHECK(csv_res->status == 200);
-    CHECK(csv_res->body.starts_with("principal_type,principal_id,"));
+    // A3: the unconditional rbac_enforcement metadata line precedes the real
+    // header — fresh harness, RBAC never toggled on in this harness.
+    CHECK(csv_res->body.starts_with("# rbac_enforcement=disabled\r\n"
+                                    "principal_type,principal_id,"));
 
     auto default_res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(default_res);
@@ -1039,6 +1063,145 @@ TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[pg][acce
     CHECK(res->status == 200);
     CHECK(res->body.find(cid) != std::string::npos);
     CHECK(res->body.find("\"List me\"") != std::string::npos);
+
+    // A3 (RBAC delivery plan) — the campaign was frozen with RBAC's default
+    // (never toggled in this harness) enforcement state.
+    auto body = nlohmann::json::parse(res->body);
+    bool found = false;
+    for (auto& c : body["data"]) {
+        if (c["campaign_id"] == cid) {
+            found = true;
+            CHECK(c["rbac_enforcement"] == "disabled");
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /access-reviews/{id} and GET .../export: rbac_enforcement is present and "
+         "reflects RBAC's current state",
+         "[pg][access_review][rest]") {
+    AccessReviewHarness h;
+
+    auto export_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(export_res);
+    REQUIRE(export_res->status == 200);
+    auto export_body = nlohmann::json::parse(export_res->body);
+    REQUIRE(export_body.contains("rbac_enforcement"));
+    CHECK(export_body["rbac_enforcement"] == "disabled");
+
+    const auto cid = h.open_campaign_rest("Enforcement stamp test");
+    auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(get_res);
+    REQUIRE(get_res->status == 200);
+    auto get_body = nlohmann::json::parse(get_res->body);
+    CHECK(get_body["data"]["campaign"]["rbac_enforcement"] == "disabled");
+}
+
+// Governance round 3 SHOULD-3: every other route-level rbac_enforcement
+// assertion in this file exercises only the harness's "disabled" default —
+// the classifier itself is exhaustively unit-tested (test_rbac_store.cpp),
+// and the wiring has been read-reviewed, but the actual end-to-end
+// route -> handler -> field path for a genuinely ENABLED store was
+// previously unverified by any test. `h.rbac->set_rbac_enabled(true)` is
+// safe here: this harness's permission gate is `perm_override`
+// (test-controlled), entirely independent of the real RBAC engine, so
+// toggling the store's enabled flag changes ONLY the derived
+// rbac_enforcement label, never what the harness permits.
+//
+// Governance round 4 (consistency-auditor): extended to also cover REST
+// campaign-open (no dedicated "enabled" case existed for it either) and to
+// assert the `rbac_enforcement=<value>` audit-detail field this round's fix
+// added at all FOUR sites (REST export, REST campaign-open, MCP export, MCP
+// campaign-open) — previously the field had zero regression coverage
+// anywhere, so a format drift or a silent drop would compile and pass CI
+// undetected. `assert_new_audit_detail` scopes its search to rows appended
+// SINCE the `before` snapshot (REST and MCP share one action-name space —
+// both log "access_review.exported"/"access_review.campaign_opened" into
+// the SAME `h.audit_log` — so a snapshot-then-diff is what isolates "the
+// row THIS call just produced" from an earlier call's row for the same
+// action). Read-back under "enabled" (`GET /access-reviews` +
+// `GET /access-reviews/{id}`) rides along on the REST-opened campaign.
+TEST_CASE("rbac_enforcement reflects a genuinely ENABLED store across REST JSON/CSV export, "
+         "REST + MCP campaign-open, and an MCP export tool, with rbac_enforcement=enabled on "
+         "every audit row",
+         "[pg][access_review][rest][mcp][audit]") {
+    AccessReviewHarness h;
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->is_rbac_enabled());
+
+    auto assert_new_audit_detail = [&](std::size_t before, const std::string& action) {
+        bool found = false;
+        for (std::size_t i = before; i < h.audit_log.size(); ++i) {
+            const auto& a = h.audit_log[i];
+            if (a.action == action && a.result == "success") {
+                found = true;
+                CHECK(a.detail.find("rbac_enforcement=enabled") != std::string::npos);
+            }
+        }
+        CHECK(found);
+    };
+
+    // REST JSON export.
+    std::size_t before = h.audit_log.size();
+    auto json_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(json_res);
+    REQUIRE(json_res->status == 200);
+    auto json_body = nlohmann::json::parse(json_res->body);
+    CHECK(json_body["rbac_enforcement"] == "enabled");
+    assert_new_audit_detail(before, "access_review.exported");
+
+    // REST CSV export (no separate audit row — same route, same action name;
+    // already covered by the JSON call's assertion above).
+    auto csv_res = h.sink.Get("/api/v1/access-reviews/export?format=csv");
+    REQUIRE(csv_res);
+    REQUIRE(csv_res->status == 200);
+    CHECK(csv_res->body.starts_with("# rbac_enforcement=enabled\r\n"
+                                    "principal_type,principal_id,"));
+
+    // REST campaign-open.
+    before = h.audit_log.size();
+    const auto cid = h.open_campaign_rest("enabled state campaign");
+    assert_new_audit_detail(before, "access_review.campaign_opened");
+
+    // Read-back under "enabled": list + single-campaign GET.
+    auto list_res = h.sink.Get("/api/v1/access-reviews");
+    REQUIRE(list_res);
+    REQUIRE(list_res->status == 200);
+    auto list_body = nlohmann::json::parse(list_res->body);
+    bool found_in_list = false;
+    for (auto& c : list_body["data"]) {
+        if (c["campaign_id"] == cid) {
+            found_in_list = true;
+            CHECK(c["rbac_enforcement"] == "enabled");
+        }
+    }
+    CHECK(found_in_list);
+
+    auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(get_res);
+    REQUIRE(get_res->status == 200);
+    auto get_body = nlohmann::json::parse(get_res->body);
+    CHECK(get_body["data"]["campaign"]["rbac_enforcement"] == "enabled");
+
+    // MCP export_access_review.
+    before = h.audit_log.size();
+    auto mcp_export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
+    REQUIRE(mcp_export_res);
+    CHECK(mcp_export_res->status == 200);
+    auto mcp_export_body = nlohmann::json::parse(mcp_export_res->body);
+    REQUIRE(mcp_export_body.contains("result"));
+    CHECK(mcp_export_body["result"]["structuredContent"]["rbac_enforcement"] == "enabled");
+    assert_new_audit_detail(before, "access_review.exported");
+
+    // MCP open_access_review.
+    before = h.audit_log.size();
+    auto mcp_open_res =
+        h.mcp_call_tool("open_access_review", {{"title", "mcp enabled state campaign"}});
+    REQUIRE(mcp_open_res);
+    CHECK(mcp_open_res->status == 200);
+    auto mcp_open_body = nlohmann::json::parse(mcp_open_res->body);
+    REQUIRE(mcp_open_body.contains("result"));
+    assert_new_audit_detail(before, "access_review.campaign_opened");
 }
 
 TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[pg][access_review][rest][list]") {
@@ -1093,6 +1256,9 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
             if (row["principal_id"] == "mcpuser")
                 found = true;
         CHECK(found);
+        // A3 (RBAC delivery plan) — fresh harness, RBAC never toggled on.
+        REQUIRE(sc.contains("rbac_enforcement"));
+        CHECK(sc["rbac_enforcement"] == "disabled");
     }
 
     // open_access_review — freezes the current population into a campaign.
@@ -1119,6 +1285,7 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
         auto& sc = body["result"]["structuredContent"];
         CHECK(sc["campaign"]["campaign_id"] == campaign_id);
         CHECK(sc["campaign"]["status"] == "open");
+        CHECK(sc["campaign"]["rbac_enforcement"] == "disabled"); // A3 — frozen at open
         CHECK(sc["pending_count"].get<std::int64_t>() >= 1);
     }
 
@@ -1130,9 +1297,12 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
         auto body = nlohmann::json::parse(res->body);
         auto& sc = body["result"]["structuredContent"];
         bool found = false;
-        for (auto& c : sc["campaigns"])
-            if (c["campaign_id"] == campaign_id)
+        for (auto& c : sc["campaigns"]) {
+            if (c["campaign_id"] == campaign_id) {
                 found = true;
+                CHECK(c["rbac_enforcement"] == "disabled"); // A3
+            }
+        }
         CHECK(found);
     }
 
