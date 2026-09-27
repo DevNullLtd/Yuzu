@@ -5652,6 +5652,17 @@ void RestApiV1::register_routes(
                 const auto regime =
                     rbac_store->check_caller_authorized_under_current_regime(session->username);
                 if (regime == RbacRegimeAuthority::kUnavailable) {
+                    // Governance re-verification: this outcome was invisible to
+                    // operators — log AND audit it, matching the FIRST check's
+                    // own kUnavailable treatment above (Doomgoose PR #4985
+                    // IMPORTANT #2) with a DISTINCT reason string so the two
+                    // checks are individually diagnosable from the audit log.
+                    spdlog::warn("rbac.role.assigned: {} (user={})",
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.assigned", "denied", "User",
+                        session->username,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
                                                            "administrator authority"),
@@ -5960,6 +5971,14 @@ void RestApiV1::register_routes(
                 const auto regime =
                     rbac_store->check_caller_authorized_under_current_regime(session->username);
                 if (regime == RbacRegimeAuthority::kUnavailable) {
+                    // Governance re-verification: see the identical fix on the
+                    // POST assign route above for the full reasoning.
+                    spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                        session->username,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
                                                            "administrator authority"),

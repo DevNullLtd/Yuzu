@@ -22073,6 +22073,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto regime = rbac_store->check_caller_authorized_under_current_regime(
                         session->username);
                     if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: this outcome was invisible
+                        // to operators — log AND audit it, matching the FIRST
+                        // check's own kUnavailable treatment above (Doomgoose
+                        // PR #4985 IMPORTANT #2) with a DISTINCT reason string
+                        // so the two checks are individually diagnosable from
+                        // the audit log.
+                        spdlog::warn("rbac.role.assigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
                         res.set_content(
                             a4_error(kInternalError,
                                      "service unavailable — cannot confirm administrator "
@@ -22327,6 +22339,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto regime = rbac_store->check_caller_authorized_under_current_regime(
                         session->username);
                     if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: see the identical fix on
+                        // assign_rbac_role above for the full reasoning.
+                        spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
                         res.set_content(
                             a4_error(kInternalError,
                                      "service unavailable — cannot confirm administrator "

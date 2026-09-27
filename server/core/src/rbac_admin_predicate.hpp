@@ -307,6 +307,18 @@ inline constexpr std::string_view kRbacAdminGateDeniedAuditReason =
 /// `kRbacAdminGateDeniedAuditReason`'s own rule above.
 inline constexpr std::string_view kRbacAdminGateUnavailableAuditReason =
     "RBAC admin gate could not confirm administrator authority — store degraded";
+/// Governance re-verification (post A1/A2 rebase, docs-writer cross-check):
+/// A1's own Gate 8 HIGH fix (`RbacAdminAuthorityOwner::regime_authority`,
+/// called via `RbacStore::check_caller_authorized_under_current_regime` at
+/// all four assign_rbac_role/unassign_rbac_role handler call sites) never
+/// carried forward the SAME "log AND audit a kUnavailable outcome" fix
+/// Doomgoose's PR #4985 finding won for the FIRST check above — the exact
+/// invisible-to-operators shape recurred on this SECOND check. Distinct
+/// wording from `kRbacAdminGateUnavailableAuditReason` (never reuse that
+/// one here) so an operator's audit-log search can tell WHICH of the two
+/// checks degraded. EXTEND this, never fork a second copy.
+inline constexpr std::string_view kRbacRegimeAuthorityUnavailableAuditReason =
+    "RBAC regime-authority check could not confirm authority — store degraded";
 
 /// Shared control-flow chokepoint for the two non-admit `RbacAdminGate`
 /// outcomes. Returns `true` (having already invoked exactly one of
