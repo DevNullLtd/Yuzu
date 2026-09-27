@@ -864,7 +864,7 @@ TEST_CASE("CaStore: publish_next_crl allocates monotonic numbers atomically", "[
             return std::nullopt;
         });
     REQUIRE_FALSE(aborted);
-    CHECK(aborted.error() == CaStore::PublishError::Failed);
+    CHECK(aborted.error().kind == CaStore::PublishError::Failed);
     CHECK_FALSE(store.publish_next_crl(
         [](uint64_t, const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
             return CaStore::BuiltCrl{};
@@ -975,7 +975,7 @@ TEST_CASE("CaStore: a publish that cannot get the CRL lock times out without a p
 
     CrlLockHolder holder{db.dsn()};
     std::atomic<bool> build_called{false};
-    std::optional<std::expected<CrlVersionRecord, CaStore::PublishError>> rec;
+    std::optional<std::expected<CrlVersionRecord, CaStore::PublishFailure>> rec;
     std::chrono::steady_clock::duration waited{};
     std::atomic<bool> done{false};
     std::vector<std::thread> threads;
@@ -999,7 +999,7 @@ TEST_CASE("CaStore: a publish that cannot get the CRL lock times out without a p
     threads[0].join();
     REQUIRE(rec);
     REQUIRE_FALSE(*rec);
-    CHECK(rec->error() == CaStore::PublishError::Failed);
+    CHECK(rec->error().kind == CaStore::PublishError::Failed);
     CHECK_FALSE(build_called); // never signed anything without holding the lock
     CHECK(waited >= CaStore::kCrlLockTimeout - std::chrono::milliseconds(500));
     // Generous upper bound: the timer also covers lease acquire and BEGIN on a loaded CI box.
@@ -1024,7 +1024,7 @@ TEST_CASE("CaStore: a publish whose root was replaced while it waited is refused
 
     CrlLockHolder holder{db.dsn()};
     bool build_called = false;
-    std::optional<CaStore::PublishError> error;
+    std::optional<CaStore::PublishFailure> error;
     std::vector<std::thread> threads;
     JoinAll join{threads};
     threads.emplace_back([&] {
@@ -1044,7 +1044,7 @@ TEST_CASE("CaStore: a publish whose root was replaced while it waited is refused
     threads[0].join();
 
     REQUIRE(error);
-    CHECK(*error == CaStore::PublishError::RootChanged);
+    CHECK(error->kind == CaStore::PublishError::RootChanged);
     CHECK_FALSE(build_called);
     CHECK_FALSE(replica_a.latest_crl());
 
@@ -1094,7 +1094,7 @@ TEST_CASE("CaStore: a publish that cannot get the per-process lock reports Busy"
     threads[0].join();
 
     REQUIRE_FALSE(second);
-    CHECK(second.error() == CaStore::PublishError::Busy);
+    CHECK(second.error().kind == CaStore::PublishError::Busy);
     CHECK_FALSE(second_built);
     REQUIRE(first_version);
     CHECK(*first_version == 1);
@@ -1268,7 +1268,7 @@ TEST_CASE("CaStore: a publish whose COMMIT fails is not reported as published",
     });
     CHECK(build_called); // the row was built and inserted; only the COMMIT failed
     REQUIRE_FALSE(rec);
-    CHECK(rec.error() == CaStore::PublishError::Failed);
+    CHECK(rec.error().kind == CaStore::PublishError::Failed);
     CHECK_FALSE(store.latest_crl());
 }
 

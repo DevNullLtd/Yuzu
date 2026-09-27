@@ -45,6 +45,7 @@
 /// `legacy_sqlite_probe::warn_if_legacy_rows` over `ca_root`/`ca_issued`/`ca_crl_versions`
 /// instead — silent unless real rows are found, never blocks boot.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -365,6 +366,50 @@ public:
     /// key and try again.
     enum class PublishError { Failed, Busy, RootChanged };
 
+    /// #4830: finer-grained cause underneath a `PublishError` — a bounded, metrics/audit-facing
+    /// label, not a substitute for `kind`'s retry/skip control flow. The first 7 values are set
+    /// inside `publish_next_crl`, at the site the corresponding `std::unexpected(...)` is
+    /// returned; the last 4 belong to `CrlPublisher` (`server/core/src/crl_publisher.hpp`) for
+    /// failures that never reach this store at all. Closed set — extend `kPublishFailReasonLabels`
+    /// below in the same change as any new value, and keep the two declarations in lock-step
+    /// order (indexed by `static_cast<size_t>(reason)`).
+    enum class PublishFailReason {
+        NoConnection,          ///< no pool connection within local_wait, or the txn-scoped
+                               ///< bounds (set_config) themselves could not be applied
+        LockTimeout,           ///< `LOCK TABLE ... SHARE ROW EXCLUSIVE MODE` timed out
+        RootReadFailed,        ///< the under-lock root re-read query failed, OR (kind ==
+                               ///< RootChanged) it succeeded but disagreed with the caller's
+                               ///< expected fingerprint
+        NumberReadFailed,      ///< `MAX(version)+1` read failed
+        DegradedRevokedRead,   ///< the revoked-set read (`query_revoked_on`) failed
+        BuildFailed,           ///< the `CrlBuilder` returned nullopt or an empty DER
+        InsertOrCommitFailed,  ///< the INSERT failed, or the txn body returned true but COMMIT
+                               ///< did not durably confirm (a lost COMMIT acknowledgement)
+        KeyLoad,               ///< CrlPublisher: the CA key failed to load
+        RootChangedTwice,      ///< CrlPublisher: the root changed on both attempts — giving up
+        Busy,                  ///< the process-local `publish_mu_` was held past `local_wait`
+        Exception,             ///< CrlPublisher: the build/signing step threw
+    };
+
+    /// Compact labels for `PublishFailReason`, in enum-declaration order. Drives both a metrics
+    /// pre-seed loop and every increment site (`server.cpp`/`crl_publisher.cpp`) so a label
+    /// string can never drift between the two — index with `static_cast<size_t>(reason)`.
+    static constexpr std::array<std::string_view, 11> kPublishFailReasonLabels{
+        "no_connection",         "lock_timeout",       "root_read_failed",
+        "number_read_failed",    "degraded_revoked_read", "build_failed",
+        "insert_or_commit_failed", "key_load",         "root_changed_twice",
+        "busy",                  "exception",
+    };
+
+    /// `publish_next_crl`'s error type: `kind` drives retry/skip control flow (unchanged since HA
+    /// WS-6 6.1 — callers must keep branching on it, not on `reason`); `reason` is the finer
+    /// #4830 cause, compiler-enforced at every `unexpected(...)` site rather than a defaulted
+    /// out-pointer a future branch could silently forget to set.
+    struct PublishFailure {
+        PublishError kind;
+        PublishFailReason reason;
+    };
+
     /// Upper bound on waiting for the CRL table lock, applied per transaction with
     /// `set_config('lock_timeout', …, true)` so it holds even when the DSN's `options=` /
     /// PGOPTIONS stops the pool from setting its own. `statement_timeout` is set the same way.
@@ -392,7 +437,7 @@ public:
     /// failure, lost COMMIT ack). Nothing is reported as published unless the txn committed.
     /// `local_wait` bounds the wait for another publish in this process; pass zero from a
     /// background pass, which should skip rather than queue behind an operator publish.
-    [[nodiscard]] std::expected<CrlVersionRecord, PublishError>
+    [[nodiscard]] std::expected<CrlVersionRecord, PublishFailure>
     publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint = {},
                      const std::string& issuer_key_id = {},
                      std::chrono::milliseconds local_wait = kCrlLeaseTimeout + kCrlLockTimeout);

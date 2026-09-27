@@ -806,14 +806,15 @@ std::optional<CrlVersionRecord> CaStore::latest_crl() {
     return r;
 }
 
-std::expected<CrlVersionRecord, CaStore::PublishError>
+std::expected<CrlVersionRecord, CaStore::PublishFailure>
 CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint,
                           const std::string& issuer_key_id,
                           std::chrono::milliseconds local_wait) {
     if (!build || !open_) {
         spdlog::error("CaStore::publish_next_crl: {} — CRL not published",
                       !open_ ? "store not open" : "no CRL builder supplied");
-        return std::unexpected(PublishError::Failed);
+        return std::unexpected(
+            PublishFailure{PublishError::Failed, PublishFailReason::NoConnection});
     }
     // Bounded, not "until the holder finishes": a holder can legitimately run longer (up to
     // kCrlStatementTimeout per statement), and giving up here is healed by the freshness pass.
@@ -822,11 +823,14 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         spdlog::warn("CaStore::publish_next_crl: another CRL publish in this process is still "
                      "running after {} ms — not publishing",
                      local_wait.count());
-        return std::unexpected(PublishError::Busy);
+        return std::unexpected(PublishFailure{PublishError::Busy, PublishFailReason::Busy});
     }
     std::optional<CrlVersionRecord> published;
     bool txn_body_ran = false;
     bool root_changed = false;
+    // Default reflects the `!txn_body_ran` case (no branch below ever ran) — every branch that
+    // returns false from the lambda overrides this to the reason it actually failed for.
+    PublishFailReason fail_reason = PublishFailReason::NoConnection;
     const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         txn_body_ran = true;
         // Transaction-scoped bounds: they hold even when the pool could not set its own at
@@ -844,6 +848,7 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         if (bounds.status() != PGRES_TUPLES_OK) {
             spdlog::error("CaStore::publish_next_crl: setting txn timeouts failed: {} — aborting",
                           PQerrorMessage(conn));
+            fail_reason = PublishFailReason::NoConnection;
             return false;
         }
         // SHARE ROW EXCLUSIVE conflicts with itself and with the ROW EXCLUSIVE any INSERT takes,
@@ -857,6 +862,7 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         if (lock.status() != PGRES_COMMAND_OK) {
             spdlog::error("CaStore::publish_next_crl: CRL table lock failed: {} — aborting",
                           PQerrorMessage(conn));
+            fail_reason = PublishFailReason::LockTimeout;
             return false;
         }
         // The caller read the root and loaded its key before the lock. A subordinate import that
@@ -872,12 +878,14 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
             if (root.status() != PGRES_TUPLES_OK) {
                 spdlog::error("CaStore::publish_next_crl: root re-read failed: {} — aborting",
                               PQerrorMessage(conn));
+                fail_reason = PublishFailReason::RootReadFailed;
                 return false;
             }
             if (PQntuples(root.get()) != 1 || text_col(root.get(), 0, 0) != issuer_fingerprint) {
                 spdlog::warn("CaStore::publish_next_crl: CA root changed since the caller loaded "
                              "it — aborting so the caller re-reads the root");
                 root_changed = true;
+                fail_reason = PublishFailReason::RootReadFailed;
                 return false;
             }
         }
@@ -887,6 +895,7 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         if (num.status() != PGRES_TUPLES_OK) {
             spdlog::error("CaStore::publish_next_crl: number read failed: {} — aborting",
                           PQerrorMessage(conn));
+            fail_reason = PublishFailReason::NumberReadFailed;
             return false;
         }
         const auto number = static_cast<std::uint64_t>(to_i64(PQgetvalue(num.get(), 0, 0)));
@@ -899,11 +908,13 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
             spdlog::error("CaStore::publish_next_crl: {} — aborting (never build a CRL over a "
                           "possibly-incomplete revoked set)",
                           revoked.error());
+            fail_reason = PublishFailReason::DegradedRevokedRead;
             return false;
         }
         auto built = build(number, *revoked);
         if (!built || built->der.empty()) {
             spdlog::error("CaStore::publish_next_crl: build produced no DER (version {})", number);
+            fail_reason = PublishFailReason::BuildFailed;
             return false; // rolled back → the number is not consumed
         }
         CrlVersionRecord rec;
@@ -915,8 +926,10 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
         rec.issuer_fingerprint = issuer_fingerprint;
         rec.issuer_key_id = issuer_key_id;
         rec.revoked_count = static_cast<int64_t>(revoked->size());
-        if (!insert_crl_on(conn, rec))
+        if (!insert_crl_on(conn, rec)) {
+            fail_reason = PublishFailReason::InsertOrCommitFailed;
             return false;
+        }
         published = std::move(rec);
         return true;
     });
@@ -925,11 +938,16 @@ CaStore::publish_next_crl(const CrlBuilder& build, const std::string& issuer_fin
                       "CRL not published",
                       kWriteTimeout.count(), pool_.last_error());
     if (root_changed)
-        return std::unexpected(PublishError::RootChanged);
+        return std::unexpected(PublishFailure{PublishError::RootChanged, fail_reason});
     // A lost COMMIT acknowledgement reports failure even if Postgres committed. That is the safe
     // direction: the caller reports "not republished", and the next publish takes the next number.
-    if (!committed || !published)
-        return std::unexpected(PublishError::Failed);
+    // The lambda returning true with no txn-level failure branch touching fail_reason means the
+    // body succeeded internally but the outer COMMIT itself never confirmed — a lost ack.
+    if (!committed || !published) {
+        if (txn_body_ran && !root_changed && published.has_value())
+            fail_reason = PublishFailReason::InsertOrCommitFailed;
+        return std::unexpected(PublishFailure{PublishError::Failed, fail_reason});
+    }
     return std::move(*published);
 }
 
