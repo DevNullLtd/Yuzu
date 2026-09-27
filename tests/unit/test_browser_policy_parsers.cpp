@@ -203,7 +203,12 @@ TEST_CASE("browser_policy: a list/dict value the wire escaper would fold is flag
     {
         const auto v = json_to_policy_value(nlohmann::json::parse(R"(["a\"b"])"));
         CHECK(v.type == PolicyType::List);
-        CHECK(v.value == R"(["a\"b"])"); // dump_json's own escaping, unfolded at this layer
+        // Hoisted out of the CHECK() argument position: MSVC's traditional preprocessor
+        // mistokenizes a raw string containing an embedded `\"` when it appears as a
+        // macro argument (#4998 review round 2) -- a plain statement isn't a macro
+        // argument, so the same literal here compiles everywhere.
+        const std::string kEscapedQuoteInList = R"(["a\"b"])";
+        CHECK(v.value == kEscapedQuoteInList); // dump_json's own escaping, unfolded at this layer
         CHECK(v.detail == "json_escaped");
     }
     {
@@ -227,7 +232,12 @@ TEST_CASE("browser_policy: a list/dict value the wire escaper would fold is flag
         r.source = "/x";
         r.value = json_to_policy_value(nlohmann::json::parse(R"(["a\"b"])"));
         const std::string wire = format_policy_row(r);
-        CHECK(wire == R"(policy|chrome|mandatory|machine|Escaped|list|["a/"b"]|/x|json_escaped)");
+        // Defensively hoisted too: no `\"` in this literal so it doesn't independently
+        // trip the MSVC bug above, but it's the same fragile embedded-quote-in-a-raw-
+        // string-macro-argument shape, and hoisting costs nothing (#4998 review round 2).
+        const std::string kExpectedEscapedListWire =
+            R"(policy|chrome|mandatory|machine|Escaped|list|["a/"b"]|/x|json_escaped)";
+        CHECK(wire == kExpectedEscapedListWire);
     }
 }
 

@@ -28,9 +28,12 @@
  *            list/dict value whose JSON dump contains a backslash (a nested
  *            string held a `"`, `\` or control character) — `safe_output_field`
  *            below folds every literal backslash to `/` before the row is
- *            written, so an escaped list/dict value on the wire is no longer
- *            valid JSON; the row still carries the best-effort (folded) text,
- *            never blanked, but `json_escaped` says not to trust it as JSON;
+ *            written, so an escaped list/dict value on the wire is lossy and
+ *            not trustworthy as the original JSON (an escaped quote in
+ *            particular can make it syntactically invalid, though not every
+ *            fold does -- e.g. a folded `\n` still parses); the row still
+ *            carries the best-effort (folded) text, never blanked, but
+ *            `json_escaped` says not to trust it as JSON;
  *            and `nul_replaced` / `utf8_replaced` / `truncated` (appended,
  *            comma-joined) when any free-text field held an embedded NUL, a
  *            byte that is not valid UTF-8, or more than kMaxFieldBytes
