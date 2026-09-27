@@ -21,4 +21,11 @@
   `mcp_tier` (e.g. `readonly`) whose principal happens to be a durable administrator can no
   longer reach this route via REST with no MFA/approval gate — REST now refuses any
   non-empty `mcp_tier` outright, the same posture every other admin-only REST route
-  already had.
+  already had. This same fresh-regime-read fix also hardens the existing fleet-wide
+  role-assignment routes (`POST/DELETE /api/v1/rbac/roles/{name}/assignments` and MCP
+  twins `assign_rbac_role`/`unassign_rbac_role`): both now re-verify, with a fresh,
+  uncached read, that the caller holds authority under the regime that is durably true
+  right now, closing the identical cross-replica cache-staleness gap in their own
+  durable-Administrator check — a grant minted through a stale-regime read would
+  otherwise persist indefinitely once written, unlike this toggle's own transient
+  window.
