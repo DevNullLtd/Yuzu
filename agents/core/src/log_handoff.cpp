@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdio>
 #include <thread>
 #include <utility>
 
@@ -271,6 +272,8 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
     // a concurrently-waiting teardown()'s wait_for_drain_quiescence().
 }
 
+void log_handoff_emit_probe_for_test(std::string_view message) { spdlog::info("{}", message); }
+
 // ---------------------------------------------------------------------------
 // LogHandoff
 // ---------------------------------------------------------------------------
@@ -383,14 +386,114 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             // a lock-free/single-writer scheme -- it is reached concurrently from the
             // pool's worker thread (a sink throw) and any producer thread (a
             // formatter/allocation exception, or "pool gone"): see the header's own
-            // NON-I/O ERROR HANDLER note.
+            // ERROR HANDLER note.
+            //
+            // STDERR FALLBACK (governance hardening round, sre finding): this handler
+            // REPLACES spdlog's own default error handler, which prints
+            // "[*** LOG ERROR #N ***] [date] [logger-name] msg" to stderr, rate-limited
+            // to once per second, for as long as the process runs. Before #4666 PR-2
+            // wired LogHandoff into production, that default handler was the live one
+            // -- so a sink-level write failure (disk full, EMFILE, a broken pipe) was
+            // always visible on stderr (reaching journald on the shipped Linux path).
+            // Recording ONLY into ErrorState -- readable via log_errors_total()/
+            // last_log_error_for_test(), but not read by any PRODUCTION consumer today
+            // (PR-3's heartbeat-surfacing work is still pending) -- would silently
+            // regress that existing operator-visible signal to nothing. Reproduce the
+            // same once-per-second stderr throttle here so a sink failure stays
+            // visible without that later work. NOT a strict superset of the handler it
+            // replaces: this line omits the timestamp and logger name spdlog's default
+            // includes (this logger's own name is always the fixed "" here anyway) and
+            // uses %llu rather than zero-padded %04zu for the counter -- the count and
+            // message text are the fields that matter for "something is failing," and
+            // both are preserved.
+            //
+            // std::fprintf/std::fflush here, not std::format (docs/cpp-conventions.md
+            // otherwise forbids printf-family calls in new code): this handler already
+            // exists to react to a possible formatting/allocation failure elsewhere in
+            // the logging path, so it deliberately avoids a second allocating
+            // formatting call of its own, mirroring spdlog's own default handler's
+            // choice of raw stdio for the same reason.
+            //
+            // LOCK SCOPE NARROWED, NOT THE FULL WEDGE CLOSED (governance hardening
+            // round, cpp-safety Gate-8 finding; PARTIALLY reopened at the next Gate-8
+            // pass by unhappy-path and sre, independently, against this exact fix --
+            // read this whole note before touching it again). fprintf/fflush are not
+            // themselves bounded. What THIS fix closes: previously, an unbounded
+            // fprintf/fflush held under error_state->mu would serialize every OTHER
+            // concurrent handler invocation AND any caller of log_errors_total()/
+            // last_log_error_for_test() (PR-3's planned heartbeat poller) behind a
+            // stuck stderr write. Snapshotting the fields the stderr line needs WHILE
+            // holding the lock, then releasing it before the actual I/O, closes
+            // exactly that: the lock now only ever guards the in-memory state, never
+            // the write, so a stuck write can no longer drag a SECOND thread down with
+            // it via this mutex.
+            //
+            // What this fix does NOT close, and cannot by construction: when the
+            // TRIGGER is a sink log()/flush() throw (the disk-full/EMFILE/broken-pipe
+            // scenario this whole handler exists for), spdlog invokes this handler
+            // SYNCHRONOUSLY, INLINE, on the async logger's own single worker thread
+            // (backend_sink_it_() -> SPDLOG_LOGGER_CATCH -> err_handler_(), no thread
+            // hop -- verified against the vendored spdlog source). Moving the I/O
+            // outside the lock does nothing for a thread that IS the one making the
+            // blocking call: if stderr is itself blocked or backpressured (a full pipe
+            // to a stalled log collector) at that moment, the worker thread still
+            // stalls inside its own fprintf/fflush for as long as stderr does, and
+            // since it is the ONLY worker thread, the entire bounded queue stops
+            // draining for that whole window -- unbounded during ordinary operation,
+            // invisible to drain_log_bounded()'s own pending() check (this is the
+            // error handler's own write, not a sink write), and recoverable only via
+            // teardown()'s 2-second watchdog, which engages only if a shutdown is
+            // attempted while the process keeps running. This is not a regression
+            // this round introduced: spdlog's own DEFAULT error handler (the one this
+            // one replaces) has the identical same-thread-blocking property, so this
+            // is a pre-existing characteristic of spdlog's async architecture, not
+            // something #4666 created. Two independently rare conditions must still
+            // coincide for the residual to matter (a sink failure AND an already-stuck
+            // stderr). Moving this handler's I/O off the worker thread's own critical
+            // path entirely (a detached best-effort emitter, or a non-blocking fd
+            // write that drops on EAGAIN, mirroring overrun_oldest's own philosophy)
+            // is the actual fix for the residual and is deliberately NOT attempted
+            // here -- tracked as a follow-up, not this round's job.
+            std::uint64_t emit_count = 0;
+            std::string emit_message;
+            bool should_emit = false;
             try {
                 std::lock_guard<std::mutex> lk(error_state->mu);
                 ++error_state->count;
                 error_state->last_message.assign(msg, 0, std::min<std::size_t>(msg.size(), 256));
+                const auto now = std::chrono::steady_clock::now();
+                if (now - error_state->last_emit >= std::chrono::seconds(1)) {
+                    error_state->last_emit = now;
+                    should_emit = true;
+                    emit_count = error_state->count;
+                    emit_message = error_state->last_message;
+                }
             } catch (...) {
             }
+            if (should_emit) {
+                try {
+                    std::fprintf(stderr, "[*** LOG ERROR #%llu ***] %s\n",
+                                 static_cast<unsigned long long>(emit_count), emit_message.c_str());
+                    std::fflush(stderr);
+                } catch (...) {
+                }
+            }
         });
+
+        // Governance hardening round, unhappy-path UP-1: bound (not eliminate -- the
+        // message must still be POPPED off the bounded queue by the worker thread
+        // before this fires, so this is a probabilistic improvement, never a
+        // guarantee) the number of already-formatted-but-undelivered lines lost if the
+        // process dies abnormally (e.g. an exception escaping main()'s agent->run()
+        // reaches std::terminate() without unwinding on this toolchain --
+        // LogHandoffEpilogue's destructor, and therefore the graceful drain in
+        // teardown(), never runs on that path). Per spdlog's own async_logger::
+        // backend_sink_it_ (verified against the vendored source), a warn-or-above
+        // line makes the WORKER THREAD call backend_flush_() synchronously and
+        // inline, in the same callback that just wrote that line to every sink --
+        // there is no second queued flush entry -- so once the worker has popped the
+        // line at all, its sinks are flushed before the callback returns.
+        logger->flush_on(spdlog::level::warn);
 
         // Drain-reader-lease control block (BLOCKER-1 fix) -- built here, still inside
         // the "everything that can throw happens before the object exists" phase, same

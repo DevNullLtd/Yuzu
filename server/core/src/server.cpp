@@ -1912,6 +1912,23 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // A2 last-Administrator guard refusal (governance SHOULD #9,
+        // full-pipeline review on 765bc7ec1) — how often an operator's
+        // unassign attempt was refused because it would leave the fleet
+        // with zero authenticatable Administrators (RbacStore::
+        // unassign_role's guard, rbac_admin_authority_owner.cpp). Zero-seeded per transport
+        // so an idle server carries both closed series from boot.
+        metrics_.describe("yuzu_server_rbac_last_admin_guard_refused_total",
+                          "RBAC role-unassign requests refused by the last-remaining-"
+                          "Administrator guard (POST/DELETE /api/v1/rbac/roles/{name}/"
+                          "assignments and its MCP twins), by transport. A sustained "
+                          "non-zero rate is an operator repeatedly trying to remove the "
+                          "fleet's last administrator, not a store fault - compare "
+                          "against yuzu_server_rbac_read_degrade_total to rule that out.",
+                          "counter");
+        for (const auto transport : {"rest", "mcp"})
+            metrics_.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                             {{"transport", transport}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since

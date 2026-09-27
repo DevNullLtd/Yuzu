@@ -3,6 +3,9 @@
 #include "service_win.hpp"
 
 #include "hard_exit.hpp" // shared TerminateProcess + F3 orphan-drain poll (rung 7.6)
+#include "service_completion.hpp" // #4666 PR-2: service_main/run_service completion handshake
+#include "log_handoff.hpp"        // for drain_log_bounded()
+#include "shutdown_deadline_guard.hpp" // kShutdownDeadlineExitCode (shared exit-code taxonomy)
 
 #include <yuzu/agent/agent.hpp>
 
@@ -13,6 +16,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <semaphore>
 
 namespace {
 
@@ -47,6 +51,18 @@ DWORD g_checkpoint = 0; // guarded by g_status_mu; monotonic within a pending ph
 std::mutex g_agent_mu;
 Agent* g_agent = nullptr; // guarded by g_agent_mu; non-owning, published by ServiceMain
 std::atomic<bool> g_stop_requested{false};
+
+// Released by service_main's FIRST-declared local (a SemaphoreReleaseGuard, so it fires
+// LAST by reverse-declaration-order destruction, after every other local and every catch
+// block in that function) -- run_service() waits on this after the SCM control dispatcher
+// returns, so main()'s log-handoff teardown (#4666 PR-2) never starts while service_main's
+// thread might still be logging. See service_completion.hpp's own file banner for the full
+// race this closes.
+std::binary_semaphore g_service_main_done{0};
+// Mirrors agent.cpp's kShutdownDeadlineGrace (20s, file-local there, not exported) -- if
+// service_main is still running normal (non-hard_exit) cleanup this long after the SCM
+// dispatcher has already returned, something past its own internal watchdogs is wedged.
+constexpr std::chrono::milliseconds kServiceMainDrainGrace{20'000};
 
 void report_status(DWORD current_state, DWORD win32_exit_code = NO_ERROR,
                     DWORD specific_exit_code = 0, DWORD wait_hint = 0) {
@@ -172,6 +188,16 @@ struct AgentUnpublisher {
 };
 
 void WINAPI service_main(DWORD, LPWSTR*) noexcept {
+    // #4666 PR-2: constructed as the ABSOLUTE FIRST statement of this function, OUTSIDE
+    // the try block below, so it is the LAST local to be destroyed (reverse-declaration-
+    // order destruction) on every exit path this function has -- normal return, either
+    // catch block below, or the early `return` inside the try. Its constructor
+    // (service_completion.hpp) is noexcept and does nothing but store a reference, so
+    // declaring it here cannot itself introduce a throw into this pre-try window.
+    // run_service() only proceeds past its wait on g_service_main_done once this guard's
+    // destructor has released it, i.e. only after this entire function has truly finished.
+    yuzu::agent::SemaphoreReleaseGuard done_guard{g_service_main_done};
+
     // The try opens here, before RegisterServiceCtrlHandlerExW, not just around
     // the agent construction/run() below: spdlog::error/report_status (fmt
     // formatting, std::mutex::lock) are not statically noexcept, and nothing
@@ -264,7 +290,23 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
 
         agent->run(); // blocks until stop() (via handler_ex, or the catch-up above) or a fatal startup error
 
-        spdlog::default_logger()->flush();
+        // #4666 PR-2: a bare logger flush() on the now-async logger only enqueues a
+        // flush request, with no delivery guarantee. This bounded drain is a best-effort
+        // attempt to actually land "Yuzu agent stopped" and similar lines before
+        // SERVICE_STOPPED is reported below -- it is NOT a guarantee.
+        //
+        // Firewalled (governance hardening round, cpp-safety/unhappy-path UP-2 finding):
+        // drain_log_bounded() is not declared noexcept. Left unguarded, an exception here
+        // would skip the "AN EXPLICIT OPERATOR STOP ALWAYS WINS" report_status() chain
+        // immediately below and fall into the outer catch blocks, which report
+        // SERVICE_STOPPED with specific=3 -- misreporting a clean operator-initiated stop
+        // as a failure and, per SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, potentially triggering
+        // an unwanted SC_ACTION_RESTART of the service the operator just stopped (the exact
+        // B-7 inversion the comment below exists to prevent).
+        try {
+            yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
+        } catch (...) {
+        }
 
         // AN EXPLICIT OPERATOR STOP ALWAYS WINS, AND IT IS TESTED FIRST.
         //
@@ -317,8 +359,12 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
             if (!yuzu::agent::wait_for_workers_to_drain(
                     [&] { return agent->guardian_active_io_workers(); },
                     yuzu::agent::kOrphanDrainGrace)) {
-                // Firewalled: a logging exception here must never skip hard_exit()
-                // below (Sol rung-7.6 review finding 2).
+                // Firewalled: a logging exception here (including the #4666 PR-2
+                // best-effort drain below -- drain_log_bounded() is not declared
+                // noexcept) must never skip hard_exit() below (Sol rung-7.6 review
+                // finding 2). Both calls share this ONE try/catch, not two separate
+                // ones, so nothing between the critical() log and hard_exit() can
+                // unwind past this point uncaught.
                 try {
                     // "Guardian I/O worker(s)" until PR-A (#2012/#3840): n is now
                     // a SUM (guardian_active_io_workers()'s own doc comment) of
@@ -332,6 +378,12 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
                                      "{}s after shutdown - forcing process exit rather than race "
                                      "static/DSO teardown against them",
                                      n, yuzu::agent::kOrphanDrainGrace.count());
+                    // #4666 PR-2: same best-effort reasoning as the flush replacement
+                    // above -- give the critical() line just logged a bounded chance to
+                    // actually land before the process exits via hard_exit() below (no
+                    // unwinding, no static/DSO teardown -- a queued-but-undelivered
+                    // async log line would otherwise be lost).
+                    yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
                 } catch (...) {
                 }
                 yuzu::agent::hard_exit(3); // the SCM status above already reported the real outcome
@@ -344,10 +396,25 @@ void WINAPI service_main(DWORD, LPWSTR*) noexcept {
         // (UB / std::terminate). AgentUnpublisher has already run by this point
         // (stack unwind destructs it before this catch runs), so g_agent is safely
         // cleared regardless of where inside the try the throw originated.
-        spdlog::critical("Unhandled exception in ServiceMain: {}", e.what());
+        //
+        // Firewalled (governance hardening round, unhappy-path UP-2 finding): the
+        // logging call itself is not guaranteed noexcept (async-logger formatting can
+        // allocate). Left bare, a throw HERE would cross this catch block's own scope
+        // and propagate out of service_main -- a noexcept function -- which calls
+        // std::terminate()/aborts the whole process BEFORE report_status() below ever
+        // runs. The SCM would then observe a raw crash instead of the coded
+        // SERVICE_STOPPED(specific=3) this catch exists to report.
+        try {
+            spdlog::critical("Unhandled exception in ServiceMain: {}", e.what());
+        } catch (...) {
+        }
         report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/3);
     } catch (...) {
-        spdlog::critical("Unhandled non-standard exception in ServiceMain");
+        // Same firewall as the sibling catch above, same reason.
+        try {
+            spdlog::critical("Unhandled non-standard exception in ServiceMain");
+        } catch (...) {
+        }
         report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, /*specific=*/3);
     }
 }
@@ -391,6 +458,47 @@ int run_service(std::move_only_function<std::unique_ptr<Agent>()> factory) {
             spdlog::error("StartServiceCtrlDispatcherW failed: {}", err);
         }
         return EXIT_FAILURE;
+    }
+
+    // #4666 PR-2: the dispatcher is documented to return once ServiceMain has reported
+    // SERVICE_STOPPED -- which service_main deliberately does BEFORE its own F3 orphan
+    // check / ~Agent / catch-block logging finish (see the STOPPED-report comments
+    // above). Without this wait, main()'s own async-log-handoff teardown could start
+    // while service_main's thread is still an active log producer, racing spdlog's
+    // registry (concurrent set_default_logger() vs. an ordinary log call is undefined
+    // per spdlog's own documented contract). This wait forces main() to be the sole
+    // teardown caller strictly after service_main has genuinely finished, under EITHER
+    // possible dispatcher-return timing (if the dispatcher already waits for
+    // ServiceMain to fully return, this wait is near-instantaneous). A timeout here
+    // means service_main is itself wedged past its own grace -- hard-exit rather than
+    // proceed into logger teardown blind.
+    //
+    // Deliberately NOT reached on the FALSE (failure) path above: that path means
+    // ServiceMain may never have run at all (Microsoft documents ERROR_FAILED_
+    // SERVICE_CONTROLLER_CONNECT / an invalid table / the dispatcher already running as
+    // the only pre-callback failure causes), so there is nothing service_main-side to
+    // wait for.
+    if (!yuzu::agent::wait_for_service_main_completion(g_service_main_done,
+                                                        kServiceMainDrainGrace)) {
+        // Governance hardening round, sre finding: unlike the adjacent F3 site
+        // (service_main, above), this timeout previously exited with no log line and no
+        // drain attempt at all. On Windows this fires strictly AFTER SERVICE_STOPPED has
+        // already been reported (no SCM/Event Viewer trace either), so the agent's own
+        // log file is the ONLY diagnostic surface for this specific wedge -- leaving it
+        // silent made this exit-4 cause indistinguishable, after the fact, from the other
+        // two watchdogs that also exit 4. Mirror the F3 pattern: log, then a best-effort
+        // bounded drain, both firewalled (this function is not noexcept, but an
+        // unguarded throw here would still terminate less predictably than a deliberate
+        // hard_exit).
+        try {
+            spdlog::critical("service_main did not complete within {}ms of the SCM dispatcher "
+                              "returning -- hard-exiting rather than starting log teardown "
+                              "against a possibly still-logging service_main thread",
+                              kServiceMainDrainGrace.count());
+            yuzu::agent::drain_log_bounded(std::chrono::milliseconds{200});
+        } catch (...) {
+        }
+        yuzu::agent::hard_exit(yuzu::agent::kShutdownDeadlineExitCode);
     }
 
     return EXIT_SUCCESS;

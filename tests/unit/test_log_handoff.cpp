@@ -17,12 +17,12 @@
 #include "guardian_spark_timing.hpp" // format_arm_committed_line (U2)
 #include "log_handoff.hpp"
 
+#include "log_handoff_test_sinks.hpp" // GatedCaptureSink, ThrowOnceSink (promoted #4666 PR-2)
 #include "test_helpers.hpp"
 
 #include <yuzu/json_log_formatter.hpp>
 
 #include <spdlog/details/os.h> // spdlog::details::os::thread_id()
-#include <spdlog/pattern_formatter.h>
 #include <spdlog/spdlog.h> // global spdlog::info() (U4)
 
 #include <catch2/catch_test_macros.hpp>
@@ -36,7 +36,6 @@
 #include <format>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,122 +44,20 @@ using namespace std::chrono_literals;
 using yuzu::agent::drain_log_bounded;
 using yuzu::agent::kLogQueueCapacity;
 using yuzu::agent::LogHandoff;
+using yuzu::test::GatedCaptureSink;
+using yuzu::test::ThrowOnceSink;
 
 namespace {
 
 // ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
-
-/// A spdlog sink test double with an in-band pause gate plus an ordered capture of
-/// every message it received (payload, the RAW log_msg time/thread_id, and the text
-/// rendered through whatever formatter is installed - mirroring what an operator's log
-/// file would actually show).
-///
-/// The gate is a single "block while paused_" check evaluated at the top of every
-/// log() call, not a one-shot "park on message N" - but under LogHandoff's
-/// single-worker pool the two are equivalent for the "park on message #0, release
-/// once" cases below (U1/U2/U3/U5): the worker dequeues and calls log() for message #0
-/// as soon as it exists, blocks there until release() flips paused_ false permanently,
-/// then drains the rest without blocking again. The same mechanism also supports U6's
-/// repeated toggling, which a one-shot design could not.
-class GatedCaptureSink final : public spdlog::sinks::sink {
-public:
-    struct Captured {
-        std::string payload;
-        std::chrono::system_clock::time_point time;
-        std::size_t thread_id{};
-        std::string formatted;
-    };
-
-    explicit GatedCaptureSink(bool initially_paused = true)
-        : paused_(initially_paused), closed_(std::make_shared<std::atomic<bool>>(false)) {}
-
-    ~GatedCaptureSink() override { closed_->store(true, std::memory_order_release); }
-
-    void log(const spdlog::details::log_msg& msg) override {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return !paused_; });
-        std::string formatted;
-        if (formatter_) {
-            spdlog::memory_buf_t buf;
-            formatter_->format(msg, buf);
-            formatted.assign(buf.data(), buf.size());
-        }
-        captured_.push_back(Captured{std::string(msg.payload.data(), msg.payload.size()),
-                                     msg.time, msg.thread_id, std::move(formatted)});
-    }
-
-    void flush() override {}
-
-    void set_pattern(const std::string& pattern) override {
-        set_formatter(std::make_unique<spdlog::pattern_formatter>(pattern));
-    }
-
-    void set_formatter(std::unique_ptr<spdlog::formatter> f) override {
-        std::lock_guard<std::mutex> lk(mu_);
-        formatter_ = std::move(f);
-    }
-
-    /// Repeated or one-shot - see the class comment.
-    void set_paused(bool paused) {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            paused_ = paused;
-        }
-        if (!paused)
-            cv_.notify_all();
-    }
-    void release() { set_paused(false); }
-
-    [[nodiscard]] std::vector<Captured> snapshot() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return captured_;
-    }
-    [[nodiscard]] std::size_t count() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return captured_.size();
-    }
-
-    /// A control block independent of `this`, so a test can hold onto it AFTER
-    /// dropping every shared_ptr<GatedCaptureSink> reference (including its own), to
-    /// observe whether the sink object was actually destroyed (U4).
-    [[nodiscard]] std::shared_ptr<std::atomic<bool>> closed_flag() const { return closed_; }
-
-private:
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
-    bool paused_;
-    std::vector<Captured> captured_;
-    std::unique_ptr<spdlog::formatter> formatter_;
-    std::shared_ptr<std::atomic<bool>> closed_;
-};
-
-/// Throws on its first call only; captures every call after that (U8).
-class ThrowOnceSink final : public spdlog::sinks::sink {
-public:
-    void log(const spdlog::details::log_msg& msg) override {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!thrown_) {
-            thrown_ = true;
-            throw std::runtime_error("ThrowOnceSink: injected failure");
-        }
-        captured_.emplace_back(msg.payload.data(), msg.payload.size());
-    }
-    void flush() override {}
-    void set_pattern(const std::string&) override {}
-    void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
-
-    [[nodiscard]] std::size_t captured_count() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return captured_.size();
-    }
-
-private:
-    mutable std::mutex mu_;
-    bool thrown_{false};
-    std::vector<std::string> captured_;
-};
+//
+// GatedCaptureSink and ThrowOnceSink live in log_handoff_test_sinks.hpp (promoted
+// #4666 PR-2) - pulled in via the `using` declarations above. The park-on-#0 cases
+// below (U1/U2/U3/U5) and U6's repeated toggling both rely on GatedCaptureSink's single
+// block-while-paused_ gate; ThrowOnceSink backs U8. See the header's own class comments
+// for the full mechanism.
 
 /// Convenience bundle: a LogHandoff built over one GatedCaptureSink, with the sink kept
 /// alive separately so the test can drive its gate and read its capture. `sink` MUST be
@@ -382,6 +279,13 @@ TEST_CASE("U4: teardown() on a healthy sink drains everything, destroys the sink
     // unconditionally - even though this handoff was never install()-ed. A straggler
     // call must not crash.
     CHECK_NOTHROW(spdlog::info("this goes to the null sink, not a crash"));
+
+    // Link/smoke check only (#4666 PR-2): proves log_handoff_emit_probe_for_test()'s
+    // exported symbol resolves across the test-binary/library boundary and does not
+    // throw against the same null-sink default logger above. The later macOS
+    // multi-image fixture is the actual consumer that exercises its cross-image
+    // behavior - not this test.
+    CHECK_NOTHROW(yuzu::agent::log_handoff_emit_probe_for_test("probe -> null sink"));
 }
 
 // ---------------------------------------------------------------------------
@@ -747,11 +651,11 @@ TEST_CASE("U7b: a --log-file open failure falls back to console-only logging ins
 }
 
 // ---------------------------------------------------------------------------
-// U8: a throwing sink is contained by the non-I/O error handler
+// U8: a throwing sink is contained by the error handler
 // ---------------------------------------------------------------------------
 
-TEST_CASE("U8: a throwing sink is contained by the non-I/O error handler; the worker "
-          "continues and the default fprintf handler is never reached",
+TEST_CASE("U8: a throwing sink is contained by the error handler; the worker "
+          "continues and spdlog's own default fprintf handler is never reached",
           "[log_handoff]") {
     auto sink = std::make_shared<ThrowOnceSink>();
     auto result = LogHandoff::create_with_sinks({sink});
