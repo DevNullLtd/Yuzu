@@ -412,7 +412,20 @@ which distinguishes "failed to load" from "not installed". The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `TAR: db_health.ledger unreadable; not overwriting` and stops updating
 the two heartbeat keys rather than resetting the count — `status` still reports
-`db_health`, and the agent log carries the warning on every collect_slow tick.
+`db_health`, and the agent log carries the warning on every collect_slow tick. If
+instead the record write itself fails persistently (as opposed to a read of it),
+there is currently no fleet-visible signal beyond that same local warning — a
+device stuck this way is silently excluded from `yuzu_fleet_tar_db_corruption_agents`
+until the fault clears; tracked as a follow-up.
+
+Two things worth knowing about the timing of this signal. **A mass event** (many
+devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still
+updates the fleet gauge in real time, but individual audit rows serialize behind
+one another server-wide, so the audit trail can lag well behind the gauge during a
+burst — don't read row latency as gauge inaccuracy. **A device already quarantined
+before this fleet-visibility mechanism shipped** has no durable epoch/basename
+recorded yet, so it produces no fleet signal until its *next* corruption event —
+there is no backfill of pre-existing quarantines.
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 

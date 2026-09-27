@@ -1,4 +1,7 @@
-- **tar.db corruption is now fleet-observable** (#1567). `tar.status` gains a
+- **tar.db corruption is now newly detected fleet-wide** (#1567; see
+  `docs/user-manual/tar.md` "Fleet visibility" for known limitations —
+  audit-row latency during a mass event, and no backfill for a device
+  quarantined before this shipped). `tar.status` gains a
   `db_health|<ok|quarantined>|<epoch>` row; the tar plugin publishes
   `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, which a new
   generic plugin heartbeat-tag bridge forwards as `yuzu.plugin.tar.*` tags. The

@@ -35,6 +35,20 @@
  * returns false (retried on a later heartbeat), so at most one audit-store
  * call is in flight gate-wide.
  *
+ * Durability choice, stated for a future third case: this gate round-trips
+ * the audit store itself so dedup survives a restart/HA switch, unlike the
+ * sibling rotation_warn_dedup.hpp, which is deliberately process-local and
+ * treats a restart-forfeits-state re-emission as correct, not merely
+ * tolerable. The difference is scale and risk shape (fleet-agent cardinality
+ * + an agent-asserted, rotating identity here vs. a small fixed rotation-pair
+ * set there) -- pick per-case, don't copy whichever file you find first.
+ *
+ * A throw between a true should_log() and its completion (whether via
+ * Reservation's destructor or a direct mark_failed()) is turned into
+ * mark_failed(), which itself takes a lock -- an exceedingly rare failure
+ * there (OS mutex-resource exhaustion) terminates the process rather than
+ * silently stranding the slot; a restart clears it either way.
+ *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
  * map answers with a hash lookup. If candidates ever become frequent this must
@@ -72,7 +86,7 @@ inline constexpr int64_t kTarCorruptionAuditMinRowInterval = 600;
 inline constexpr int64_t kTarCorruptionAuditDegradedRetry = 60;
 
 /// Parse `yuzu.plugin.tar.db_corruption_total`: digits only, <= 18 chars, > 0.
-[[nodiscard]] inline std::optional<int64_t> parse_tar_corruption_total(std::string_view raw) {
+[[nodiscard]] inline std::optional<int64_t> parse_tar_corruption_total(std::string_view raw) noexcept {
     if (raw.empty() || raw.size() > 18)
         return std::nullopt;
     int64_t v = 0;

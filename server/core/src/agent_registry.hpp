@@ -1232,8 +1232,15 @@ public:
     /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
     /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
     /// memory is per-process and pruned every ~90 s): the sink
-    /// (TarCorruptionAuditGate) owns durable dedup, and a failed audit write is
-    /// retried on the next heartbeat. Invoked OUTSIDE mu_.
+    /// (TarCorruptionAuditGate) owns durable dedup and its own rate limit; a
+    /// failed write is retried after the gate's degraded window, and a
+    /// candidate skipped only because the gate's slot was busy is retried on
+    /// the next heartbeat -- see tar_corruption_audit.hpp for the distinction.
+    /// This is the store's first plugin-specific side-effecting hook -- a
+    /// second consumer of the same "surface a candidate, let an injected sink
+    /// durably dedup it" shape should generalize this to a small named-sink
+    /// registry rather than adding a second `set_<plugin>_sink`. Invoked
+    /// OUTSIDE mu_.
     using CorruptionSink =
         std::function<void(const std::string& agent_id, int64_t corruption_total,
                            const std::string& quarantine_last)>;

@@ -10,6 +10,8 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <sqlite3.h>
+
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
@@ -17,8 +19,6 @@
 
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
-
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <cstdlib>

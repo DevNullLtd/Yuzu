@@ -11,6 +11,17 @@
  *
  * Pure: the KV is reached only through the injected list/get callbacks, so it
  * is unit-tested with lambdas (no KvStore, no disk).
+ *
+ * Bounds a byte-length and a key count, nothing more: a future NUMERIC
+ * consumer that sums a tag's raw value into a fleet gauge (rather than only
+ * counting agents, as tar_corruption_audit.hpp's parser does today) must add
+ * its OWN plausibility ceiling, mirroring the kMaxPlausible*Count pattern in
+ * the sibling spark_fleet_tags.hpp/guardian_*_fleet_tags.hpp headers — an
+ * unbounded value summed into a double silently annihilates every honest
+ * agent's contribution via IEEE-754. A plugin publishing more than
+ * kPluginHeartbeatMaxKeys keys has the excess silently dropped (sorted,
+ * truncated) with no warning to the plugin author; not reachable today (every
+ * current consumer publishes at most 2 keys).
  */
 
 #include <algorithm>
