@@ -1117,7 +1117,7 @@ public:
     // plugin.h's negative-on-error contract), so a read fault on the ledger
     // probe followed by a successful write in the same tick restarts the count
     // at 1 — the count is monotonic per agent except for that fault; tracked as
-    // a follow-up (KvStore::exists tri-state). The two windows where the fact is
+    // a follow-up, #5037 (KvStore::exists tri-state). The two windows where the fact is
     // lost are a crash between the quarantine rename and the fresh DB's config
     // write inside TarDatabase::open(), and that config write failing (logged by
     // open(); db_health|quarantined still shows for this process).
