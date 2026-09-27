@@ -20,9 +20,12 @@
 /// accepted, already-reviewed residual, not an oversight).
 ///
 /// Lock order (a change that inverts it can deadlock): the `rbac_store.rbac_meta`
-/// rbac_enabled row (`set_enforcement` only — `RbacStore::set_rbac_enabled`,
-/// the unguarded seed/test primitive, does not take it), then
-/// `rbac_store.principal_roles` rows FOR UPDATE OF pr (unassign always;
+/// rbac_enabled row (`set_enforcement`'s explicit `FOR UPDATE` read takes it
+/// first; `RbacStore::set_rbac_enabled`, the unguarded seed/test primitive,
+/// ALSO takes it — via `write_rbac_enabled_in_txn`'s UPSERT's own implicit
+/// row lock, not a preceding explicit read — same relative order, no
+/// inversion between the two), then `rbac_store.principal_roles` rows FOR
+/// UPDATE OF pr (unassign always;
 /// `set_enforcement`'s ENABLE direction only), then one `auth.users` row
 /// (unassign only), then the `rbac_meta` write_generation row. A path that
 /// holds an `auth.users` row lock and then touches those would invert it.
@@ -76,9 +79,13 @@ public:
         bool previous_enabled{false};
         bool enabled{false};
         std::int64_t post_transition_administrators{0};
-        /// Present ONLY on a REAL applied transition (`changed == true`) —
-        /// absent on the no-op path and on any refusal/failure. Mirrors
-        /// `UnassignOutcome::new_gen`'s own optional shape.
+        /// Meaningful ONLY when `ok` is true: present on a REAL applied
+        /// transition (`changed == true`), absent on the no-op path — never
+        /// meaningful on a refusal or a store failure regardless of what
+        /// `changed`/`new_gen` might already hold at that point (the current
+        /// implementation never sets `changed` before `ok` is known to be
+        /// true, but this doc deliberately does not rely on that ordering).
+        /// Mirrors `UnassignOutcome::new_gen`'s own optional shape.
         std::optional<std::uint64_t> new_gen;
         std::string err; ///< store-level failure text; empty unless `!ok`
     };
