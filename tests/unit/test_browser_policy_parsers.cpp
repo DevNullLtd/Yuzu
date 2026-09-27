@@ -197,9 +197,11 @@ TEST_CASE("browser_policy: a list/dict value the wire escaper would fold is flag
           "[browser_policy][parsers]") {
     // safe_output_field folds every literal backslash to '/', so a JSON dump
     // containing one (a nested string held a `"`, `\` or control character) is
-    // no longer valid JSON once written to the wire. json_to_policy_value must
-    // flag this in `detail` while still keeping the (folded) value -- never
-    // blank it to unmodelled, which would throw away otherwise-useful content.
+    // lossy and not trustworthy as the original JSON once written to the wire
+    // -- an escaped quote can even make it syntactically invalid, though not
+    // every fold does. json_to_policy_value must flag this in `detail` while
+    // still keeping the (folded) value -- never blank it to unmodelled, which
+    // would throw away otherwise-useful content.
     {
         const auto v = json_to_policy_value(nlohmann::json::parse(R"(["a\"b"])"));
         CHECK(v.type == PolicyType::List);
@@ -224,7 +226,9 @@ TEST_CASE("browser_policy: a list/dict value the wire escaper would fold is flag
         CHECK(v.detail.empty());
     }
     // End-to-end through the wire escaper: the folded value on the actual row
-    // is no longer valid JSON, but the row still carries it, with the flag.
+    // is lossy and not trustworthy as the original JSON (this particular fold
+    // breaks an escaped quote, so it's also syntactically invalid), but the
+    // row still carries it, with the flag.
     {
         PolicyRow r;
         r.name = "Escaped";
@@ -650,7 +654,13 @@ TEST_CASE("browser_policy: max_nesting_depth counts brackets outside strings and
     };
     const std::string deep = std::string(kMaxNestingDepth, '[') + std::string(kMaxNestingDepth, ']');
     CHECK(parse_text(R"({"a":)" + deep + R"(,"b":[]})").failure == kTokenJsonTooDeep);
-    CHECK(parse_text(R"({"a":"\"","b":)" + deep + "}").failure == kTokenJsonTooDeep);
+    // Hoisted out of the CHECK() argument position: MSVC's traditional preprocessor
+    // mistokenizes a raw string containing an embedded `\"` when it appears as a
+    // macro argument (governance sweep, #4998 round 3 -- same class as
+    // kEscapedQuoteInList/kEscapedQuoteThenBrackets above, missed by round 2's
+    // fix because this site nests the literal inside parse_text(...) + deep).
+    const std::string kEscapedQuoteThenDeepNesting = R"({"a":"\"","b":)" + deep + "}";
+    CHECK(parse_text(kEscapedQuoteThenDeepNesting).failure == kTokenJsonTooDeep);
 }
 
 namespace {
