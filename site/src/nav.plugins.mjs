@@ -10,6 +10,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/autoruns/README', slug: 'plugins/autoruns', title: 'autoruns' },
   { file: 'agents/plugins/bitlocker/README', slug: 'plugins/bitlocker', title: 'bitlocker' },
   { file: 'agents/plugins/browser_inventory/README', slug: 'plugins/browser_inventory', title: 'browser_inventory' },
+  { file: 'agents/plugins/browser_policy/README', slug: 'plugins/browser_policy', title: 'browser_policy' },
   { file: 'agents/plugins/certificates/README', slug: 'plugins/certificates', title: 'certificates' },
   { file: 'agents/plugins/chargen/README', slug: 'plugins/chargen', title: 'chargen' },
   { file: 'agents/plugins/content_dist/README', slug: 'plugins/content_dist', title: 'content_dist' },

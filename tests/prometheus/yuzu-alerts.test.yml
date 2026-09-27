@@ -1655,6 +1655,85 @@ tests:
           - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="query_error", severity="critical"}'
             value: 1
 
+  # ── YuzuRbacEnforcementChanged (A1) ──────────────────────────────────────
+  #
+  # Threshold-free by design: fires on ANY observed change to the gauge
+  # within the 15m lookback window, for: 0m. These two cases prove the alert
+  # both directions: a genuine flip fires (and stays firing for the rest of
+  # the window), and a flat series — including what a replica restart
+  # re-publishing the SAME value looks like — never does.
+
+  # CASE 49 -- a genuine flip (disabled -> enabled) fires at an eval point
+  # after the flip.
+  - interval: 1m
+    name: rbac enforcement changed - a genuine flip fires
+    input_series:
+      - series: 'yuzu_server_rbac_enforcement_enabled{job="yuzu",instance="s1"}'
+        values: "0 0 0 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacEnforcementChanged", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacEnforcementChanged", alertstate="firing", instance="s1", job="yuzu", severity="info"}'
+            value: 1
+
+  # CASE 50 -- a flat series (never changed) never fires — the shape a
+  # replica restart with an unchanged flag produces (the gauge is
+  # re-published with the same value, not left absent).
+  - interval: 1m
+    name: rbac enforcement changed - a flat series never fires
+    input_series:
+      - series: 'yuzu_server_rbac_enforcement_enabled{job="yuzu",instance="s1"}'
+        values: "1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacEnforcementChanged", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+
+  # ── YuzuRbacEnforcementDisabled (Gate 7 Fix 14) ──────────────────────────
+  #
+  # Direction-aware companion to YuzuRbacEnforcementChanged above: fires ONLY
+  # when the gauge transitions TO 0 (disabled) — RBAC ships off by default,
+  # so disable is the security-regression direction.
+
+  # CASE 51 -- a disable transition (enabled -> disabled) fires.
+  - interval: 1m
+    name: rbac enforcement disabled - a disable transition fires
+    input_series:
+      - series: 'yuzu_server_rbac_enforcement_enabled{job="yuzu",instance="s1"}'
+        values: "1 1 1 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacEnforcementDisabled", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacEnforcementDisabled", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 52 -- an ENABLE transition (disabled -> enabled) never fires this
+  # rule — direction-specific, the mirror-image case CASE 49 already proves
+  # fires the OTHER (undirected) alert.
+  - interval: 1m
+    name: rbac enforcement disabled - an enable transition never fires
+    input_series:
+      - series: 'yuzu_server_rbac_enforcement_enabled{job="yuzu",instance="s1"}'
+        values: "0 0 0 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacEnforcementDisabled", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+
+  # CASE 53 -- a flat series held at disabled (0) never fires — no CHANGE,
+  # just steady-state off (e.g. a fresh install that never enabled RBAC).
+  - interval: 1m
+    name: rbac enforcement disabled - a flat disabled series never fires
+    input_series:
+      - series: 'yuzu_server_rbac_enforcement_enabled{job="yuzu",instance="s1"}'
+        values: "0 0 0 0 0 0"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacEnforcementDisabled", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+
   # ── YuzuRotationSweepNotRunning (#2964) ─────────────────────────────────
   #
   # Reads `yuzu_rotation_sweep_last_pass_timestamp_seconds` (server.cpp) --

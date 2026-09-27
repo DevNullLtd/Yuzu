@@ -2881,7 +2881,9 @@ private:
     ///    log line, FilePassWork destruction), where Registry stamps after its
     ///    tail; wait_timeout_locked() therefore treats a deadline that has
     ///    already passed as "retry due now";
-    ///  - logging happens off-lock, after this returns;
+    ///  - logging happens off-lock, after this returns - Registry's sweeper_main()
+    ///    does the same since #4704, but keeps its failure count as a sweeper-local
+    ///    and captures its PassOutcome inline rather than through a helper;
     ///  - a real completion's pass counts toward the three like any other pass;
     ///  - clearing inert_ has no `if (core_)` guard: run() is the only writer
     ///    while it executes (see the pass-failure member comment).
@@ -2915,10 +2917,14 @@ private:
         return out;
     }
 
-    /// Off-lock, noexcept: run() has NO outer catch, so a throw from a log call
-    /// here would be worker death, the very thing the pass catch exists to
-    /// prevent. Same wrapping rule as every other diagnostic in a recovery path
-    /// in this file.
+    /// Off-lock, noexcept with an internal catch: an ordinary formatting/
+    /// allocation failure is already handled inside spdlog's own logging
+    /// pipeline and does not reach here (verified against spdlog's
+    /// SPDLOG_TRY/CATCH machinery, #4704 review). This catch(...) is a
+    /// last-resort backstop for a genuinely exceptional failure surviving
+    /// that pipeline, so the worker cannot be brought down by a diagnostic
+    /// log call - run() has NO outer catch of its own. Same wrapping rule as
+    /// every other diagnostic in a recovery path in this file.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {
             if (o.recovered) {

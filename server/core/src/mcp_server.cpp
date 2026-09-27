@@ -2625,6 +2625,26 @@ static const ToolDef kTools[] = {
      // closed, never a success payload with audit_persisted:false).
      R"j(},"required":["unassigned","principal_id","role"]})j"},
 
+    // ── A1: RBAC enforcement enable/disable toggle — MCP twin of
+    // PUT /api/v1/rbac/enforcement.
+    {"set_rbac_enforcement",
+     "Switch RBAC enforcement ON or OFF fleet-wide (durable; every replica converges within "
+     "~1s). Requires the CALLER to hold a durable Administrator role (same dedicated gate as "
+     "assign_rbac_role, not a plain permission check). On a real transition, REFUSED unless the "
+     "caller ALSO holds authority under the regime that is durably true RIGHT NOW (enabling "
+     "requires the caller's own local admin role; disabling requires the caller's own fleet-wide "
+     "Administrator grant) AND would REMAIN a durable administrator after the switch: enabling "
+     "requires the caller's own fleet-wide Administrator grant (call assign_rbac_role for "
+     "yourself first); disabling requires the caller's local account to hold the admin role. "
+     "Destructive: enabling immediately denies every operator who lacks a role grant. "
+     "Idempotent: requesting the current state returns changed=false without evaluating either "
+     "check. Requires Security:Write (supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{"enabled":{"type":"boolean","description":"true to enable RBAC enforcement, false to disable it"}},"required":["enabled"]})j",
+     R"j({"type":"object","properties":{"enabled":{"type":"boolean"},"previous_enabled":{"type":"boolean"},"changed":{"type":"boolean"},)j"
+     R"j("post_transition_administrators":{"type":"integer","minimum":0,"description":"after enabling: fleet-wide Administrator grants held by currently-active local accounts; after disabling: active local accounts holding the admin role"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["enabled","previous_enabled","changed","post_transition_administrators"]})j"},
+
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
      "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
@@ -3414,6 +3434,8 @@ static const char* const kWriteToolsRaw[] = {
     "assign_engine_role", "unassign_engine_role",
     // A2 (delivery plan §2) — global human role assignment authoring.
     "assign_rbac_role", "unassign_rbac_role",
+    // A1 — RBAC enforcement enable/disable toggle.
+    "set_rbac_enforcement",
     // Periodic Access Reviews (SOC 2 CC6.2) — campaign-opening, attestation, and
     // close are mutations (persist a new campaign / a reviewer decision / a
     // lifecycle transition); export/get/list are read-only and deliberately
@@ -3868,6 +3890,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // grant needs a stronger gate than a plain Security:Write check.
     {"assign_rbac_role", {"Security", "Write"}},
     {"unassign_rbac_role", {"Security", "Write"}},
+    // A1 — drives the generic C8 tier/approval gate; the actual decision is
+    // is_rbac_administrator, same as the two rows above.
+    {"set_rbac_enforcement", {"Security", "Write"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -4609,6 +4634,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"assign_rbac_role", {ToolEffect::Additive, true, "Assign fleet-wide RBAC role to user"}},
     {"unassign_rbac_role",
      {ToolEffect::Destructive, true, "Revoke fleet-wide RBAC role from user"}},
+    // A1 — Destructive (enabling immediately denies every operator who
+    // lacks a role grant); idempotent (requesting the current state is a
+    // no-op, changed=false).
+    {"set_rbac_enforcement", {ToolEffect::Destructive, true, "Set RBAC enforcement"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
     // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
@@ -22031,6 +22060,50 @@ McpServer::HandlerFn McpServer::build_handler(
                                             "application/json");
                         }))
                     return;
+                // Gate 8 HIGH (security-guardian): is_rbac_administrator's
+                // branch selection is driven by a replica-local cached
+                // rbac_enabled_ view that can lag a real commit — the SAME
+                // cross-replica cache-staleness gap set_rbac_enforcement's own
+                // source-regime check closes for the toggle
+                // (rbac_admin_predicate.hpp). Unlike the toggle's transient
+                // window, a grant minted here persists indefinitely once
+                // written, so the caller must be re-verified against the
+                // FRESH durable regime before this mutates principal_roles.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: this outcome was invisible
+                        // to operators — log AND audit it, matching the FIRST
+                        // check's own kUnavailable treatment above (Doomgoose
+                        // PR #4985 IMPORTANT #2) with a DISTINCT reason string
+                        // so the two checks are individually diagnosable from
+                        // the audit log.
+                        spdlog::warn("rbac.role.assigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable — cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, "rbac.role.assigned", "denied", "User", session->username,
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
                 // Empty mcp_tier guard (adversarial-review PR1/A2 round-2 finding,
                 // #4309 gap class): an empty tier makes tier_allows()/requires_approval()
                 // both no-op (tier_allows("") == true, requires_approval("") == false),
@@ -22257,6 +22330,42 @@ McpServer::HandlerFn McpServer::build_handler(
                                             "application/json");
                         }))
                     return;
+                // Gate 8 HIGH (security-guardian): see assign_rbac_role's
+                // identical block above for the full reasoning — a caller
+                // admitted under a STALE regime read of is_rbac_administrator
+                // must be re-verified against the FRESH durable regime before
+                // this mutates principal_roles.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: see the identical fix on
+                        // assign_rbac_role above for the full reasoning.
+                        spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable — cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, "rbac.role.unassigned", "denied", "User", session->username,
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
                 // Empty mcp_tier guard — see assign_rbac_role's identical guard
                 // above for the full reasoning (adversarial-review PR1/A2 round-2
                 // finding, #4309 gap class).
@@ -22372,6 +22481,183 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 nlohmann::json payload = {
                     {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_rbac_enforcement") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp); matches
+                // assign_rbac_role's/unassign_rbac_role's identical usage
+                // above.
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            spdlog::warn("rbac.enforcement_changed: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                           "rbac_enabled",
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                           "rbac_enabled",
+                                           std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
+                    return;
+                // Empty mcp_tier guard — see assign_rbac_role's/unassign_rbac_role's
+                // identical guard above for the full reasoning
+                // (adversarial-review PR1/A2 round-2 finding, #4309 gap class).
+                if (session->mcp_tier.empty()) {
+                    (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                   "rbac_enabled",
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "set_rbac_enforcement requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "PUT /api/v1/rbac/enforcement instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
+
+                if (!args.contains("enabled") || !args["enabled"].is_boolean()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "enabled is required and must be a boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool enabled = args["enabled"].get<bool>();
+
+                auto result = rbac_store->set_rbac_enforcement(enabled, session->username);
+                if (!result) {
+                    const auto err_kind = result.error().kind;
+                    const bool survivor_refused =
+                        err_kind == RbacEnforcementError::Kind::kCallerNotSurvivor;
+                    // Gate 7 Fix 1: a plain authority failure under the regime
+                    // that is durably true right now — distinct from
+                    // survivor_refused's post-transition survival conflict.
+                    const bool regime_refused =
+                        err_kind ==
+                        RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime;
+                    const bool refused = survivor_refused || regime_refused;
+                    (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                   "rbac_enabled",
+                                   refused ? "guard: " + result.error().message
+                                           : result.error().message);
+                    if (refused) {
+                        // retry-hint-exempt: business-rule refusal (caller would
+                        // not survive the transition, or lacks authority under
+                        // the current regime), not a store fault.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                         {{"transport", "mcp"}, {"result", "refused"}})
+                                .increment();
+                        // Gate 7 Fix 5: route through the same A4-shaped a4_error
+                        // lambda the tier/permission denials above use (correlation
+                        // id + retry_after_ms + remediation), rather than a bare
+                        // error_response with no error.data. Remediation mirrors
+                        // the REST route's equivalent text (rest_api_v1.cpp) for
+                        // the SAME two directions — survivor_refused names the
+                        // DESTINATION-regime fix (matching `enabled`); regime_refused
+                        // names the SOURCE-regime fix (the opposite direction).
+                        const std::string_view administrator_grant_remediation =
+                            "POST /api/v1/rbac/roles/Administrator/assignments "
+                            "{\"principal_type\":\"user\",\"principal_id\":\"<your "
+                            "username>\"} (or MCP assign_rbac_role), then retry";
+                        const std::string_view local_admin_role_remediation =
+                            "only a local account holding the admin role satisfies this check; "
+                            "sign in as one, or have one set your local role via POST "
+                            "/api/settings/users/{username}/role, then retry";
+                        const std::string_view remediation =
+                            survivor_refused
+                                ? (enabled ? administrator_grant_remediation
+                                          : local_admin_role_remediation)
+                                : (enabled ? local_admin_role_remediation
+                                          : administrator_grant_remediation);
+                        res.set_content(
+                            a4_error(survivor_refused ? kInvalidParams : kPermissionDenied,
+                                     result.error().message, remediation),
+                            "application/json");
+                        return;
+                    }
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                     {{"transport", "mcp"}, {"result", "failed"}})
+                            .increment();
+                    // Gate 7 Fix 6: a fixed, generic client-facing message —
+                    // never the raw store error (can carry PQerrorMessage detail:
+                    // schema/table names, lock detail). The raw message is still
+                    // audited above (server-side only), matching REST's posture.
+                    res.set_content(
+                        a4_error(kInternalError, "RBAC store write failed; retry shortly",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const std::string audit_detail =
+                    "enabled=" + std::string(result->enabled ? "true" : "false") +
+                    "; previous=" + std::string(result->previous_enabled ? "true" : "false") +
+                    "; changed=" + std::string(result->changed ? "true" : "false") +
+                    "; post_transition_administrators=" +
+                    std::to_string(result->post_transition_administrators);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "rbac.enforcement_changed", "success", "Setting",
+                    "rbac_enabled", audit_detail);
+                if (!audit_ok) {
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the enforcement change took effect but its audit record could "
+                                 "not be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", "mcp"},
+                                  {"result", result->changed ? "applied" : "unchanged"}})
+                        .increment();
+                nlohmann::json payload = {{"enabled", result->enabled},
+                                          {"previous_enabled", result->previous_enabled},
+                                          {"changed", result->changed},
+                                          {"post_transition_administrators",
+                                           result->post_transition_administrators}};
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");

@@ -301,18 +301,23 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
 }
 
 // A2 (Doomgoose external review, PR #4985 round-2, CRITICAL/BLOCKING — #520):
-// an MCP-tier bearer token of ANY tier must never reach this REST admin pair
-// — `is_rbac_administrator(..., RbacAdminSurface::kRest)` ALSO denies this
-// structurally, but that shared chokepoint's audit reason
+// an MCP-tier bearer token of ANY tier must never reach this REST admin
+// surface — `is_rbac_administrator(..., RbacAdminSurface::kRest)` ALSO
+// denies this structurally, but that shared chokepoint's audit reason
 // (`kRbacAdminGateDeniedAuditReason`, "caller is not a durable RBAC
 // administrator") would be misleading for THIS specific denial reason: the
 // caller may well BE a durable administrator — the denial is about which
 // TRANSPORT presented the credential, not whether the credential holds
 // authority. A CC7.2 audit-evidence accuracy concern, so this is its own
 // helper with its own audit detail, called BEFORE the predicate (mirrors
-// `deny_engine_session`'s own belt-and-suspenders placement). Returns true
-// (having already written the 403 A4 body) when the caller must stop; false
-// when the session carries no mcp_tier and the route may proceed.
+// `deny_engine_session`'s own belt-and-suspenders placement). Used at all
+// THREE REST routes gated on `is_rbac_administrator` — the original A2 pair
+// plus A1's enforcement-toggle route, which reuses this helper verbatim
+// rather than forking a second one (see rbac_admin_predicate.hpp's own doc
+// comment: this Fable-adjudicated design supersedes an independently-derived
+// narrower A1 fix that predated A2's merge). Returns true (having already
+// written the 403 A4 body) when the caller must stop; false when the session
+// carries no mcp_tier and the route may proceed.
 static bool deny_mcp_token_session(const auth::Session& s, const httplib::Request& req,
                                    httplib::Response& res, const RestApiV1::AuditFn& audit,
                                    const char* action, const char* target) {
@@ -323,7 +328,8 @@ static bool deny_mcp_token_session(const auth::Session& s, const httplib::Reques
         res.status = 403;
         res.set_content(
             detail::a4_error(res, "MCP tokens cannot perform admin operations; use the MCP tool "
-                                  "assign_rbac_role/unassign_rbac_role instead"),
+                                  "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement "
+                                  "instead"),
             "application/json");
         return true;
     }
@@ -1011,6 +1017,9 @@ const std::string& openapi_spec() {
     },
     "/rbac/roles/{name}/assignments/{principal_id}": {
       "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment. Removing the fleet's last remaining authenticatable Administrator grant is refused for anyone, by a store-level check in the same transaction as the removal. That check also holds against a concurrent reactivation of an existing account. It does not cover an account created concurrently for a pre-provisioned grant, or a surviving Administrator's account deactivated concurrently (both tracked at #4966).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the unassign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault removing the grant, or the audit write for this mutation failed (fail-closed)"}}}
+    },
+    "/rbac/enforcement": {
+      "put": {"summary": "Enable or disable RBAC enforcement fleet-wide (A1)", "tags": ["RBAC"], "description": "Gated on the SAME durable is_rbac_administrator check as the role-assignment routes above, not an ordinary permission check, plus MFA step-up. On a real transition, refused (403) unless the caller ALSO holds authority under the regime that is durably true right now (an authenticatable fleet-wide Administrator grant while currently on, local admin role while currently off), and refused (409) unless the caller would remain a durable administrator under the destination regime: enabling requires the caller's own fleet-wide Administrator grant, disabling requires the caller's own local account to hold the admin role. Idempotent: requesting the current state returns changed=false without evaluating either check. No GET twin — read the current state via GET /api/v1/me (rbac_enabled) or this route's own response.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}}}, "responses": {"200": {"description": "Enforcement state applied (or already matched — changed=false)"}, "400": {"description": "Invalid JSON, or enabled missing/not a JSON boolean (strict — no string/number coercion)"}, "401": {"description": "Not authenticated, or MFA step-up required or failed (stale/absent proof; api_token/mcp_token bearer sessions are exempt) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the set_rbac_enforcement tool instead, which requires the supervised tier plus an approval ticket), or (on a real transition) does not hold authority under the regime that is durably true right now"}, "409": {"description": "Refused: the caller would not remain a durable administrator after the switch"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
@@ -5630,6 +5639,48 @@ void RestApiV1::register_routes(
                                         "application/json");
                     }))
                 return;
+            // Gate 8 HIGH (security-guardian): is_rbac_administrator's branch
+            // selection is driven by a replica-local cached rbac_enabled_ view
+            // that can lag a real commit — the SAME cross-replica
+            // cache-staleness gap set_rbac_enforcement's own source-regime
+            // check closes for the toggle (#1398 rbac_admin_predicate.hpp).
+            // Unlike the toggle's transient window, a grant minted here
+            // persists indefinitely once written, so a caller admitted under
+            // a stale regime read must be re-verified against the FRESH
+            // durable regime before this route ever mutates principal_roles.
+            {
+                const auto regime =
+                    rbac_store->check_caller_authorized_under_current_regime(session->username);
+                if (regime == RbacRegimeAuthority::kUnavailable) {
+                    // Governance re-verification: this outcome was invisible to
+                    // operators — log AND audit it, matching the FIRST check's
+                    // own kUnavailable treatment above (Doomgoose PR #4985
+                    // IMPORTANT #2) with a DISTINCT reason string so the two
+                    // checks are individually diagnosable from the audit log.
+                    spdlog::warn("rbac.role.assigned: {} (user={})",
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.assigned", "denied", "User",
+                        session->username,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
+                                                           "administrator authority"),
+                                    "application/json");
+                    return;
+                }
+                if (regime != RbacRegimeAuthority::kAuthorized) {
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.assigned", "denied", "User",
+                        session->username,
+                        "caller does not hold authority under the regime that is durably true "
+                        "right now");
+                    res.status = 403;
+                    res.set_content(detail::a4_error(res, "administrator role required"),
+                                    "application/json");
+                    return;
+                }
+            }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/rbac/roles/{name}/assignments"))
                 return;
@@ -5911,6 +5962,41 @@ void RestApiV1::register_routes(
                                         "application/json");
                     }))
                 return;
+            // Gate 8 HIGH (security-guardian): see the identical block on the
+            // POST assign route above for the full reasoning — a caller
+            // admitted under a STALE regime read of is_rbac_administrator
+            // must be re-verified against the FRESH durable regime before
+            // this route ever mutates principal_roles.
+            {
+                const auto regime =
+                    rbac_store->check_caller_authorized_under_current_regime(session->username);
+                if (regime == RbacRegimeAuthority::kUnavailable) {
+                    // Governance re-verification: see the identical fix on the
+                    // POST assign route above for the full reasoning.
+                    spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                        session->username,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable — cannot confirm "
+                                                           "administrator authority"),
+                                    "application/json");
+                    return;
+                }
+                if (regime != RbacRegimeAuthority::kAuthorized) {
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                        session->username,
+                        "caller does not hold authority under the regime that is durably true "
+                        "right now");
+                    res.status = 403;
+                    res.set_content(detail::a4_error(res, "administrator role required"),
+                                    "application/json");
+                    return;
+                }
+            }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session,
                             "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"))
@@ -5991,6 +6077,218 @@ void RestApiV1::register_routes(
                 return;
             }
             res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
+        });
+
+    // A1: RBAC enforcement enable/disable toggle. Same gate order and same
+    // "durable Administrator" authority (is_rbac_administrator, not an
+    // ordinary permission check) as A2's assign/unassign routes above — the
+    // production toggle path (RbacStore::set_rbac_enforcement) shares that
+    // gate deliberately. GET is not shipped: the read paths are
+    // GET /api/v1/me (rbac_enabled) and the access-review export's
+    // rbac_enforcement label; this PUT's own response echoes the
+    // authoritative post-write value.
+    sink.Put(
+        "/api/v1/rbac/enforcement",
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "rbac.enforcement_changed", "Setting",
+                    "service-scoped token blocked from RBAC enforcement toggle",
+                    "service-scoped tokens cannot change RBAC enforcement", "", ""))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "rbac.enforcement_changed",
+                                    "Setting"))
+                return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, "rbac.enforcement_changed",
+                                       "Setting"))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "service unavailable",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
+            // Doomgoose external review, PR #4985 MINOR "duplicated
+            // gate-denial classification" — shared chokepoint, see its own
+            // doc comment (rbac_admin_predicate.hpp).
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        // Doomgoose external review, PR #4985 IMPORTANT #2:
+                        // a kUnavailable gate outcome was previously invisible
+                        // to operators — log AND audit it, matching every
+                        // sibling degraded-store denial in this codebase
+                        // (e.g. AuthRoutes::require_permission's engine
+                        // branch) and A2's assign/unassign routes above.
+                        spdlog::warn("rbac.enforcement_changed: {} (user={})",
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.enforcement_changed", "denied", "Setting",
+                            "rbac_enabled", std::string(kRbacAdminGateUnavailableAuditReason));
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(
+                                res, kRbacAdminGateUnavailableMessage,
+                                detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                            "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.enforcement_changed", "denied", "Setting",
+                            "rbac_enabled", std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
+                return;
+            if (step_up_fn && !step_up_fn(req, res, *session, "PUT /api/v1/rbac/enforcement"))
+                return;
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            // Strict boolean (governance precedent, this route's own blast
+            // radius): the strings "true"/"false" and the numbers 0/1 are
+            // rejected, never coerced.
+            if (!body.contains("enabled") || !body["enabled"].is_boolean()) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, "enabled is required and must be a JSON boolean"),
+                    "application/json");
+                return;
+            }
+            const bool enabled = body["enabled"].get<bool>();
+
+            // Nothing caller-controlled is ever embedded in an audit/log
+            // string on this route (CWE-117): `enabled` is a validated JSON
+            // boolean and session->username was validated at login and is
+            // already used as an audit target by A2's sibling routes.
+            auto r = rbac_store->set_rbac_enforcement(enabled, session->username);
+            if (!r) {
+                if (r.error().kind == RbacEnforcementError::Kind::kCallerNotSurvivor) {
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                     {{"transport", "rest"}, {"result", "refused"}})
+                            .increment();
+                    (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                        "rbac.enforcement_changed", "denied",
+                                                        "Setting", "rbac_enabled",
+                                                        "guard: " + r.error().message);
+                    const std::string_view remediation =
+                        enabled
+                            ? "POST /api/v1/rbac/roles/Administrator/assignments "
+                              "{\"principal_type\":\"user\",\"principal_id\":\"<your "
+                              "username>\"} (or MCP assign_rbac_role), then retry"
+                            : "only a local account holding the admin role can disable "
+                              "enforcement; sign in as one, or have one set your local role via "
+                              "POST /api/settings/users/{username}/role, then retry";
+                    // retry_after_ms stays null — this is a business-rule
+                    // refusal, not a transient store fault.
+                    res.status = 409;
+                    res.set_content(
+                        detail::a4_error(res, r.error().message,
+                                         detail::A4ErrorOpts{.remediation = remediation}),
+                        "application/json");
+                    return;
+                }
+                if (r.error().kind ==
+                    RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime) {
+                    // Gate 7 Fix 1: an authority failure under the regime that is
+                    // durably true RIGHT NOW, distinct from kCallerNotSurvivor's
+                    // post-transition survival conflict above — a plain 403, not
+                    // a 409, since the transition itself is not in dispute.
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                     {{"transport", "rest"}, {"result", "refused"}})
+                            .increment();
+                    (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                        "rbac.enforcement_changed", "denied",
+                                                        "Setting", "rbac_enabled",
+                                                        "guard: " + r.error().message);
+                    // Mirrors the kCallerNotSurvivor remediation above but on the
+                    // OPPOSITE branch: the source check requires authority under
+                    // the regime the caller is trying to LEAVE, not the one they
+                    // are trying to reach.
+                    const std::string_view remediation =
+                        enabled
+                            ? "only a local account holding the admin role can change "
+                              "enforcement while it is off; sign in as one, or have one set your "
+                              "local role via POST /api/settings/users/{username}/role, then retry"
+                            : "POST /api/v1/rbac/roles/Administrator/assignments "
+                              "{\"principal_type\":\"user\",\"principal_id\":\"<your "
+                              "username>\"} (or MCP assign_rbac_role), then retry";
+                    res.status = 403;
+                    res.set_content(
+                        detail::a4_error(res, r.error().message,
+                                         detail::A4ErrorOpts{.remediation = remediation}),
+                        "application/json");
+                    return;
+                }
+                // kStoreFailure.
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", "rest"}, {"result", "failed"}})
+                        .increment();
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.enforcement_changed",
+                                                    "denied", "Setting", "rbac_enabled",
+                                                    r.error().message);
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "RBAC store write failed; retry shortly",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            const std::string audit_detail =
+                "enabled=" + std::string(r->enabled ? "true" : "false") +
+                "; previous=" + std::string(r->previous_enabled ? "true" : "false") +
+                "; changed=" + std::string(r->changed ? "true" : "false") +
+                "; post_transition_administrators=" +
+                std::to_string(r->post_transition_administrators);
+            // #2466/#2406: fail closed — never report a toggle whose audit
+            // record did not persist.
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "rbac.enforcement_changed",
+                                               "success", "Setting", "rbac_enabled",
+                                               audit_detail)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "the enforcement change took effect but its audit record could not "
+                             "be persisted; treat as unconfirmed and reconcile via GET "
+                             "/api/v1/me"),
+                    "application/json");
+                return;
+            }
+            if (metrics_registry)
+                metrics_registry
+                    ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                             {{"transport", "rest"},
+                              {"result", r->changed ? "applied" : "unchanged"}})
+                    .increment();
+            res.set_content(ok_json(JObj()
+                                        .add("enabled", r->enabled)
+                                        .add("previous_enabled", r->previous_enabled)
+                                        .add("changed", r->changed)
+                                        .add("post_transition_administrators",
+                                             r->post_transition_administrators)
+                                        .str()),
+                            "application/json");
         });
 
     sink.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
