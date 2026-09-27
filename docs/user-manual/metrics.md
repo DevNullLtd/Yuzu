@@ -1908,6 +1908,9 @@ authorization-availability event**, not a silent partial outage.
 | `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time — also recorded here when the fail-fast circuit breaker denies without touching the pool, since a breaker-open denial is one of this reason's two contributing failure modes, not a distinct reason), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read PAST the bounded ~5s stale-serve window — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Three reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3 + the 2026-08-11 bounded-stale-serve split): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced), `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache), and `generation_refresh_failed_within_bound` (a generation refresh failed but the store is still inside the bounded ~5s stale-serve window from ADR-0041's "Update" — the existing cache keeps answering unchanged; early warning only, nobody is denied). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
 | `yuzu_server_rbac_authz_check_seconds` | histogram | none | End-to-end latency of `check_permission` — acquire + query + cache lookup, every outcome including cache hits and breaker-denied fast paths. Extended buckets out to 60s (not the default 10s ceiling), because the measured lock-contention tail on this path runs to ~18.5s and, per the dark-network analysis in the SOC2 doc's availability-posture note, as far as ~40s. Distinct from `yuzu_pg_acquire_wait_seconds`, which reads fast even when the acquire itself succeeds but the query afterward blocks on `PgPool`'s injected `lock_timeout` — this histogram is the only place that scenario's true end-to-end cost is visible. |
 | `yuzu_server_rbac_breaker_open` | gauge | none | `1` when the authz-hot-path fail-fast circuit breaker is open (2 consecutive `pool_acquire_timeout`/`query_error` failures), `0` when closed. Per-process/per-replica, not fleet-wide — a fleet-wide view needs `count(yuzu_server_rbac_breaker_open == 1)` across replicas. |
+| `yuzu_server_rbac_last_admin_guard_refused_total` | counter | `transport` (`rest`/`mcp`) | A2's last-remaining-Administrator guard (`RbacStore::unassign_role`) refused an unassign that would have left the fleet with zero authenticatable Administrators — `POST/DELETE /api/v1/rbac/roles/{name}/assignments` or its MCP twins. This is a **business-rule** refusal, not a store degrade — it does not share `yuzu_server_rbac_read_degrade_total`'s reasons and is not itself alerting-worthy at any nonzero rate (an operator repeatedly hitting this while trying to remove the fleet's last admin is expected, not a fault); compare against `yuzu_server_rbac_read_degrade_total` before assuming a sustained rate here signals a store problem. |
+| `yuzu_server_rbac_enforcement_enabled` | gauge | none | A1's enforcement toggle. This replica's CACHED view of the durable `rbac_enabled` flag (`RbacStore::rbac_enabled_`) — published at store construction, on every `set_rbac_enabled`/`set_rbac_enforcement` call, and on this replica's own ~1s generation refresh. Cross-replica convergence is bounded by that refresh interval; a fleet-wide view is `min()`/`max()` across replicas, same idiom as `yuzu_server_rbac_breaker_open` above. |
+| `yuzu_server_rbac_enforcement_toggle_total` | counter | `transport` (`rest`/`mcp`), `result` (`applied`/`unchanged`/`refused`/`failed`) | Business outcomes of `PUT /api/v1/rbac/enforcement` and its MCP twin `set_rbac_enforcement`. `refused` is an operator hitting the caller-survives guard (`RbacStore::set_rbac_enforcement`) — a business rule, not a store fault, same non-alerting posture as the last-admin-guard counter above; `failed` is a genuine store/txn failure and correlates with `yuzu_server_rbac_read_degrade_total`. Zero-seeded for all 8 series so an idle server carries every dimension from boot. |
 
 `yuzu_server_rbac_backfill_total` (the one-time legacy `rbac.db` → PostgreSQL backfill outcome)
 was retired along with `RbacStore::migrate_from_sqlite()` itself
@@ -1951,6 +1954,26 @@ yuzu_server_rbac_authz_check_seconds_count 0
 # HELP yuzu_server_rbac_breaker_open 1 when the authz fail-fast breaker is open, 0 when closed
 # TYPE yuzu_server_rbac_breaker_open gauge
 yuzu_server_rbac_breaker_open 0
+
+# HELP yuzu_server_rbac_last_admin_guard_refused_total RBAC role-unassign requests refused by the last-remaining-Administrator guard, by transport
+# TYPE yuzu_server_rbac_last_admin_guard_refused_total counter
+yuzu_server_rbac_last_admin_guard_refused_total{transport="rest"} 0
+yuzu_server_rbac_last_admin_guard_refused_total{transport="mcp"} 0
+
+# HELP yuzu_server_rbac_enforcement_enabled This replica's cached view of the durable rbac_enabled flag
+# TYPE yuzu_server_rbac_enforcement_enabled gauge
+yuzu_server_rbac_enforcement_enabled 0
+
+# HELP yuzu_server_rbac_enforcement_toggle_total Business outcomes of the RBAC enforcement toggle, by transport and result
+# TYPE yuzu_server_rbac_enforcement_toggle_total counter
+yuzu_server_rbac_enforcement_toggle_total{transport="rest",result="applied"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="rest",result="unchanged"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="rest",result="refused"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="rest",result="failed"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="applied"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="unchanged"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="refused"} 0
+yuzu_server_rbac_enforcement_toggle_total{transport="mcp",result="failed"} 0
 ```
 
 **Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**
@@ -1964,6 +1987,8 @@ sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query
 ```
 
 The shipped rule is `YuzuRbacReadDegraded` in `docs/prometheus/yuzu-alerts.yml`.
+
+A1's enforcement-state changes are covered by the separate, threshold-free `YuzuRbacEnforcementChanged` rule (same file) — see `docs/user-manual/rbac.md` "Enabling RBAC" for the audit-row cross-reference it points at. A direction-aware companion, `YuzuRbacEnforcementDisabled` (warning severity), fires specifically when the gauge transitions to disabled — RBAC ships off by default, so a disable is the security-regression direction and gets louder treatment than a bare "something changed."
 
 ## Useful PromQL queries
 
