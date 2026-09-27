@@ -4561,13 +4561,15 @@ as it was pre-#4666.
 **If log lines go missing under load with no error printed (#5023).** Check the
 consumer of the agent's stdout and stderr first (journald, the container log
 driver, a collector backlog): a stalled one stalls delivery as described above,
-and restarting the agent does not fix it. As root (or as the agent's own account),
+and restarting the agent does not fix it. As root,
 `ls -l /proc/<pid>/fd/1 /proc/<pid>/fd/2` shows whether each is a pipe
 (containers) or a socket (journald under the shipped unit), and
 `grep . /proc/<pid>/task/*/wchan` shows a logging thread parked in the write.
 The symbol depends on the kernel (`pipe_write` or `anon_pipe_write` for a
-pipe, `sock_alloc_send_pskb` for a socket), and for any other non-root account
-those files read `0`. Then check disk space and fd limits on the log destination.
+pipe, `sock_alloc_send_pskb` for a socket). Without root, only the agent's own
+account can read these, and only while the agent process is dumpable (an agent
+binary installed with file capabilities is not); otherwise the `wchan` files
+read `0` and the fd links fail with "Permission denied". Then check disk space and fd limits on the log destination.
 `overrun_oldest` drops are silent in this release, with no counter or alert to
 point at them yet.
 

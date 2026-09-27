@@ -79,10 +79,11 @@
 /// isolate delivery from a blocked stderr/stdout that is ALSO one of this logger's sinks
 /// (create() adds a stderr sink beside the file sink outside a Windows service, and a
 /// stdout sink when there is no usable log file, i.e. none configured or it could not be
-/// opened; a Windows service always derives one): that stall is in the sink's own write, unchanged, exposed by stalled_for()
-/// (no shipped code reads it) and bounded only at shutdown by teardown()'s watchdog. The
-/// mutex above guards only the in-memory ErrorState fields. See the handler's own comment
-/// in log_handoff.cpp for the full rationale.
+/// opened; a Windows service derives one when none is configured): that stall is in the
+/// sink's own write, unchanged, exposed by stalled_for() (no shipped code reads it) and
+/// bounded only at shutdown by teardown()'s watchdog. The mutex above guards only the
+/// in-memory ErrorState fields. See the handler's own comment in log_handoff.cpp for the
+/// full rationale.
 ///
 /// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent -- a second SEQUENTIAL
 /// call (or the destructor firing after an explicit call already returned) is a no-op. A second
