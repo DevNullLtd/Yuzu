@@ -1475,9 +1475,9 @@ consumer of `inert` needs and two further recorded limits.
      `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). Since #4704 the
      two mechanisms share one shape for their pass-outcome lines (`pass failed`, `failing
      persistently`, `pass recovered`): each is written OFF `mu_`, after the pass's bookkeeping
-     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2928-2943`), called
-     after `lk.unlock()` at `:3303-3304` and `:3358-3359`. Registry: its own `PassOutcome` /
-     `log_pass_outcome()` (`spark_registry.cpp:1888-1903`), called after the `lk.unlock()` on
+     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2941-2956`), called
+     after `lk.unlock()` at `:3316-3317` and `:3371-3372`. Registry: its own `PassOutcome` /
+     `log_pass_outcome()` (`spark_registry.cpp:1883-1912`), called after the `lk.unlock()` on
      each of `sweeper_main()`'s two branches (recovery, and failure with the inert transition).
      Before #4704 those three Registry lines ran while `mu_` was held, so a stalled sink there
      also stalled every other `mu_` caller (`arm()`, `disarm()`, `apply_test_controls()`), a
