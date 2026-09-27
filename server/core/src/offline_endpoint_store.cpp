@@ -27,10 +27,9 @@ constexpr const char* kStoreName = "endpoint_state";
 // The read is a user-facing /viz request and can wait a little longer.
 constexpr std::chrono::milliseconds kUpsertAcquireTimeout{250};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{2000};
-// Hard cap on rows materialised by query_stale_within (gov sec-LOW / UP-5): the
-// viz machines_max ceiling, so the store can never allocate more than the page
-// could ever serve even if the table has grown large.
-constexpr int kQueryRowCap = 100000;
+// kQueryRowCap moved to OfflineEndpointStore::kQueryRowCap (public,
+// offline_endpoint_store.hpp) so query_live_ids's truncation test (#4981
+// PR-1) can size its fixture against the real value.
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -79,9 +78,14 @@ std::int64_t to_i64(const char* s) {
 // `{op}`-only counter, which also mis-named itself "_read_" despite firing
 // from `remove_if_session` (a write). Documented in
 // docs/observability-conventions.md's HA metrics table.
+//
+// #4981 PR-1 (Finding B): `reason_override` widens the label set to include
+// "truncated" (a `query_live_ids` result past `kQueryRowCap`, distinct from
+// both a connection failure and a query error) without disturbing the
+// `had_lease`-derived default any other caller still relies on.
 void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
-                                   bool had_lease) {
-    const char* reason = had_lease ? "db_error" : "store_unavailable";
+                                   bool had_lease, const char* reason_override = nullptr) {
+    const char* reason = reason_override ? reason_override : (had_lease ? "db_error" : "store_unavailable");
     if (metrics) {
         metrics
             ->counter("yuzu_server_agent_presence_store_failed_total",
@@ -166,33 +170,45 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     return true;
 }
 
-std::vector<PresenceIdentity> OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
-    std::vector<PresenceIdentity> out;
+std::expected<std::vector<PresenceIdentity>, PresenceReadError>
+OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
     if (!open_)
-        return out;
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
         spdlog::debug("OfflineEndpointStore: query_live_ids skipped, no connection in time ({})",
                       pool_.last_error());
         record_presence_store_failure(metrics_, "query_live_ids", /*had_lease=*/false);
-        return out;
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     }
     // DATABASE-clock filter (`now()` in-SQL) — never the replica's own
     // `system_clock` (#3715 precedent) — so every replica agrees on which
-    // rows are live regardless of local clock skew. LIMIT bounds the
-    // materialised set the same way query_stale_within does.
+    // rows are live regardless of local clock skew. LIMIT is kQueryRowCap+1,
+    // not kQueryRowCap (#4981 PR-1): fetching one row past the cap is how a
+    // truncated result is DETECTED (a row count of exactly kQueryRowCap is
+    // ambiguous — it could be the true, complete live set) rather than
+    // silently dropped.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT agent_id, hostname, os, agent_version, arch FROM endpoint_state.endpoints "
         "WHERE last_seen_at >= now() - ($1::bigint * interval '1 second') "
         "ORDER BY last_seen_at DESC LIMIT $2::bigint",
-        std::vector<std::string>{std::to_string(ttl.count()), std::to_string(kQueryRowCap)});
+        std::vector<std::string>{std::to_string(ttl.count()),
+                                 std::to_string(kQueryRowCap + 1)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: query_live_ids failed: {}", PQerrorMessage(lease.get()));
         record_presence_store_failure(metrics_, "query_live_ids", /*had_lease=*/true);
-        return out;
+        return std::unexpected(PresenceReadError::DbError);
     }
     const int rows = PQntuples(res.get());
+    if (rows > kQueryRowCap) {
+        spdlog::warn("OfflineEndpointStore: query_live_ids result exceeds kQueryRowCap ({}) — "
+                     "reporting Truncated rather than a partial set",
+                     kQueryRowCap);
+        record_presence_store_failure(metrics_, "query_live_ids", /*had_lease=*/true, "truncated");
+        return std::unexpected(PresenceReadError::Truncated);
+    }
+    std::vector<PresenceIdentity> out;
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i) {
         PresenceIdentity p;
