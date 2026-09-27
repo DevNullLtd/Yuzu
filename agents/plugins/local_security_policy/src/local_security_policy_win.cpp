@@ -138,7 +138,14 @@ static_assert(kWin32AccessDenied == ERROR_ACCESS_DENIED);
 int emit_failure(yuzu::CommandContext& ctx, YuzuResultStatus status, const std::string& token) {
     ctx.set_result_status(status, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
     ctx.write_output(join_row("constrained", {token}));
-    return 1;
+    // Unlike execution_artifacts' identically-named helper, this plugin's rc contract
+    // (set by apply_collected in local_security_policy_legs.hpp, which the Linux/macOS
+    // legs always route through) is "a read returns 0, degradation is the status" --
+    // rc is not a proxy for OK-vs-degraded here. This Windows-only helper bypasses
+    // apply_collected entirely, so it must return 0 itself or the three secedit-backed
+    // actions silently diverge from the plugin's own documented, tested contract
+    // (caught 2026-09-27: this dispatcher test's first real run on Windows CI).
+    return 0;
 }
 
 int emit_constrained(yuzu::CommandContext& ctx, const std::string& token) {
