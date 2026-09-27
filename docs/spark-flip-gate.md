@@ -1714,8 +1714,8 @@ Registry while holding `mu_`; found by #4658's governance run)
   (allocation failure) with something due, which an observe-only engine with no watches never
   has. The pre-fix window in a shipped build was therefore effectively zero; at the F14 flip it
   would have opened at every runtime-inert episode, which is why this gated the flip.
-- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, open,
-  not yet merged - `<sha>`/`<date>` filled at merge).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
+- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, merged
+  `063885c9e`, 2026-09-27).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
   File's shipped #4658 shape, not the shared-async-primitive option. `sweeper_main()` now
   captures a value `PassOutcome` (failure count, backoff ms, flipped-inert, recovered) under
   `mu_`, releases the lock on the branch's existing unlock, and writes the line through a
@@ -1970,7 +1970,7 @@ detector, not a stuck-state detector (its `for:` hold means it does not see an e
 the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
 on the section 5 query. #4704 (a blocked log sink stalled the Registry sweeper WHILE IT HELD
 `mu_`, so `arm()`/`disarm()` on that mechanism stalled with it; File's equivalent lines were
-already off-lock) is FIXED (PR #5004, open - `<sha>` filled at merge): both mechanisms now write their pass-outcome
+already off-lock) is FIXED (PR #5004, merged `063885c9e`): both mechanisms now write their pass-outcome
 lines off-lock, see the section 5 entry. What remains is the shared, disclosed limit that a
 stalled sink stalls the worker's own loop, bounded only on shutdown (R5.7 (g)(4)) - plus the
 residual per-key warn sites named in #4999 (Registry) and #5002 (File, untracked mirror,

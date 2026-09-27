@@ -69,7 +69,7 @@ history:
     written before #4658 landed on this branch, narrowed the check to Registry-only and
     contradicted them — caught and fixed in adversarial review before merge, see the counter
     rule's `pass_failed` fix too).
-  - 2026-09-XX - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
+  - 2026-09-27 - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
     failed`, `failing persistently`, `pass recovered`) now use File's `PassOutcome` /
     `log_pass_outcome()` shape and are written after `mu_` is released (they ran under `mu_`
     before, stalling `arm()`/`disarm()` on a blocked sink). (g)(4)'s blocked-sink bullet
@@ -78,7 +78,7 @@ history:
     deadline-stamp bullet gains the matching clause. The operator manual's "Diagnosing an inert
     File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
     gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
-    fixed. PR #5004 (open, not yet merged), full `/governance` (Spark row).
+    fixed. PR #5004, merged `063885c9e`, full `/governance` (Spark row).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
