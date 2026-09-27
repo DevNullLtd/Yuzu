@@ -5500,17 +5500,18 @@ public:
                                 return cached->second;
                             bool member = false;
                             if (auto parsed = yuzu::scope::parse(expr)) {
-                                // No rs_store/principal passed here. If this
-                                // rule's scope references from_result_set:,
-                                // evaluate_scope now ABORTS (nullopt, H1)
-                                // rather than silently evaluating the atom
-                                // false — value_or({}) then collapses to "not
-                                // a member", i.e. the rule is NOT pushed to
-                                // this agent. Arming nothing is the safe
-                                // direction here; the old comment's "cannot
-                                // degrade" claim was wrong for exactly the
-                                // NOT-combinator case.
-                                for (const auto& id : registry_.evaluate_scope(
+                                // No rs_store/principal passed here — this is a
+                                // LOCAL-ONLY dispatch (send_system_reserved), so
+                                // evaluate_scope_local (#4981 PR-1 B4) is the
+                                // correct entry point: it shares evaluate_scope's
+                                // Unresolvable/StoreDegraded abort semantics for
+                                // from_result_set:/props.<key> atoms with no
+                                // store wired (value_or({}) then collapses that
+                                // to "not a member" — arming nothing is the safe
+                                // direction), but can NEVER abort for a presence
+                                // reason, so a presence-store blip cannot
+                                // periodically disarm this scoped rule.
+                                for (const auto& id : registry_.evaluate_scope_local(
                                          *parsed, tag_store_.get(),
                                          custom_properties_store_.get())
                                          .value_or(std::vector<std::string>{}))
@@ -12969,15 +12970,21 @@ private:
     // 2026-07-26 hardening round B4: distinct audit + metric for a WHOLE
     // scope evaluation ABORTING (as opposed to audit_scope_resolution_failed's
     // per-ref "not found/not owned" forensic row above). Fires when
-    // AgentRegistry::evaluate_scope() returns std::nullopt on a from_result_set:
-    // scope — either the membership preload hit a Postgres error
-    // (reason="db_degraded", ADR-0036) or a from_result_set: atom had no
-    // principal to owner-resolve against (reason="principal_unresolved", B2).
-    // Without this, a dispatch silently reduced to 0 targets by an ABORT is
-    // indistinguishable in telemetry/audit from a genuine "0 agents matched"
-    // (UP-12) — an operator investigating "why did my command reach nobody"
-    // would find nothing. The Prometheus counter makes the failure alertable
-    // rather than buried in audit.db alone (sre SHOULD).
+    // AgentRegistry::evaluate_scope() returns an error (#4981 PR-1: was
+    // std::nullopt pre-PR-1) on a from_result_set:/props.<key> scope — one of
+    // `to_string(ScopeEvalError::Kind)`'s reason strings: "db_degraded"
+    // (ADR-0036/ADR-0045, a preload hit a Postgres error),
+    // "principal_unresolved" (B2, a from_result_set: atom had no principal to
+    // owner-resolve against), "owner_check_failed" (#4981 PR-1 A3, a
+    // referenced set is absent/expired/not owned — including the Finding A
+    // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
+    // presence read could not answer), or "unresolvable" (a store the atom
+    // needs was never wired at this call site). Without this, a dispatch
+    // silently reduced to 0 targets by an ABORT is indistinguishable in
+    // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
+    // investigating "why did my command reach nobody" would find nothing. The
+    // Prometheus counter makes the failure alertable rather than buried in
+    // audit.db alone (sre SHOULD).
     void audit_scope_evaluation_aborted(const std::string& principal,
                                         const std::string& principal_role,
                                         const std::string& command_id, const std::string& reason) {
@@ -12992,7 +12999,11 @@ private:
         ev.principal = principal.empty() ? "unknown" : principal;
         ev.principal_role = principal_role;
         ev.action = "scope.evaluation_aborted";
-        ev.target_type = "result_set";
+        // #4981 PR-1 B6: "result_set" is only accurate for a reason that is
+        // actually ABOUT a result set (owner_check_failed) — every other
+        // reason (a presence degrade, a generic store degrade, an unwired
+        // store) has nothing to do with a result set and mislabels the row.
+        ev.target_type = (reason == "owner_check_failed") ? "result_set" : "scope";
         ev.target_id = "";
         ev.detail = "SCOPE_EVALUATION_ABORTED command=" + command_id + " reason=" + reason;
         ev.result = "failure";
@@ -18919,14 +18930,19 @@ private:
                     auto parsed = yuzu::scope::parse(scope);
                     if (!parsed)
                         return -1;
-                    // No rs_store/principal passed. A scope referencing
-                    // from_result_set: now ABORTS (nullopt, H1) instead of
-                    // silently evaluating the atom false (which a NOT
-                    // combinator inverted to a fleet-wide arm);
-                    // value_or({}) collapses the abort to zero targets —
-                    // arm nothing, the safe direction on the push path.
-                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                       custom_properties_store_.get())
+                    // No rs_store/principal passed — LOCAL-ONLY dispatch
+                    // (registry_.send_to below), so evaluate_scope_local
+                    // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>
+                    // atom with no store wired still ABORTS (Unresolvable)
+                    // instead of silently evaluating the atom false (which a
+                    // NOT combinator inverted to a fleet-wide arm);
+                    // value_or({}) collapses the abort to zero targets — arm
+                    // nothing, the safe direction on the push path. Unlike
+                    // evaluate_scope, this can never abort for a presence
+                    // reason, so a presence-store blip cannot periodically
+                    // disarm this push.
+                    targets = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
+                                                             custom_properties_store_.get())
                                   .value_or(std::vector<std::string>{});
                 }
 
@@ -18940,11 +18956,13 @@ private:
                     if (it == scope_cache.end()) {
                         std::unordered_set<std::string> ids;
                         if (auto parsed = yuzu::scope::parse(expr)) {
-                            // Same H1 semantics as above: a from_result_set:
-                            // atom aborts to nullopt; value_or({}) => this
-                            // agent is treated as out-of-scope (arm nothing).
-                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                              custom_properties_store_.get())
+                            // Same evaluate_scope_local semantics as above
+                            // (#4981 PR-1 B4): a from_result_set: atom aborts;
+                            // value_or({}) => this agent is treated as
+                            // out-of-scope (arm nothing) — never a presence
+                            // abort, since this push is LOCAL-ONLY.
+                            auto v = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
+                                                                    custom_properties_store_.get())
                                         .value_or(std::vector<std::string>{});
                             ids.insert(v.begin(), v.end());
                         }

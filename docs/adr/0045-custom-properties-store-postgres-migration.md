@@ -120,11 +120,13 @@ resolution is now given the same treatment:
   `from_result_set:` preload (N sequential blocking Postgres calls held under
   `AgentRegistry::mu_` is both a fail-open surface and a lock-hold-during-network-I/O violation of
   ADR-0012 §2(b)).
-- A `kDegraded` preload result **aborts the whole scope evaluation** (`nullopt`), exactly like a
+- A `kDegraded` preload result **aborts the whole scope evaluation** (`nullopt` at the time this
+  ADR was written; `evaluate_scope` widened again to `std::expected<..., ScopeEvalError>` by
+  #4981 PR-1, `ScopeEvalError::Kind::StoreDegraded` for this exact case), exactly like a
   `member_set_owned` degrade — never silently resolves every `props.<key>` atom to `""` (no
   match), which inverts to "matches every agent" under `NOT`/`!=`.
 - A scope with no `props.<key>` atom is unaffected — the preload is a no-op, and every existing
-  `evaluate_scope` call site already collapses `nullopt` via `.value_or(std::vector<std::string>{})`
+  `evaluate_scope` call site already collapses the abort via `.value_or(std::vector<std::string>{})`
   (the same `H1`-established pattern used for the `from_result_set:` fix), so no call site needed
   a signature or behavior change beyond this.
 
