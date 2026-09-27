@@ -183,6 +183,7 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
@@ -20015,6 +20016,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
+        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
         yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
