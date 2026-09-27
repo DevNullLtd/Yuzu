@@ -37,9 +37,10 @@ constexpr const char* kStoreName = "rbac_store";
 
 // Bounded acquires (ADR-0012 §2(a)). Reads back interactive REST/dashboard/MCP
 // callers; writes get a slightly wider budget. Backfill runs single-threaded at
-// construction before serving, so a wide deadline is fine.
-constexpr std::chrono::milliseconds kReadTimeout{2000};
-using rbac_sql::kWriteTimeout; // defined in rbac_store_sql_helpers.hpp
+// construction before serving, so a wide deadline is fine. Defined in
+// rbac_store_sql_helpers.hpp (shared with RbacAdminAuthorityOwner).
+using rbac_sql::kReadTimeout;
+using rbac_sql::kWriteTimeout;
 // Availability hardening (governance re-review, #2703 Gate 7 — Fable-reviewed
 // merge slice, item 1 commit A). The hot authz path (`maybe_refresh_generation`,
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
@@ -193,26 +194,10 @@ std::int64_t now_ms() {
         .count();
 }
 
-using rbac_sql::to_i64;  // defined in rbac_store_sql_helpers.hpp
-using rbac_sql::to_u64;  // defined in rbac_store_sql_helpers.hpp
-using rbac_sql::to_bool; // defined in rbac_store_sql_helpers.hpp
-
-/// Strict canonical-boolean parser for `rbac_meta.value` (rbac_enabled):
-/// unlike `to_bool` above (the loose native-PG-boolean-text convention —
-/// 't'/'T'/'1'), this column is application-level TEXT storing the EXACT
-/// literal "true"/"false" this store itself writes. fjarvis F2 (#2703): a
-/// loose `== "true"` comparison silently treats ANY other value ("TRUE",
-/// "1", corruption, a hand-edit) as false with no error — the RBAC-disabled
-/// fail-open direction. `nullopt` means the value is neither canonical
-/// string; every call site must treat that identically to an
-/// unreadable/missing flag (fail closed), never coerce it to false.
-std::optional<bool> parse_canonical_bool(std::string_view s) {
-    if (s == "true")
-        return true;
-    if (s == "false")
-        return false;
-    return std::nullopt;
-}
+using rbac_sql::to_i64;             // defined in rbac_store_sql_helpers.hpp
+using rbac_sql::to_u64;             // defined in rbac_store_sql_helpers.hpp
+using rbac_sql::to_bool;            // defined in rbac_store_sql_helpers.hpp
+using rbac_sql::parse_canonical_bool; // defined in rbac_store_sql_helpers.hpp
 
 using rbac_sql::text_col; // defined in rbac_store_sql_helpers.hpp
 
@@ -1447,173 +1432,15 @@ void RbacStore::breaker_note_result(bool success) const {
 
 namespace {
 // Defined in rbac_store_sql_helpers.hpp (shared with RbacAdminAuthorityOwner).
-using rbac_sql::bump_generation_in_txn;
-
-// NOTE (Step 1 rebase, pre-Step-2-migration): the helpers below are A1's
-// original cross-schema copies, temporarily still defined here because
-// set_rbac_enforcement/check_caller_authorized_under_current_regime still
-// call them directly. Step 2 of this rebase moves the cross-schema ones
+// The cross-schema "authenticatable Administrator" helpers
 // (kAuthenticatableAdminGrantsFrom and its lock_/list_/count_ siblings,
-// list_active_local_admin_accounts) into RbacAdminAuthorityOwner, and the
-// own-schema ones (read_rbac_enabled_for_update/_lockfree,
-// write_rbac_enabled_in_txn) into rbac_store_sql_helpers.hpp — this file
-// will then define none of them. Until that lands, this duplicates
-// rbac_admin_authority_owner.cpp's copy of kAuthenticatableAdminGrantsFrom,
-// which test_rbac_query_owner_seam.py will correctly flag.
-
-// THE definition of "an authenticatable Administrator grant" — shared by
-// RbacStore::unassign_role (A2 last-Administrator guard) and
-// RbacStore::set_rbac_enforcement (A1 caller-survives guard). A second copy
-// of this JOIN is the drift this constant exists to remove.
-constexpr std::string_view kAuthenticatableAdminGrantsFrom =
-    "FROM rbac_store.principal_roles pr "
-    "JOIN auth.users u ON u.username = pr.principal_id "
-    "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
-    "AND u.is_active";
-
-// "SELECT pr.principal_id " + kAuthenticatableAdminGrantsFrom + " FOR UPDATE OF pr"
-// Returns the principal_ids of the rows ACTUALLY LOCKED (nullopt on query
-// error). set_rbac_enforcement answers BOTH "is the caller in the set"
-// (std::find) and "how many" (.size()) from this one result: no second
-// query, no second snapshot, so the caller's grant is by construction one of
-// the rows this transaction holds FOR UPDATE. unassign_role calls it for the
-// lock only and discards the vector.
-std::optional<std::vector<std::string>> lock_authenticatable_admin_grants(PGconn* c,
-                                                                          std::string& err) {
-    const std::string sql = std::string("SELECT pr.principal_id ") +
-                            std::string(kAuthenticatableAdminGrantsFrom) + " FOR UPDATE OF pr";
-    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    std::vector<std::string> ids;
-    ids.reserve(static_cast<size_t>(PQntuples(r.get())));
-    for (int i = 0; i < PQntuples(r.get()); ++i)
-        ids.push_back(text_col(r.get(), i, 0));
-    return ids;
-}
-
-// "SELECT pr.principal_id " + kAuthenticatableAdminGrantsFrom (no FOR UPDATE).
-// Lock-free sibling of lock_authenticatable_admin_grants — the DISABLE
-// direction's SOURCE-regime check (Gate 7 Fix 1): set_rbac_enforcement's
-// disable branch already reads the durable-ON regime's authority set via
-// lock_authenticatable_admin_grants when the TRANSITION happens to be
-// enable, but a disable transition needs to know the SAME set without
-// taking the FOR UPDATE lock unassign_role serializes against — that lock
-// exists to protect the destination-survival guarantee on the enable path,
-// and taking it again here (over the same candidate rows, with no ORDER BY)
-// on every disable would add contention with no corresponding write on this
-// path. Keeps the "Lock order: ... principal_roles (enable only)" clause in
-// set_rbac_enforcement's doc comment true: this call reads principal_roles
-// but never locks it.
-std::optional<std::vector<std::string>> list_authenticatable_admin_grants(PGconn* c,
-                                                                          std::string& err) {
-    const std::string sql =
-        std::string("SELECT pr.principal_id ") + std::string(kAuthenticatableAdminGrantsFrom);
-    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    std::vector<std::string> ids;
-    ids.reserve(static_cast<size_t>(PQntuples(r.get())));
-    for (int i = 0; i < PQntuples(r.get()); ++i)
-        ids.push_back(text_col(r.get(), i, 0));
-    return ids;
-}
-
-// "SELECT count(*) " + kAuthenticatableAdminGrantsFrom
-// Lock-free. Two callers: unassign_role's POST-delete count, and
-// set_rbac_enforcement's idempotent no-op path, which must NEVER take row
-// locks for a response-only count. The transition path never needs it (it
-// counts the locked set it already holds via lock_authenticatable_admin_grants).
-std::optional<std::int64_t> count_authenticatable_admin_grants(PGconn* c, std::string& err) {
-    const std::string sql =
-        std::string("SELECT count(*) ") + std::string(kAuthenticatableAdminGrantsFrom);
-    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    return to_i64(PQgetvalue(r.get(), 0, 0));
-}
-
-// Disable direction (auth.users only; `role` stores the literal
-// 'admin'/'user', auth_db.cpp). ONE statement, same reason as above:
-// membership and count from one snapshot, never two queries that can
-// observe two account states. Deliberately NO FOR SHARE / FOR UPDATE (A2
-// parity — see RbacStore::set_rbac_enforcement's doc comment on why no
-// auth.users row lock is taken).
-std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn* c,
-                                                                         std::string& err) {
-    pg::PgResult r = pg::exec_params(c, "SELECT username FROM auth.users WHERE role = 'admin' AND is_active",
-                                     std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    std::vector<std::string> names;
-    names.reserve(static_cast<size_t>(PQntuples(r.get())));
-    for (int i = 0; i < PQntuples(r.get()); ++i)
-        names.push_back(text_col(r.get(), i, 0));
-    return names;
-}
-
-// "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled' FOR UPDATE"
-// Absent row or a non-canonical value is an ERROR (fail closed), never
-// coerced — mirrors load_enabled_flag()'s own boot-time posture.
-std::optional<bool> read_rbac_enabled_for_update(PGconn* c, std::string& err) {
-    pg::PgResult r = pg::exec_params(
-        c, "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled' FOR UPDATE",
-        std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    const auto parsed = parse_canonical_bool(text_col(r.get(), 0, 0));
-    if (!parsed) {
-        err = "rbac_enabled holds a non-canonical value";
-        return std::nullopt;
-    }
-    return *parsed;
-}
-
-// "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'" (no
-// FOR UPDATE). Lock-free sibling of read_rbac_enabled_for_update — Gate 8
-// HIGH: check_caller_authorized_under_current_regime's own fresh read
-// (below), called from a REST/MCP handler outside any write transaction, so
-// there is nothing to protect with a row lock here.
-std::optional<bool> read_rbac_enabled_lockfree(PGconn* c, std::string& err) {
-    pg::PgResult r = pg::exec_params(
-        c, "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
-        std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
-        err = PQerrorMessage(c);
-        return std::nullopt;
-    }
-    const auto parsed = parse_canonical_bool(text_col(r.get(), 0, 0));
-    if (!parsed) {
-        err = "rbac_enabled holds a non-canonical value";
-        return std::nullopt;
-    }
-    return *parsed;
-}
-
-// The one INSERT ... ON CONFLICT DO UPDATE for the flag, shared by both
-// set_rbac_enabled and set_rbac_enforcement.
-bool write_rbac_enabled_in_txn(PGconn* c, bool enabled, std::string& err) {
-    pg::PgResult r = pg::exec_params(
-        c,
-        "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('rbac_enabled', $1) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        std::vector<std::string>{enabled ? "true" : "false"});
-    if (r.status() != PGRES_COMMAND_OK) {
-        err = PQerrorMessage(c);
-        return false;
-    }
-    return true;
-}
+// list_active_local_admin_accounts) live ONLY in
+// rbac_admin_authority_owner.cpp (ADR-0012 §3) — RbacStore no longer calls
+// any of them directly; set_rbac_enforcement/
+// check_caller_authorized_under_current_regime are thin wrappers over
+// RbacAdminAuthorityOwner::set_enforcement/regime_authority below.
+using rbac_sql::bump_generation_in_txn;
+using rbac_sql::write_rbac_enabled_in_txn;
 } // namespace
 
 // ── Global toggle ────────────────────────────────────────────────────────────
@@ -1685,192 +1512,55 @@ std::expected<void, std::string> RbacStore::set_rbac_enabled(bool enabled) {
     return {};
 }
 
-// See rbac_store.hpp for the full rule. Guard summary: a REAL transition
-// (previous != enabled; the idempotent no-op path below evaluates neither
-// guard) is refused unless the CALLER passes BOTH:
-//   (1) SOURCE-regime authority (Gate 7 Fix 1) — matching whichever regime
-//       is durably true RIGHT NOW (`previous`): an authenticatable Administrator
-//       grant if currently ON, local role='admin'+active if currently OFF.
-//       Closes a cross-replica cache-staleness gap: the outer
-//       is_rbac_administrator gate that admits a caller to this route at
-//       all reads a replica-local view of `rbac_enabled_` that can lag a
-//       real commit by up to kRbacGenerationRefreshMs, and this route is
-//       the thing that FLIPS the value that gate reads — so it cannot be
-//       the sole regime check for itself.
-//   (2) DESTINATION-regime survival (pre-existing) — enable requires the
-//       caller's own authenticatable (auth.users-joined, active) fleet-wide
-//       Administrator grant; disable requires the caller's own local
-//       account to hold role='admin' AND active.
-// Lock order: rbac_meta('rbac_enabled') -> principal_roles (enable direction
-// locks it via lock_authenticatable_admin_grants for its destination check;
-// disable direction reads the SAME rows unlocked via
-// list_authenticatable_admin_grants for its source check — never both on
-// one call, since source and destination regimes are always opposite on a
-// genuine transition) -> rbac_meta('write_generation') [inside
-// bump_generation_in_txn]. The FOR UPDATE lock, when taken, is the
-// SAME principal_roles JOIN + FOR UPDATE OF pr lock unassign_role takes
-// (kAuthenticatableAdminGrantsFrom, shared next to bump_generation_in_txn),
-// taken over the identical candidate rows, so the two guards serialize
-// against each other under READ COMMITTED: a grant committed after this
-// transaction's lock query ran is not in the locked set (refused; the
-// operator retries and it is then locked), and a grant that IS in the set is
-// held FOR UPDATE, so a concurrent unassign_role of it blocks behind this
-// transaction's lock and re-evaluates its own count against this
-// transaction's committed outcome (and vice versa). This does NOT claim
-// PG-level deadlock freedom for two transactions locking the same multi-row
-// set without an ORDER BY (neither query carries one, because the JOIN must
-// stay byte-identical to unassign_role's original literal) — if PG's
-// detector fires, or `lock_timeout` expires, ONE side's transaction aborts
-// and surfaces here as kStoreFailure (never a hang, never a half-applied
-// write).
-//
-// The guarantee is honestly point-in-time, not enduring: the caller was
-// eligible under the destination regime AS OBSERVED INSIDE this transaction,
-// never "the caller survives at commit" — A2 deliberately never locks
-// `auth.users` (it would serialize unrelated logins/role changes) and A1
-// keeps that parity, so a demotion/deactivation/unassign committing
-// immediately after this transaction is the accepted residual (#4966). The
-// SAME accepted property applies to the disable direction's lock-free
-// SOURCE-regime check (Gate 8 HIGH follow-up) — it too observes the
-// caller's authenticatable-Administrator-grant membership AS OF ITS OWN
-// unlocked read, not "the caller still holds it at commit"; a concurrent
-// unassign of that very grant committing immediately after is the identical
-// point-in-time residual, not a new one.
+// See rbac_store.hpp for the full rule (the idempotent no-op short-circuit,
+// the SOURCE-then-DESTINATION guard order, the lock order and its
+// point-in-time-not-enduring guarantee). The guarded transaction itself
+// lives in `RbacAdminAuthorityOwner::set_enforcement`
+// (rbac_admin_authority_owner.cpp) — the ADR-0012 §3 cross-schema query
+// owner, which shares `kAuthenticatableAdminGrantsFrom` with
+// `unassign_role`'s last-Administrator guard from ONE definition. This is a
+// thin translation from the owner's `EnforcementOutcome` to this method's
+// own `RbacEnforcementTransition`/`RbacEnforcementError` public shape,
+// mirroring `unassign_role`'s own delegation pattern exactly.
 std::expected<RbacEnforcementTransition, RbacEnforcementError>
 RbacStore::set_rbac_enforcement(bool enabled, const std::string& caller_username) {
     if (!open_)
         return std::unexpected(RbacEnforcementError{RbacEnforcementError::Kind::kStoreFailure,
                                                      "database not open"});
 
-    RbacEnforcementTransition result{};
-    bool refused = false;
-    RbacEnforcementError::Kind refused_kind = RbacEnforcementError::Kind::kCallerNotSurvivor;
-    std::string refusal_message;
-    std::string err;
-    std::optional<std::uint64_t> new_gen;
+    const RbacAdminAuthorityOwner::EnforcementOutcome outcome =
+        RbacAdminAuthorityOwner{pool_}.set_enforcement(enabled, caller_username);
 
-    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        // The row ALWAYS exists on an open store (seed_defaults' `('rbac_enabled','false')
-        // ON CONFLICT DO NOTHING` plus the rbac_meta_enabled_canonical CHECK), so an
-        // absent/non-canonical read here means corruption, not a fresh install.
-        const auto previous = read_rbac_enabled_for_update(c, err);
-        if (!previous)
-            return false; // err set by read_rbac_enabled_for_update; maps to kStoreFailure
-
-        result.previous_enabled = *previous;
-        result.enabled = enabled;
-
-        if (*previous == enabled) {
-            // Idempotent no-op: report the direction-appropriate count for the
-            // response WITHOUT taking any row lock beyond the rbac_enabled one
-            // already held above — a response-only count must never block a
-            // concurrent unassign_role. No UPDATE, no bump_generation_in_txn.
-            if (enabled) {
-                const auto count = count_authenticatable_admin_grants(c, err);
-                if (!count)
-                    return false;
-                result.post_transition_administrators = *count;
-            } else {
-                const auto admins = list_active_local_admin_accounts(c, err);
-                if (!admins)
-                    return false;
-                result.post_transition_administrators = static_cast<std::int64_t>(admins->size());
-            }
-            result.changed = false;
-            return true;
-        }
-
-        // Gate 7 Fix 1 (security-guardian, HIGH): SOURCE-regime authority
-        // check — reached ONLY on a real transition (the no-op path above
-        // already returned), matching whichever regime is durably true RIGHT
-        // NOW (`*previous`), not the destination regime evaluated below. The
-        // outer is_rbac_administrator gate that admitted the caller to this
-        // route reads a replica-local cached view of `rbac_enabled_` that
-        // can lag a real commit by up to kRbacGenerationRefreshMs; without
-        // this check, a caller admitted under a STALE view (e.g. a session
-        // with only local role='admin', wrongly admitted because the cache
-        // still thought RBAC was off, while it is durably ON) could disable
-        // enforcement purely by satisfying the destination check below —
-        // fail-open on disable. Source and destination regimes are always
-        // opposite on a genuine transition, so this is always a second,
-        // distinct query from the destination check further down — never a
-        // second query of the SAME set.
-        if (*previous) {
-            const auto source_admins = list_authenticatable_admin_grants(c, err);
-            if (!source_admins)
-                return false;
-            if (std::find(source_admins->begin(), source_admins->end(), caller_username) ==
-                source_admins->end()) {
-                refused = true;
-                refused_kind = RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime;
-                refusal_message =
-                    "refused: caller does not currently hold a fleet-wide Administrator grant, "
-                    "required to change enforcement while it is on";
-                return false; // rolls back — no write, no bump
-            }
-        } else {
-            const auto source_local_admins = list_active_local_admin_accounts(c, err);
-            if (!source_local_admins)
-                return false;
-            if (std::find(source_local_admins->begin(), source_local_admins->end(),
-                          caller_username) == source_local_admins->end()) {
-                refused = true;
-                refused_kind = RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime;
-                refusal_message =
-                    "refused: caller does not currently hold the local admin role, required to "
-                    "change enforcement while it is off";
-                return false; // rolls back — no write, no bump
-            }
-        }
-
-        if (enabled) {
-            const auto locked = lock_authenticatable_admin_grants(c, err);
-            if (!locked)
-                return false;
-            if (std::find(locked->begin(), locked->end(), caller_username) == locked->end()) {
-                refused = true;
-                refusal_message =
-                    "refused: enabling RBAC enforcement would leave the caller with no "
-                    "fleet-wide Administrator grant; assign yourself Administrator first";
-                return false; // rolls back — no write, no bump
-            }
-            result.post_transition_administrators = static_cast<std::int64_t>(locked->size());
-        } else {
-            const auto admins = list_active_local_admin_accounts(c, err);
-            if (!admins)
-                return false;
-            if (std::find(admins->begin(), admins->end(), caller_username) == admins->end()) {
-                refused = true;
-                refusal_message =
-                    "refused: disabling RBAC enforcement would leave the caller without the "
-                    "local admin role that is the only durable administrator authority while "
-                    "enforcement is off";
-                return false; // rolls back — no write, no bump
-            }
-            result.post_transition_administrators = static_cast<std::int64_t>(admins->size());
-        }
-
-        if (!write_rbac_enabled_in_txn(c, enabled, err))
-            return false;
-        new_gen = bump_generation_in_txn(c);
-        if (!new_gen) {
-            if (err.empty())
-                err = "write_generation bump failed";
-            return false;
-        }
-        result.changed = true;
-        return true;
-    });
-
-    if (refused)
-        return std::unexpected(RbacEnforcementError{refused_kind, refusal_message});
-    if (!ok)
+    if (outcome.refused) {
+        const auto kind =
+            outcome.refusal_kind ==
+                    RbacAdminAuthorityOwner::EnforcementOutcome::RefusalKind::kSourceRegime
+                ? RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime
+                : RbacEnforcementError::Kind::kCallerNotSurvivor;
+        return std::unexpected(RbacEnforcementError{kind, outcome.refusal_message});
+    }
+    if (!outcome.ok)
         return std::unexpected(RbacEnforcementError{
             RbacEnforcementError::Kind::kStoreFailure,
-            err.empty() ? "set_rbac_enforcement transaction failed; flag unchanged" : err});
+            outcome.err.empty() ? "set_rbac_enforcement transaction failed; flag unchanged"
+                                : outcome.err});
+
+    RbacEnforcementTransition result{};
+    result.previous_enabled = outcome.previous_enabled;
+    result.enabled = outcome.enabled;
+    result.changed = outcome.changed;
+    result.post_transition_administrators = outcome.post_transition_administrators;
 
     if (result.changed) {
-        publish_local_toggle(*new_gen, enabled);
+        // `!outcome.new_gen` is unreachable while the owner's lambda always
+        // bumps generation on a real applied transition; guards the
+        // dereference below if that ever changes — mirrors unassign_role's
+        // own `!outcome.new_gen` unreachable note.
+        if (!outcome.new_gen)
+            return std::unexpected(RbacEnforcementError{
+                RbacEnforcementError::Kind::kStoreFailure,
+                "internal error: applied transition missing its generation bump"});
+        publish_local_toggle(*outcome.new_gen, enabled);
         publish_enforcement_gauge();
     }
     return result;
@@ -2366,42 +2056,17 @@ std::expected<void, std::string> RbacStore::validate_assignment(const std::strin
     return {};
 }
 
-// See rbac_store.hpp for the full rule. A single connection lease serves
-// BOTH reads below, back-to-back with no intervening work — but each is its
-// own autocommit statement (no `pool_.with_txn_for`/`BEGIN`), so this is NOT
-// one shared point-in-time snapshot: under READ COMMITTED, a commit landing
-// between the two statements is visible to the second read but not the
-// first. Deliberately not wrapped in a transaction to force a true single
-// snapshot — both cpp-safety and security-guardian independently assessed
-// this residual as low-exploitability and already-accepted-class (the same
-// shape as every other point-in-time, not-enduring guarantee in this file).
+// See rbac_store.hpp for the full rule. The fresh, lock-free two-statement
+// read lives in `RbacAdminAuthorityOwner::regime_authority`
+// (rbac_admin_authority_owner.cpp) — see that method's own doc comment for
+// why it is a single lease across two autocommit statements rather than one
+// transaction (a deliberately accepted, already-reviewed residual, not an
+// oversight).
 RbacRegimeAuthority
 RbacStore::check_caller_authorized_under_current_regime(const std::string& caller_username) const {
     if (!open_)
         return RbacRegimeAuthority::kUnavailable;
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return RbacRegimeAuthority::kUnavailable;
-    std::string err;
-    const auto durable_enabled = read_rbac_enabled_lockfree(lease.get(), err);
-    if (!durable_enabled)
-        return RbacRegimeAuthority::kUnavailable;
-
-    if (*durable_enabled) {
-        const auto admins = list_authenticatable_admin_grants(lease.get(), err);
-        if (!admins)
-            return RbacRegimeAuthority::kUnavailable;
-        return std::find(admins->begin(), admins->end(), caller_username) != admins->end()
-                   ? RbacRegimeAuthority::kAuthorized
-                   : RbacRegimeAuthority::kNotAuthorized;
-    }
-    const auto local_admins = list_active_local_admin_accounts(lease.get(), err);
-    if (!local_admins)
-        return RbacRegimeAuthority::kUnavailable;
-    return std::find(local_admins->begin(), local_admins->end(), caller_username) !=
-                   local_admins->end()
-               ? RbacRegimeAuthority::kAuthorized
-               : RbacRegimeAuthority::kNotAuthorized;
+    return RbacAdminAuthorityOwner{pool_}.regime_authority(caller_username);
 }
 
 std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr) {
