@@ -15,4 +15,10 @@
   concurrently (the account-deactivation path has no last-Administrator guard);
   both are tracked at #4966.
   `ITServiceOwner` and any custom/unknown role are rejected uniformly (no role-catalog
-  oracle); pre-provisioning a role ahead of a user's first login is allowed.
+  oracle); pre-provisioning a role ahead of a user's first login is allowed. Both routes
+  ALSO re-verify, with a fresh, uncached read, that the caller holds authority under the
+  regime that is durably true right now, closing a cross-replica cache-staleness gap in
+  the durable-Administrator check itself — a grant minted through a stale-regime read
+  would otherwise persist indefinitely once written. A bearer token minted with a
+  restrictive `mcp_tier` (e.g. `readonly`) whose principal happens to be a durable
+  administrator can no longer reach either route via REST with no MFA/approval gate.

@@ -77,6 +77,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 ### Evidence
 
 - SSO configuration records, role assignment exports, access review sign-offs, and sampled auth logs.
+- **RBAC enforcement-state changes (A1):** every `PUT /api/v1/rbac/enforcement` / `set_rbac_enforcement` toggle attempt either persists an attributable `rbac.enforcement_changed` row (`docs/user-manual/audit-log.md`) naming the caller, the before/after state, and the post-transition administrator count, or fails **closed** rather than silently succeeding unaudited (REST `503`; MCP `audit_persisted:false`) — the `yuzu_server_rbac_enforcement_enabled` gauge transition serves as an independent trace of the same event during that window. A **refused** attempt (the caller survives the outer admin gate but is denied by the store-level guard — service-scoped, engine-session, or a caller-authority check) is ALSO captured as a `denied` row with cause, not silently dropped — exactly the lockout-risk-relevant evidence this section exists to promote. The `yuzu_server_rbac_enforcement_enabled` gauge plus the threshold-free `YuzuRbacEnforcementChanged` alert and its direction-aware `YuzuRbacEnforcementDisabled` warning-severity companion (`docs/prometheus/yuzu-alerts.yml`) give a real-time, cross-replica-convergent signal independent of the audit log for the same event.
 
 **Addendum — the access-review export was readable by any authenticated user on a
 default install until #2376 (CC6.2/CC6.1).** Recorded here because this section cites

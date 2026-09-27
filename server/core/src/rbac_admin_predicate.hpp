@@ -9,19 +9,23 @@
 
 /// @file rbac_admin_predicate.hpp
 /// THE gate for "is this caller allowed to author a fleet-wide RBAC role
-/// grant" (A2, `.claude/plans/rbac-industry-leading-DELIVERY-PLAN.md` §2 "A2
-/// — Global human role assignment/unassignment").
+/// grant, or flip fleet-wide RBAC enforcement" (A2,
+/// `.claude/plans/rbac-industry-leading-DELIVERY-PLAN.md` §2 "A2 — Global
+/// human role assignment/unassignment"; A1, §2 "A1 — Enable/disable
+/// toggle").
 ///
 /// WHY THIS EXISTS: granting (or revoking) a role — especially `Administrator`
-/// itself — is a stronger security decision than an ordinary permission
-/// check. An `Administrator` grant is not merely a `Security:Write`-gated
-/// mutation; it is the act of minting NEW standing Administrator authority
-/// (or removing the last of it), so `POST/DELETE
-/// /api/v1/rbac/roles/{name}/assignments` and their MCP twins are gated on
-/// this dedicated predicate INSTEAD OF `perm_fn`/`require_permission`, not in
-/// addition to it. A future PR in this same delivery plan (A1's
-/// enable/disable toggle, §2 "A1 — Enable/disable toggle") reuses this
-/// predicate verbatim — EXTEND it, never fork it, exactly like
+/// itself — or flipping whether RBAC is enforced at all, is a stronger
+/// security decision than an ordinary permission check. An `Administrator`
+/// grant is not merely a `Security:Write`-gated mutation; it is the act of
+/// minting NEW standing Administrator authority (or removing the last of
+/// it), and flipping enforcement changes which authority model governs
+/// every OTHER gate in the process — so `POST/DELETE
+/// /api/v1/rbac/roles/{name}/assignments` (A2), `PUT
+/// /api/v1/rbac/enforcement` (A1), and their MCP twins are ALL gated on this
+/// ONE dedicated predicate INSTEAD OF `perm_fn`/`require_permission`, not in
+/// addition to it. A1 reuses this predicate verbatim, exactly as originally
+/// planned — EXTEND it, never fork it, exactly like
 /// `authz_topology_floor.hpp`'s own rule.
 ///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`
@@ -75,17 +79,20 @@
 ///    `require_admin`'s posture and the platform's #520 rule ("a REST route
 ///    hit by an MCP token must not bypass the ticket flow"): REST carries no
 ///    maker-checker approval machinery, so an MCP-tiered credential reaching
-///    it would mint/revoke standing Administrator authority with neither
-///    REST's MFA step-up nor MCP's approval ticket. The MCP surface applies
-///    NO tier rule here — its own ladder (`tier_allows` gating
-///    `Security:Write` to the supervised tier only, `requires_approval`'s
-///    ticket flow, and the handler's own pre-existing empty-tier deny, the
-///    "#4309" guard) already fully governs tier for that surface; duplicating
-///    any of it in this predicate would break the existing #4309 tests. This
-///    is decided by the caller-supplied `RbacAdminSurface` parameter (below),
-///    which has NO default value BY DESIGN — a compile-time forcing function
-///    so every caller, present and future, must explicitly declare which
-///    transport it is on. Doomgoose external review, PR #4985 (round-2,
+///    it would mint/revoke standing Administrator authority (or flip
+///    enforcement) with neither REST's MFA step-up nor MCP's approval
+///    ticket. The MCP surface applies NO tier rule here — its own ladder
+///    (`tier_allows` gating `Security:Write` to the supervised tier only,
+///    `requires_approval`'s ticket flow, and the handler's own pre-existing
+///    empty-tier deny, the "#4309" guard) already fully governs tier for
+///    that surface; duplicating any of it in this predicate would break the
+///    existing #4309 tests. This is decided by the caller-supplied
+///    `RbacAdminSurface` parameter (below), which has NO default value BY
+///    DESIGN — a compile-time forcing function so every caller, present and
+///    future, must explicitly declare which transport it is on — A1's own
+///    toggle route is the first NEW caller this forcing function was built
+///    for, and it passes `kRest`/`kMcp` exactly like A2's two routes, adding
+///    no exception. Doomgoose external review, PR #4985 (round-2,
 ///    CRITICAL/BLOCKING): this predicate previously never consulted
 ///    `session.mcp_tier` at all, so an MCP bearer token minted at ANY tier
 ///    (even the least-privileged) for a principal who separately held durable
@@ -96,7 +103,11 @@
 ///    REJECTED: it would make `assign_rbac_role`/`unassign_rbac_role`
 ///    permanently unreachable, since their own dispatch path deliberately
 ///    gates a supervised-tier caller through to this SAME predicate after the
-///    ticket flow).
+///    ticket flow). This same Fable-adjudicated design supersedes an
+///    independently-derived, narrower A1 fix (a per-REST-call-site
+///    `deny_mcp_tier_rbac_admin` helper with no compile-time forcing
+///    function) that predated A2's merge — A1 was rebased onto this shared
+///    mechanism rather than the reverse.
 /// 4. **Pre-provisioning is a caller decision, not this predicate's.** This
 ///    file answers only "is the CALLING session an administrator" — whether
 ///    a role may be ASSIGNED to a target username with no `auth.users` row
@@ -118,14 +129,15 @@ namespace yuzu::server {
 /// change that adds a default argument, reopens the #520 gap the
 /// `kRest`-only tier check (below) exists to close.
 enum class RbacAdminSurface {
-    kRest, ///< The REST v1 route pair. An MCP-tier bearer token of ANY tier
-           ///< is structurally denied here — REST has no maker-checker
-           ///< approval flow to fall back on.
-    kMcp,  ///< The `assign_rbac_role`/`unassign_rbac_role` MCP tools. NO tier
-           ///< rule is applied here — the MCP transport's own ladder
-           ///< (`tier_allows`, `requires_approval`'s ticket flow, the
-           ///< handler's own #4309 empty-tier deny) already fully governs
-           ///< tier for this surface.
+    kRest, ///< The REST v1 route pair (A2) plus the enforcement-toggle route
+           ///< (A1). An MCP-tier bearer token of ANY tier is structurally
+           ///< denied here — REST has no maker-checker approval flow to fall
+           ///< back on.
+    kMcp,  ///< The `assign_rbac_role`/`unassign_rbac_role` MCP tools (A2)
+           ///< plus `set_rbac_enforcement` (A1). NO tier rule is applied
+           ///< here — the MCP transport's own ladder (`tier_allows`,
+           ///< `requires_approval`'s ticket flow, the handler's own #4309
+           ///< empty-tier deny) already fully governs tier for this surface.
 };
 
 /// Outcome of `is_rbac_administrator`. Mirrors the shape of
@@ -276,16 +288,16 @@ enum class RbacAdminGate {
 /// for its two non-admit outcomes. Doomgoose external review, PR #4985
 /// MINOR "duplicated gate-denial classification": these strings (and the
 /// kUnavailable/kDenied branching that selects between them) were
-/// duplicated verbatim across all 4 REST/MCP assign+unassign call sites —
-/// EXTEND this, never fork a second copy, matching
-/// `authz_topology_floor.hpp`'s own rule.
+/// duplicated verbatim across the 4 REST/MCP assign+unassign call sites, and
+/// now ALSO the 2 REST/MCP enforcement-toggle call sites (A1) — EXTEND this,
+/// never fork a second copy, matching `authz_topology_floor.hpp`'s own rule.
 inline constexpr std::string_view kRbacAdminGateUnavailableMessage =
     "service unavailable — cannot confirm administrator authority";
 inline constexpr std::string_view kRbacAdminGateDeniedMessage = "administrator role required";
 inline constexpr std::string_view kRbacAdminGateDeniedAuditReason =
     "caller is not a durable RBAC administrator";
 /// Doomgoose external review, PR #4985 IMPORTANT finding #2: the `kUnavailable`
-/// outcome was previously invisible to operators — all 4 call sites'
+/// outcome was previously invisible to operators — all call sites'
 /// `on_unavailable` closures only touched the response, with no log line and
 /// no audit row, unlike every sibling degraded-store denial in this codebase
 /// (e.g. `AuthRoutes::require_permission`'s engine branch, which audits

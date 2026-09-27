@@ -1165,6 +1165,7 @@ if build_server
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
+      'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement

@@ -263,6 +263,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // guard, take one shared transaction-scoped advisory lock as the first statement of
     // its own transaction; an advisory lock taken by only some of them removes no
     // inversion.
+    //
+    // A1's `RbacStore::set_rbac_enforcement` is the SECOND external
+    // cross-schema reader of `users.is_active` (its enable direction shares
+    // the identical JOIN above via `kAuthenticatableAdminGrantsFrom`). Its
+    // DISABLE direction ALSO reads `users.role` for the literal `'admin'`
+    // (written here by the first-admin bootstrap and by `update_role`'s
+    // `SET role = $1`) — a rename of EITHER column fails that guard closed
+    // the same way.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("
