@@ -633,12 +633,13 @@ public:
     /// (count, message). Default (nullptr) is the real stderr write.
     using StderrEmitFn = void (*)(std::uint64_t count, const std::string& message);
 
-    /// Test-only seam (the U11 family): replaces the stderr write so a test can make it
+    /// Test-only seam (the U11 family, and the no-op EmitSilencer in tests that only
+    /// incidentally trip the handler): replaces the stderr write so a test can make it
     /// block and assert log delivery continues (#5023). Read once per emit, when the emit
     /// thread is launched. PROCESS-WIDE and NOT auto-reset (unlike
-    /// set_construction_fault_for_test): the setter must restore nullptr, ideally via a
-    /// ScopeExit declared after the LogHandoff, and must first release any emit it made
-    /// block. Production callers never set this.
+    /// set_construction_fault_for_test): the setter must restore nullptr, via a ScopeExit
+    /// declared after the LogHandoff (a blocking stub, which must first be released) or an
+    /// EmitSilencer declared before it (a no-op). Production callers never set this.
     static void set_stderr_emit_for_test(StderrEmitFn fn) noexcept;
 
     /// Test-only fault injection (#5023): the next emit-thread LAUNCH ATTEMPT fails as if

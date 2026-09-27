@@ -869,10 +869,10 @@ TEST_CASE("U10: two concurrent teardown() calls on a stably-owned object never r
 // stall is deterministic and identical on every platform; the U12 family (U12 to U12d)
 // exercises the REAL write against a real pipe (POSIX). A test that lets the real emit run
 // must not return until its last real write has completed, and one that does not care about
-// the diagnostic silences it (EmitSilencer), so no stray write reaches a later test's
-// capture. SCOPE: these pin the handler's own write. A console sink sharing the blocked fd
-// still stalls the worker in its own write; that case is unchanged by #5023 and not covered
-// here.
+// the diagnostic silences it (EmitSilencer), so on a passing run no stray write reaches a
+// later test's capture (a REQUIRE that fails before the barrier can leave one). SCOPE:
+// these pin the handler's own write. A console sink sharing the blocked fd still stalls the
+// worker in its own write; that case is unchanged by #5023 and not covered here.
 
 namespace {
 
@@ -1100,10 +1100,10 @@ TEST_CASE("U11d: diagnostics inside the once-per-second throttle window are neit
     LogHandoff::set_stderr_emit_for_test(&blocking_emit_stub);
     yuzu::test::ScopeExit cleanup{[] { restore_emit_seams(); }};
 
-    // 20 failures inside one second (two bursts of ten): every one is an error, exactly one is
-    // emitted, and the other 19 are throttled BEFORE the slot is claimed, so they are not drops. If the
-    // worker was descheduled for over a second the window legitimately reopens, so one more
-    // emit is allowed per whole second that elapsed.
+    // 20 failures inside one second (two bursts of ten): every one is an error, exactly one
+    // is emitted, and the other 19 are throttled BEFORE the slot is claimed, so they are not
+    // drops. If the worker was descheduled for over a second the window legitimately
+    // reopens, so one more emit is allowed per whole second that elapsed.
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 10; ++i)
         logger->info("fail");

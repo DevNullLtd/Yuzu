@@ -499,8 +499,9 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             // to once per second, for as long as the process runs. Before #4666 PR-2
             // wired LogHandoff into production, that default handler was the live one
             // -- so a sink-level write failure (disk full or EMFILE on the rotating
-            // file sink) was always visible on stderr (which reaches journald under the
-            // shipped unit).
+            // file sink of a --log-file run) was always visible on stderr, which reaches
+            // journald when the agent runs under the shipped unit (that unit passes no
+            // --log-file).
             // Recording ONLY into ErrorState -- readable via log_errors_total()/
             // last_log_error_for_test(), but not read by any PRODUCTION consumer today
             // (PR-3's heartbeat-surfacing work is still pending) -- would silently

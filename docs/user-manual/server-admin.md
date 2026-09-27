@@ -4543,7 +4543,9 @@ console): the agent has no valid standard error handle there and attaches no
 stderr sink.
 
 **This covers the diagnostic's own write only, and on the shipped
-configurations that is a narrow gain.** When stdout or stderr is itself one of
+configurations that is a narrow gain**: the stall it removes is the one a blocked
+stderr caused through this diagnostic when stderr is not itself a sink, or when a
+producer thread hits the failure. When stdout or stderr is itself one of
 the agent's log sinks, a blocked stream still stalls the logging worker in that
 sink's own write and queued lines are dropped oldest-first (`overrun_oldest`),
 exactly as for any stuck sink; only the shutdown watchdog bounds that, and only
@@ -4567,9 +4569,11 @@ and restarting the agent does not fix it. As root,
 `grep . /proc/<pid>/task/*/wchan` shows a logging thread parked in the write.
 The symbol depends on the kernel (`pipe_write` or `anon_pipe_write` for a
 pipe, `sock_alloc_send_pskb` for a socket). Without root, only the agent's own
-account can read these, and only while the agent process is dumpable (an agent
-binary installed with file capabilities is not); otherwise the `wchan` files
-read `0` and the fd links fail with "Permission denied". Then check disk space and fd limits on the log destination.
+account can read these, and only while the agent process is dumpable (a process
+that gained capabilities at exec, for example from file capabilities on a binary
+started outside a `NoNewPrivileges=true` unit, is not); otherwise the `wchan`
+files read `0` and the fd links fail with "Permission denied". Then check disk
+space and fd limits on the log destination.
 `overrun_oldest` drops are silent in this release, with no counter or alert to
 point at them yet.
 
