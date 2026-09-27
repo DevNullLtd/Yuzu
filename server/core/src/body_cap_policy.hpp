@@ -495,6 +495,16 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // /api/v1/uploads entry above closes.
     {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware"},
 
+    // /api/v1/rbac/roles/{name}/assignments[/{principal_id}] — A2 global
+    // human role assignment (rest_api_v1.cpp). POST's body is
+    // {principal_type, principal_id}, two short strings well under a KiB;
+    // DELETE carries no body. ANY method: the DELETE sibling shares this
+    // literal prefix once past the role-name path segment the URL regex
+    // captures — see the file header's MATCHING section for the same
+    // reasoning applied to every other any-method entry with a same-prefix
+    // sibling. 4 KiB leaves generous headroom over the real shape.
+    {kBodyCapAnyMethod, "/api/v1/rbac/roles/", 4u * 1024, false, "rbac_role_assignment"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

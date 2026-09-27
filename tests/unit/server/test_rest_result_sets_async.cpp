@@ -2716,8 +2716,15 @@ TEST_CASE("POST /api/v1/inventory/evaluate: no malformed record present -- "
     CHECK_FALSE(body.contains("results_excluded_by_parse_error"));
 }
 
-TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
+TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 9",
           "[pg][result_set][security]") {
+    // #4980: from-inventory-query joined the other 8 hard-denied siblings —
+    // previously it gated purely via fleet_read_fn's admit-and-confine
+    // branch, which ADMITS a service-scoped caller rather than denying it,
+    // even though the result set it materializes is owner-scoped to
+    // session->username (the minting principal's identity, not the token's
+    // own service tag) — the same cross-service-reach class the other 8
+    // routes' hard-deny exists to prevent.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -2749,12 +2756,43 @@ TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on a
     CHECK(post("/api/v1/result-sets/" + id + "/pin", "{}") == 403);
     CHECK(post("/api/v1/result-sets/" + id + "/unpin", "{}") == 403);
     CHECK(del("/api/v1/result-sets/" + id) == 403);
+    CHECK(post("/api/v1/result-sets/from-inventory-query",
+                R"({"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]})") ==
+          403);
 
     bool saw_list_denied = false;
     for (const auto& a : h.audits)
         if (a.action == "result_set.list.access_denied" && a.result == "denied")
             saw_list_denied = true;
     CHECK(saw_list_denied);
+
+    bool saw_from_inventory_query_denied = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create.access_denied" && a.result == "denied" &&
+            a.detail.find("from-inventory-query") != std::string::npos)
+            saw_from_inventory_query_denied = true;
+    CHECK(saw_from_inventory_query_denied);
+
+    // Clause (5), routed-concerns-access-control.md "Service-scoped API token
+    // confinement": the A4 body must NOT name a `.permission` that would not,
+    // by itself, admit the caller — a service-scoped token holding
+    // Inventory:Read is STILL denied here, so naming it would be a false
+    // self-remediation claim. Pin this on the response body itself (matching
+    // test_inventory_routes.cpp's identical idiom for the same clause) rather
+    // than relying only on the status-code check above, which would stay
+    // green even if a future edit dropped the explicit "" and fell back to
+    // the helper's GuaranteedState:Read default.
+    auto raw = h.sink.Post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]})");
+    REQUIRE(raw);
+    REQUIRE(raw->status == 403);
+    auto body = nlohmann::json::parse(raw->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(raw->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
 }
 
 TEST_CASE("owner-scoped result-set routes: an ordinary session is unaffected "

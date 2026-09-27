@@ -244,7 +244,28 @@ What you may observe after upgrading:
   points at `/readyz`, move it to `/livez` before upgrading — otherwise a database blip restarts every
   server.
 - **One more Postgres connection per server** (the probe). Budget `N_servers × 2` connections beyond the
-  pool against `max_connections` (the other extra one is the leader-election connection).
+  pool against `max_connections` (the other extra one is the leader-election connection) — the full
+  formula is in `server-admin.md`, "Sizing `max_connections`".
+- **The shipped `yuzu-postgres` images now reserve connection slots for the app role** (#4943):
+  `reserved_connections = 40` (env `YUZU_PG_RESERVED_CONNECTIONS`) and `GRANT pg_use_reserved_connections`
+  to the app role, applied at **first boot only** (PostgreSQL 16 or newer). Three cases:
+  - **A fresh install or reinstall** (a new, empty data volume) picks up the new default **silently, with no
+    action needed** — but it also reduces headroom for third-party tooling (a backup job, a monitoring agent)
+    sized against `max_connections` alone with no margin by up to 40 connections versus a deployment built
+    before this release.
+  - **An in-place upgrade of an existing database does NOT pick this up** — the new default only applies at
+    first boot, and an existing data volume already had its first boot. Without action, a backup job or
+    ad-hoc session can still take the slot the `/readyz` probe needs to reconnect, same as before this release.
+  - **To apply it to that existing database**, run the `ALTER SYSTEM` (restart) and the `GRANT` by hand as
+    "Sizing `max_connections`" above shows.
+
+  **A new boot-time failure mode on the Postgres container itself**, not just the server binary: both
+  `yuzu-postgres` images now refuse to start if `YUZU_PG_RESERVED_CONNECTIONS` is set at or past
+  `max_connections − superuser_reserved_connections` — that value would leave zero connection slots any
+  other client could ever use. Only reachable by explicitly setting the env var too high; the shipped
+  default (40) never triggers it. On the single-node image this refusal happens after the role/database/grant
+  already exist, so restarting the same container with a corrected value does not retroactively apply
+  anything — see the note in "Sizing `max_connections`" above.
 - **A new alert, `YuzuServerPostgresUnreachable`**, and three `yuzu_server_pg_reachab*` metrics — see
   `docs/user-manual/metrics.md`.
 - **New flag `--shutdown-drain-seconds`** (`YUZU_SHUTDOWN_DRAIN_SECONDS`, default **0**, max 60). On
@@ -262,8 +283,9 @@ What you may observe after upgrading:
   readiness, but under Docker Swarm or an auto-heal sidecar an outage longer than the healthcheck's
   retry window marks the container unhealthy and restarts it. Point restart-driving checks at `/livez`.
 
-**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; check your Postgres
-`max_connections` headroom; set `--shutdown-drain-seconds` if a load balancer fronts the server.
+**What to do:** point liveness probes at `/livez`, readiness at `/readyz`; size `max_connections` by the
+formula and apply the reserved-slot grant on an existing database; set `--shutdown-drain-seconds` and the
+recommended health-check thresholds if a load balancer fronts the server.
 
 ## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
 
@@ -3048,6 +3070,28 @@ Before upgrading any component:
   `SERVICE_STOPPED` report doesn't trigger the recovery actions above
   either). See *Stopping a wedged agent* in
   [Server Administration](server-admin.md).
+- [ ] **Agent logging is now asynchronous, with a new self-exit code 5 (#4666
+  PR-2):** on upgrade, the agent stops writing log lines synchronously on the
+  thread that produced them and instead hands them off to a dedicated
+  logging worker thread over a fixed-size, pre-allocated 8192-slot queue
+  (3.34 MB of RSS, paid regardless of how much is actually logged). Under
+  sustained overload the queue drops the oldest still-queued lines
+  (`overrun_oldest`) rather than blocking or growing; there is no
+  `--log-sync` opt-out. Not a breaking change: same log format, same
+  `--log-file`/rotation behaviour, no new flags, with one exception: the
+  "Received signal, shutting down..." line on `SIGINT`/`SIGTERM`/Ctrl-C used
+  to be a raw stderr-only write and now goes through the same configured
+  logger as everything else, so it also lands in `--log-file` and picks up
+  JSON formatting under `--log-format json` — and, since it's now an
+  ordinary `info`-level line rather than an unconditional raw write, it is
+  silently **absent entirely** at `--log-level warn` or above (previously it
+  always printed regardless of level). The other new operator-visible
+  surface is a fifth self-exit code: tearing down the async logger during
+  shutdown either times out on a 2-second internal watchdog or fails
+  outright, and either cause self-terminates with **exit code 5**, distinct
+  from the existing 1, 3, and 4. A supervisor script or alert keyed to a
+  fixed exit-code set should widen it to include 5. See *Stopping a wedged
+  agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
@@ -3822,6 +3866,73 @@ every enrolled agent.
 on the install path (`POST /api/product-packs`). List, get, and
 uninstall paths do not re-verify, so already-installed unsigned packs
 remain queryable and uninstallable after upgrade.
+
+### vNEXT — Access-review CSV export gains a leading metadata line (breaking for fixed-column-index CSV consumers)
+
+`GET /api/v1/access-reviews/export?format=csv` (SOC 2 CC6.2 evidence) now
+emits one new line before the existing header row:
+
+```
+# rbac_enforcement=enabled
+principal_type,principal_id,display_name,owner_or_email,roles,effective_permission_count,last_activity_ms,last_activity_kind,classification,lifecycle_state,source
+user,alice,...
+```
+
+This line is unconditional — present even when the grant population is
+empty — so it stamps whether RBAC was actually enforced when the file was
+pulled, travelling with the retained/offline copy an auditor keeps (see
+`rest-api.md`'s `rbac_enforcement` section for what the three values mean).
+
+**This breaks any consumer that assumes row 1 is the header.** Verified
+empirically against this exact output shape (not a blanket claim about "CSV
+tools" — the actual split matters):
+
+- **Silently WRONG output, no error, no warning:** Python's `csv.DictReader`
+  reads the new line 1 as a single-column header, then feeds the REAL header
+  row (line 2) into the result set as if it were data — every field name and
+  every row is now misaligned. The `awk -F, 'NR>1'` idiom (and any hand-rolled
+  "skip the first line" loop in another language) does the same thing: it now
+  emits the real header row as a spurious first "data" row, ahead of the
+  genuine data rows, which otherwise parse correctly.
+- **Also silently WRONG, not a loud failure:** `pandas.read_csv(path)` with
+  its default settings does **not** raise `ParserError` on this shape — do
+  not rely on pandas to "fail loud" here. Because every row past line 1 is
+  uniformly wider than the 1-field metadata line, pandas' documented
+  "extra leading columns become an implicit index" heuristic kicks in: it
+  silently produces a 1-column, tuple-indexed `DataFrame` with the metadata
+  line as the sole column name and the leading fields folded into a
+  `MultiIndex`, leaving only the last field (`source`) as the actual,
+  mislabeled `DataFrame` column — wrong, but no exception. (Verified
+  directly against pandas 3.0.6, both the `c` and `python` engines; on that
+  version, neither engine's default settings raise instead of silently
+  misparsing — untested against older pandas majors, so treat "on 3.0.6"
+  as the scope of this claim, not a guarantee for every pandas release.)
+
+**The fix is the same for every consumer class: skip exactly one line before
+treating the next line as the header**, verified working against each tool
+above:
+
+```python
+# csv.DictReader
+with open(path, newline="") as f:
+    next(f)                      # skip the metadata line
+    reader = csv.DictReader(f)   # now reads the real header correctly
+```
+
+```bash
+# awk (was NR>1 under the old format; now NR>2)
+awk -F, 'NR>2' access-review.csv
+```
+
+```python
+# pandas
+df = pd.read_csv(path, skiprows=1)
+```
+
+A consumer that already treats the file as free-form text and looks for the
+`# rbac_enforcement=` prefix, or that reads the `rbac_enforcement` field from
+the sibling **JSON** export (`GET .../export` without `?format=csv`, or the
+frozen campaign row's `rbac_enforcement` field), is unaffected either way.
 
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 

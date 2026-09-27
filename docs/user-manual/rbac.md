@@ -245,6 +245,44 @@ See `docs/auth-architecture.md` → "The authorization topology floor
 `docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded
 decision (including what was deliberately excluded from the floor and why).
 
+**The access-review export's `rbac_enforcement` stamp inherits this same
+degrade-vs-outage ambiguity — read this if you're relying on it as
+evidence.** `enabled`/`disabled`/`degraded` (full description:
+`rest-api.md` → the `GET /api/v1/access-reviews/export` section) is derived
+from the identical fail-closed machinery described above under "RBAC store
+integrity (fail-closed / deny-on-degrade)" — a replica whose generation
+refresh has failed reports `degraded`, same as a replica whose RBAC store is
+unreachable. **Correlate against
+`yuzu_server_rbac_read_degrade_total{reason=~"generation_refresh_failed.*"}`**
+(and the narrower `stale_beyond_accepted_bound` reason) if you need to
+distinguish "the store genuinely couldn't confirm state at pull time" from
+"an administrator turned RBAC on/off" — the stamp alone cannot make that
+distinction for you.
+
+**The frozen campaign row is a strictly worse case than the live export.**
+`GET .../export` recomputes `rbac_enforcement` fresh on every pull — a
+transient degrade self-corrects the next time someone re-runs the export.
+`POST /api/v1/access-reviews` (opening a review campaign) computes the
+stamp **once**, at open time, and — per this feature's deliberate no-prune
+retention policy — that campaign row persists **indefinitely**. A
+`degraded` (or, on the cached-enabled short-circuit documented in
+`rest-api.md`, an `enabled`) stamp recorded during a transient partition is
+therefore **permanent evidence with no later self-correction**: re-reading
+the same closed campaign always returns the value frozen at open, never a
+retry. If a campaign was opened during a known RBAC-store incident, treat
+its `rbac_enforcement` value as suspect and open a fresh campaign once the
+store is confirmed healthy, rather than trusting the frozen one.
+
+**This is an evidence-confidence gap, never a security-control failure.**
+A stale or degraded `rbac_enforcement` reading never weakens actual
+authorization — `check_permission`/`check_scoped_permission` independently
+deny on the exact same degraded view (deny-on-degrade, ADR-0041, as
+described throughout this section); nothing about the access-review stamp
+being wrong changes what a real request is allowed to do. The risk is
+purely that an auditor reading the export or a closed campaign draws the
+wrong conclusion about what state RBAC was in — not that access control
+itself misbehaves.
+
 ## Concepts
 
 | Concept | Description |
@@ -485,14 +523,64 @@ curl -s -b cookies.txt \
 
 ### Custom Roles (Planned)
 
-Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
+Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role **creation** are planned but **not yet implemented** — there is no HTMX Settings UI fragment for this either (`settings_routes.cpp` has no RBAC role-CRUD registration). Currently, a genuinely NEW custom role can only be created directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
+
+**Assigning one of the 6 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 7th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
 
 **Planned endpoints (not yet available):**
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/v1/rbac/roles` | Create a custom role |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign a role to a principal |
+| `PUT` | `/api/v1/rbac/roles/{name}` | Update a role |
+| `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role |
+
+### Fleet-Wide Role Assignment (Built-in Roles)
+
+An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
+
+```bash
+# Grant the Operator role to a user, fleet-wide
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/rbac/roles/Operator/assignments \
+  -H "Content-Type: application/json" \
+  -d '{
+    "principal_type": "user",
+    "principal_id": "jane.doe"
+  }'
+
+# Revoke it again
+curl -s -b cookies.txt -X DELETE \
+  http://localhost:8080/api/v1/rbac/roles/Operator/assignments/jane.doe
+```
+
+Key constraints:
+
+- **`principal_type` must be `"user"`.** Group-scoped fleet-wide assignment is not supported yet — `rbac_store.group_members` is written solely by IdP group-sync, so a group-held grant would make the IdP the admin-authority source, a decision not made by this surface.
+- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to devices tagged with their IT Service — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
+- **Only the 6 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name. An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
+- **A caller may not revoke the fleet's last remaining `Administrator` grant through this surface.** The store-level guard runs inside the same transaction as the delete, so two concurrent revokes cannot both succeed and leave zero administrators. It counts only `principal_type='user'` rows that ALSO name a currently-active `auth.users` account — a grant naming a nonexistent, deactivated, or (soft-)deleted username is never treated as a survivor.
+  - **A principal reactivated while an unassign is in flight is caught (Doomgoose external review, PR #4985).** The guard first locks the candidate Administrator grant rows (`FOR UPDATE OF pr`) and deliberately does not lock the candidate set of `auth.users` rows, because that would serialize unassigns against unrelated logins and role changes. A grant whose account was deactivated at that moment is therefore excluded from that snapshot and could be reactivated by an independent transaction (for example an account reactivation) before the delete runs. After the delete, in the same transaction, and only when the removed grant was not already among the counted rows, the guard re-reads the deleted principal's own `auth.users` row with `FOR UPDATE`: a reactivation that has already committed is seen, one still in flight makes the guard wait and re-read it, and one that starts later blocks until this transaction finishes. If the reactivated principal is the fleet's only real Administrator, the removal is refused. This is closed for an existing account only. Two cases remain outside the guard: a pre-provisioned grant whose `auth.users` row is created concurrently (there is no row to lock), and deactivation of a surviving Administrator between the guard's recount and its commit (`remove_user` has no last-Administrator guard). Both are tracked at #4966. A lock wait is bounded by the database pool's lock timeout (10 seconds by default; the pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is set, and the wait is then bounded only if that setting, or the server or role default, sets a `lock_timeout`); on timeout nothing is deleted, the REST route answers `503`, and the MCP twin answers an internal error with a retry hint.
+  - **This guard covers only THIS route's own unassign path** — it does not, on its own, guarantee the fleet always has a *usable* administrator. Deactivating or deleting the account behind the fleet's last Administrator grant is a **separate, unguarded** path (account lifecycle management, not role-grant management) that can still leave zero authenticatable administrators. Tracked as a real gap in [#4966](https://github.com/Tr3kkR/Yuzu/issues/4966).
+  - **An SSO (OIDC/SAML) Administrator cannot receive a `principal_roles` grant through THIS surface at all, which is a usability limitation for SSO fleets, not a security gap — and not because the row can't exist.** The real mechanism: this route's `principal_id` charset check (`is_valid_username` — alphanumeric plus `.`/`_`/`-`, 1–64 characters) rejects the stable SSO principal formats outright before an assignment is ever attempted — OIDC's `"oidc:" + iss + "#" + sub` and SAML's `"saml:" + entity_id + "#" + name_id` (`oidc_principal_id`/`saml_principal_id`) both contain `:` and `#`, neither of which the charset allows. So a `principal_roles` row naming an SSO principal can never be WRITTEN via this route in the first place — a stricter, earlier-stage gap than "the row doesn't exist". Whether an `auth.users` row separately exists for the principal differs by protocol and doesn't change this: **OIDC** *does* durably provision one — every successful OIDC login calls `AuthManager::provision_sso_identity` → `AuthDB::upsert_sso_identity`, an `INSERT ... ON CONFLICT (username) DO UPDATE` that creates (first login) or refreshes (every login after) a real, `is_active=TRUE`-by-default `auth.users` row keyed on the same stable principal — but that row is moot for this guard, since no `principal_roles` row can ever be assigned to that principal_id to begin with. **SAML**, by contrast, provisions no `auth.users` row at all today — `AuthManager::create_saml_session` only writes the session store, never `AuthDB` — so for SAML the original "no `auth.users` row" framing happens to still hold, just not for a reason that matters once the charset check is understood. Net effect: an SSO principal is entirely outside this guard's count — its `principal_id` format can never reach `principal_roles` via this route at all, so there is no "SSO grant this guard fails to recognize." Every grant the guard can ever count arrives through THIS route (the only writer of `principal_roles` Administrator rows for `principal_type="user"`), so in practice it only ever counts local-account grants (`AuthDB` usernames, not `oidc:`/`saml:`-prefixed ones) — the guard's own JOIN has no charset restriction and would count an `oidc:`/`saml:`-prefixed row too if one existed, but this route can never write one. Since the last-Administrator fix above (governance ledger `a2-p7-doomgoose-1`), a local grant that was never counted — a ghost (no matching `auth.users` row) or deactivated-account grant — no longer blocks its own removal; the guard only refuses when removing a grant that was itself counted (or whose account was reactivated while the unassign was in flight, see above) would take the count to zero. Also tracked in [#4966](https://github.com/Tr3kkR/Yuzu/issues/4966) (see that issue for a correction to its own originally-stated mechanism).
+- **Assigning a role to a username with no existing account is allowed** (pre-provisioning) — RBAC's `principal_roles` and `AuthDB`'s `users` table are independent, unrelated by foreign key.
+- **An MCP-tier bearer token of any tier — including `supervised` — is denied on this REST pair**, matching every other admin-only route ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)): REST carries no maker-checker approval machinery, so an MCP-tiered credential reaching it directly would mint/revoke standing Administrator authority with neither REST's MFA step-up nor an approval ticket. MCP callers use the `assign_rbac_role`/`unassign_rbac_role` twins instead, which require the supervised tier plus an approval ticket.
+- MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see `docs/user-manual/mcp.md`.
+
+> **Before enabling RBAC, mint at least one `principal_roles` Administrator
+> row first — same chicken-and-egg hazard as the management-group callout
+> above, in this route's own currency.** With RBAC **enabled** (and no legacy
+> fallback available), `is_rbac_administrator`'s RBAC-on branch requires a
+> `principal_roles` row naming the caller as `Administrator` — but this
+> route's own gate is `is_rbac_administrator` itself, so a fleet that flips
+> RBAC on before any such row exists locks EVERY caller, including the
+> `admin`-role session that flipped the toggle, out of the ONLY route able to
+> create one. Two ways out: flip the toggle **off** again and use RBAC's
+> disabled-mode durable-admin fallback (`auth_db`'s `role='admin'` re-read,
+> the predicate's OTHER branch) to assign the first `Administrator` grant
+> before re-enabling, or mint the first grant directly against `rbac_store.
+> principal_roles` (see the "Storage (ADR-0041)" callout above for the shared
+> Postgres substrate) before ever flipping the toggle on a fresh install.
 
 ### Scoped Role Assignments
 
@@ -514,7 +602,7 @@ curl -s -b cookies.txt -X POST \
 
 ### Deny a Specific Operation
 
-Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via the Settings UI or direct database access, since the role creation API is not yet available):
+Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via direct database access, since the role creation API is not yet available — no HTMX Settings UI fragment exists for this either):
 
 ```sql
 -- Example: create a deny role directly against the shared rbac_store schema
@@ -538,13 +626,15 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `POST` | `/api/v1/rbac/roles` | Create a custom role | Planned |
 | `PUT` | `/api/v1/rbac/roles/{name}` | Update a role | Planned |
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign a role to a principal | Planned |
-| `DELETE` | `/api/v1/rbac/roles/{name}/assignments` | Unassign a role | Planned |
+| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 6 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
+| `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
 
 ## Planned Features
 
 | Feature | Phase | Status |
 |---|---|---|
-| REST API for role creation and assignment | 3 | Planned |
+| REST API for fleet-wide built-in role assignment | A2 | Implemented |
+| REST API for custom role creation | 3 (Priority B) | Planned |
+| Group-scoped fleet-wide role assignment (`principal_type=group`) | 3 | Planned |
 | OIDC group-to-role auto-mapping refinements | 3 | Stub |
 | Role management via Settings UI matrix | 3 | Planned |

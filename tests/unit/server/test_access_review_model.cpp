@@ -565,6 +565,26 @@ TEST_CASE("build_access_review: R1 — a genuine read failure MID-enumeration re
     CHECK(result.error().find("engine principal") != std::string::npos);
 }
 
+// ── access_review_rbac_enforcement (A3, RBAC delivery plan) ────────────────
+
+// Thin-wrapper correctness only — the exhaustive three-way derivation
+// (null/unopened store, cached-enabled, fresh-disabled, degraded-view) is
+// covered by rbac_enforcement_label's own tests in test_rbac_store.cpp; this
+// proves access_review_rbac_enforcement forwards to it faithfully rather than
+// re-deriving anything independently.
+TEST_CASE("access_review_rbac_enforcement forwards to rbac_enforcement_label/to_string",
+          "[access_review][model][pg]") {
+    CHECK(yuzu::server::access_review_rbac_enforcement(nullptr) == "degraded");
+
+    ModelHarness h;
+    REQUIRE_FALSE(h.rbac->is_rbac_enabled()); // fresh install default
+    CHECK(yuzu::server::access_review_rbac_enforcement(h.rbac.get()) == "disabled");
+
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.rbac->is_rbac_enabled());
+    CHECK(yuzu::server::access_review_rbac_enforcement(h.rbac.get()) == "enabled");
+}
+
 // ── to_csv ───────────────────────────────────────────────────────────────────
 
 TEST_CASE("to_csv: header + RFC 4180 escaping for comma/quote/newline", "[access_review][model]") {
@@ -581,9 +601,11 @@ TEST_CASE("to_csv: header + RFC 4180 escaping for comma/quote/newline", "[access
     r.lifecycle_state = "active";
     r.source = "local";
 
-    auto csv = to_csv({r});
+    auto csv = to_csv({r}, "enabled");
 
-    CHECK(csv.starts_with("principal_type,principal_id,display_name,owner_or_email,roles,"
+    // The unconditional leading metadata line precedes the header row.
+    CHECK(csv.starts_with("# rbac_enforcement=enabled\r\n"
+                         "principal_type,principal_id,display_name,owner_or_email,roles,"
                          "effective_permission_count,last_activity_ms,last_activity_kind,"
                          "classification,lifecycle_state,source\r\n"));
     // display_name has a comma, embedded double-quotes, AND a newline — must
@@ -598,11 +620,48 @@ TEST_CASE("to_csv: header + RFC 4180 escaping for comma/quote/newline", "[access
     CHECK(csv.ends_with(",active,local\r\n"));
 }
 
-TEST_CASE("to_csv: empty input yields header only", "[access_review][model]") {
-    auto csv = to_csv({});
-    CHECK(csv == "principal_type,principal_id,display_name,owner_or_email,roles,"
+TEST_CASE("to_csv: empty input yields metadata line + header only", "[access_review][model]") {
+    auto csv = to_csv({}, "disabled");
+    // A3: the metadata line is unconditional — present even with zero rows,
+    // so "no grants" is never ambiguous with "the stamp was omitted".
+    CHECK(csv == "# rbac_enforcement=disabled\r\n"
+                "principal_type,principal_id,display_name,owner_or_email,roles,"
                 "effective_permission_count,last_activity_ms,last_activity_kind,"
                 "classification,lifecycle_state,source\r\n");
+}
+
+// ── to_csv: rbac_enforcement metadata line (A3, RBAC delivery plan) ────────
+
+TEST_CASE("to_csv: rbac_enforcement metadata line carries each of the three enforcement "
+         "values, both with and without rows",
+         "[access_review][model][csv]") {
+    AccessReviewRow r;
+    r.principal_type = "user";
+    r.principal_id = "alice";
+    r.display_name = "Alice";
+    r.source = "local";
+
+    for (const std::string& value : {"enabled", "disabled", "degraded"}) {
+        INFO("rbac_enforcement=" << value);
+
+        // Non-empty population: exactly one metadata line, immediately
+        // followed by the real header — never duplicated, never
+        // interleaved with a data row.
+        auto csv = to_csv({r}, value);
+        CHECK(csv.find("# rbac_enforcement=" + value +
+                       "\r\nprincipal_type,principal_id,display_name,owner_or_email,roles,"
+                       "effective_permission_count,last_activity_ms,last_activity_kind,"
+                       "classification,lifecycle_state,source\r\n") == 0);
+
+        // Empty population: the metadata line is UNCONDITIONAL — a
+        // zero-grant population is never ambiguous with "the stamp was
+        // omitted".
+        auto csv_empty = to_csv({}, value);
+        CHECK(csv_empty == "# rbac_enforcement=" + value +
+                          "\r\nprincipal_type,principal_id,display_name,owner_or_email,roles,"
+                          "effective_permission_count,last_activity_ms,last_activity_kind,"
+                          "classification,lifecycle_state,source\r\n");
+    }
 }
 
 // ── to_csv: CWE-1236 formula-injection neutralization ──────────────────────
@@ -618,7 +677,7 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
         r.principal_id = R"(=HYPERLINK("http://evil.example","click"))";
         r.display_name = "x";
         r.source = "local";
-        auto csv = to_csv({r});
+        auto csv = to_csv({r}, "enabled");
         // Neutralize first ('=HYPERLINK(...) -> '=HYPERLINK(...)), THEN
         // RFC-4180-quote (still contains commas/quotes, so it's wrapped, with
         // interior quotes doubled) — the apostrophe is the first character
@@ -638,7 +697,7 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
             r.display_name = "x";
             r.roles = {std::string(1, trigger) + "cmd"};
             r.source = "local";
-            auto csv = to_csv({r});
+            auto csv = to_csv({r}, "enabled");
             // roles field sits between owner_or_email (empty) and
             // effective_permission_count (0) — bounded on both sides by a
             // comma with nothing else that could false-match.
@@ -654,7 +713,7 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
         r.principal_id = "id2";
         r.display_name = "\t=cmd";
         r.source = "local";
-        auto csv = to_csv({r});
+        auto csv = to_csv({r}, "enabled");
         CHECK(csv.find("id2,'\t=cmd,,") != std::string::npos);
     }
 
@@ -665,7 +724,7 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
         r.principal_id = "id3";
         r.display_name = "\r=cmd";
         r.source = "local";
-        auto csv = to_csv({r});
+        auto csv = to_csv({r}, "enabled");
         CHECK(csv.find("id3,\"'\r=cmd\",") != std::string::npos);
     }
 
@@ -675,7 +734,7 @@ TEST_CASE("to_csv: CWE-1236 — a leading formula-trigger byte is neutralized wi
         r.principal_id = "normal-id";
         r.display_name = "Normal Name";
         r.source = "local";
-        auto csv = to_csv({r});
+        auto csv = to_csv({r}, "enabled");
         CHECK(csv.find(",normal-id,Normal Name,") != std::string::npos);
     }
 }

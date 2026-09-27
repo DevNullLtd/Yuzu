@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-22 · euid 0 · leg-hash 57448de65bb7
+== action=managers
+status|managers|unsupported|linux:planned
+[result_status] UNAVAILABLE / PARTIAL / linux:planned
+
+== action=packages
+status|packages|unsupported|linux:owned_by_installed_apps
+[result_status] UNAVAILABLE / PARTIAL / linux:owned_by_installed_apps

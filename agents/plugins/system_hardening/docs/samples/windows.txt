@@ -1,0 +1,13 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated) · leg-hash e678758a486f
+== action=posture
+posture|windows|mitigation_options|-|absent
+posture|windows|mitigation_audit_options|-|absent
+posture|windows|self.dep|3|on
+posture|windows|self.aslr_bottom_up|5|on
+posture|windows|self.aslr_force_relocate|5|off
+posture|windows|self.aslr_high_entropy|5|on
+posture|windows|self.cfg|0|off
+posture|windows|self.cfg_export_suppression|0|off
+posture|windows|self.cfg_strict_mode|0|off
+[result_status] OK / FULL / 
+

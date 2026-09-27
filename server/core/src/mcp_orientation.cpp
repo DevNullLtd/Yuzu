@@ -232,6 +232,12 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check).
 constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// A2 (delivery plan §2) — global human role assignment/unassignment. Own
+// family, distinct from RBAC self-check above (a read, not an authoring
+// action) and from Engine principals' assign/unassign_engine_role (a
+// different principal class — engine, not human — with its own structural
+// "no admin, ever" bar these tools deliberately do NOT carry).
+constexpr std::string_view kRbacRoleAssignment[] = {"assign_rbac_role", "unassign_rbac_role"};
 // B4 — no existing family covers local-account lockout lifecycle; own family,
 // distinct from Directory & identity (AD/Entra sync, a different identity
 // axis) and from Engine principals (a different principal class entirely).
@@ -259,7 +265,7 @@ constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
 
-constexpr std::array<ToolFamily, 38> kFamilies{{
+constexpr std::array<ToolFamily, 39> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -338,6 +344,10 @@ constexpr std::array<ToolFamily, 38> kFamilies{{
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
                         "permission",
      kRbacCheck},
+    {"RBAC role assignment", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+                             "roles to a human user (Administrator-gated, not a plain "
+                             "permission check)",
+     kRbacRoleAssignment},
     {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
      kAccountLockout},
     {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "

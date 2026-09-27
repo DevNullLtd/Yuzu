@@ -1004,11 +1004,21 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
         // privacy_permissions
         {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
+        // system_hardening
+        {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
         {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
+        // pkg_inventory
+        {"pkg_inventory.managers",
+         "List package managers present on the host with manager-level config facts "
+         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
+         "macOS only today, Linux and Windows report unsupported)"},
+        {"pkg_inventory.packages",
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
+         "today; the Linux package roster is owned by installed_apps)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture

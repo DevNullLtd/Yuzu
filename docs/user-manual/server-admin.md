@@ -349,9 +349,9 @@ The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=
 - **Today, on the legacy path:** up to one server line and one agent line per Guardian event, so it tracks your Guardian event volume. The agent debounces drift events per rule (default 1000 ms, the rule parameter `event_debounce_ms`), which collapses rapid drifts; a rule configured with `event_debounce_ms` of `0` emits every drift, and a return to compliant is never debounced, so a rule that flaps can still log at its flap rate.
 - **Once the Spark path is live:** up to two agent lines per event (`T_detect` and `T_wire`) plus the server line. Lifecycle events, replayed events and health events raised by a subscription fault or its recovery log `T_wire` with no `T_detect` (health entries raised by an evaluation pass do get one), a retried send logs `T_wire` again, lifecycle journal replays re-send on every reconnect (with no info-level server line), a rule stuck in an unknown or error state re-emits on the errored-refresh cadence (default 5 minutes, and in practice no faster than the rule type's convergence sweep), and each evaluation pass rejected by a full outbox logs another `accepted=0` `T_detect` line with no rate limit of its own.
 - **Where the lines go:** wherever a log file is in use (`--log-file` on the server or the agent; a Windows service agent defaults to `yuzu-agent.log` under its data directory) the file sink rotates at 50 MB and keeps the active file plus up to 5 rotated files by default (up to about 300 MB per sink; `--log-max-size` in bytes, `--log-max-files`), so an event storm shortens how far back your logs reach. Without a log file the lines go to the console and Yuzu applies no rotation: retention and any rate limiting belong to your service manager or container runtime (a journald rate limit can drop lines, including unrelated warnings).
-- **They are written synchronously** by the threads that handle the event: on the agent, a guard worker (legacy path) or the Spark consumer, convergence and send threads; on the server, the thread that reads the agent's stream, or the `ForwardGuardianMessage` handler when the agent is behind a gateway. A log sink that blocks, such as an undrained pipe or a stalled network mount, blocks those threads too. The agent's guard workers already write `info` lines on drift, so the legacy agent side adds volume rather than a new coupling; on the server, `T_server` is the first per-event `info` line on that ingest path, and for the Spark path the coupling is a precondition of the `prefer_spark` flip recorded in `docs/spark-flip-gate.md` section 7.
+- **They are written synchronously on the server; the agent side is now asynchronous (#4666 PR-2).** On the server, the thread that reads the agent's stream, or the `ForwardGuardianMessage` handler when the agent is behind a gateway, still writes `T_server` inline, and a blocked sink (an undrained pipe, a stalled network mount) still blocks that thread. On the agent, a guard worker (legacy path) or the Spark consumer, convergence and send threads call the same bare `spdlog::` functions as before, but main.cpp now installs the async hand-off logger (see "Agent logging is now asynchronous" under *systemd Units*, further down this page) as the process's spdlog default logger, so every one of those calls, including the Spark runtime's own arm-committed/late-arm/sweep-residue lines, now enqueues and returns rather than blocking on sink I/O, on any platform where the agent image and `libyuzu_agent_core` share one spdlog registry (confirmed on Linux, inferred but not directly measured on Windows from its dynamic spdlog linkage; see "spdlog registry identity across images" in `docs/darwin-compat.md` for the measured macOS exception — two separate registries there). This is the mechanism, not a dedicated per-line change: the `docs/spark-flip-gate.md` section 7 precondition (synchronous benchmark and Spark-runtime log writes) is addressed by this global default-logger swap, not by threading a bounded-wait call through each individual `T_detect`/`T_wire`/arm-committed site.
 
-**If log volume matters.** There is no dedicated switch for these lines. The only lever is the log level, and it is blunt: `warn` also suppresses every other `info` line, including on the server the authentication and session lines (for example `User '…' authenticated`, `Local session created`) and the API-token created/revoked lines, which a SIEM ingesting the server log would then lose, and the Guardian arm/commit messages on an agent. The audit log is a separate store and is not affected by the log level. Prefer applying it to agents only, and weigh it before applying it fleet-wide.
+**If log volume matters.** There is no dedicated switch for these lines. The only lever is the log level, and it is blunt: `warn` also suppresses every other `info` line, including on the server the authentication and session lines (for example `User '…' authenticated`, `Local session created`) and the API-token created/revoked lines, which a SIEM ingesting the server log would then lose, and the Guardian arm/commit messages on an agent. It also silences the agent's own "Received signal, shutting down..." line (an ordinary `info`-level call since #4666 PR-2): at `--log-level warn` or above that line is absent entirely on a clean `SIGINT`/`SIGTERM`/Ctrl-C stop, so if you rely on it to confirm an intentional stop, keep agents at `info` or below, or check the process exit code (0 = clean) instead. The audit log is a separate store and is not affected by the log level. Prefer applying it to agents only, and weigh it before applying it fleet-wide.
 
 - **At startup:** `--log-level warn` (env `YUZU_LOG_LEVEL`) on the server and/or the agent; this needs a restart. Level names are lowercase and matching is case sensitive, so `WARN` is not `warn`: an unrecognised value given this way is treated as `off`, not rejected, so a typo silences everything. On an agent, `--verbose` forces `trace` whatever `--log-level` says.
 - **Without a restart:** on the server, the `log_level` runtime-configuration key (`PUT /api/config/log_level`, needs `Infrastructure:Write`, applied immediately and persisted, so it survives a restart; an invalid value is rejected; see [REST API: Runtime Configuration](rest-api.md#when-a-change-takes-effect)); on an agent, the `agent_actions` plugin's `set_log_level` action, which is in-process only and lasts until that agent restarts (see the agent `--log-level` flag in [device-management.md](device-management.md)).
@@ -2461,7 +2461,23 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **Before upgrading, check whether this affects you.** If your `delete` automation for Windows hosts does not already treat a non-zero exit / an `error|...` result as a hard failure requiring investigation, add that check now. There is no way to pre-check for the specific `LOCAL_MACHINE`-unopenable-with-a-`CURRENT_USER`-fallback condition from outside the action itself; the fix is unconditional and has no opt-out.
 
+### vNEXT — service-scoped tokens can no longer create a result set from an inventory query (#4980) (breaking)
+
+**What changed.** `POST /api/v1/result-sets/from-inventory-query` now denies a service-scoped API token outright (`403`), matching its 8 non-dispatch sibling result-set routes. Before this fix, the route gated only through the `Inventory:Read` fleet-read chokepoint (`fleet_read_fn`), which admits and confines a service-scoped caller rather than denying it — but the result set this route creates is owner-scoped to the minting principal's identity, not the token's own service tag, so a service-scoped token holding `Inventory:Read` could mint a set that its minting principal's other tokens/session could then read back.
+
+**Who this affects.** Any integration using a service-scoped API token to call this specific route. No legitimate use of a service-scoped token should have depended on this — the other 8 result-set routes have always denied this way, and the MCP twin (`create_result_set_from_inventory_query`) was never affected. There is no opt-out.
+
+**What to do.** Nothing for a correctly-built integration. If a service-scoped workflow did depend on this route, it needs a non-service-scoped credential going forward, same as the flip notes above; there is no per-route or per-deployment allow.
+
 ---
+
+### vNEXT - agent logging is now asynchronous, with a new self-exit code 5 (#4666 PR-2) (NOT breaking)
+
+**What changed.** The agent no longer writes log lines synchronously on the thread that produced them; `main.cpp` installs a bounded async hand-off logger as the process's spdlog default (see "Agent logging is now asynchronous", the paragraph immediately before *Stopping a wedged agent* under *systemd Units*, further down this page, for the queue-size/memory-cost/overrun details). Agent shutdown gains one more possible self-exit code, **5**, distinct from the existing 1/3/4, fired from either of two causes at that step: tearing down that logger (flushing its queue, joining its worker thread) does not complete within an internal 2-second watchdog, **or the teardown itself fails outright** (an immediate exit with no wait at all — see *Stopping a wedged agent* under *systemd Units*, further down this page, for both causes in full).
+
+**Impact.** Not a breaking change: no flag, wire format, API, or default behavior changes, and no operator action is required. Log output looks the same (same pattern/JSON formatting, same `--log-file`/rotation behavior) with one exception below. The externally-visible differences are: (1) under sustained log-sink overload, the agent can now silently drop older queued lines (`overrun_oldest`) rather than blocking, so a very bursty logger under a stuck sink may show gaps instead of a stall; (2) a shutdown wedge that used to hang or need `SIGKILL` before this and the related #2233 watchdogs landed can now self-exit with code 5 specifically, in addition to the pre-existing 1/3/4; (3) the "Received signal, shutting down..." line the agent prints on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw, fixed-format write straight to stderr — it is now routed through the same configured logger as everything else, so it picks up the configured pattern (or JSON structure under `--log-format json`) and now also lands in `--log-file` when one is configured, not stderr alone. A plain substring match against the message text (the default text pattern keeps the original words verbatim) is unaffected; a line-anchored or byte-exact matcher, or one that assumed this specific line was stderr-only, needs updating; (4) that same line is now an ordinary `info`-level call rather than an unconditional raw write, so at `--log-level warn` or above — a configuration this page itself recommends for agents to cut noise, see "If log volume matters" above — the line is silently **absent entirely**, whereas before it always printed regardless of level. If you rely on this line's presence to confirm a clean/intentional stop, either keep `--log-level` at `info` or below, or switch to checking the process exit code (0 = clean) instead.
+
+**Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* under *systemd Units*, further down this page, for what each code means and how they interact.
 
 ## Settings Page
 
@@ -3469,7 +3485,13 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
 
-**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8) — so budget `N_servers × 2` connections against Postgres `max_connections` on top of the pool size below. (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure, so leave `max_connections` headroom for it — at the limit it is the connection that gets refused.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
+**Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8). (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
+
+**Sizing `max_connections` (#4943).** The server's whole Postgres footprint is static: **`pool_size + 2` per server** — the pool never opens more than `--postgres-pool-size` connections, plus the two dedicated ones above; there is no other connect site. So
+
+`max_connections ≥ N_servers × (pool_size + 2) + superuser_reserved_connections (3) + every other client`
+
+— backup tooling, Grafana's data source, ad-hoc `psql`. Sized this way the servers cannot exhaust the database by themselves; only other clients can. To keep *them* out of the servers' share, the shipped `yuzu-postgres` images (single-node and the HA Patroni profile) set **`reserved_connections`** (PostgreSQL 16+; default **40**, env `YUZU_PG_RESERVED_CONNECTIONS`, `0` disables) and **grant `pg_use_reserved_connections` to the app role** at first boot. Once the free slots fall to `superuser_reserved_connections + reserved_connections`, only the app role (and superusers) can still connect — so a backup job or a stray session can never take the slot the `/readyz` probe needs to reconnect, which would otherwise turn a replica red on a database that still serves (the probe holds its connection in steady state and reconnects only after a failure; at the limit that reconnect was the connection refused first). The reserve covers the pool and the probe alike — the probe connects exactly as a pool connection does, so it is never green while the pool is refused. Set `YUZU_PG_RESERVED_CONNECTIONS` to `N_servers × (pool_size + 2)` (the default fits two servers at the default pool, e.g. 2 × (16 + 2) = 36 ≤ 40). **Never set it to `max_connections` minus `superuser_reserved_connections` or higher** — both scripts refuse to boot on that value (the boot-time check reads the live `max_connections`; the Patroni entrypoint checks against its own literal 200), because it would leave zero connection slots any ordinary (non-privileged) client could ever use, not merely under load. **On the single-node image this refusal happens AFTER the role/database/grant already exist** on the now-initialized data directory (Postgres's initdb-only-runs-once convention means those steps ran before this check) — restarting the SAME container with a corrected value does **not** retroactively apply anything; either start over on a fresh (wiped) data volume, or apply the fix by hand per "Existing databases" just below. The Patroni entrypoint's check runs before ANY of that (at bootstrap, before the cluster exists), so a Patroni refusal is a clean, no-op-safe retry. **This check runs once, at bootstrap.** A later `patronictl edit-config --set postgresql.parameters.max_connections=...` on an already-running Patroni cluster is not re-validated against the `reserved_connections` value already in force — re-check the arithmetic by hand after any live `max_connections` change (tracked for a real runtime check: #4943 fast-follow). **Existing databases:** first-boot init does not re-run; apply it by hand — `ALTER SYSTEM SET reserved_connections = 40;` (restart required; under Patroni, `patronictl edit-config --set postgresql.parameters.reserved_connections=40` then `patronictl restart <scope>` — `edit-config` alone only writes the DCS config and marks the member pending-restart, it does not apply a postmaster-context GUC like this one; the GRANT below is unchanged either way) and `GRANT pg_use_reserved_connections TO yuzu;`. Verify with `SHOW reserved_connections` and `SELECT pg_has_role('yuzu', 'pg_use_reserved_connections', 'MEMBER')`. On PostgreSQL 15 or older the grant is skipped with a notice and only the formula protects you. **Re-run this same verification** after anything that can silently undo it: a first boot interrupted between the `GRANT` and the `ALTER SYSTEM` (the init script never re-runs once the data directory exists, so a kill in that narrow window leaves the grant in place but the GUC at Postgres's own default of 0 — inert, not incorrect, but not protecting anything either), or any role recreation, credential rotation, or disaster-recovery restore that can drop and re-add the app role without this script running again.
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
@@ -4394,6 +4416,8 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 - **What `/readyz` does not see: the pool's existing connections.** The probe holds one connection of its own, re-checks it every 2 s, and reconnects — walking the host list as a new pool connection does — only when that check fails; it answers "can this replica reach a writable primary", not "is every pooled connection healthy". Precisely: `pg_reachable` is red when the probe's most recent connect — made with the pool's own settings — could not establish a session to a server that accepts writes, or when the probe's own session stops answering or turns read-only. Because it keeps a healthy session open, it does not observe the pool's other held connections, nor anything that changed since it last connected. Known gaps: pooled connections to a server demoted in place (below; #4942); anything that changes whether a *new* connection would succeed — a service-file or environment edit, a password rotation or expiry, a `pg_hba.conf` or certificate change — which shows only at the probe's next reconnect (#4956), so restart or re-check after such a change; a host name with several addresses, one of them silent (#4954); `max_connections` exhaustion, where the probe is the connection refused first (#4943); and timing — about ±1 s from the pool's own connect, and a single host capped at 5 s (it can read red while a slower pool connect succeeds, never green). The pool does not re-check the connections it already holds, and never retires them by age, so a connection whose server turns read-only *in place* keeps failing writes until that connection breaks. If that server is the one a new connection reaches, `/readyz` goes red as well; it stays green only when a new connection reaches a different, writable host. Connecting to Postgres directly, a real demotion restarts the old primary and breaks those connections; the gap needs a server that flips read-only while staying up (for example `default_transaction_read_only` set on a running primary), or a pooler in between that keeps its server connections across the demotion.
 - **Point the DSN at the primary.** A proxy that load-balances plain `SELECT`s across replicas (pgpool-II `load_balance_mode`, a read-any port) can send the probe's query to a standby and report `read_only` while writes still reach the primary. Use the proxy's read-write endpoint.
 - **During a Postgres failover every replica goes red at once**, for roughly the failover time (Patroni: 10–30 s). That is correct — nothing can serve writes until the new primary is up. Many load balancers fail open when every backend is unhealthy and keep forwarding. What the forwarded requests then see depends on the outage: against a stopped or refusing database they fail fast with `503`; against a *frozen* one (a paused VM, a black-holed host) queries on already-open pooled connections can hang for up to ~100 s before failing, so expect slow errors rather than quick ones until the failover completes.
+- **Two different causes can both read `/readyz` unreachable, and only the server log tells them apart.** A `max_connections` exhaustion (#4943 — every ordinary slot held by other clients) and a genuine overload (#4944, below) both collapse to the same `pg_reachable=unreachable` verdict and the same alert. Check the `[readyz] Postgres not reachable ...` log line: `remaining connection slots are reserved for roles with privileges of the "pg_use_reserved_connections" role` names the #4943 case specifically (lower `max_connections` pressure from other clients, or verify the reserve per the formula above); anything else reading `unreachable` — a timeout, a refused connection with no such text — points at #4944 or a genuine outage instead.
+- **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
 - **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
 
@@ -4404,6 +4428,8 @@ On `SIGTERM` the server sets `/readyz` to `503 {"status":"draining"}` and then k
 For any deployment behind a load balancer:
 
 1. Set `--shutdown-drain-seconds` to at least the load balancer's **health-check interval × unhealthy threshold, plus one interval** (e.g. 5 s interval × 2 failures + 5 s = 15 s).
+1. **Set the health-check thresholds to `interval 5 s`, `unhealthy_threshold 2`, `healthy_threshold 3`** (the names vary: HAProxy `inter 5s fall 2 rise 3`, Kubernetes `periodSeconds: 5`, `failureThreshold: 2`, `successThreshold: 3`, AWS target groups the same three fields). Eviction then needs ≥ 10 s continuously red, so a single database stall never evicts a replica; re-admission needs ≥ 15 s continuously green, so a database hovering at the edge of its capacity does not pull every replica in and out every few seconds — which drops held-open SSE/MCP streams, and their reconnects are what turns a slow database into a slower one. `/readyz` itself adds no hysteresis (#4944): two failed probes red it, one success greens it.
+1. **Know what your load balancer does when every backend is unhealthy.** During a Postgres failover or a sustained overload every replica is red at once (above). An AWS ALB/NLB and nginx `upstream` route to all backends anyway (fail open) — requests then fail fast or slowly depending on the outage; a Kubernetes `Service` removes every endpoint and HAProxy answers `503` (fail closed) — an outage of the API plane for the duration. Neither is wrong; make sure the choice is yours.
 2. **Raise the orchestrator's stop timeout by the same N.** The drain grace comes *before* the rest of the shutdown, which is unchanged, so it adds to it: the shipped compose `stop_grace_period` and systemd `TimeoutStopSec` of **210 s** become **210 + N**. Kubernetes' default `terminationGracePeriodSeconds` of 30 s is far too short in any case (see `docs/user-manual/upgrading.md`, the stacked-shutdown section).
 3. Health-check `/readyz`, not `/health`.
 
@@ -4476,6 +4502,47 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 | `deploy/systemd/yuzu-agent.service` | Yuzu agent unit |
 | `deploy/systemd/yuzu-gateway.service` | Erlang gateway unit |
 
+**Agent logging is now asynchronous (#4666 PR-2).** `main.cpp` no longer calls
+spdlog's sinks directly on the thread that logs; it installs a bounded async
+hand-off logger (`agents/core/src/log_handoff.hpp`) as the process's spdlog
+default. A producer thread formats the line and enqueues it (`overrun_oldest`
+policy); one dedicated worker thread does the actual sink I/O. The queue is a
+FIXED-SIZE ring, pre-allocated in full at startup, not proportional to log
+volume: 8192 message slots plus one in-flight slot (8193 total), each slot
+`sizeof(spdlog::details::async_msg) == 408` bytes on x64: 8193 x 408 =
+3,342,744 bytes = 3.34 MB (about 3.19 MiB) of RSS, paid up front the moment
+the agent starts, whether or not anything is ever logged. Formatted-text
+payload beyond that fixed per-slot cost is additional and not bounded by this
+primitive. Under sustained overload (more lines produced than the worker can
+write, e.g. a stalled log destination) the queue does not block the
+producer and does not grow; `overrun_oldest` silently evicts the oldest
+still-queued message to admit the new one, so a busy agent under a stuck sink
+can lose log lines rather than pause. There is currently no counter or
+heartbeat field surfacing how many lines were dropped this way: an
+`overrun_total()` accessor exists on the primitive but nothing in the shipped
+binary reads it yet (planned for a later PR's heartbeat poller). A sink-level
+write/format failure (as opposed to an overrun) is tracked internally too —
+count plus the last 256 bytes of the failing message, in `LogHandoff`'s
+private `ErrorState`. Two accessors exist: `log_errors_total()`, exercised
+by this PR's own unit test; and `last_log_error_for_test()`, which despite
+its name is not currently called by any test or production code. Neither
+has a production/heartbeat consumer yet — the same later-PR heartbeat
+poller planned for `overrun_total()` above. The only production-visible
+signal today is a rate-limited (once per second) fallback line to stderr at
+the moment of failure, reproducing what spdlog's own default error handler
+always did before #4666 PR-2 installed this one. That fallback line is
+unlikely to be visible at all under a genuine Windows-service session
+(`--install-service`, no console): the agent attaches no stderr sink at
+all in that mode, log-file destination or not. If log lines appear to go
+missing under load with no error printed, check disk space and fd limits on
+the log destination first: `overrun_oldest` drops are silent in this
+release, with no counter or alert to point at them yet. There is no `--log-sync` flag or other escape
+hatch back to synchronous logging; this is unconditional for every build. A
+`--log-file` that cannot be opened still falls back to console-only logging
+exactly as before (`used_log_file_fallback()` prints the same kind of startup
+diagnostic), except the console sink is now async too, not synchronous as it
+was pre-#4666.
+
 **Stopping a wedged agent (Linux/macOS).** `SIGTERM`/`SIGINT` (`systemctl stop`,
 Ctrl-C) triggers a graceful agent stop — plugin shutdown, thread joins, store
 close. If that teardown hangs (e.g. the server is unreachable and a drain is
@@ -4490,21 +4557,69 @@ automatically: `AgentImpl::stop()` and the agent's own `run()`-exit teardown
 each arm a 20-second internal watchdog, and self hard-exit (**code 4** — new,
 distinct from this section's exit 1 and the crash-loop-backstop's exit 3
 below) if guardian/spark/DEX teardown or any other blocking step hasn't
-returned within it. You do not need to send a second signal to recover from
-this class of wedge — doing so just makes the exit happen sooner (code 1)
-instead of after the 20s deadline (code 4). If a wedge triggers both at once
-(an operator's second signal racing the watchdog for the same hang), which
-code is actually reported is a race — treat it as a hint, not a certain
-diagnosis. On Windows, a second Ctrl-C also terminates promptly (via the
-escalation or the CRT's default disposition); the service path (`sc stop`) is
-now also bounded by the same 20s watchdog. The agent's own `--install-service`
-path (see below) does configure automatic service recovery — 3 restarts, 60s
-apart, resetting after 24h, firing on both a crash and a clean exit that never
-reported `SERVICE_STOPPED` (#1822) — so a watchdog fire there behaves similarly
-to the Linux `Restart=always` unit, not as a permanent stop. What it does
-change: `TerminateProcess` bypasses `report_status`, so a code-4 exit
-does not land in the `sc query`/Event Viewer "specific error" buckets
-described further down — it surfaces as a generic unexpected termination.
+returned within it. Separately again (#4666 PR-2), once the rest of shutdown
+has already finished (after both watchdogs above have been cancelled and
+after the F3 orphan-exit check below has run), the agent tears down its own
+async log hand-off logger before the process exits: **code 5** (distinct from
+codes 1/3/4) fires from EITHER of two causes at that step — a 2-second
+internal watchdog if flushing the queue and joining the logging worker thread
+hasn't finished in time, **or an immediate exit (no 2-second wait at all) if
+the teardown itself fails outright** (an exception during the flush/join
+sequence, or a failure while releasing this image's own reference to the
+logger — the exe-image-swap step this exists to protect is unconditional on
+every platform, not gated to macOS, even though the underlying hazard it
+guards against is real only there: macOS's agent and its shared library run
+in separate spdlog registries, so a failed swap there can leave a live
+reference past the watchdog; on Linux (confirmed) and Windows (inferred from
+dynamic spdlog linkage, not directly measured) the registry is shared and a
+later teardown step already nulls it regardless, so a transient failure at
+this specific step forces the same hard exit there too even though nothing
+was actually left dangling). An operator seeing code 5 land instantly,
+with no apparent delay, should not read that as a broken or skipped
+watchdog; it means the second cause fired. You do not need to send a second
+signal to recover from a code-4 or code-5-class wedge; doing so just makes
+the exit happen sooner (code 1) instead of after the relevant internal
+deadline. **Codes 3, 4,
+and 5 are sequential, non-overlapping checkpoints in the same shutdown, not
+independent watchdogs racing each other**: code 4's watchdogs run first
+(during `stop()`/`run()`-exit teardown), the F3 orphan check (code 3) runs
+after both have been cancelled, and the log-teardown watchdog (code 5) is the
+last step before the process exits, so at most one of them can actually fire
+for a given shutdown. **Code 1 is different**: because the agent stays
+signal-responsive throughout every one of those checkpoints, an operator's
+second signal can still preempt whichever one would otherwise have fired, so
+code 1 can race with 3, 4, *or* 5 for the same underlying wedge; treat the
+exact code reported in that case as a useful hint, not a certain diagnosis,
+mirroring the existing code 1-vs-4 framing `main.cpp`'s own comments use. On
+Windows, a second Ctrl-C also terminates promptly (via the escalation or the
+CRT's default disposition); the service path (`sc stop`) is now also bounded
+by the same 20s watchdog, **and by a second, independent 20-second wait**
+(`kServiceMainDrainGrace`) that `run_service()` performs after the SCM's
+control dispatcher returns, before handing control back to `main()` for its
+own log-teardown step: a timeout there also self hard-exits with code 4 (the
+same code as the two `stop()`/`run()`-exit watchdogs, reused deliberately
+rather than minting a fourth code for "something past its own internal
+watchdogs is wedged"; see `shutdown_deadline_guard.hpp`). Because this wait
+sits strictly after `service_main` has already reported its final SCM status
+(`SERVICE_STOPPED`, clean or with a "specific error" code, see below), a
+timeout here changes nothing about what the SCM was already told; it only
+means the process takes longer to actually exit. The agent's own
+`--install-service` path (see below) does configure automatic service
+recovery (3 restarts, 60s apart, resetting after 24h, firing on both a crash
+and a clean exit that never reported `SERVICE_STOPPED`, #1822), so a
+watchdog fire there behaves similarly to the Linux `Restart=always` unit, not
+as a permanent stop. What it does change: `TerminateProcess` bypasses
+`report_status`, so none of codes 3/4/5 land in the `sc query`/Event Viewer
+"specific error" buckets described further down. A code-4 fired by
+`AgentImpl::stop()`'s or `run()`-exit's own watchdog, while `service_main` is
+still running and has not yet reported `SERVICE_STOPPED`, surfaces as a
+generic unexpected termination. A code-3, a code-5, or a code-4 fired by
+`run_service()`'s own drain-grace wait all sit strictly *after*
+`service_main` has already reported its final status (`SERVICE_STOPPED`,
+clean or with a "specific error" code, see below), so by construction none
+of those three changes what the SCM was already told, and none produces an
+Event Viewer entry distinguishable from a normal stop; the process simply
+takes a little longer to actually exit than the SCM's report suggested.
 
 **Two watchdogs, not one, and their budgets don't share a clock.**
 `AgentImpl::stop()` and the agent's own `run()`-exit teardown each arm their
@@ -4525,6 +4640,37 @@ exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
+
+**A third, independent watchdog now follows the two above (#4666 PR-2), and
+this is a SUM of bounded phases plus genuinely unbounded ones, not a single
+derived guarantee.** The log-teardown watchdog (`kLogTeardownGrace`, 2s
+default) only arms once the earlier phases have already finished, so its
+grace ADDS to theirs rather than overlapping them. On the POSIX/console path
+the fully-bounded phases are: `AgentImpl::stop()`'s watchdog (≤20s) plus the
+`run()`-exit ScopeExit's watchdog (≤20s) plus the F3 orphan-exit grace
+(`kOrphanDrainGrace`, 3s) plus the log-teardown grace (2s), **45 seconds**
+total in the worst case where every phase is legitimately slow but none
+individually wedged. That figure is bounded-phases-only and does **not**
+cover the whole shutdown: the inline plugin-shutdown loop that `run()`'s
+reconnect thread runs BETWEEN noticing `stop_requested_` and the `run()`-exit
+ScopeExit even arming its own watchdog has no named bound at all (tracked as
+#3756 item 5), and neither does `~Agent`'s own destructor work once every
+watchdog has already been cancelled; a hang in either of those is caught by
+nothing described here. On the Windows service path the arithmetic is
+different in shape, not just in number: `run_service()`'s own drain-grace
+wait (`kServiceMainDrainGrace`, 20s) sits AFTER the SCM dispatcher returns
+and effectively caps whatever is left of `service_main` at that point,
+including the F3 orphan grace and `~Agent`, as one bounded 20-second window,
+regardless of which specific phase `service_main` is actually in when the
+dispatcher returns; the log-teardown grace (2s) then runs separately, in
+`main()`, strictly after `run_service()` itself has already returned, adding
+to that 20s rather than being covered by it. Neither `deploy/systemd/yuzu-agent.service`
+nor `deploy/packaging/macos/com.yuzu.agent.plist` overrides its supervisor's
+own stop-timeout default (`TimeoutStopSec=` is absent from the unit;
+`ExitTimeOut` is absent from the plist); systemd's and launchd's own
+defaults apply on top of everything above, and this document does not assert
+what those defaults are. Check `systemd.service(5)`/`launchd.plist(5)` on
+your own host if you need the exact figure.
 
 **Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
 agent above, applied to the server. If a stop appears to hang: **send the
@@ -4568,13 +4714,27 @@ silently ignored).
 `RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
 rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`
 (exit 3); the shutdown-teardown watchdog above (#2233 item 3) triggers the same
-`hard_exit()` mechanism at exit 4. Either way, against
+`hard_exit()` mechanism at exit 4; the log hand-off teardown watchdog (#4666 PR-2)
+triggers it at exit 5. Either way, against
 a *permanently* wedged target (a dead NFS mount, a hung service query) that would
 otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
 puts the unit into `failed` and stops retrying (the device goes dark rather than looping
 silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
 once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
-behaviour hid a crash-looping agent.
+behaviour hid a crash-looping agent. The unit sets no `SuccessExitStatus=`, so systemd's
+default success check (exit code `0` only) applies to every exit the agent makes,
+including a `hard_exit()`-driven one. `Restart=always` restarts on any SPONTANEOUS exit the
+process makes (0 included; it does not distinguish success from failure for the *restart*
+decision), except one thing: systemd suppresses `Restart=` entirely for a process that exits
+in response to an explicit `systemctl stop` (`systemd.service(5)`), so a wedge that
+self-exits 1/3/4/5 while an operator-initiated stop is in flight does NOT trigger a restart
+and does NOT count toward `StartLimitBurst=5`, even though the exit code is still a
+"failure" result and can still leave the unit reporting `failed` in `systemctl status`
+rather than `inactive`. The `StartLimitBurst=5` ceiling above applies only to the
+crash-loop case this paragraph is about: a spontaneous, unrequested exit that systemd
+itself decides to restart from. This document does not independently verify the
+suppress-on-explicit-stop behaviour against a real systemd instance; it follows from
+`systemd.service(5)`'s own documented `Restart=` semantics.
 
 **Persisting deploy-time settings (systemd).** The `yuzu-agent` unit also loads an optional
 `EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env` (`-` = no error when absent, not shipped by
@@ -4664,7 +4824,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4) described under *Stopping a wedged agent* above — they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets — Event Viewer shows it as a generic unexpected termination, not "specific error N".
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 
 ### Server: sc.exe (native wrapper not yet available)
 

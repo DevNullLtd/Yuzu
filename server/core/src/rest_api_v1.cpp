@@ -12,6 +12,8 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
+#include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
+#include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 6-role set
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
@@ -293,6 +295,36 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
         res.status = 403;
         res.set_content(detail::a4_error(res, "engine principals cannot access this endpoint"),
                         "application/json");
+        return true;
+    }
+    return false;
+}
+
+// A2 (Doomgoose external review, PR #4985 round-2, CRITICAL/BLOCKING — #520):
+// an MCP-tier bearer token of ANY tier must never reach this REST admin pair
+// — `is_rbac_administrator(..., RbacAdminSurface::kRest)` ALSO denies this
+// structurally, but that shared chokepoint's audit reason
+// (`kRbacAdminGateDeniedAuditReason`, "caller is not a durable RBAC
+// administrator") would be misleading for THIS specific denial reason: the
+// caller may well BE a durable administrator — the denial is about which
+// TRANSPORT presented the credential, not whether the credential holds
+// authority. A CC7.2 audit-evidence accuracy concern, so this is its own
+// helper with its own audit detail, called BEFORE the predicate (mirrors
+// `deny_engine_session`'s own belt-and-suspenders placement). Returns true
+// (having already written the 403 A4 body) when the caller must stop; false
+// when the session carries no mcp_tier and the route may proceed.
+static bool deny_mcp_token_session(const auth::Session& s, const httplib::Request& req,
+                                   httplib::Response& res, const RestApiV1::AuditFn& audit,
+                                   const char* action, const char* target) {
+    if (!s.mcp_tier.empty()) {
+        (void)detail::emit_behavioral_audit(
+            audit, req, res, action, "denied", target, "",
+            "MCP token blocked from admin route (mcp_tier='" + s.mcp_tier + "')");
+        res.status = 403;
+        res.set_content(
+            detail::a4_error(res, "MCP tokens cannot perform admin operations; use the MCP tool "
+                                  "assign_rbac_role/unassign_rbac_role instead"),
+            "application/json");
         return true;
     }
     return false;
@@ -974,6 +1006,12 @@ const std::string& openapi_spec() {
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
     },
+    "/rbac/roles/{name}/assignments": {
+      "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Invalid JSON, a non-object body, a wrong-typed principal_type/principal_id (degrades to missing/invalid, never a 500), unknown role, ITServiceOwner, principal_type != \"user\", invalid principal_id format, or the store rejects the grant for a genuine client-validation reason (defensive -- not reachable via this route today, since principal_type is hardcoded \"user\" and principal_id has already passed the same charset check DELETE enforces, but kept classified as 400 rather than 503 for when this changes) — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the assign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault while writing the grant (never misreported as a 400 — classified via an allow-list of known validation-error shapes), the defense-in-depth role lookup finding an already-validated role missing from the store, or the audit write for this mutation failed (fail-closed)"}}}
+    },
+    "/rbac/roles/{name}/assignments/{principal_id}": {
+      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment. Removing the fleet's last remaining authenticatable Administrator grant is refused for anyone, by a store-level check in the same transaction as the removal. That check also holds against a concurrent reactivation of an existing account. It does not cover an account created concurrently for a pre-provisioned grant, or a surviving Administrator's account deactivated concurrently (both tracked at #4966).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the unassign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault removing the grant, or the audit write for this mutation failed (fail-closed)"}}}
+    },
     "/tag-categories": {
       "get": {"summary": "List tag categories and allowed values", "tags": ["Tags"], "responses": {"200": {"description": "List of tag categories"}}}
     },
@@ -995,7 +1033,11 @@ const std::string& openapi_spec() {
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
-    },
+    },)json"
+        // Split again (MSVC C2026 16,380-byte cap) — A2's rbac/roles/{name}/
+        // assignments entries pushed this segment over the limit; concatenated
+        // at compile time, byte-identical JSON.
+        R"json(
     "/inventory/tables": {
       "get": {"summary": "List available inventory data types", "tags": ["Inventory"], "description": "Lists distinct plugins that have reported inventory data, with agent counts and last collection timestamps.", "responses": {"200": {"description": "List of inventory tables", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InventoryTable"}}}}}}
     },
@@ -1329,14 +1371,14 @@ const std::string& openapi_spec() {
         // Access Reviews (SOC 2 CC6.2) paths.
         R"json(,
     "/access-reviews/export": {
-      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}. CSV: same fields, Content-Disposition: attachment.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
+      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}, rbac_enforcement (enabled|disabled|degraded — whether RBAC actually governs this grant population right now; degraded means the read couldn't confirm state, so gates deny defensively, NOT that an admin turned RBAC off). CSV: same row fields, Content-Disposition: attachment, PLUS an unconditional leading metadata line `# rbac_enforcement=<enabled|disabled|degraded>` before the header row (present even for a zero-row population) — this is the retained offline evidence artifact, so the stamp travels with the file itself, not only the JSON sibling response.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
     },
     "/access-reviews": {
-      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}], meta}"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}. rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state AT OPEN, frozen with the rest of the campaign; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
-      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}"}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
+      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}. campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
       "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
@@ -1491,9 +1533,14 @@ const std::string& openapi_spec() {
     "/result-sets": {
       "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
       "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
-    },
+    },)json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
+        // #4980 service-scope 403 description addition below pushed this
+        // literal back over the cap; split immediately before it, same
+        // idiom as the #3992 F2 / #4540 splits elsewhere in this file.
+        R"json(
     "/result-sets/from-inventory-query": {
-      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
+      "post": {"summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403, #4980 — same cross-service-reach reasoning as the other 8 non-dispatch result-set routes; the fleet_read_fn admit-and-confine mechanism this route also uses for management-group confinement does not by itself close the service-scope axis, since the created set is owner-scoped to the minting principal's identity, not the token's own service tag). Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"type": "string"}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token (#4980, checked before any other gate); unlike its 8 non-dispatch siblings, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an ADR-1005 engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (#4306, a distinct cause from the Inventory-store read degrading)"}}}
     },
     "/result-sets/from-tar-query": {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH — a command already dispatched but the store fault persisting the pending row afterward (#4306, previously 400); do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch) — the per-owner quota could not be verified before dispatch (#4306); nothing sent, safe to retry"}}}
@@ -3269,10 +3316,16 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
-            // #2466/#2406: fail closed — never report an unassign that was not audited.
-            if (!detail::emit_behavioral_audit(audit_fn, req, res,
-                                               "engine_principal.role.unassigned", "success",
-                                               "EnginePrincipal", principal_id, role_name)) {
+            // #2466/#2406: fail closed — never report an unassign that was not
+            // audited. `removed=<bool>` (governance SHOULD #10, matching the
+            // human-route convention above) lets an auditor tell an actual
+            // revoke apart from an idempotent no-op from the log alone
+            // (Doomgoose external review, PR #4985 MINOR "audit-fidelity
+            // asymmetry").
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.role.unassigned", "success",
+                    "EnginePrincipal", principal_id,
+                    role_name + "; removed=" + (*result ? "true" : "false"))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the role unassignment took effect but its audit record "
@@ -5490,6 +5543,456 @@ void RestApiV1::register_routes(
                  res.set_content(ok_json(arr.str()), "application/json");
              });
 
+    // ── A2: global human role assignment/unassignment ───────────────────
+    // (.claude/plans/rbac-industry-leading-DELIVERY-PLAN.md §2 "A2 — Global
+    // human role assignment/unassignment"). Lets an Administrator grant/
+    // revoke one of the 6 fleet-wide-assignable built-in RBAC roles to a human (principal_type=
+    // "user") principal, fleet-wide, through RbacStore::assign_role/
+    // unassign_role — before this PR those methods had ZERO production
+    // callers for a human principal anywhere in the codebase.
+    //
+    // Gated on `is_rbac_administrator` (rbac_admin_predicate.hpp), NOT
+    // perm_fn/require_permission: minting (or revoking) standing
+    // Administrator authority is a stronger security decision than an
+    // ordinary Security:Write permission check — see that header's file
+    // comment for the full rule and its four deliberate scope decisions
+    // (no JIT elevation, no group-held Administrator, structural
+    // service-scope/engine-session/MCP-tier-token denial — this route's own
+    // `deny_mcp_token_session` belt pre-empts the predicate's REST-surface
+    // tier check for audit-truth reasons, see that helper's own comment —
+    // pre-provisioning is this route's own call).
+    //
+    // Route shape: POST .../roles/{name}/assignments +
+    // {principal_type, principal_id} body, DELETE
+    // .../roles/{name}/assignments/{principal_id} — chosen over a body-only
+    // DELETE (httplib DELETE handlers here don't read a body) and over
+    // mirroring the engine-principal shape's "/roles" + body-role verbatim,
+    // because "assignments" as the resource noun reads more naturally once
+    // principal_type is in play (a future group-scoped PR extends the SAME
+    // resource rather than needing a second one).
+    sink.Post(
+        R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped](
+            const httplib::Request& req, httplib::Response& res) {
+            // Explicit per-route service-scope deny (routed-concern clause 4:
+            // EXTEND this file's existing helper, never fork) — the predicate
+            // below ALSO denies a service-scoped token structurally, but this
+            // is the file's own belt for a route with no perm_fn/securable
+            // gate at all. No `.permission` field (clause 5): there is no
+            // grant that would, by itself, admit a service-scoped caller
+            // here.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "rbac.role.assigned", "User",
+                    "service-scoped token blocked from RBAC role assignment",
+                    "service-scoped tokens cannot manage RBAC role assignments", "", ""))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "rbac.role.assigned", "User"))
+                return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, "rbac.role.assigned", "User"))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
+            // Doomgoose external review, PR #4985 MINOR "duplicated
+            // gate-denial classification" — shared chokepoint, see its own
+            // doc comment (rbac_admin_predicate.hpp).
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        // Doomgoose external review, PR #4985 IMPORTANT #2:
+                        // a kUnavailable gate outcome was previously invisible
+                        // to operators — log AND audit it, matching every
+                        // sibling degraded-store denial in this codebase
+                        // (e.g. AuthRoutes::require_permission's engine
+                        // branch).
+                        spdlog::warn("rbac.role.assigned: {} (user={})",
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.assigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateUnavailableAuditReason));
+                        res.status = 503;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
+                                        "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                            "denied", "User", session->username,
+                                                            std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session, "POST /api/v1/rbac/roles/{name}/assignments"))
+                return;
+
+            const std::string role_name = req.matches[1].str();
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            // Doomgoose external review, PR #4985 IMPORTANT finding #4: a
+            // non-object top-level body (e.g. a JSON array/scalar) reaches
+            // nlohmann::json::value() below and THROWS type_error.306
+            // ("cannot use value() with <type>") — verified empirically, an
+            // uncaught exception rather than the documented 400. Reject it
+            // here with an honest message before either field is touched.
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+            // Doomgoose external review, PR #4985 IMPORTANT finding #4:
+            // body.value(key, default) THROWS nlohmann's type_error.302 when
+            // the key is present but not string-convertible (e.g.
+            // {"principal_id": 123}) — verified empirically, an uncaught
+            // exception rather than the documented 400.
+            // access_review_str_field (above) is the established,
+            // non-throwing extractor for this exact defect class
+            // (#4623/#2146 A2-R1) — EXTEND it, never fork a second copy;
+            // matches MCP's own param_str, which already degrades a
+            // wrong-typed value to the default rather than throwing.
+            auto principal_type = access_review_str_field(body, "principal_type");
+            auto principal_id = access_review_str_field(body, "principal_id");
+            if (principal_id.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "principal_id is required"),
+                                "application/json");
+                return;
+            }
+
+            // Governance BLOCKING #2 (audit-log-injection, CWE-117): every
+            // audit call below uses `audit_target_id`, never raw
+            // `principal_id`, as its target_id argument — an authenticated
+            // durable Administrator (the only actor who can reach this
+            // route) supplying a CRLF/control-byte/ANSI-escape payload in
+            // principal_id must not be able to forge an adjacent audit
+            // field or inject terminal escapes into the audit trail that is
+            // supposed to hold THEM accountable. Matches this file's
+            // established `audit_token`/`log_token` convention
+            // (web_utils.hpp) used 8+ times elsewhere in this file.
+            const std::string audit_target_id = audit_token(principal_id);
+
+            // Strict username charset — validated BEFORE the principal_type
+            // check below and BEFORE any other audit call in this handler
+            // (governance BLOCKING #2's "ordering bug": the raw-embed
+            // sites must never fire ahead of validation) — the SAME set the
+            // DELETE twin's URL-path-captured principal_id is constrained
+            // to, so nothing POST accepts here is unreachable via DELETE.
+            // Deliberately excludes a durable SSO principal
+            // ("oidc:<iss>#<sub>", #1852): its '#' is a URL-fragment
+            // separator a browser/HTTP client never sends past, so the
+            // DELETE route below could never address it via a path
+            // segment. SSO-principal role assignment is out of scope for
+            // this PR.
+            if (!is_valid_username(principal_id)) {
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                    "denied", "User", audit_target_id,
+                                                    "invalid principal_id format");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid principal_id format"),
+                                "application/json");
+                return;
+            }
+
+            // A2 scope: principal_type=="user" ONLY. Group-scoped assignment
+            // is deferred — rbac_store.group_members is written solely by
+            // IdP group-sync (reconcile_idp_memberships), so a group-held
+            // Administrator grant would make the IdP the admin-authority
+            // source, a decision this PR does not make. principal_type is
+            // free-text JSON (never charset-validated, only equality-
+            // checked), so it is ALSO neutralized before embedding.
+            if (principal_type != "user") {
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
+                    "principal_type '" + audit_token(principal_type) + "' not supported (user "
+                    "only)");
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, "principal_type must be \"user\" (group-scoped "
+                                          "assignment is not supported yet)"),
+                    "application/json");
+                return;
+            }
+
+            // Uniform rejection (M1 — no role-catalog oracle): ITServiceOwner
+            // and an unknown role both return the SAME client-facing
+            // message; the specific reason is audited server-side only.
+            const std::string kUniformReject =
+                "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
+
+            // Closed six-name allow-list (rbac_assignable_roles.hpp —
+            // adversarial-review PR1/A2 finding: docs claimed a closed
+            // 6-role set but the code previously accepted ANY existing
+            // role, including a pre-existing is_system=false custom role).
+            // Covers BOTH the ITServiceOwner named exclusion (delivery plan
+            // §2 "A2 excludes ITServiceOwner" — its confinement is enforced
+            // entirely by ManagementGroupStore::get_visible_agents, which
+            // reads ONLY management_group_roles, never principal_roles (A2's
+            // only write target) — a fleet-wide grant would resolve
+            // type-level checks unconfined/global while any per-device list
+            // read through that confinement returns ZERO visible devices for
+            // the holder) AND a genuinely unknown/custom role name, with the
+            // SAME uniform client message either way — no role-catalog
+            // oracle, and no "which of these two things is wrong" oracle
+            // either.
+            if (!is_rbac_assignable_role(role_name)) {
+                const std::string reason =
+                    rbac_role_rejection_reason(role_name, audit_token(role_name));
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                    "denied", "User", audit_target_id, reason);
+                res.status = 400;
+                res.set_content(detail::a4_error(res, kUniformReject), "application/json");
+                return;
+            }
+            // Defense-in-depth: role_name is one of the six allow-listed
+            // names, which are seeded unconditionally at construction
+            // (seed_defaults()) — this should always resolve. Kept because
+            // assign_role's INSERT carries no FK to `roles`, so an
+            // unchecked call on a genuinely missing row (e.g. a tampered/
+            // hand-edited store) would silently create an orphan grant that
+            // resolves as a no-op hole, discoverable only by confusion, not
+            // by an error.
+            if (!rbac_store->get_role(role_name)) {
+                // Doomgoose external review, PR #4985 IMPORTANT finding #3:
+                // reclassified from 400 to 503 — `role_name` has ALREADY
+                // passed the closed six-name allow-list above, so the
+                // caller's input was never wrong; a missing row here is a
+                // tampered/hand-edited store (see the comment above), a
+                // store-integrity fault, never a client-facing rejection.
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "rbac.role.assigned", "denied", "User", audit_target_id,
+                    role_name + ": assignable role name missing from store (internal "
+                                "inconsistency)");
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "role store integrity fault — an allow-listed role "
+                                          "name is missing from the store; escalate to an "
+                                          "operator"),
+                    "application/json");
+                return;
+            }
+
+            // Pre-provisioning IS allowed: a durable auth.users row is not
+            // required to hold a role grant — RBAC's principal_roles and
+            // AuthDB's users table are independent, unrelated by FK, so an
+            // admin may grant a role to a username ahead of that person's
+            // first login (e.g. pre-staging an OIDC principal's eventual
+            // access). Recorded either way via target_provisioned in the
+            // audit detail, never silently assumed. Three-state
+            // ("true"/"false"/"unknown", not a bool — governance SHOULD #4):
+            // a genuinely-absent user and a degraded AuthDB read must not
+            // both collapse to the same "false".
+            const std::string_view target_provisioned =
+                target_provisioned_state(auth_db, principal_id);
+
+            PrincipalRole assignment;
+            assignment.principal_type = "user";
+            assignment.principal_id = principal_id;
+            assignment.role_name = role_name;
+
+            auto result = rbac_store->assign_role(assignment);
+            if (!result) {
+                // Doomgoose external review, PR #4985 IMPORTANT finding #3:
+                // this used to map EVERY assign_role failure to 400
+                // unconditionally — a genuine store fault ("database not
+                // open", a raw PQerrorMessage, the "assign_role failed"
+                // fallback) was misreported as a client rejection instead of
+                // the retryable 503 it actually is. Classify via the shared,
+                // ALLOWLIST-based chokepoint (rbac_store.hpp) — only a
+                // recognized validate_assignment/F1 client-validation shape
+                // maps to 400 (M1's uniform reject message, matching the
+                // unknown-role/ITServiceOwner cases); everything else
+                // (including an unrecognized future error string) defaults
+                // to 503, the safer classification.
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.assigned",
+                                                    "denied", "User", audit_target_id,
+                                                    role_name + ": " + result.error());
+                if (rbac_assign_error_is_client_fault(result.error())) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, kUniformReject), "application/json");
+                } else {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "role assignment store fault — retry; "
+                                                          "if this persists, escalate to an "
+                                                          "operator"),
+                                    "application/json");
+                }
+                return;
+            }
+            // #2466/#2406: a privileged mutation whose audit row did not
+            // persist FAILS CLOSED — never return success on an unrecorded
+            // grant of standing authority.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "rbac.role.assigned", "success", "User", audit_target_id,
+                    role_name + "; target_provisioned=" + std::string(target_provisioned))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the role assignment took effect but its audit record "
+                                          "could not be persisted; treat as unconfirmed and "
+                                          "reconcile"),
+                    "application/json");
+                return;
+            }
+            res.status = 201;
+            res.set_content(ok_json(JObj()
+                                        .add("assigned", true)
+                                        .add("principal_type", "user")
+                                        .add("principal_id", principal_id)
+                                        .add("role", role_name)
+                                        .add("target_provisioned", target_provisioned)
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Delete(
+        R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))",
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "rbac.role.unassigned", "User",
+                    "service-scoped token blocked from RBAC role unassignment",
+                    "service-scoped tokens cannot manage RBAC role assignments", "", ""))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "rbac.role.unassigned", "User"))
+                return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, "rbac.role.unassigned",
+                                       "User"))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
+            // Doomgoose external review, PR #4985 MINOR "duplicated
+            // gate-denial classification" — shared chokepoint, see its own
+            // doc comment (rbac_admin_predicate.hpp).
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        // Doomgoose external review, PR #4985 IMPORTANT #2:
+                        // a kUnavailable gate outcome was previously invisible
+                        // to operators — log AND audit it, matching every
+                        // sibling degraded-store denial in this codebase
+                        // (e.g. AuthRoutes::require_permission's engine
+                        // branch).
+                        spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateUnavailableAuditReason));
+                        res.status = 503;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateUnavailableMessage),
+                                        "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "rbac.role.unassigned", "denied", "User",
+                            session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
+                return;
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session,
+                            "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"))
+                return;
+
+            const std::string role_name = req.matches[1].str();
+            const std::string principal_id = req.matches[2].str();
+
+            // Self-target guard (#397/#403 — third call site, per that
+            // guard's own doc comment at settings_routes.cpp; shared via
+            // rbac_admin_predicate.hpp's is_self_target). A caller may not
+            // remove their OWN Administrator assignment through this route.
+            // Scoped to role_name=="Administrator" ONLY: self-removing a
+            // non-Administrator role (e.g. an admin demoting their own
+            // extra Viewer grant) is not a lockout risk and stays
+            // permitted — matches the store-level last-admin guard
+            // (RbacStore::unassign_role) which is likewise scoped to
+            // "Administrator" only.
+            if (role_name == "Administrator" && is_self_target(*session, principal_id)) {
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
+                                                    "denied", "User", principal_id,
+                                                    "self_admin_unassign_blocked");
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, "cannot remove your own Administrator role assignment"),
+                    "application/json");
+                return;
+            }
+
+            // Idempotent DELETE (matches the engine-principal sibling):
+            // success even when the role was not held. With the store
+            // confirmed open above, a !result here is either a genuine
+            // runtime query failure (503) or the store-layer A2
+            // last-Administrator guard refusing to leave the fleet with
+            // zero administrators (409 — a conflict with current state, not
+            // a client input error). principal_id/role_name here are the
+            // URL-path-captured groups (`[A-Za-z0-9._-]+`), so both are
+            // already regex-charset-safe by construction — no audit_token
+            // needed on this transport (unlike POST's JSON-body fields).
+            auto result = rbac_store->unassign_role("user", principal_id, role_name);
+            if (!result) {
+                const bool last_admin = is_rbac_last_admin_refusal(result.error());
+                if (last_admin && metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                                 {{"transport", "rest"}})
+                        .increment();
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
+                                                    "denied", "User", principal_id,
+                                                    result.error());
+                res.status = last_admin ? 409 : 503;
+                // The 409 carries the store's business-rule message; a store fault
+                // returns a constant client message (the raw text, which can name
+                // relations or carry a CONTEXT line, goes only to the audit row).
+                res.set_content(
+                    detail::a4_error(res, last_admin
+                                              ? result.error()
+                                              : std::string("role unassignment store fault; retry, "
+                                                            "and if this persists escalate to an "
+                                                            "operator")),
+                    "application/json");
+                return;
+            }
+            // #2466/#2406: fail closed — never report an unassign that was
+            // not audited. `removed=<bool>` (governance SHOULD #10) lets an
+            // auditor tell an actual revoke apart from an idempotent no-op
+            // (the principal never held the role) from the log alone.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "rbac.role.unassigned", "success", "User", principal_id,
+                    role_name + "; removed=" + (*result ? "true" : "false"))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "the role unassignment took effect but its audit record "
+                                     "could not be persisted; treat as unconfirmed and "
+                                     "reconcile"),
+                    "application/json");
+                return;
+            }
+            res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
+        });
+
     sink.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
                                                           httplib::Response& res) {
         auto session = auth_fn(req, res);
@@ -6848,6 +7351,13 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto& rows = *rows_res;
+            // A3 (RBAC delivery plan): stamp the export with whether RBAC is
+            // actually enforced right now — without this, the grant
+            // population above certifies nothing about whether it governs
+            // real access. Computed independently of build_access_review
+            // (it's fleet-wide, not per-row) via the same RbacStore this
+            // route already holds.
+            const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
             // Evidence access is itself auditable (CC6.2/CC7.2): the export still
             // proceeds if the audit row fails to persist, but the failure is made
@@ -6857,7 +7367,8 @@ void RestApiV1::register_routes(
             try {
                 audit_emitted =
                     audit_fn(req, "access_review.exported", "success", "AccessReview", "",
-                            "format=" + format + " rows=" + std::to_string(rows.size()));
+                            "format=" + format + " rows=" + std::to_string(rows.size()) +
+                                " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.exported audit emission threw: {}", ex.what());
             }
@@ -6875,7 +7386,7 @@ void RestApiV1::register_routes(
                     "Content-Disposition",
                     "attachment; filename=\"access-review-" +
                         std::to_string(static_cast<std::int64_t>(std::time(nullptr))) + ".csv\"");
-                res.set_content(to_csv(rows), "text/csv");
+                res.set_content(to_csv(rows, rbac_enforcement), "text/csv");
                 return;
             }
 
@@ -6897,7 +7408,20 @@ void RestApiV1::register_routes(
                             .add("lifecycle_state", r.lifecycle_state)
                             .add("source", r.source));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+            // Hand-built (not list_json) so rbac_enforcement can sit alongside
+            // data/pagination/meta as a top-level field, same idiom as the
+            // auth-sample export's "sampling" block above.
+            std::string pagination = JObj()
+                                         .add("total", static_cast<int64_t>(rows.size()))
+                                         .add("start", static_cast<int64_t>(0))
+                                         .add("page_size", static_cast<int64_t>(50))
+                                         .str();
+            res.set_content(JObj()
+                                .raw("data", arr.str())
+                                .raw("pagination", pagination)
+                                .add("rbac_enforcement", rbac_enforcement)
+                                .raw("meta", R"({"api_version":"v1"})")
+                                .str(),
                             "application/json");
         });
 
@@ -6950,7 +7474,8 @@ void RestApiV1::register_routes(
                             .add("created_by", c.created_by)
                             .add("created_at_ms", c.created_at_ms)
                             .add("closed_by", c.closed_by)
-                            .add("closed_at_ms", c.closed_at_ms));
+                            .add("closed_at_ms", c.closed_at_ms)
+                            .add("rbac_enforcement", c.rbac_enforcement));
             }
             (void)audit_fn(req, "access_review.list", "success", "AccessReview", "",
                            "count=" + std::to_string(rows_res->size()));
@@ -7006,6 +7531,14 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // A3 (RBAC delivery plan): the enforcement state stamped onto this
+            // campaign row at freeze time — computed from the same RbacStore
+            // INSTANCE, read immediately after the grant population above
+            // (a separate, later call — not the same read; it can trigger
+            // its own maybe_refresh_generation() round-trip), never
+            // re-derived on a later read (matches every other frozen field).
+            const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
+
             // Expand each row to one GrantRef per (principal, role) pair — the
             // shape access_review_store.hpp's open_campaign requires — carrying an
             // opaque JSON snapshot of the row's non-role fields as observed right
@@ -7028,7 +7561,8 @@ void RestApiV1::register_routes(
                     frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
             }
 
-            auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+            auto open_res = access_review_store->open_campaign(title, session->username, frozen,
+                                                                rbac_enforcement);
             if (!open_res) {
                 try {
                     (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
@@ -7048,7 +7582,8 @@ void RestApiV1::register_routes(
             try {
                 open_audit_emitted =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
             } catch (const std::exception& ex) {
                 spdlog::warn("access_review.campaign_opened audit emission threw: {}", ex.what());
             }
@@ -7104,7 +7639,8 @@ void RestApiV1::register_routes(
                 .add("created_by", view.campaign.created_by)
                 .add("created_at_ms", view.campaign.created_at_ms)
                 .add("closed_by", view.campaign.closed_by)
-                .add("closed_at_ms", view.campaign.closed_at_ms);
+                .add("closed_at_ms", view.campaign.closed_at_ms)
+                .add("rbac_enforcement", view.campaign.rbac_enforcement);
 
             JArr attestations;
             for (const auto& a : view.attestations) {
@@ -10390,8 +10926,36 @@ void RestApiV1::register_routes(
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
                   [auth_fn, fleet_read_fn, audit_fn, result_set_store, inventory_store,
-                   metrics_registry, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                   metrics_registry, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                      // #4980: this tool's 8 non-dispatch siblings in the
+                      // result-sets family hard-deny a service-scoped token
+                      // outright via this same helper (see the GET/POST
+                      // /api/v1/result-sets handlers above). This route
+                      // instead gated purely via fleet_read_fn's own
+                      // admit-and-confine branch, which ADMITS a service-
+                      // scoped caller (narrowed to its scope) rather than
+                      // denying it — but the result set this call
+                      // materializes is owner-scoped to session->username
+                      // (the minting PRINCIPAL's identity, not the token's
+                      // own service tag), so a service-scoped token holding
+                      // Inventory:Read could mint a result set the minting
+                      // principal's OTHER tokens/session can then read —
+                      // the exact cross-service-reach class the siblings'
+                      // hard-deny exists to prevent. No `.permission` label
+                      // (explicit "" — matches every sibling call site
+                      // above): a service-scoped caller holding
+                      // Inventory:Read is STILL denied outright after this
+                      // fix, so naming Inventory:Read as "the permission
+                      // that would help" would be a false self-remediation
+                      // claim.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.create.access_denied", "ResultSet",
+                              "result-set-from-inventory-query create denied to a "
+                              "service-scoped token",
+                              "service-scoped tokens may not create result sets", "", ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
