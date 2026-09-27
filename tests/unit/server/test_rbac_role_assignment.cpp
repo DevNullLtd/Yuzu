@@ -786,6 +786,85 @@ TEST_CASE("MCP assign_rbac_role: the admin gate's own kUnavailable outcome "
     CHECK(found);
 }
 
+// ── REST/MCP: the Gate 8 HIGH regime check's OWN kUnavailable outcome
+// (governance re-verification, post A1/A2 rebase) — the SECOND, independent
+// degradable check on these routes (RbacAdminAuthorityOwner::regime_authority,
+// via RbacStore::check_caller_authorized_under_current_regime) never had this
+// same audit+log treatment carried over when it was added during the rebase —
+// the exact invisible-to-operators shape the two tests above already close
+// for the FIRST check (is_rbac_administrator). Distinguished from those tests
+// by degrading ONLY `auth.users` (never `rbac_store.principal_roles`):
+// is_rbac_administrator's own RBAC-on branch reads bare `principal_roles`
+// (no join) and still succeeds, admitting the caller — regime_authority's
+// `list_authenticatable_admin_grants` JOINs `auth.users`, so ONLY its read
+// fails, isolating the SECOND check's own degradation from the first. ───────
+
+TEST_CASE("REST assign: the Gate 8 HIGH regime check's own kUnavailable "
+          "outcome (RBAC-on, is_rbac_administrator passes but the fresh "
+          "regime read degrades) is 503 with an audited denial",
+          "[pg][rest][rbac][a1]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    // DROP auth.users only — is_rbac_administrator's RBAC-on branch never
+    // touches it (bare principal_roles read) and still admits the caller;
+    // regime_authority's list_authenticatable_admin_grants JOINs auth.users,
+    // so its read — and only its read — now fails.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP TABLE auth.users CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.assign_rest("Operator",
+                             R"({"principal_type":"user","principal_id":"jane"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacRegimeAuthorityUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP assign_rbac_role: the Gate 8 HIGH regime check's own "
+          "kUnavailable outcome (RBAC-on, is_rbac_administrator passes but "
+          "the fresh regime read degrades) is kInternalError with an "
+          "audited denial",
+          "[pg][mcp][rbac][a1]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP TABLE auth.users CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    // Full ticket-then-recall, matching the sibling kUnavailable test above:
+    // the mint/approve dance itself has no notion of admin status — only the
+    // RECALL reaches is_rbac_administrator/regime_authority.
+    auto res = h.mcp_call_tool_approved(
+        "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool found = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "rbac.role.assigned" && a.result == "denied" &&
+            a.detail == std::string(yuzu::server::kRbacRegimeAuthorityUnavailableAuditReason))
+            found = true;
+    }
+    CHECK(found);
+}
+
 // ── REST: the MFA step-up gate (Doomgoose external review, PR #4985 round 3):
 // the OpenAPI 401 text says "MFA step-up required (stale/absent proof)". The harness
 // used to pass no step-up gate at all, so that claim had no test. These prove the
