@@ -237,7 +237,11 @@ constexpr std::string_view kRbacCheck[] = {"check_permission"};
 // action) and from Engine principals' assign/unassign_engine_role (a
 // different principal class — engine, not human — with its own structural
 // "no admin, ever" bar these tools deliberately do NOT carry).
-constexpr std::string_view kRbacRoleAssignment[] = {"assign_rbac_role", "unassign_rbac_role"};
+// A1 (RBAC enforcement toggle) folds set_rbac_enforcement into A2's family
+// rather than creating a second one-tool family — same Administrator gate,
+// same "not a plain permission check" story.
+constexpr std::string_view kRbacAdministration[] = {"assign_rbac_role", "unassign_rbac_role",
+                                                    "set_rbac_enforcement"};
 // B4 — no existing family covers local-account lockout lifecycle; own family,
 // distinct from Directory & identity (AD/Entra sync, a different identity
 // axis) and from Engine principals (a different principal class entirely).
@@ -344,10 +348,10 @@ constexpr std::array<ToolFamily, 39> kFamilies{{
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
                         "permission",
      kRbacCheck},
-    {"RBAC role assignment", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
-                             "roles to a human user (Administrator-gated, not a plain "
-                             "permission check)",
-     kRbacRoleAssignment},
+    {"RBAC administration", "grant or revoke one of the 6 fleet-wide-assignable built-in RBAC "
+                            "roles to a human user, and switch RBAC enforcement on/off "
+                            "(Administrator-gated, not a plain permission check)",
+     kRbacAdministration},
     {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
      kAccountLockout},
     {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "

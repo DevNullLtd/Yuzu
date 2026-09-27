@@ -384,10 +384,18 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 // "error", not "denied" (merge-time re-verify finding): an infra degrade is not
                 // an operator denial — matches /remediate's own degraded ? "error" : "denied"
                 // convention a few lines below, which this re-add had missed.
-                audit_fn_(req, "policy.evaluate", "error", "policy", id, "degraded");
+                //
+                // #4981 PR-1 (gov Gate 6, enterprise-readiness): thread the real cause
+                // (exec_res.error(), e.g. "kickoff_check degraded for <id>: scope
+                // evaluation degraded: owner_check_failed") into both the message and
+                // the audit detail, matching /remediate's own result.error convention
+                // below and the rest-api.md contract this route is documented against —
+                // the previous generic "policy evaluation degraded" literal discarded
+                // the specific reason on this route while /remediate already surfaced it.
+                audit_fn_(req, "policy.evaluate", "error", "policy", id, exec_res.error());
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503}, {"message", "policy evaluation degraded"}}},
+                    nlohmann::json({{"error", {{"code", 503}, {"message", exec_res.error()}}},
                                     {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");

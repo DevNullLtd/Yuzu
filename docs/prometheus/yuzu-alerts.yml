@@ -559,6 +559,66 @@ groups:
             docs/ops-runbooks/auth-db-recovery.md.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
 
+      - alert: YuzuRbacEnforcementChanged
+        # A1 (RBAC enforcement enable/disable toggle). Threshold-free by
+        # design — this fires on ANY observed change to this replica's
+        # cached view of the durable rbac_enabled flag, not on a rate or a
+        # duration, so there is no fleet-behaviour claim to tune (unlike the
+        # OTA bounds alerts, which ship separately for exactly that reason).
+        # A replica RESTART with an unchanged flag does not fire: the gauge
+        # is re-published with the SAME value at construction
+        # (RbacStore::set_metrics), so changes() over the window sees no
+        # transition. info severity: this is an audit/notification signal
+        # for a deliberate operator action, not an incident.
+        expr: |
+          changes(yuzu_server_rbac_enforcement_enabled[15m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "RBAC enforcement state changed on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_enforcement_enabled changed value on this
+            replica within the last 15 minutes. This reflects a durable
+            RBAC enforcement toggle (PUT /api/v1/rbac/enforcement or the
+            set_rbac_enforcement MCP tool) converging to this replica, not a
+            local-only event — every replica observes the same durable
+            flag within the ~1s generation refresh. Check the
+            rbac.enforcement_changed audit rows (target_id="rbac_enabled")
+            for WHO made the change and WHEN. See
+            docs/user-manual/rbac.md "Enabling RBAC".
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
+
+      - alert: YuzuRbacEnforcementDisabled
+        # Gate 7 Fix 14 (sre): the rule above fires identically for enable
+        # AND disable, but RBAC ships OFF by default — DISABLE is the
+        # security-REGRESSION direction (a fleet reverting from enforced to
+        # legacy-open access), which arguably deserves louder treatment than
+        # a bare "something changed" info. Keep BOTH rules: the one above
+        # still tells you SOMETHING changed at a glance; this one flags
+        # specifically when it went to disabled. Direction-aware, not a
+        # replacement — same threshold-free reasoning as the rule above (no
+        # fleet-behaviour claim to tune).
+        expr: |
+          (yuzu_server_rbac_enforcement_enabled == 0)
+          and (changes(yuzu_server_rbac_enforcement_enabled[15m]) > 0)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RBAC enforcement was DISABLED on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_enforcement_enabled transitioned to 0 (disabled)
+            on this replica within the last 15 minutes — RBAC ships OFF by
+            default, so this is the security-regression direction: the
+            fleet just reverted from enforced access to the legacy-open
+            fallback. This reflects a durable toggle converging to this
+            replica, not a local-only event. Check the
+            rbac.enforcement_changed audit rows (target_id="rbac_enabled")
+            for WHO made the change and WHEN, and confirm it was expected.
+            See docs/user-manual/rbac.md "Enabling RBAC".
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
+
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
   # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never

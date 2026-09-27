@@ -2079,6 +2079,7 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"unassign_engine_role", true},
         {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
         {"unassign_rbac_role", true},
+        {"set_rbac_enforcement", true}, // A1: enabling denies every ungranted operator
         {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
@@ -22806,6 +22807,8 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
              R"({"principal_type":"user","principal_id":"jane","role":"Operator"})")},
         {"unassign_rbac_role",
          nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
+        // A1 — same Security:Write-driven gate as assign/unassign_rbac_role above.
+        {"set_rbac_enforcement", nlohmann::json::parse(R"({"enabled":true})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},

@@ -420,8 +420,8 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 | `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. Permission: `Policy:Delete`. |
 | `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. Permission: `Policy:Write`. |
 | `POST` | `/api/policies/{id}/disable` | Disable an active policy. Permission: `Policy:Write`. |
-| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents. |
-| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. |
+| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents; `503` on a genuine store/InstructionStore degrade or (#4981 PR-1) if the policy's scope expression itself could not be evaluated — never reported as the `409` "matches no agents" case. |
+| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. `503` on a genuine store degrade or, when `agent_ids` is supplied, a scope-evaluation abort (#4981 PR-1) — never reported as the `409` "no in-scope agents" case. |
 | `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. Permission: `Policy:Execute`. |
 | `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). Permission: `Policy:Execute`. |
 
