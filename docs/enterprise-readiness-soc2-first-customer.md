@@ -156,6 +156,32 @@ retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
 closed route inventory:
 `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
+**Addendum — `POST /api/v1/result-sets/from-inventory-query` service-scope
+regression, closed (CC6.1/CC6.3, #4980, 2026-09-25).** The addendum above's
+closed route inventory (row 25) correctly reported this route's
+service-scope gap as closed on 2026-08-18 — that closure was real. An
+unrelated confinement fix on 2026-09-12 (`606b9ec72`, closing a real
+management-group scoping gap on this same route) replaced the route's
+`require_permission` gate with the ADR-0017 `fleet_read_fn` admit-then-filter
+chokepoint, whose service-scope branch admits-and-confines a service-scoped
+caller UNDER RBAC-ON rather than denying it outright (it still hard-403s
+under RBAC-off, same as `require_permission`) — silently reopening the
+cross-service-reach class the flip had closed, on this one route, in
+RBAC-enabled deployments only. #4980 closed it again with a dedicated
+`deny_fleet_wide_service_scoped` call that no longer depends on which
+underlying gate this route uses, matching the route's 8 non-dispatch
+siblings. **For any assessment covering the period 2026-09-12 through
+#4980's merge, on a deployment with RBAC enabled, treat this one route as
+NOT covered by the flip's confinement guarantee above** — a service-scoped
+token holding `Inventory:Read` could, during that window, mint a result
+set that its minting principal's other tokens/session could then read
+back (owner-scoping keys on the minting principal's identity, not the
+token's own service tag). RBAC-off deployments (the default) were never
+exposed by this regression. No other route in the closed inventory is
+affected; this is a single-route regression-and-fix, not a reopening of
+the flip's broader closure. Correction also recorded in the route
+inventory doc itself.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
 default-deny RBAC resolution, structurally barred from admin/built-in/

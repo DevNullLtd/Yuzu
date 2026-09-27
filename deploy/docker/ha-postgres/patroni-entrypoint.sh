@@ -16,6 +16,12 @@
 #   YUZU_PG_REPLICATION_PASSWORD  replication-role password             [required]
 #   YUZU_DB_USER/NAME/PASSWORD    app role/db/password — consumed by the
 #                            inherited post_init init script, NOT here  [required]
+#   YUZU_PG_RESERVED_CONNECTIONS  slots reserved for the app role ahead of every
+#                            other client (HA WS-8, #4943); rendered into the
+#                            bootstrap parameters here (Patroni owns
+#                            postgresql.conf) while the inherited init script
+#                            does the GRANT. Size: N_servers x (pool + 2)
+#                                                                    [default: 40]
 #   YUZU_PG_DURABILITY       quorum3 (default) | sync2 | async          [default: quorum3]
 #   YUZU_PG_SYNC_STRICT      fail-closed on total standby loss          [default: false]
 #   YUZU_PG_TRUST_CIDR       CIDR allowed host (TCP) connections        [default: 0.0.0.0/0]
@@ -28,6 +34,29 @@ set -euo pipefail
 : "${YUZU_PG_REPLICATION_PASSWORD:?YUZU_PG_REPLICATION_PASSWORD is required}"
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 PATRONI_CONNECT_HOST="${PATRONI_CONNECT_HOST:-$PATRONI_NAME}"
+YUZU_PG_RESERVED_CONNECTIONS="${YUZU_PG_RESERVED_CONNECTIONS:-40}"
+if ! [[ "${YUZU_PG_RESERVED_CONNECTIONS}" =~ ^[0-9]{1,6}$ ]]; then
+    echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS must be a non-negative integer (got '${YUZU_PG_RESERVED_CONNECTIONS}')" >&2
+    exit 1
+fi
+# The bootstrap max_connections this cluster renders with, and Postgres's
+# superuser_reserved_connections default (not overridden below) — ONE shell
+# variable each, substituted into the YAML template further down AND used in
+# the bound check here, so the two can never drift apart (Gate 8 re-review,
+# #4943: two independent literals 86 lines apart was the exact drift the
+# clock-guarded-retention/dispatch-confined-arms rows warn about elsewhere —
+# a future edit to one without the other would silently reopen the gap).
+readonly PATRONI_MAX_CONNECTIONS=200
+readonly PATRONI_SUPERUSER_RESERVED_CONNECTIONS=3
+# A value at or past (max_connections - superuser_reserved_connections) leaves
+# ZERO slots any ordinary (non-privileged) client can ever use, not merely
+# under load (security-guardian, Gate 2 finding #1). No server is running yet
+# at render time, so this is a static check against the two constants above,
+# not a live query (contrast the single-node script's SHOW-based check).
+if (( YUZU_PG_RESERVED_CONNECTIONS >= PATRONI_MAX_CONNECTIONS - PATRONI_SUPERUSER_RESERVED_CONNECTIONS )); then
+    echo "patroni-entrypoint: YUZU_PG_RESERVED_CONNECTIONS=${YUZU_PG_RESERVED_CONNECTIONS} is >= max_connections(${PATRONI_MAX_CONNECTIONS}) - superuser_reserved_connections(${PATRONI_SUPERUSER_RESERVED_CONNECTIONS}) = $(( PATRONI_MAX_CONNECTIONS - PATRONI_SUPERUSER_RESERVED_CONNECTIONS ))" >&2
+    exit 1
+fi
 YUZU_PG_DURABILITY="${YUZU_PG_DURABILITY:-quorum3}"
 # CIDR permitted to open host (TCP) connections — replication + app. Defaults
 # OPEN so a bring-your-own network works out of the box; the shipped compose
@@ -110,7 +139,12 @@ bootstrap:
       use_pg_rewind: true
       parameters:
         # Keep aligned with the single-node substrate's operational envelope.
-        max_connections: 200
+        max_connections: ${PATRONI_MAX_CONNECTIONS}
+        # Slots only pg_use_reserved_connections members (the app role, granted
+        # by post_init) may take once the free count drops this low — so a
+        # foreign client can never hold the slot a server's /readyz probe needs
+        # to reconnect (HA WS-8, #4943). N_servers x (pool 16 + 2), two servers.
+        reserved_connections: ${YUZU_PG_RESERVED_CONNECTIONS}
         wal_level: replica
         hot_standby: "on"
         max_wal_senders: 10
