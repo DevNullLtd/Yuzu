@@ -820,7 +820,8 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 route_unreadable = result.route_unreadable;
             }
             // else: the ladder already audited the abort (db_degraded /
-            // owner_check_failed / principal_unresolved) — sent stays 0.
+            // owner_check_failed / principal_unresolved / presence_degraded /
+            // unresolvable, #4981 PR-1) — sent stays 0.
         } else if (arm == yuzu::server::DispatchArm::Ids) {
             // #1788: an explicit id list is the arm #1788 named directly —
             // the shared seam intersects it against the operator's
