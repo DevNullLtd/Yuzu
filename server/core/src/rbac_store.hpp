@@ -118,6 +118,51 @@ struct ListReadAuthorization {
     std::vector<std::string> visible_agents;
 };
 
+/// Result of a successful `RbacStore::set_rbac_enforcement` call.
+struct RbacEnforcementTransition {
+    bool previous_enabled{false};   ///< durable value read under the row lock
+    bool enabled{false};            ///< durable value after the call
+    bool changed{false};            ///< false = already in the requested state (no write, no bump)
+    std::int64_t post_transition_administrators{0}; ///< enable: authenticatable Administrator
+                                                     ///< grants; disable: active local
+                                                     ///< role=admin accounts
+};
+
+/// Outcome of `RbacStore::check_caller_authorized_under_current_regime` —
+/// see that method's own doc comment for the full reasoning (Gate 8 HIGH:
+/// `assign_role`/`unassign_role` share `set_rbac_enforcement`'s exact
+/// cross-replica cache-staleness root cause). A tri-state, matching
+/// `RbacAdminGate`'s own shape (`rbac_admin_predicate.hpp`) rather than
+/// collapsing "denied" and "could not confirm" into one boolean.
+enum class RbacRegimeAuthority {
+    kAuthorized,    ///< caller holds authority under the regime read fresh, right now
+    kNotAuthorized, ///< caller confirmed NOT in that regime's authority set — 403-class
+    kUnavailable,   ///< could not confirm (pool/query failure) — 503-class, NEVER treat as
+                    ///< either of the above
+};
+
+/// Refusal/failure of `RbacStore::set_rbac_enforcement`.
+struct RbacEnforcementError {
+    enum class Kind {
+        kStoreFailure,      ///< pool/txn/query failure, absent or non-canonical flag row → 503-class
+        kCallerNotSurvivor, ///< the caller would not remain a durable administrator under the
+                            ///< DESTINATION regime → 409-class (a post-transition survival
+                            ///< conflict — the transition itself is legitimate, but this
+                            ///< particular caller would be locked out by it)
+        kCallerNotAuthorizedUnderCurrentRegime, ///< Gate 7 Fix 1 (security-guardian,
+                                                 ///< cross-replica cache staleness): the caller
+                                                 ///< does not hold authority under the SOURCE
+                                                 ///< (durably current, freshly re-read) regime —
+                                                 ///< a plain authority failure, not a survival
+                                                 ///< conflict → 403-class. Only ever evaluated on
+                                                 ///< a real transition (never the idempotent
+                                                 ///< no-op path — see set_rbac_enforcement's own
+                                                 ///< doc comment).
+    };
+    Kind kind{Kind::kStoreFailure};
+    std::string message; ///< human-readable; no caller-supplied text is ever embedded
+};
+
 class RbacStore {
 public:
     /// Borrows the shared pool and runs the `rbac_store` schema migration on a
@@ -164,7 +209,63 @@ public:
     /// instead, which additionally fails closed on a degraded view — this
     /// raw accessor is for callers that only display or log the toggle.
     bool is_rbac_enabled() const;
-    void set_rbac_enabled(bool enabled);
+
+    /// UNGUARDED seed/test primitive: writes the durable flag unconditionally,
+    /// with no last-administrator/caller-survives guard of any kind. Reports
+    /// the write outcome; deliberately NOT `[[nodiscard]]` — ~70 existing test
+    /// call sites across `tests/unit/server/` seed with this deliberately
+    /// UNguarded ("enforcement in effect; no roles/grants created") and a
+    /// nodiscard would force every one of them into a discard/REQUIRE wrapper
+    /// for a test-only primitive (`meson.build` sets `werror=false`, so the
+    /// warning would never fail a build, only add 20 files of noise). NEW
+    /// callers (including new tests) MUST still check the result explicitly.
+    /// NEVER call this from a route or MCP handler — the production,
+    /// caller-survives-guarded path is `set_rbac_enforcement` below.
+    std::expected<void, std::string> set_rbac_enabled(bool enabled);
+
+    /// THE route/MCP-callable toggle. On a REAL transition (requested state
+    /// differs from the durable, freshly-locked current state), refuses
+    /// (without writing) unless the CALLER (`caller_username`) passes BOTH:
+    ///
+    ///  1. A SOURCE-regime authority check (Gate 7 Fix 1) — the caller must
+    ///     hold authority under the regime that is durably true RIGHT NOW:
+    ///     an authenticatable fleet-wide `Administrator` grant while
+    ///     currently ON, or the caller's own local `role='admin' AND
+    ///     is_active` while currently OFF. This exists because the outer
+    ///     `is_rbac_administrator` gate (the route/MCP-handler's own
+    ///     admission check) reads a replica-LOCAL cached view of the flag
+    ///     that can lag a real commit by up to `kRbacGenerationRefreshMs` —
+    ///     this route is the thing that FLIPS the value that gate reads, so
+    ///     it cannot rely on that gate as its sole regime check for itself.
+    ///  2. A DESTINATION-regime survival check (pre-existing) — would the
+    ///     caller remain a durable administrator AFTER the switch: enabling
+    ///     requires an authenticatable fleet-wide `Administrator` grant;
+    ///     disabling requires the caller's own local `role='admin' AND
+    ///     is_active`.
+    ///
+    /// Both checks run INSIDE the same transaction as the flag write, under
+    /// the `rbac_meta` row lock and (enable direction only) the same `FOR
+    /// UPDATE OF pr` lock `unassign_role` takes over the identical candidate
+    /// rows — the enable direction's membership/count are decided FROM that
+    /// locked result set, never a second, unlocked query. The disable
+    /// direction's source check reads the same `principal_roles` rows
+    /// WITHOUT locking them (`list_authenticatable_admin_grants`) — a real
+    /// transition never needs BOTH the locked and unlocked reads of the same
+    /// set, because source and destination regimes are always opposite on a
+    /// genuine transition. See the .cpp for the full rule, including the
+    /// accepted point-in-time (not enduring) nature of BOTH the destination
+    /// guarantee AND the disable direction's lock-free source check — the
+    /// same property, not a stricter one, since the source check is also an
+    /// unlocked read observed inside this transaction, never "still holds it
+    /// at commit."
+    ///
+    /// Idempotent: requesting the current state returns `changed=false`
+    /// WITHOUT evaluating either guard or bumping `write_generation` — this
+    /// is a DELIBERATE, tested contract (a caller with no authority at all
+    /// may still learn "already in that state"), not an oversight; the
+    /// source-regime check above is reached only past that early return.
+    [[nodiscard]] std::expected<RbacEnforcementTransition, RbacEnforcementError>
+    set_rbac_enforcement(bool enabled, const std::string& caller_username);
     /// True when the cached `rbac_enabled` view is no longer trustworthy —
     /// checked as: `!generation_valid_` (a refresh attempt actually completed
     /// and found itself past `kRbacStaleServeBoundMs`), OR, independently,
@@ -272,10 +373,101 @@ public:
                                                                  const std::string& principal_id,
                                                                  const std::string& role_name);
 
+    /// Gate 8 HIGH (security-guardian): `assign_role`/`unassign_role` take
+    /// no caller identity and perform no equivalent of
+    /// `set_rbac_enforcement`'s own source-regime check (Gate 7 Fix 1) — a
+    /// caller admitted by `is_rbac_administrator` under a STALE cached view
+    /// of `rbac_enabled_` (which can lag a real commit by up to
+    /// `kRbacGenerationRefreshMs`, or the wider `kRbacStaleServeBoundMs`
+    /// while degraded) could mint or revoke a DURABLE `principal_roles`
+    /// Administrator grant — unlike the toggle's own transient window, this
+    /// persists indefinitely once written.
+    ///
+    /// Deliberately NOT a parameter added to `assign_role`/`unassign_role`
+    /// themselves — those are store-level primitives with many existing
+    /// direct-store-level tests that neither supply nor need a caller
+    /// identity; forcing one on would churn every one of them for a check
+    /// that is really about REST/MCP call-CONTEXT, not store-level
+    /// semantics. This is instead a HANDLER-level convenience: a FRESH,
+    /// uncached, lock-free read of the durable `rbac_enabled` flag,
+    /// followed by a membership check against whichever authority set that
+    /// regime requires — reusing the SAME two sets
+    /// `set_rbac_enforcement`'s own source-regime check reads
+    /// (`list_authenticatable_admin_grants` while durably on,
+    /// `list_active_local_admin_accounts` while durably off), never a third
+    /// copy of that logic. Call this AFTER `is_rbac_administrator` and
+    /// BEFORE `assign_role`/`unassign_role`, at all four call sites (REST
+    /// `POST`/`DELETE .../rbac/roles/{name}/assignments`, MCP
+    /// `assign_rbac_role`/`unassign_rbac_role`).
+    ///
+    /// Point-in-time, not enduring — the SAME accepted residual
+    /// `set_rbac_enforcement`'s own source/destination checks carry (#4966):
+    /// the durable regime, or the caller's own authority, could change
+    /// between this call returning and the actual mutation landing a moment
+    /// later. This is not a new gap this method introduces; it is the same
+    /// window every other caller-survives-style check in this file already
+    /// accepts, just at a different call boundary (handler-to-store instead
+    /// of store-internal).
+    [[nodiscard]] RbacRegimeAuthority
+    check_caller_authorized_under_current_regime(const std::string& caller_username) const;
+
+    /// Takes no caller identity — any REST/MCP handler-layer caller acting on
+    /// behalf of a human (`principal_type == "user"`) operator MUST call
+    /// `check_caller_authorized_under_current_regime` (above) first and
+    /// refuse before reaching here; this method itself enforces no
+    /// equivalent check, so skipping that call site re-opens the exact
+    /// cross-replica cache-staleness gap it exists to close.
     std::expected<void, std::string> assign_role(const PrincipalRole& pr);
-    std::expected<void, std::string> unassign_role(const std::string& principal_type,
-                                                   const std::string& principal_id,
-                                                   const std::string& role_name);
+
+    /// The guard's transaction lives in `RbacAdminAuthorityOwner`
+    /// (rbac_admin_authority_owner.cpp), an ADR-0012 §3 query owner; this method
+    /// delegates to it.
+    ///
+    /// A2 last-Administrator guard: when `role_name == "Administrator"`,
+    /// refuses (and rolls back) a delete that would leave ZERO
+    /// `principal_roles` rows naming `role_name = 'Administrator'` AND
+    /// `principal_type = 'user'` for a genuinely AUTHENTICATABLE
+    /// administrator — deliberately NOT a bare grant-row count. The guard
+    /// JOINs `auth.users` (`u.username = pr.principal_id AND u.is_active`)
+    /// so a pre-provisioned grant on a nonexistent username, or a
+    /// deactivated/(soft-)deleted account, never counts as a "surviving"
+    /// administrator — see rbac_admin_authority_owner.cpp for the full reasoning (this is safe
+    /// only because `RbacStore` and `AuthDB` always share one PgPool in
+    /// production, ADR-0006). Also matches
+    /// `rbac_admin_predicate.hpp::is_rbac_administrator`'s gate exactly on
+    /// the `principal_type` axis — it never resolves a group-held
+    /// Administrator row either (a documented A2 scope exclusion),
+    /// deliberately NOT `principal_type IN ('user', 'group')`. The count
+    /// runs INSIDE the same transaction as the delete, under a
+    /// `FOR UPDATE OF pr` row lock on the candidate `principal_roles` rows
+    /// (the candidate `auth.users` rows are never locked; only the deleted
+    /// principal's own row is, by the post-DELETE recheck), so two concurrent
+    /// unassigns racing to remove the last two Administrator grants serialize
+    /// instead of both observing "1 remaining" and both committing. The
+    /// guard does NOT cover an `auth.users` row created concurrently for a
+    /// pre-provisioned grant, nor deactivation of a surviving Administrator
+    /// between the recount and COMMIT (#4966). Every other
+    /// role/principal_type combination — including both existing
+    /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
+    /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as
+    /// before (an Administrator grant held by a non-user principal still runs the
+    /// candidate lock query but is never counted). The
+    /// refusal's error string always contains `kRbacLastAdminRefusalMarker`
+    /// (below) — callers that need to distinguish this business-rule
+    /// refusal from a genuine store/query failure match on that constant
+    /// rather than inventing their own substring.
+    ///
+    /// Returns `true` iff a row was actually removed (idempotent — an
+    /// unassign of a role the principal never held returns `false`, not an
+    /// error) — surfaced so a caller's audit trail can distinguish an actual
+    /// revoke from a no-op, rather than auditing both identically.
+    ///
+    /// Same caller-identity contract as `assign_role` above: takes none of
+    /// its own, so a REST/MCP handler acting on behalf of a human operator
+    /// MUST call `check_caller_authorized_under_current_regime` first.
+    std::expected<bool, std::string> unassign_role(const std::string& principal_type,
+                                                    const std::string& principal_id,
+                                                    const std::string& role_name);
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
@@ -393,6 +585,23 @@ private:
     // `rbac_meta.rbac_enabled` at most once per refresh interval and updates it
     // (never flips it to disabled on a read error — that would be fail-open).
     mutable std::atomic<bool> rbac_enabled_{false};
+    // Gate 7 Fix 2 (cpp-safety, CRITICAL): the generation `rbac_enabled_`
+    // itself is gated on — DELIBERATELY separate from `cached_generation_`
+    // below, which belongs to `perm_cache_` and is bumped by EVERY RBAC
+    // writer (assign_role/unassign_role/group CRUD/...), not just a toggle.
+    // `perm_cache_` self-heals on the next refresh regardless of who bumped
+    // the generation (it is empty until repopulated on demand), but
+    // `rbac_enabled_` does not — nothing repopulates it except a toggle's own
+    // `publish_local_toggle` or the next periodic refresh's adopt branch. Pre-fix,
+    // `publish_local_toggle` gated on the SHARED `cached_generation_`, so an
+    // unrelated writer's flag-less generation bump (which advances
+    // `cached_generation_` via `apply_local_generation` alone) could race
+    // ahead of a toggle's own commit and make the toggle's OWN publish look
+    // "behind", silently masking it — this replica's `rbac_enabled_` then
+    // stayed wrong until the next refresh interval elapsed. Written ONLY by
+    // `publish_local_toggle` and `maybe_refresh_generation`'s flag-adoption
+    // branch — the two places that ever change `rbac_enabled_`.
+    mutable std::atomic<std::uint64_t> flag_generation_{0};
 
     void seed_defaults();     // idempotent (ON CONFLICT DO NOTHING)
     // Loads rbac_enabled_ + the generation anchor from the durable rbac_meta
@@ -480,6 +689,54 @@ private:
     /// writing replica is immediately coherent with itself).
     void apply_local_generation(uint64_t new_gen) const;
 
+    /// Publish a locally-committed `(generation, enabled)` pair from
+    /// `set_rbac_enabled`/`set_rbac_enforcement`. Generation-gated (A1,
+    /// #2703-adjacent): does the same cache-clear/re-anchor work as
+    /// `apply_local_generation`, in the SAME critical section, ALWAYS (the
+    /// perm-cache half is unconditional except for the pre-existing
+    /// not-behind-`cached_generation_` check, untouched by Gate 7 Fix 2)
+    /// PLUS a SEPARATELY-gated `rbac_enabled_.store(enabled)` guarded by its
+    /// own dedicated `flag_generation_` — `if (new_gen <
+    /// flag_generation_.load()) return;` (skip only the flag write)
+    /// otherwise `rbac_enabled_.store(enabled); flag_generation_.store(new_gen);`.
+    ///
+    /// Gate 7 Fix 2 (cpp-safety, CRITICAL — corrected from the original A1
+    /// design, which gated the flag write on the SAME `cached_generation_`
+    /// the perm-cache half uses): `cached_generation_`/`perm_cache_` SELF-HEAL
+    /// on the next refresh regardless of which writer bumped the durable
+    /// generation — the cache is just empty until repopulated on demand, so
+    /// an unrelated writer racing ahead costs nothing but a redundant clear.
+    /// `rbac_enabled_` does NOT share that property: nothing repopulates it
+    /// except a toggle's own publish or the next periodic refresh's adopt.
+    /// Gating the flag write on the shared `cached_generation_` meant an
+    /// UNRELATED, flag-less writer (`assign_role`/`unassign_role`/group
+    /// CRUD/...) committing at N+1 and calling `apply_local_generation(N+1)`
+    /// on this replica BEFORE a toggle's OWN thread reached
+    /// `publish_local_toggle(N, ...)` made the toggle's publish look "behind"
+    /// (`N < N+1`) and skip ENTIRELY — this replica's `rbac_enabled_` then
+    /// stayed wrong for a full refresh interval, restarted by a commit that
+    /// had nothing to do with the toggle. `flag_generation_` is written ONLY
+    /// by this method and `maybe_refresh_generation`'s flag-adoption branch,
+    /// so a flag-less writer's generation bump can never mask a real toggle's
+    /// publish again. `bump_generation_in_txn` runs inside the writer's own
+    /// transaction and holds the `write_generation` row lock until COMMIT, so
+    /// generation order equals commit order — the same soundness argument
+    /// that justified the original `cached_generation_` gate for `perm_cache_`
+    /// applies identically to `flag_generation_` for `rbac_enabled_`, just
+    /// evaluated against its own counter. `apply_local_generation` itself and
+    /// its other callers are unchanged — they never touch `flag_generation_`.
+    void publish_local_toggle(std::uint64_t new_gen, bool enabled) const;
+
+    /// Publish `yuzu_server_rbac_enforcement_enabled` (gauge, no labels, per
+    /// replica) from the current `rbac_enabled_` atomic. Called after
+    /// `set_metrics()`, after `publish_local_toggle`'s adopt (outside
+    /// `cache_mtx_` — same after-release pattern as the breaker gauge, see
+    /// `breaker_note_result`), and from `maybe_refresh_generation`'s adopt
+    /// site. Reads the atomic at call time rather than taking a captured
+    /// local, so two racing publishes both end up reporting the latest
+    /// adopted value.
+    void publish_enforcement_gauge() const noexcept;
+
     std::string perm_cache_key(const std::string& user, const std::string& type,
                                const std::string& op) const;
 
@@ -532,18 +789,55 @@ private:
 /// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
-/// Three-way, AUDIT-FACING classification of RBAC enforcement state (A3, the
-/// Periodic Access Review export, SOC 2 CC6.2) — strictly more granular than
-/// `rbac_enforcement_in_effect`'s plain enforced/not-enforced boolean, which
-/// deliberately conflates "genuinely enabled" with "degraded view, deny by
-/// default" (both gate DENY, so the boolean is right for authorization). An
-/// auditor reading an evidence export needs the distinction: a `kDegraded`
-/// stamp says "we could not confirm the state, gates denied defensively" —
-/// NOT "an administrator turned RBAC on".
+/// Three-way classification of RBAC enforcement state — strictly more
+/// granular than `rbac_enforcement_in_effect`'s plain enforced/not-enforced
+/// boolean, which deliberately conflates "genuinely enabled" with "degraded
+/// view, deny by default" (both gate DENY, so the boolean is right for
+/// authorization).
 ///
-/// This is a READ-ONLY label for export/evidence surfaces — never an
-/// authorization decision. A caller deciding whether to admit/deny a request
-/// MUST keep using `rbac_enforcement_in_effect()` directly, never this enum.
+/// THE TEST for whether a NEW use of this label is permitted: does it change
+/// the SET OF INPUTS THAT ADMIT a request? If yes — forbidden. Use
+/// `rbac_enforcement_in_effect()`'s boolean directly; the admit/deny outcome
+/// must always equal what that boolean alone gives (see the documented
+/// equivalence below). If no — the use only stamps an audit label, or picks
+/// between two outcomes that are BOTH already non-admitting — it is
+/// permitted, subject to two further conditions: (1) a SINGLE snapshot read
+/// per logical decision (call `rbac_enforcement_label()` exactly once and
+/// branch on that one result — never decompose into this call plus a
+/// separate `rbac_enforcement_in_effect()` call, or two calls to this
+/// function, "to satisfy the letter" of a narrower use: the underlying view
+/// can self-heal between calls — a healthy pool's next refresh clears a
+/// stale cache — so two calls can observe two different states across one
+/// logical decision); (2) a `security-guardian` review, via this file's
+/// routed-concerns row (`.claude/routed-concerns-access-control.md`, the A2
+/// row's trigger list names this enum/function explicitly) — adding a new
+/// consumer is a security decision, not a routine edit, and that row is
+/// where consumers satisfying this test are tracked, not a hardcoded count
+/// in this comment.
+///
+/// PRIMARY use: an AUDIT-FACING label for export/evidence surfaces
+/// (`access_review_model.cpp`, A3, the Periodic Access Review export, SOC 2
+/// CC6.2). An auditor reading an evidence export needs the distinction a
+/// bare boolean erases: a `kDegraded` stamp says "we could not confirm the
+/// state, gates denied defensively" — NOT "an administrator turned RBAC on".
+///
+/// WORKED EXAMPLE of a sanctioned non-export use, satisfying the test above:
+/// `rbac_admin_predicate.hpp`'s `is_rbac_administrator` (Doomgoose external
+/// review, PR #4985 IMPORTANT #2, reconciled with A3 above at merge time —
+/// both PRs independently built this identical shape against this branch's
+/// own primitives before either merged). It reads the label TWICE from one
+/// snapshot: once to pick which authority source to consult (`!= kDisabled`
+/// — this IS the same routing decision `rbac_enforcement_in_effect()`'s own
+/// boolean makes, by the documented equivalence below, so it changes nothing
+/// about which inputs admit), and once — only after that source's own row
+/// lookup has already found no matching grant, i.e. only on an
+/// already-non-admitting path — to choose WHICH non-admitting failure to
+/// return: a retryable `kUnavailable` (503) for `kDegraded`, versus a
+/// terminal `kDenied` (403) otherwise. It was previously conflating those
+/// two "no row" cases and returning a terminal 403 for a transient store
+/// hiccup, exactly the failure mode this enum exists to let a caller avoid.
+/// Neither read ever returns `kAdmin` by itself — an actual grant/role match
+/// is still required on every path.
 enum class RbacEnforcementLabel {
     kEnabled,  ///< store open, `is_rbac_enabled() == true`.
     kDisabled, ///< store open, `is_rbac_enabled() == false`, view FRESH — the
@@ -565,7 +859,12 @@ enum class RbacEnforcementLabel {
 /// `is_rbac_enabled()` short-circuits before `rbac_enabled_view_degraded()`
 /// is ever consulted, exactly like `rbac_enforcement_in_effect()` itself;
 /// gates still deny either way, so this is the same fail-closed answer, just
-/// a less granular label for that one case.
+/// a less granular label for that one case. `is_rbac_administrator` inherits
+/// this asymmetry unchanged (a cached-enabled+stale RBAC-off admin still
+/// gets a definitive `kDenied`, never `kUnavailable`) — this is the
+/// platform's existing accepted fail-closed posture for that direction
+/// (#2703 addressed the cached-*disabled* direction only), not a new gap
+/// this reconciliation introduces.
 [[nodiscard]] RbacEnforcementLabel rbac_enforcement_label(const RbacStore* store) noexcept;
 
 /// "enabled" | "disabled" | "degraded" — the wire/DB string form of
@@ -587,6 +886,57 @@ enum class RbacEnforcementLabel {
         return "degraded";
     }
     return "degraded"; // unreachable for a valid enumerator; fail closed on the label too
+}
+
+/// The fixed marker substring `RbacStore::unassign_role`'s error string
+/// always contains when refusing the A2 last-Administrator guard (see that
+/// method's doc comment). The REST route (POST/DELETE
+/// `/api/v1/rbac/roles/{name}/assignments`) and its MCP twin both match
+/// against this ONE constant — via `is_rbac_last_admin_refusal` below — to
+/// distinguish the business-rule refusal (409/Conflict-class) from a genuine
+/// store/query failure (503/Transient-class). EXTEND this, never invent a
+/// second copy of the wording to match against.
+inline constexpr std::string_view kRbacLastAdminRefusalMarker = "zero administrators";
+
+/// True iff `msg` (an `unassign_role` error string) is the last-Administrator
+/// refusal above, rather than a genuine store/query failure.
+[[nodiscard]] inline bool is_rbac_last_admin_refusal(const std::string& msg) noexcept {
+    return msg.find(kRbacLastAdminRefusalMarker) != std::string::npos;
+}
+
+/// True iff `msg` (an `RbacStore::assign_role` error string) is a genuine
+/// CLIENT-facing validation rejection — one of `validate_assignment`'s own
+/// messages, or `assign_role`'s own built-in-system-role rejection (F1) —
+/// rather than a store/query fault (`"database not open"`, a raw
+/// `PQerrorMessage` string, or the ambiguous `"assign_role failed"`
+/// fallback). Doomgoose external review, PR #4985 IMPORTANT finding #3: both
+/// the REST and MCP `assign_rbac_role` twins previously mapped EVERY
+/// `!assign_role(...)` outcome to a 400/`kInvalidParams` client error
+/// unconditionally — a genuine store fault (a dropped connection, a Postgres
+/// error) was misreported as "your input was rejected" rather than the
+/// retryable 503/`kInternalError` it actually is.
+///
+/// ALLOWLIST, not a denylist, by design: an unrecognized FUTURE error string
+/// from `assign_role` (one this list has not been updated for) defaults to
+/// the SAFER "store fault, retryable" classification rather than silently
+/// masquerading as a permanent client rejection. EXTEND this allowlist
+/// whenever `validate_assignment`/`assign_role` grows a new genuine
+/// client-validation message — match the FIXED, non-interpolated wording
+/// only, never a caller-controlled substring (`role_name`/`principal_id` are
+/// interpolated into several of these messages).
+///
+/// Scoped to `assign_role` only — `unassign_role`'s error vocabulary is
+/// different (no `validate_assignment` call) and is already correctly
+/// classified via `is_rbac_last_admin_refusal` above; do not reuse this
+/// helper for unassign's errors.
+[[nodiscard]] inline bool rbac_assign_error_is_client_fault(std::string_view msg) noexcept {
+    return msg.find("reserved 'engine:' namespace may only be assigned under") !=
+               std::string_view::npos ||
+           msg.find("unrecognized principal_type '") != std::string_view::npos ||
+           msg.find("must be in the reserved 'engine:<slug>' namespace") !=
+               std::string_view::npos ||
+           msg.find("cannot be granted the admin/full-access role") != std::string_view::npos ||
+           msg.find("cannot be granted a built-in system role") != std::string_view::npos;
 }
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.

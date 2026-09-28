@@ -10995,6 +10995,136 @@ TEST_CASE("Registry mechanism (direct): a sweeper whose passes keep failing repo
     mech->stop();
 }
 
+// ── #4704: the sweeper's pass-outcome lines are written OFF mu_ ──────────────
+//
+// Before #4704 sweeper_main() wrote its `pass failed`, `failing persistently` and
+// `pass recovered` lines while holding mu_, so a blocked log sink stalled every other
+// mu_ taker (watch()/unwatch() behind arm()/disarm(), apply_test_controls(), stop()), not
+// only the sweeper. Each case parks the sweeper INSIDE the sink on one of those lines
+// (PfStallLogger's on_hit runs on the sweeper thread before the sleep; it blocks on a
+// test-owned gate) and requires a mu_ taker to complete while the sweeper is still parked.
+// Falsifier: move `log_pass_outcome(po)` above either branch's `lk.unlock()` in
+// sweeper_main() and the matching case(s) fail at the 2000 ms `done` wait (verified red on
+// DGRHP, PR #N). PfStallLogger's preconditions apply: one instance at a time, declared before
+// the mechanism, `hits() > 0` asserted (#3355), and no other thread logs while it lives -
+// the driver below emits nothing on the test thread, the probe worker, or the TP_WAIT
+// callback (its emit is a no-op, so on_fire()'s emit-threw warn cannot fire).
+namespace {
+
+struct RegLogGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool released{false};
+    void release() {
+        { std::lock_guard lk(m); released = true; }
+        cv.notify_all();
+    }
+    void wait_released() {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return released; });
+    }
+};
+
+struct RegLogOffLock {
+    const char* stall_target; // the sweeper line to park on
+    bool drive_recovery;      // park on the recovery branch (after the failing passes)
+};
+
+void reg_run_log_off_lock(const RegLogOffLock& sc) {
+    ScratchRegKey a("log_off_lock");
+    // Every captured piece of state is declared BEFORE stall_log and the mechanism
+    // (locals unwind in reverse: the mechanism joins its sweeper first, then the logger
+    // restores the previous default logger, then the gate and atomics die).
+    std::atomic<bool> failing{false};
+    std::atomic<bool> parked{false};
+    RegLogGate gate;
+    // PfStallLogger copies the default logger's level; the `recovered` line is INFO, so a
+    // raised default level would hide it from the sink and fail this case for a reason
+    // unrelated to mu_ (the operator manual's own "--log-level warn hides the recovery").
+    INFO("default logger level " << static_cast<int>(spdlog::default_logger()->level()));
+    REQUIRE(spdlog::default_logger()->level() <= spdlog::level::info);
+    PfStallLogger stall_log(sc.stall_target, 0ms);
+    stall_log.set_on_hit([&] {
+        parked.store(true, std::memory_order_release);
+        gate.wait_released(); // the sweeper is now where a blocked sink would hold it
+    });
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    // Release on EVERY exit path (a failed REQUIRE included) BEFORE `mech` is destroyed:
+    // ~WindowsRegistryMechanism joins a sweeper that would otherwise be parked for ever.
+    // Declared after `mech` so it runs first.
+    struct ReleaseOnExit {
+        RegLogGate& g;
+        ~ReleaseOnExit() { g.release(); }
+    } release_on_exit{gate};
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the set.
+    const auto controls = [&] {
+        RegistryMechanismTestControls ctl;
+        ctl.sweep_cadence = 5ms;
+        ctl.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    REQUIRE(set_registry_test_controls_for_test(*mech, controls()));
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value()); // control-path establishment
+    // Only now start failing: a pass that parked under mu_ BEFORE watch() (the pre-#4704
+    // code) would hang watch() with no release in sight instead of failing this case.
+    failing.store(true, std::memory_order_release);
+    a.write(1); // consumed notification -> re-arm published -> passes run and throw (sre6-1)
+    if (sc.drive_recovery) {
+        REQUIRE(eventually([&] { return mech->stats().inert; }, 8000ms));
+        failing.store(false, std::memory_order_release); // the next pass succeeds -> `recovered`
+    }
+    REQUIRE(eventually([&] { return parked.load(std::memory_order_acquire); }, 8000ms));
+    // The oracle: a mu_ taker completes while the sweeper is parked in the sink.
+    // set_registry_test_controls_for_test() is a bare lock_guard(mu_) plus a nudge (no OS
+    // work, no logging). Pre-#4704 it blocked here until the gate released.
+    std::atomic<bool> done{false};
+    std::thread taker([&] {
+        (void)set_registry_test_controls_for_test(*mech, controls());
+        done.store(true, std::memory_order_release);
+    });
+    // CHECK, not REQUIRE: `taker` is joinable below and must be joined on the red path too
+    // (the release unparks the sweeper, which unlocks mu_, so the taker then completes).
+    CHECK(eventually([&] { return done.load(std::memory_order_acquire); }, 2000ms));
+    // Still parked: hits() increments only after on_hit RETURNS, so 0 here proves the taker
+    // completed while the sweeper was inside the sink (the ordering pin, see §3.3).
+    CHECK(stall_log.hits() == 0);
+    gate.release();
+    taker.join();
+    // #3355 FALSE-GREEN guard: the parked line really went through the library's logger.
+    CHECK(eventually([&] { return stall_log.hits() >= 1; }, 5000ms));
+    mech->stop();
+}
+
+} // namespace
+
+TEST_CASE("Registry mechanism (direct): the `sweeper pass failed` line is written off mu_ - "
+          "a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper pass failed (consecutive #1)",
+                          .drive_recovery = false});
+}
+
+TEST_CASE("Registry mechanism (direct): the `sweeper failing persistently` line is written off "
+          "mu_ - a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper failing persistently",
+                          .drive_recovery = false});
+}
+
+TEST_CASE("Registry mechanism (direct): the `sweeper pass recovered` line is written off mu_ - "
+          "a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper pass recovered after",
+                          .drive_recovery = true});
+}
+
 TEST_CASE("Registry mechanism (Windows, direct): while every sweeper pass fails the staged None is "
           "not delivered, and after recovery the sequence is [Notification, None, Notification] "
           "(CH-1 direct layer, characterisation)",

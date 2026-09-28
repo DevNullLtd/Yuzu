@@ -96,6 +96,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
@@ -131,19 +132,24 @@ FRAGMENT_FILES = [
 # Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
 # Wave 8 PR8.1-b: +1 system_hardening (posture).
 # Wave 10 PR10.1-c: +2 pkg_inventory (managers/packages).
+# Wave 10 PR10.2-b: +1 browser_policy (policies).
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
 # 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
 # 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
 # 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
-# 1 (system_hardening) + 2 (pkg_inventory, managers/packages) = 222.
+# 1 (system_hardening) + 2 (pkg_inventory, managers/packages) + 1 (browser_policy) = 223.
 # This constant has been bumped independently on several sides of several merges
 # (PR #4719 and PR #4964 CI are the trail; #4721 tracks deriving it per fragment).
 # The rule is always the same: find the shared baseline all sides agree on and add
 # EVERY side's new plugin on top of it, never pick one side's total -- and re-derive
 # by RUNNING parse_fragment_gate_rows over FRAGMENT_FILES rather than trusting hand
-# arithmetic, which has drifted before (206, then 203, then repeatedly since).
-EXPECTED_TOTAL_ROWS = 222
+# arithmetic, which has drifted before (206, then 203, then repeatedly since). Dev
+# landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); this
+# branch's own browser_policy (+1) lands on top of dev's 222: 222 + 1 = 223. Verified
+# directly against the merged fragment files (not by combining stale totals) before
+# landing -- see the merge commit for the confirming test run.
+EXPECTED_TOTAL_ROWS = 223
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

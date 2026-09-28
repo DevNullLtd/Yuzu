@@ -1859,6 +1859,49 @@ private:
         nudged_ = false; // the backoff wait below decides when the next pass runs
     }
 
+    /// What sweeper_main() logs once mu_ is released (#4704). Before #4704 the
+    /// three pass-outcome lines were written while mu_ was held, so a blocked or
+    /// slow log sink stalled every other mu_ taker (watch()/unwatch() behind
+    /// arm()/disarm(), apply_test_controls(), stop()'s first block), not only this
+    /// worker - the "one stalled operation blocks the type's arm/disarm" shape
+    /// PR-B1 removed for the OS calls. Same shape as spark_file.cpp's
+    /// PassOutcome / log_pass_outcome() (#4658). Values only, captured on the
+    /// sweeper's own stack before the unlock; nothing is re-read afterwards, so
+    /// the line always describes the pass that produced it.
+    struct PassOutcome {
+        unsigned failures{0};
+        std::int64_t delay_ms{0};
+        bool flipped_inert{false};
+        bool recovered{false};
+    };
+
+    /// Off-lock, static (touches no member), noexcept with an internal catch:
+    /// an ordinary formatting/allocation failure is already handled inside
+    /// spdlog's own logging pipeline and does not reach here (verified against
+    /// spdlog's SPDLOG_TRY/CATCH machinery, #4704 review). This catch(...) is
+    /// a last-resort backstop for a genuinely exceptional failure surviving
+    /// that pipeline, so the sole producer of health edges cannot be brought
+    /// down by a diagnostic log call - sweeper_main() has no outer catch of
+    /// its own. Content, level and the 1/2/4/8 gate are exactly what
+    /// sweeper_main() wrote under mu_ before #4704; a default-constructed
+    /// outcome (a clean pass) logs nothing.
+    static void log_pass_outcome(const PassOutcome& o) noexcept {
+        try {
+            if (o.recovered) {
+                spdlog::info("spark_registry: sweeper pass recovered after {} failure(s)",
+                             o.failures);
+                return;
+            }
+            if (o.failures != 0 && (o.failures & (o.failures - 1)) == 0) // 1, 2, 4, 8 ... : bounded log rate (sre6-2)
+                spdlog::error("spark_registry: sweeper pass failed (consecutive #{}) - retrying in {} ms",
+                              o.failures, o.delay_ms);
+            if (o.flipped_inert)
+                spdlog::error("spark_registry: sweeper failing persistently - registry sparks "
+                              "reported inert until a pass succeeds");
+        } catch (...) {
+        }
+    }
+
     void sweeper_main() {
         std::unique_lock lk(mu_);
         unsigned failures = 0; // consecutive failed passes
@@ -1886,20 +1929,23 @@ private:
                 // (sre6-1). Neither: put back what this pass took, count, back off,
                 // and after kSweeperInertAfterFailures consecutive failures publish
                 // inertness through the existing wire signal (the capability CSV).
+                // The outcome lines are written after the branch's unlock (#4704, PassOutcome).
                 ok = false;
                 if (!lk.owns_lock())
                     lk.lock();
                 unwind_pass_locked(work, dispatched);
             }
             if (ok) {
+                PassOutcome po;
                 if (failures) {
-                    spdlog::info("spark_registry: sweeper pass recovered after {} failure(s)",
-                                 failures);
+                    po.recovered = true;
+                    po.failures = failures;
                     failures = 0;
                     if (core_)
                         inert_.store(false, std::memory_order_release);
                 }
                 lk.unlock();
+                log_pass_outcome(po); // #4704: off mu_ - see PassOutcome
                 {
                     SweepWork dead = std::move(work); // handle closes + abandons run off-lock
                 }
@@ -1909,15 +1955,15 @@ private:
             sweep_pass_failed_.fetch_add(1, std::memory_order_relaxed);
             ++failures;
             const auto delay = doubled(sweep_cadence(), failures, kRegAdmissionBackoffCap);
-            if ((failures & (failures - 1)) == 0) // 1, 2, 4, 8 ... : bounded log rate (sre6-2)
-                spdlog::error("spark_registry: sweeper pass failed (consecutive #{}) - retrying in {} ms",
-                              failures, delay.count());
+            PassOutcome po;
+            po.failures = failures;
+            po.delay_ms = delay.count();
             if (failures >= kSweeperInertAfterFailures && !inert_.load(std::memory_order_acquire)) {
                 inert_.store(true, std::memory_order_release);
-                spdlog::error("spark_registry: sweeper failing persistently - registry sparks "
-                              "reported inert until a pass succeeds");
+                po.flipped_inert = true;
             }
             lk.unlock();
+            log_pass_outcome(po); // #4704: off mu_ - see PassOutcome
             {
                 SweepWork dead = std::move(work);
             }

@@ -324,6 +324,25 @@ MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string 
 post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
 document both tokens explicitly).
 
+### vNEXT — `POST /api/policies/{id}/evaluate` and `/remediate` can now answer `503` where they previously answered `409`/`400` (#4981; breaking)
+
+**What changed.** Both routes previously classified a degraded scope evaluation — a `from_result_set:`
+reference whose owning set was deleted by a concurrent operation, or a presence-store outage during a
+fleet-wide scope check — as an ordinary "no agents matched" or "request rejected" outcome:
+`/evaluate` returned a clean `409`, and `/remediate` (when `agent_ids` is supplied) returned a `400`
+audited as an operator `denied`. Neither was true — the check could not actually be evaluated. Both
+routes now answer `503` for this case, audited as `error`, with the response `message` (and audit
+detail) carrying the specific underlying cause rather than a generic string.
+
+**Who this affects.** Any automation that treats `409` from `/evaluate` or `400` from `/remediate`
+(with `agent_ids`) as terminal, or that logs either code as an operator denial. A `503` from either
+route is safe to retry
+once the underlying condition (a concurrent result-set delete, a presence-store hiccup) clears —
+typically within seconds.
+
+**What to do.** Treat `503` on these two routes as retryable infrastructure degradation, distinct from
+a genuine `409`/`400`. No action needed if your automation already retries on `503` generically.
+
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
 **What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.

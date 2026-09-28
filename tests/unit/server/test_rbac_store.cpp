@@ -20,6 +20,7 @@
 #include "rbac_generation_rules.hpp"
 #include "rbac_store.hpp"
 
+#include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -96,6 +98,126 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     REQUIRE(rbac_pool_fx_.valid());                                                                 \
     RbacStore store_var{rbac_pool_fx_};                                                             \
     REQUIRE(store_var.is_open())
+
+// Fixture for the A2 last-Administrator guard (governance BLOCKING #1,
+// full-pipeline review on 765bc7ec1): `RbacStore::unassign_role`'s guard now
+// JOINs `auth.users`, so these tests need BOTH schemas in the SAME
+// database — unlike `RBAC_STORE` above, which uses the shared "rbacstore"
+// `PgTestTemplate` name that 9+ OTHER test files also register verbatim
+// (the registry's replay-verification requires every registration of one
+// template name stay behaviorally identical), so extending THAT template to
+// also carry `auth.users` is out of scope for this fix — it would have to
+// change in lockstep across every one of those files. Instead: construct
+// `RbacStore` DIRECTLY on a real `AuthDbPg` fixture's own pool (mirrors
+// `server.cpp`'s own composition — ONE `pg_pool_`, both stores built from
+// it, ADR-0006) rather than via the shared template. Slower than a
+// template clone (a fresh RbacStore migration+seed every case, not a
+// pre-migrated clone) but this fixture backs a small, dedicated set of
+// cases, not the whole file.
+#define RBAC_STORE_WITH_AUTH(store_var, auth_var)                                                 \
+    yuzu::test::AuthDbPg auth_var;                                                                \
+    RbacStore store_var{auth_var.pool()};                                                         \
+    REQUIRE(store_var.is_open())
+
+/// Seed an ACTIVE auth.users row for `username` (a genuinely authenticatable
+/// account) — the shared building block for every last-admin-guard test
+/// below. `role` doesn't matter to `unassign_role`'s guard (it JOINs only on
+/// `is_active`), so this defaults to a plain non-admin `auth::Role::user`
+/// row; RBAC administrator authority comes entirely from the
+/// `principal_roles` grant, a separate table this helper does not touch.
+void seed_active_user(yuzu::test::AuthDbPg& auth_db, const std::string& username) {
+    REQUIRE(auth_db->upsert_user(username, "hash", "salt", auth::Role::user).has_value());
+}
+
+/// Doomgoose external review, PR #4985 (IMPORTANT #6): poll `pg_stat_activity`
+/// for a backend GENUINELY blocked on a Postgres lock (row lock via `FOR
+/// UPDATE`, or an advisory lock — both register `wait_event_type = 'Lock'`),
+/// rather than a blind `sleep_for` + assume-timing "prove a thread has
+/// started" (CLAUDE.md forbids sleep_for+assume-timing synchronization for
+/// correctness — a sleep-gated interleaving proof can flake on a loaded
+/// shared CI runner even though the load-bearing correctness here depends on
+/// the real lock, not the sleep duration).
+///
+/// MUST run on its OWN ad-hoc connection, opened here from `dsn` — NEVER on
+/// the lock HOLDER's own connection, even though that connection is idle and
+/// available to accept a new query. Verified empirically while building this
+/// fix (5+ minute live-PG debugging session, not a documentation guess):
+/// `pg_stat_activity` is snapshotted ONCE per transaction (PostgreSQL's own
+/// documented statistics-view behavior — "information ... is collected when
+/// any such information is first requested within a transaction, and the
+/// same information will be displayed throughout the transaction"). The lock
+/// holder's connection (e.g. `lease_a` in every caller below) is ALWAYS
+/// mid-explicit-transaction (`BEGIN` already issued) by the time this is
+/// called, so probing through it would take ONE snapshot on the first poll
+/// iteration and silently keep re-reading that SAME frozen, pre-block
+/// snapshot for every remaining iteration — never observing the waiter no
+/// matter how long or how many times it polls. This exact bug shipped in an
+/// earlier draft of this fix and hung every test using it indefinitely (the
+/// blocked backend was real — confirmed via `pg_backend_pid()` self-query
+/// and independent `psql` inspection — `pg_stat_activity` just never
+/// refreshed on the probing connection to show it). A separate, dedicated
+/// connection issuing bare autocommit statements (no explicit `BEGIN`) gets
+/// a fresh snapshot on every single statement, which is what makes polling
+/// here actually work. `own_pid` excludes the lock HOLDER's own backend so
+/// it's never mistaken for the waiter. Bounded: up to `max_attempts` x 50ms
+/// (5s by default) before giving up and returning 0.
+// (cpp-safety re-review, PR #4985 fix round: `PQntuples(r.get()) == 1` is a
+// strict-equality match — a SECOND concurrent lock-waiter on a shared/loaded
+// CI Postgres at the same moment (this box runs 4 runner agents as one OS
+// identity, #1871) makes every iteration return 0 or 2+ rows and spin to the
+// full timeout. Same shape as the blind-sleep code this replaced, not a new
+// defect — flagged since it's the kind of shared-runner collision
+// unit-test-conventions.md already tracks for fixed identifiers, and a
+// row-count predicate is the same class of thing.)
+int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_attempts = 100) {
+    pg::PgConn probe{PQconnectdb(dsn.c_str())};
+    if (PQstatus(probe.get()) != CONNECTION_OK) {
+        UNSCOPED_INFO("poll_for_blocked_backend_pid: probe connection failed, distinct from "
+                      "'no lock wait observed within the bound'");
+        return 0;
+    }
+    for (int i = 0; i < max_attempts; ++i) {
+        pg::PgResult r = pg::exec_params(probe.get(),
+                                         "SELECT pid FROM pg_stat_activity WHERE datname = "
+                                         "current_database() AND wait_event_type = 'Lock' "
+                                         "AND pid <> $1",
+                                         std::vector<std::string>{std::to_string(own_pid)});
+        if (r.ok() && PQntuples(r.get()) == 1)
+            return std::atoi(PQgetvalue(r.get(), 0, 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return 0;
+}
+
+// Joins its std::thread on scope exit, after running `before_join` (used to roll back a
+// held lease so a worker blocked on that lease's row lock can finish). A failing REQUIRE
+// therefore never leaves a joinable std::thread behind (std::terminate) and never waits
+// out a lock_timeout. std::jthread is not available on every supported toolchain (the
+// tree notes Apple Clang's libc++ lacks it), so this stands in for it.
+namespace {
+class ScopedJoin {
+public:
+    explicit ScopedJoin(std::thread t, std::function<void()> before_join = {})
+        : t_(std::move(t)), before_join_(std::move(before_join)) {}
+    ScopedJoin(const ScopedJoin&) = delete;
+    ScopedJoin& operator=(const ScopedJoin&) = delete;
+    ~ScopedJoin() {
+        if (t_.joinable()) {
+            if (before_join_)
+                before_join_();
+            t_.join();
+        }
+    }
+    void join() {
+        if (t_.joinable())
+            t_.join();
+    }
+
+private:
+    std::thread t_;
+    std::function<void()> before_join_;
+};
+} // namespace
 
 TEST_CASE("RbacStore migration lands at v4 and poisons (not deletes) the backfill marker rows "
           "(#3623, governance unhappy-path fix)",
@@ -679,6 +801,8 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     // write racing a concurrent seed_defaults() boot on another connection.
     auto lease_a = rbac_pool_fx_.acquire();
     REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
     REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
     REQUIRE(pg::exec_params(lease_a.get(),
                             "SELECT pg_advisory_xact_lock(2037545589, "
@@ -735,9 +859,11 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     } joiner{grant_thread};
 
     // Give the grant thread time to start and genuinely block on connection
-    // A's held lock — proves this is a real blocked-then-unblocked
-    // interleaving, not a lucky race.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // A's held lock — poll pg_stat_activity for a real Lock wait rather than
+    // trust a fixed sleep duration to prove it (Doomgoose external review,
+    // PR #4985 IMPORTANT #6). MUST use a separate probe connection, never
+    // lease_a itself — see poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(rbac_db_fx_.dsn(), lease_a_pid) != 0);
     CHECK(b_started.load());
     CHECK_FALSE(b_done.load());
 
@@ -831,6 +957,801 @@ TEST_CASE("RbacStore: unassign role", "[rbac_store][pg]") {
 
     auto roles = store.get_principal_roles("user", "carol");
     CHECK(roles.empty());
+}
+
+// ── A2 last-Administrator guard (delivery plan §2) ──────────────────────────
+
+TEST_CASE("RbacStore: unassign_role refuses to remove the fleet's last remaining "
+          "Administrator grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "onlyadmin");
+    REQUIRE(store.assign_role({"user", "onlyadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "onlyadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+
+    // The DELETE rolled back — the grant is still there.
+    auto roles = store.get_principal_roles("user", "onlyadmin");
+    REQUIRE(roles.size() == 1);
+    CHECK(roles[0].role_name == "Administrator");
+}
+
+TEST_CASE("RbacStore: unassign_role removes an Administrator grant when another "
+          "Administrator remains",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "admin1");
+    seed_active_user(auth_db, "admin2");
+    REQUIRE(store.assign_role({"user", "admin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "admin2", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "admin1", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
+    CHECK(store.get_principal_roles("user", "admin1").empty());
+    CHECK(store.get_principal_roles("user", "admin2").size() == 1);
+}
+
+// ── Governance BLOCKING #1 (full-pipeline review on 765bc7ec1) — C1: the
+// guard counts AUTHENTICATABLE administrators, not bare grant rows. Three
+// sub-cases, each proving the "other" Administrator row does NOT save the
+// real admin's removal from refusal, because nobody can actually log in as
+// it. `remove_user()` is a SOFT delete in this codebase (auth_db.cpp:
+// `UPDATE auth.users SET is_active = FALSE ...` — there is no hard-delete
+// path anywhere), so (b) deactivated and (c) deleted are the SAME code path
+// here; both are kept as distinct cases anyway (matching the finding's own
+// three named sub-cases) to document that equivalence explicitly rather
+// than assuming a reader already knows it. ────────────────────────────────
+
+TEST_CASE("RbacStore C1(a): last-admin guard refuses when the only 'other' "
+          "Administrator row names a NONEXISTENT username (pre-provisioned, "
+          "never logged in)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    // "ghostadmin" has NO auth.users row at all — A2 explicitly permits
+    // pre-provisioning a grant ahead of an account existing.
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+
+    // Negative control: documents the PRE-FIX behavior this test would have
+    // observed — a bare grant-row count (ignoring auth.users entirely) sees
+    // TWO rows ("realadmin", "ghostadmin") and would have allowed the
+    // delete, reaching zero AUTHENTICATABLE administrators. Reproduced here
+    // directly against the raw table, independent of unassign_role, so this
+    // assertion can never silently start exercising the real (fixed) code
+    // path instead of the historical defect shape.
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto bare_count = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM rbac_store.principal_roles WHERE role_name = "
+            "'Administrator' AND principal_type = 'user'",
+            std::vector<std::string>{});
+        REQUIRE(bare_count.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(bare_count.get(), 0, 0)) == "2"); // would have allowed it
+    }
+}
+
+TEST_CASE("RbacStore C1(b): last-admin guard refuses when the only 'other' "
+          "Administrator row names a DEACTIVATED account",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    seed_active_user(auth_db, "deactivatedadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "deactivatedadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deactivatedadmin").has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+}
+
+TEST_CASE("RbacStore C1(c): last-admin guard refuses when the only 'other' "
+          "Administrator row names a DELETED account (this codebase's "
+          "remove_user() is a soft-delete — is_active=FALSE, no hard-delete "
+          "path exists — so this is mechanically the SAME guard as C1(b), "
+          "kept distinct to document that equivalence explicitly)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    seed_active_user(auth_db, "deletedadmin");
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "deletedadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deletedadmin").has_value());
+
+    auto result = store.unassign_role("user", "realadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+}
+
+// Doomgoose external review, PR #4985 (IMPORTANT #1): the guard's post-delete
+// refusal previously fired on ANY post-delete zero count, not only when the
+// delete ITSELF removed one of the rows the earlier `SELECT ... FOR UPDATE OF
+// pr` lock query actually counted. A ghost/deactivated Administrator row is
+// never among those counted rows (it fails the `auth.users`/`is_active` JOIN)
+// -- so if it is the ONLY Administrator grant left, the active-admin count is
+// ALREADY zero before the call, and removing that ghost row cannot be what
+// drives the count from >0 to 0. Two sub-cases (never-existed vs.
+// deactivated), matching the C1(a)/(b) shape above.
+TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a ghost Administrator "
+          "grant (no auth.users row at all) that is the ONLY Administrator "
+          "row left, instead of spuriously refusing",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    // "ghostadmin" has NO auth.users row — A2 explicitly permits
+    // pre-provisioning — and is the ONLY Administrator grant on this store,
+    // so the counted active-admin total is ALREADY zero before this call.
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+
+    auto result = store.unassign_role("user", "ghostadmin", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
+    CHECK(store.get_principal_roles("user", "ghostadmin").empty());
+}
+
+TEST_CASE("RbacStore: unassign_role SUCCEEDS removing a DEACTIVATED "
+          "Administrator grant that is the ONLY Administrator row left, "
+          "instead of spuriously refusing",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "deactivatedonly");
+    REQUIRE(store.assign_role({"user", "deactivatedonly", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deactivatedonly").has_value());
+
+    auto result = store.unassign_role("user", "deactivatedonly", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK(*result); // a row was actually removed
+    CHECK(store.get_principal_roles("user", "deactivatedonly").empty());
+}
+
+// Doomgoose external review, PR #4985 (IMPORTANT finding #1, TOCTOU): the
+// `locked_admin_principal_ids` snapshot above is taken BEFORE the DELETE, and
+// the candidate `auth.users` rows are deliberately left unlocked by this guard
+// (see the Concurrency note in rbac_admin_authority_owner.cpp) — so a
+// principal that is a ghost/deactivated Administrator grant at lock time (and
+// therefore excluded from the locked/counted set) can be reactivated by a
+// FULLY INDEPENDENT, concurrent transaction (`AuthDB::reactivate_user`) in the
+// gap between the lock query and the DELETE. If that reactivated principal is
+// the fleet's ONLY real Administrator, the guard must still refuse — this
+// reproduces exactly that interleaving and confirms the fix (the fresh
+// post-DELETE `auth.users.is_active` re-check) catches it.
+//
+// Deterministic interleaving: production's own `FOR UPDATE OF pr` lock query
+// does NOT lock ghostadmin's row (it's inactive at lock time, so it fails the
+// JOIN's `is_active` filter and is never in that query's result set) — so,
+// unlike the CHAOS-1/race tests above, there is no natural production lock to
+// hang the background thread on here. This test manufactures its own
+// synchronization point instead: connection A takes a direct `FOR UPDATE` on
+// ghostadmin's own `principal_roles` row (not a production statement, purely
+// a test-only control point) BEFORE the background thread starts, which
+// blocks that thread's own `DELETE` (targeting the identical row) until
+// connection A releases it — giving a guaranteed window in which to commit
+// the reactivation from a third, fully independent connection before letting
+// the background thread's DELETE (and this fix's fresh re-check) proceed.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard REFUSES when "
+          "the ONLY Administrator grant is reactivated by an independent "
+          "transaction between the lock query and the DELETE (TOCTOU close, "
+          "PR #4985 finding #1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    // Deactivate — ghostadmin is now the fleet's ONLY Administrator grant, and
+    // it is NOT counted (mirrors the "ghost/deactivated" scenario the earlier
+    // succeeds-test above covers), so `unassign_role`'s lock query will find
+    // zero locked/counted rows.
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Test-only lock (NOT a production statement — see the header comment
+    // above): locks the exact row the background thread's DELETE will target,
+    // so that DELETE blocks here regardless of the production lock query's
+    // own (empty, since ghostadmin is inactive) result set.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT principal_id FROM rbac_store.principal_roles WHERE "
+                            "principal_type = 'user' AND principal_id = 'ghostadmin' AND "
+                            "role_name = 'Administrator' FOR UPDATE",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    ScopedJoin unassign_thread{std::thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    // Prove a real blocked-then-unblocked interleaving (Doomgoose external
+    // review, PR #4985 IMPORTANT #6) — separate probe connection, never
+    // lease_a itself. See poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Reactivate ghostadmin from a FULLY INDEPENDENT connection/transaction
+    // (AuthDB::reactivate_user acquires its own pool lease and commits
+    // immediately) WHILE the background thread's unassign is still blocked
+    // between its lock query and its DELETE — the exact race window finding
+    // #1 identified.
+    REQUIRE(auth_db->reactivate_user("ghostadmin").has_value());
+
+    // Release connection A's hold so the background DELETE can proceed.
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // Must now be refused: ghostadmin is (as of the reactivation, already
+    // committed) the fleet's ONLY real Administrator, and this delete would
+    // leave zero.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+
+    // Refused ⇒ rolled back ⇒ the grant survives, and the account is (per the
+    // reactivation) active — the fleet still has exactly one real admin.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+}
+
+// Doomgoose external review, PR #4985 round 3 (TOCTOU residual window): the test
+// above commits the reactivation BEFORE the post-DELETE recheck runs, so it also
+// passes against a plain (unlocked) recheck. This one holds the reactivation IN
+// FLIGHT across the recheck: connection A updates ghostadmin's own `auth.users`
+// row and leaves it uncommitted, so the recheck (`SELECT ... FOR UPDATE`) must
+// WAIT on that row lock and then re-read the COMMITTED reactivation. A plain
+// SELECT would not wait, would read the still-inactive committed row, and the
+// unassign would commit; the poll REQUIRE below is what fails in that case.
+//
+// The unassign's lock query reads `auth.users` through a JOIN without locking it
+// (`FOR UPDATE OF pr`), so it is not blocked by connection A's row lock; nor is
+// the DELETE, which targets the `principal_roles` row. The only statement that
+// can wait on A is the recheck.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
+          "reactivation still in flight across the post-DELETE recheck and then "
+          "REFUSES (FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // The in-flight reactivation: same effect as AuthDB::reactivate_user's UPDATE,
+    // issued on this lease so the test controls exactly when it commits.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    // If a REQUIRE below throws while the worker is blocked, ScopedJoin rolls back
+    // lease_a before joining, which releases the row lock the worker waits on, so the
+    // failure surfaces immediately instead of after the pool's lock_timeout.
+    ScopedJoin unassign_thread{std::thread([&] {
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    // The unassign has passed its lock query (ghostadmin's COMMITTED row is still
+    // inactive, so it is not counted) and its DELETE, and is now blocked in the
+    // recheck on connection A's row lock. Separate probe connection, never lease_a.
+    // The location is inferred by elimination: no other statement in the
+    // unassign can wait on that one row lock.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The recheck re-read the committed reactivation: ghostadmin is now the fleet's
+    // only real Administrator and this delete would leave zero.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+    // Refused => rolled back => the grant survives.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+    // Not asserted here: the two cases the guard does NOT close (an auth.users row
+    // created concurrently for a pre-provisioned grant, and deactivation of a
+    // surviving Administrator, #4966). Pinning a known hole would have to be
+    // inverted when #4966 lands.
+}
+
+// Complement of the test above: the in-flight reactivation ROLLS BACK, so the
+// recheck re-reads the unchanged inactive row and the removal must go through.
+// Guards against over-refusal after the wait.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for an "
+          "in-flight reactivation that rolls back and then SUCCEEDS "
+          "(FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_removed{false};
+    std::atomic<bool> b_ok{false};
+    ScopedJoin unassign_thread{std::thread([&] {
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (res)
+            b_removed = *res;
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    CHECK(b_ok.load());
+    CHECK(b_removed.load());
+    CHECK(store.get_principal_roles("user", "ghostadmin").empty());
+}
+
+// The reactivation COMMITS during the wait, but another active Administrator
+// remains, so the recount is non-zero and the removal must still go through.
+// Guards against an implementation that refuses outright whenever the recheck sees
+// a reactivation (over-refusal, the safe direction, which no other test catches).
+TEST_CASE("RbacStore: unassign_role's guard WAITS for an in-flight reactivation "
+          "that commits and then SUCCEEDS when another Administrator remains "
+          "(FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    seed_active_user(auth_db, "realadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::atomic<bool> b_removed{false};
+    ScopedJoin unassign_thread{std::thread([&] {
+        auto res = store.unassign_role("user", "ghostadmin", "Administrator");
+        b_ok = res.has_value();
+        if (res)
+            b_removed = *res;
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    CHECK(b_ok.load());
+    CHECK(b_removed.load());
+    CHECK(store.get_principal_roles("user", "ghostadmin").empty());
+    CHECK(store.get_principal_roles("user", "realadmin").size() == 1);
+}
+
+// The lock-wait bound: when the reactivation stays in flight longer than the
+// pool's lock_timeout, the recheck errors, the transaction rolls back (the DELETE
+// is undone), and the failure is NOT a last-Administrator refusal (callers map it
+// to 503 / an MCP internal error with a retry hint, never to the 409 refusal).
+// A second store on a pool with a 300 ms lock_timeout keeps the test fast; the
+// call is synchronous (the statement times out on its own), so no thread is needed.
+TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
+          "fault and rolls the DELETE back (FOR UPDATE; PR #4985 round 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "ghostadmin");
+    REQUIRE(store.assign_role({"user", "ghostadmin", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("ghostadmin").has_value());
+
+    PgPool short_pool{{.conninfo = auth_db.dsn(), .size = 2, .lock_timeout_ms = 300}};
+    REQUIRE(short_pool.valid());
+    RbacStore short_store{short_pool};
+    REQUIRE(short_store.is_open());
+    {
+        // Fail fast if `-c lock_timeout` did not reach the session (a DSN carrying
+        // `options`, or PGOPTIONS set): the synchronous call below would otherwise
+        // wait on a lock held by this same thread.
+        auto probe = short_pool.acquire();
+        REQUIRE(probe);
+        pg::PgResult lt = pg::exec_params(probe.get(), "SELECT current_setting('lock_timeout')",
+                                          std::vector<std::string>{});
+        REQUIRE(lt.status() == PGRES_TUPLES_OK);
+        REQUIRE(std::string(PQgetvalue(lt.get(), 0, 0)) == "300ms");
+    }
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE auth.users SET is_active = TRUE WHERE username = 'ghostadmin'",
+                            std::vector<std::string>{})
+                .ok());
+
+    auto res = short_store.unassign_role("user", "ghostadmin", "Administrator");
+    REQUIRE_FALSE(res.has_value());
+    CHECK_FALSE(is_rbac_last_admin_refusal(res.error()));
+    // Pin the cause: Postgres reports "canceling statement due to lock timeout".
+    CHECK(res.error().find("lock timeout") != std::string::npos);
+
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+    // The timed-out transaction rolled back: the grant is still there.
+    CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
+}
+
+// MINOR (Doomgoose external review, PR #4985): the idempotent no-op shape a
+// regression here would actually spuriously refuse — unassigning
+// "Administrator" from a principal who never held it at all, on a store with
+// ZERO real (counted) admins. `removed` must be false and the call must
+// still succeed; a regression that fires the recount/refuse logic
+// unconditionally (ignoring `removed`) would wrongly reject this.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard is a true "
+          "no-op (not a refusal) for a principal who never held the role, "
+          "on a store with zero real administrators",
+          "[rbac_store][pg]") {
+    // RBAC_STORE_WITH_AUTH, not plain RBAC_STORE: role_name=="Administrator"
+    // always runs the guard's `JOIN auth.users`, which needs the `auth`
+    // schema present in this database — the shared "rbacstore" PgTestTemplate
+    // RBAC_STORE clones does NOT carry it (see RBAC_STORE_WITH_AUTH's own doc
+    // comment above).
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    REQUIRE(store.get_role_members("Administrator").empty());
+
+    auto result = store.unassign_role("user", "neverhadit", "Administrator");
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result); // no row was removed — genuine no-op
+}
+
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard is scoped to the "
+          "Administrator role only — a Viewer/Operator unassign on a ZERO-admin "
+          "store still succeeds (fresh-install bootstrap shape, A2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Fresh RBAC_STORE holds ZERO Administrator principal_roles rows — this is
+    // the real fresh-install shape (A2 is the bootstrap step). Assigning and
+    // then removing a non-Administrator role must be a pure, unconditional
+    // DELETE, exactly as it was before this guard existed — matching every
+    // existing production caller (both engine-only) of unassign_role.
+    REQUIRE(store.get_role_members("Administrator").empty());
+    REQUIRE(store.assign_role({"user", "vera", "Viewer"}).has_value());
+
+    auto result = store.unassign_role("user", "vera", "Viewer");
+    REQUIRE(result.has_value());
+    CHECK(store.get_principal_roles("user", "vera").empty());
+}
+
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard IGNORES a group-held "
+          "Administrator grant — it never counts as a surviving administrator "
+          "(adversarial-review PR1/A2 finding: the guard must match "
+          "is_rbac_administrator's gate, which never resolves group membership)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "soleadmin");
+    // A group-held Administrator row (however it got there today — no
+    // production caller writes one — the guard is a property of
+    // unassign_role, shared by any future caller) must NOT be treated as a
+    // surviving administrator: rbac_admin_predicate.hpp's
+    // is_rbac_administrator gate can never authenticate as one (principal_
+    // type="user" only), so a group row "surviving" would be a false sense
+    // of safety — the fleet would have zero GATE-PASSING administrators.
+    REQUIRE(store.assign_role({"group", "admins-group", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "soleadmin", "Administrator"}).has_value());
+
+    // Removing the ONLY user Administrator must be refused even though a
+    // group row is still present — the guard counts principal_type='user'
+    // ONLY now, ignoring the group row entirely.
+    auto result = store.unassign_role("user", "soleadmin", "Administrator");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(is_rbac_last_admin_refusal(result.error()));
+    CHECK(store.get_principal_roles("user", "soleadmin").size() == 1);
+
+    // The group row is untouched by this refusal (unassign_role never
+    // touched it — different principal_type).
+    CHECK(store.get_principal_roles("group", "admins-group").size() == 1);
+}
+
+// Adversarial-review PR1/A2 finding #2's own regression test: seed a group
+// Administrator row PLUS two real user Administrators, then drive two
+// CONCURRENT REAL RbacStore::unassign_role calls (std::thread, not
+// hand-copied SQL on a puppeteered connection — unlike the deterministic
+// race test below, this one only needs to prove the invariant holds under
+// genuine concurrency, not exercise one specific interleaving) each
+// removing one of the two user rows. Exactly one must succeed and one must
+// be refused — the group row must never be counted as a reason both can
+// succeed.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard under real "
+          "concurrency still refuses to remove the last USER administrator "
+          "even with a group-held Administrator row present",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "concadmin1");
+    seed_active_user(auth_db, "concadmin2");
+    REQUIRE(store.assign_role({"group", "admins-group", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "concadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "concadmin2", "Administrator"}).has_value());
+
+    std::atomic<bool> ok1{false}, ok2{false};
+    std::atomic<bool> done1{false}, done2{false};
+    // ScopedJoin (above) joins on scope exit, so a live std::thread is never left
+    // joinable when a REQUIRE throws (std::terminate); std::jthread would do the same
+    // but is not available on every supported toolchain.
+    ScopedJoin t1{std::thread([&] {
+        ok1 = store.unassign_role("user", "concadmin1", "Administrator").has_value();
+        done1 = true;
+    })};
+    ScopedJoin t2{std::thread([&] {
+        ok2 = store.unassign_role("user", "concadmin2", "Administrator").has_value();
+        done2 = true;
+    })};
+    t1.join();
+    t2.join();
+    CHECK(done1.load());
+    CHECK(done2.load());
+
+    // Exactly one succeeded, one was refused — never both (which would mean
+    // the group row was silently counted as a survivor) and never neither.
+    CHECK(ok1.load() != ok2.load());
+
+    // Exactly one real user Administrator remains — never zero.
+    const std::size_t user_admins_left = store.get_principal_roles("user", "concadmin1").size() +
+                                         store.get_principal_roles("user", "concadmin2").size();
+    CHECK(user_admins_left == 1);
+    // The group row is unaffected either way.
+    CHECK(store.get_principal_roles("group", "admins-group").size() == 1);
+}
+
+// chaos-injector-style: two concurrent unassigns racing to remove the last two
+// Administrator grants must NOT both succeed (which would leave zero admins).
+// Deterministic interleaving via a manually-held FOR UPDATE lock on connection
+// A (mirrors the CHAOS-1 test above) rather than a hope-for-the-best race:
+// connection A holds the SAME row lock unassign_role's own transaction takes,
+// blocking a background thread's REAL store.unassign_role call; A then
+// performs the exact DELETE unassign_role would (removing admin1, leaving
+// admin2) and commits, unblocking the background thread's transaction, which
+// must then observe exactly ONE remaining Administrator row (admin2's) before
+// ITS OWN delete and refuse to remove it.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
+          "concurrent unassigns of the last two Administrator grants — exactly "
+          "one succeeds, never zero remain",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "raceadmin1");
+    seed_active_user(auth_db, "raceadmin2");
+    REQUIRE(store.assign_role({"user", "raceadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "raceadmin2", "Administrator"}).has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Mirrors the production lock statement exactly (rbac_admin_authority_owner.cpp) —
+    // governance BLOCKING #1 re-verification: the JOIN must not weaken this
+    // deterministic interleaving proof.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                            "JOIN auth.users u ON u.username = pr.principal_id "
+                            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                            "'user' AND u.is_active "
+                            "FOR UPDATE OF pr",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    // ScopedJoin (above) joins on scope exit, so a REQUIRE failure anywhere below
+    // (before the explicit .join() call further down) can never leave this thread
+    // live-and-unguarded (governance NICE finding); it also rolls back lease_a first.
+    // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
+    // `unassign_thread` blocks on connection A's row lock for at most
+    // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
+    // indefinitely. If a REQUIRE above connection A's COMMIT fails, ScopedJoin
+    // rolls back lease_a first, so the worker unblocks at once instead of waiting
+    // out that timeout.
+    ScopedJoin unassign_thread{std::thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "raceadmin2", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    // Prove a real blocked-then-unblocked interleaving, not a lucky race:
+    // poll pg_stat_activity for the background thread's own backend
+    // registering a genuine Lock wait (Doomgoose external review, PR #4985
+    // IMPORTANT #6). MUST use a separate probe connection, never lease_a
+    // itself — see poll_for_blocked_backend_pid's own doc comment.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Connection A now performs the delete + count check unassign_role's own
+    // transaction would for raceadmin1, and commits — mirroring the real
+    // production statements exactly.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM rbac_store.principal_roles WHERE principal_type = "
+                            "'user' AND principal_id = 'raceadmin1' AND role_name = "
+                            "'Administrator'",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The background thread's own FOR UPDATE only sees raceadmin2's row by the
+    // time it unblocks (raceadmin1's is already gone) — removing it would
+    // leave zero, so it must be refused.
+    CHECK_FALSE(b_ok.load());
+    CHECK(is_rbac_last_admin_refusal(b_error));
+
+    // Exactly one Administrator remains — never zero.
+    CHECK(store.get_principal_roles("user", "raceadmin1").empty());
+    CHECK(store.get_principal_roles("user", "raceadmin2").size() == 1);
+}
+
+// C2 (governance BLOCKING #1's required regression test, full-pipeline
+// review on 765bc7ec1): a connection lost MID-TRANSACTION, while blocked on
+// the guard's own `FOR UPDATE OF pr` lock, must roll back cleanly — no
+// partial delete, no generation bump — and must not wedge the pool.
+// Precedent for the pg_terminate_backend idiom: test_pg_pool.cpp's "PgPool
+// discards a connection lost mid-use", test_api_token_store.cpp,
+// test_kek_op_lock_holder.cpp. Reuses the deterministic-race scaffold above
+// (connection A holds the lock; the background thread blocks on it) but
+// instead of A committing cleanly, A TERMINATES the blocked backend instead.
+TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
+          "cleanly and never bumps the generation when its connection is "
+          "lost mid-transaction (governance BLOCKING #1 C2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "killadmin1");
+    seed_active_user(auth_db, "killadmin2");
+    REQUIRE(store.assign_role({"user", "killadmin1", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "killadmin2", "Administrator"}).has_value());
+
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    // Mirrors the production lock statement exactly (rbac_admin_authority_owner.cpp) — locks
+    // BOTH candidate rows, so the background unassign below has no
+    // unlocked row left to race past.
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                            "JOIN auth.users u ON u.username = pr.principal_id "
+                            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                            "'user' AND u.is_active "
+                            "FOR UPDATE OF pr",
+                            std::vector<std::string>{})
+                .ok());
+
+    // Durable write_generation baseline, read before the background call
+    // ever starts.
+    pg::PgResult gen_before_res{
+        PQexec(lease_a.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = "
+                              "'write_generation'")};
+    REQUIRE(gen_before_res.ok());
+    REQUIRE(PQntuples(gen_before_res.get()) == 1);
+    const std::string gen_before = PQgetvalue(gen_before_res.get(), 0, 0);
+
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_ok{false};
+    std::string b_error;
+    ScopedJoin unassign_thread{std::thread([&] {
+        b_started = true;
+        auto res = store.unassign_role("user", "killadmin2", "Administrator");
+        b_ok = res.has_value();
+        if (!res)
+            b_error = res.error();
+        b_done = true;
+    }), [&] { lease_a.reset(); }};
+
+    // Find the background thread's own backend, blocked on connection A's
+    // lock — never assume which pool slot it landed on. Poll pg_stat_activity
+    // for a genuine Lock wait rather than trust a fixed sleep duration
+    // (Doomgoose external review, PR #4985 IMPORTANT #6). MUST use a separate
+    // probe connection, never lease_a itself — see
+    // poll_for_blocked_backend_pid's own doc comment.
+    const int blocked_pid = poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid);
+    REQUIRE(blocked_pid > 0);
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    // Sever it — the F1 ledger's "connection loss mid-txn" error path,
+    // fired while the transaction is genuinely mid-flight (blocked on the
+    // row lock), not merely idle.
+    pg::PgResult kill{pg::exec_params(lease_a.get(),
+                                      "SELECT pg_terminate_backend($1)",
+                                      std::vector<std::string>{std::to_string(blocked_pid)})};
+    REQUIRE(kill.ok());
+
+    // Release connection A's lock so the (now-dying) background transaction
+    // isn't also waiting on anything else; its own connection loss is what
+    // ends it, not this rollback.
+    REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+
+    unassign_thread.join();
+    CHECK(b_done.load());
+    // The killed transaction must report failure — never a false success on
+    // a connection that died before COMMIT.
+    CHECK_FALSE(b_ok.load());
+    CHECK_FALSE(b_error.empty());
+
+    // No partial delete: both grants survive, untouched by the aborted txn.
+    CHECK(store.get_principal_roles("user", "killadmin1").size() == 1);
+    CHECK(store.get_principal_roles("user", "killadmin2").size() == 1);
+
+    // The generation counter must NOT have bumped — a killed transaction
+    // rolls back in Postgres itself (no COMMIT ever reached), so
+    // bump_generation_in_txn's own write is discarded along with everything
+    // else in that transaction.
+    pg::PgResult gen_after_res{
+        PQexec(lease_a.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = "
+                              "'write_generation'")};
+    REQUIRE(gen_after_res.ok());
+    REQUIRE(PQntuples(gen_after_res.get()) == 1);
+    CHECK(std::string(PQgetvalue(gen_after_res.get(), 0, 0)) == gen_before);
+
+    // Pool recovery: the dead connection must have been discarded (never
+    // recycled into the idle pool — PgPool::release's health check), and a
+    // fresh call through the SAME store must still work normally.
+    lease_a.reset();
+    REQUIRE(store.assign_role({"user", "postkill-canary", "Viewer"}).has_value());
+    CHECK(store.get_principal_roles("user", "postkill-canary").size() == 1);
 }
 
 TEST_CASE("RbacStore: get role members", "[rbac_store][pg]") {
@@ -1772,7 +2693,14 @@ TEST_CASE("RbacStore: every authz read fails closed (DENY) on a broken store",
 // in-txn and clears the local cache, so the next check re-reads and denies.
 TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
           "[rbac_store][pg]") {
-    RBAC_STORE(store);
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    // A second Administrator holder so the revoke below doesn't trip the A2
+    // last-Administrator guard — this test is about cache invalidation, not
+    // that guard, which has its own dedicated test cases. Both need a real
+    // auth.users row now that the guard JOINs on it.
+    seed_active_user(auth_db, "otheradmin");
+    seed_active_user(auth_db, "cacheuser");
+    store.assign_role({"user", "otheradmin", "Administrator"});
     store.assign_role({"user", "cacheuser", "Administrator"}); // Administrator = allow-all
     // Warm perm_cache_ with an ALLOW verdict.
     CHECK(store.check_permission("cacheuser", "Execution", "Execute"));
@@ -2254,6 +3182,47 @@ TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
     CHECK_FALSE(is_stale_beyond_bound(999, 0, 1000));
 }
 
+// Doomgoose external review, PR #4985 IMPORTANT finding #3 — direct coverage
+// of the ALLOWLIST classifier itself, no DB (a pure std::string_view
+// function). From the A2 route this classifier serves, the 400 branch is
+// actually UNREACHABLE today: `principal_type` is hardcoded `"user"` and
+// `principal_id` has already passed `is_valid_username` (which rejects `:`,
+// so none of `validate_assignment`'s engine-namespace messages can ever
+// reach it either) — the 3 regression tests added alongside this fix (REST/
+// MCP store-fault-maps-to-503, REST get_role()-integrity-fault-maps-to-503)
+// therefore only exercise the 503/default side of the classifier through
+// the route. This test exercises the ALLOWLIST side directly, so a future
+// edit to `validate_assignment`'s wording that silently drifts from this
+// classifier's own strings is caught here rather than nowhere.
+TEST_CASE("rbac_assign_error_is_client_fault classifies the known "
+          "client-validation shapes true and everything else (including "
+          "store faults) false",
+          "[rbac_store]") {
+    using yuzu::server::rbac_assign_error_is_client_fault;
+
+    // The 5 known validate_assignment/F1 client-validation shapes.
+    CHECK(rbac_assign_error_is_client_fault(
+        "principal_id in the reserved 'engine:' namespace may only be assigned under "
+        "principal_type=\"engine\""));
+    CHECK(rbac_assign_error_is_client_fault("unrecognized principal_type 'bogus'"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principal_id must be in the reserved 'engine:<slug>' namespace with a "
+        "non-empty slug"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principals cannot be granted the admin/full-access role 'Administrator' — no "
+        "admin, ever (design §4.2)"));
+    CHECK(rbac_assign_error_is_client_fault(
+        "engine principals cannot be granted a built-in system role 'Administrator' — no "
+        "built-in role, ever (design §4.2)"));
+
+    // Store/query faults — must default to false (503), never the allowlist.
+    CHECK_FALSE(rbac_assign_error_is_client_fault("database not open"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault("assign_role failed"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault(
+        "ERROR:  relation \"rbac_store.principal_roles\" does not exist"));
+    CHECK_FALSE(rbac_assign_error_is_client_fault(""));
+}
+
 // fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
 // key='rbac_enabled' is now constrained to exactly "true"/"false" (migration
 // v2). A write attempting anything else — a hand-edit, a future bug writing
@@ -2375,4 +3344,833 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // never being confirmed, so this would have stayed false forever.
     CHECK(replica_b.rbac_enabled_view_degraded());
     CHECK(rbac_enforcement_in_effect(&replica_b));
+}
+
+// ── A1: RbacStore::set_rbac_enforcement (the caller-survives guard) ─────────
+// See rbac_store.hpp's doc comment for the full rule this section tests:
+// enable requires the caller's own authenticatable (auth.users-joined,
+// active) fleet-wide Administrator grant; disable requires the caller's own
+// local account to hold role='admin' AND active. Both directions run inside
+// the SAME transaction as the flag write, under the rbac_meta row lock and
+// (enable) the same FOR UPDATE OF pr lock unassign_role takes.
+
+namespace {
+// Raw read of the durable write_generation counter — used by several tests
+// below to prove a refusal/no-op wrote nothing and bumped nothing.
+std::string read_write_generation_raw(PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = 'write_generation'",
+        std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetvalue(r.get(), 0, 0);
+}
+} // namespace
+
+TEST_CASE("RbacStore: set_rbac_enforcement(true) refuses when the caller holds no "
+          "authenticatable Administrator grant (fresh store) — flag unchanged, no generation "
+          "bump",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "wannabe");
+    // Gate 7 Fix 1: give "wannabe" the SOURCE authority (local admin role,
+    // required while RBAC is durably OFF) so this test isolates the
+    // pre-existing DESTINATION check (no fleet-wide grant) it was written to
+    // exercise, rather than tripping the new source check for an unrelated
+    // reason.
+    REQUIRE(auth_db->update_role("wannabe", auth::Role::admin).has_value());
+
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+    auto result = store.set_rbac_enforcement(true, "wannabe");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotSurvivor);
+    CHECK_FALSE(store.is_rbac_enabled());
+    CHECK(read_write_generation_raw(auth_db.pool()) == gen_before);
+}
+
+// A1-C1(a-c) — mirrors A2's own C1(a-c) three sub-cases (lines ~820-889
+// above) but for the ENABLE guard's caller check rather than unassign_role's
+// survivor count: a grant naming a nonexistent/deactivated/(soft-)deleted
+// account must never let the guard treat its holder as a durable
+// administrator.
+//
+// Gate 7 Fix 1 note: all three callers here also fail the NEW source-regime
+// check (previous=false ⇒ requires local role='admin' AND active) for the
+// exact same underlying reason (no row / not active) — so that check now
+// fires FIRST and is what these tests actually observe below. The original
+// DESTINATION-check property these tests were written for (the
+// kAuthenticatableAdminGrantsFrom JOIN excludes a grant naming a
+// nonexistent/inactive account) is the SAME JOIN Fix 1's source check uses
+// for the disable direction (list_authenticatable_admin_grants) — exercised
+// directly, unmasked, by the new dedicated Fix 1 test further below.
+TEST_CASE("RbacStore A1-C1(a): set_rbac_enforcement(true) refuses when the caller's grant "
+          "names a NONEXISTENT auth.users account (pre-provisioned, never logged in)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    // "ghostcaller" has NO auth.users row at all — A2 explicitly permits
+    // pre-provisioning a grant ahead of an account existing.
+    REQUIRE(store.assign_role({"user", "ghostcaller", "Administrator"}).has_value());
+
+    auto result = store.set_rbac_enforcement(true, "ghostcaller");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+    CHECK_FALSE(store.is_rbac_enabled());
+}
+
+TEST_CASE("RbacStore A1-C1(b): set_rbac_enforcement(true) refuses when the caller's grant "
+          "names a DEACTIVATED auth.users account",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "deactivatedcaller");
+    REQUIRE(store.assign_role({"user", "deactivatedcaller", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deactivatedcaller").has_value());
+
+    auto result = store.set_rbac_enforcement(true, "deactivatedcaller");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+    CHECK_FALSE(store.is_rbac_enabled());
+}
+
+TEST_CASE("RbacStore A1-C1(c): set_rbac_enforcement(true) refuses when the caller's grant "
+          "names a DELETED (soft-deleted via remove_user) auth.users account — mechanically "
+          "the same guard as C1(b), this codebase's remove_user() being a soft-delete",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "deletedcaller");
+    REQUIRE(store.assign_role({"user", "deletedcaller", "Administrator"}).has_value());
+    REQUIRE(auth_db->remove_user("deletedcaller").has_value());
+
+    auto result = store.set_rbac_enforcement(true, "deletedcaller");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+    CHECK_FALSE(store.is_rbac_enabled());
+}
+
+// Gate 7 Fix 1 — dedicated regression test: durable state is X, caller does
+// NOT hold authority under regime X but DOES hold authority under the
+// destination regime — the call must be refused, not applied. Uses the
+// disable direction (X=on): "localonly" holds the DESTINATION authority
+// (local role='admin', the disable target regime) but no fleet-wide
+// Administrator grant (the SOURCE authority required while RBAC is durably
+// ON) — pre-fix, the destination-only check would have let this caller
+// disable enforcement despite never having been a real RBAC administrator
+// (the concrete "fail-open on disable" scenario the fix closes). Also
+// exercises the SAME kAuthenticatableAdminGrantsFrom JOIN as C1(a-c) above,
+// unmasked, via the new lock-free list_authenticatable_admin_grants source
+// check.
+TEST_CASE("RbacStore Gate7-Fix1: set_rbac_enforcement(false) refuses a caller who holds the "
+          "DESTINATION authority (local admin) but not the SOURCE authority (fleet-wide "
+          "Administrator grant) required while enforcement is durably on",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.set_rbac_enforcement(true, "realadmin").has_value());
+    REQUIRE(store.is_rbac_enabled());
+
+    // "localonly" is a local admin (destination-survivor for a disable) but
+    // was NEVER assigned the fleet-wide Administrator role — under a stale
+    // outer is_rbac_administrator view (or a direct store call, as here),
+    // the pre-fix code would have let this caller disable enforcement purely
+    // because they'd survive AFTER the switch.
+    REQUIRE(auth_db->upsert_user("localonly", "hash", "salt", auth::Role::admin).has_value());
+
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+    auto result = store.set_rbac_enforcement(false, "localonly");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+    CHECK(store.is_rbac_enabled()); // unchanged — still on
+    CHECK(read_write_generation_raw(auth_db.pool()) == gen_before);
+}
+
+TEST_CASE("RbacStore: set_rbac_enforcement(true) applies for a caller holding an "
+          "authenticatable Administrator grant — previous=false, changed=true, "
+          "post_transition_administrators=N, exactly one generation bump",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    seed_active_user(auth_db, "other");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off) in addition to the
+    // pre-existing destination check (fleet-wide Administrator grant).
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "other", "Administrator"}).has_value());
+
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+    auto result = store.set_rbac_enforcement(true, "realadmin");
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->previous_enabled);
+    CHECK(result->enabled);
+    CHECK(result->changed);
+    CHECK(result->post_transition_administrators == 2);
+    CHECK(store.is_rbac_enabled());
+    CHECK(std::to_string(std::stoll(gen_before) + 1) == read_write_generation_raw(auth_db.pool()));
+}
+
+TEST_CASE("RbacStore: set_rbac_enforcement is idempotent — requesting the current state "
+          "returns changed=false, writes nothing, bumps nothing, evaluates no guard",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(store.set_rbac_enforcement(true, "realadmin").has_value());
+    REQUIRE(store.is_rbac_enabled());
+
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+    // "nonsurvivor" holds no grant at all — if the guard were evaluated on
+    // this idempotent no-op path, this call would incorrectly refuse instead
+    // of reporting changed=false.
+    seed_active_user(auth_db, "nonsurvivor");
+    auto result = store.set_rbac_enforcement(true, "nonsurvivor");
+    REQUIRE(result.has_value());
+    CHECK(result->previous_enabled);
+    CHECK(result->enabled);
+    CHECK_FALSE(result->changed);
+    CHECK(result->post_transition_administrators == 1); // realadmin only
+    CHECK(read_write_generation_raw(auth_db.pool()) == gen_before); // no bump
+}
+
+TEST_CASE("RbacStore: set_rbac_enforcement(false) refuses unless the caller's local account "
+          "is role=admin AND active; applies when it is",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    REQUIRE(auth_db->upsert_user("caller", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(store.set_rbac_enabled(true).has_value());
+    REQUIRE(store.is_rbac_enabled());
+
+    {
+        // Gate 7 Fix 1: "caller" holds neither the SOURCE authority
+        // (fleet-wide Administrator grant, required while RBAC is durably
+        // on) nor the local admin role — the new source check now fires
+        // first, before ever reaching the local-role destination check this
+        // block was originally written to exercise.
+        auto result = store.set_rbac_enforcement(false, "caller");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+        CHECK(store.is_rbac_enabled());
+    }
+
+    REQUIRE(auth_db->update_role("caller", auth::Role::admin).has_value());
+    // Gate 7 Fix 1: disabling now ALSO requires the SOURCE authority
+    // (fleet-wide Administrator grant, required while RBAC is durably on) in
+    // addition to the pre-existing destination check (local admin role) —
+    // "caller" only satisfying the local-role check would be exactly the
+    // fail-open-on-disable gap the fix closes; give them the real grant too.
+    REQUIRE(store.assign_role({"user", "caller", "Administrator"}).has_value());
+    {
+        auto result = store.set_rbac_enforcement(false, "caller");
+        REQUIRE(result.has_value());
+        CHECK(result->previous_enabled);
+        CHECK_FALSE(result->enabled);
+        CHECK(result->changed);
+        CHECK(result->post_transition_administrators == 1);
+        CHECK_FALSE(store.is_rbac_enabled());
+    }
+
+    REQUIRE(store.set_rbac_enabled(true).has_value());
+    REQUIRE(auth_db->remove_user("caller").has_value());
+    {
+        // Gate 7 Fix 1: "caller"'s grant is now excluded by the SAME
+        // is_active JOIN the source check uses (list_authenticatable_admin_grants)
+        // — the same underlying "deactivated" reason the original
+        // destination-only check exercised, now observed via the source
+        // check that fires first.
+        auto result = store.set_rbac_enforcement(false, "caller");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime);
+    }
+}
+
+// Gate 8 quality-engineer finding: Fix 1's edit above repurposed the ONLY
+// test exercising set_rbac_enforcement(false)'s DESTINATION-check branch
+// specifically (caller HOLDS the source authority — an active fleet-wide
+// Administrator grant — but FAILS the destination check — local role is
+// 'user', not 'admin') — that combination now has zero coverage on its own,
+// since the source check passing lets it fall through to the destination
+// check, unmasked. Isolates it: the caller here DOES pass the source check
+// (real Administrator grant, active account) and is refused purely on the
+// destination check, asserting the pre-existing kCallerNotSurvivor kind,
+// not the new source-check kind.
+TEST_CASE("RbacStore: set_rbac_enforcement(false) refuses via the DESTINATION check "
+          "(kCallerNotSurvivor) for a caller who holds the source authority (active "
+          "fleet-wide Administrator grant) but whose local role is 'user', not 'admin'",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    REQUIRE(auth_db->upsert_user("caller", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(store.assign_role({"user", "caller", "Administrator"}).has_value());
+    REQUIRE(store.set_rbac_enabled(true).has_value());
+    REQUIRE(store.is_rbac_enabled());
+
+    auto result = store.set_rbac_enforcement(false, "caller");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kCallerNotSurvivor);
+    CHECK(store.is_rbac_enabled());
+}
+
+// A1 test 6a/6b — deterministic scaffolds proving the READ COMMITTED
+// FOR UPDATE re-evaluation claim in the plan's §1(b) "Locking/ordering":
+// set_rbac_enforcement's enable path and unassign_role take the SAME
+// FOR UPDATE OF pr lock over the SAME candidate rows
+// (kAuthenticatableAdminGrantsFrom), so the two guards serialize against
+// each other instead of either observing a stale, unlocked snapshot. A raw
+// connection holds the production lock statement; a std::jthread runs the
+// REAL store call and is proven blocked-then-unblocked with a 500ms check;
+// the raw connection then performs the OTHER operation's exact statements
+// and commits/rolls back, mirroring A2's own "serializes two concurrent
+// unassigns" scaffold above (line ~1001).
+TEST_CASE("RbacStore A1(6a): sole authenticatable Administrator — unassign_role is refused "
+          "under both lock orderings, set_rbac_enforcement(true) succeeds under both",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "soleadmin");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off).
+    REQUIRE(auth_db->update_role("soleadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "soleadmin", "Administrator"}).has_value());
+
+    SECTION("ordering 1: a raw-connection unassign attempt lands at 0 and rolls back; the "
+            "blocked real enable then finds the row intact and applies") {
+        auto lease_a = auth_db.pool().acquire();
+        REQUIRE(lease_a);
+        REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                                "JOIN auth.users u ON u.username = pr.principal_id "
+                                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                std::vector<std::string>{})
+                    .ok());
+
+        std::atomic<bool> b_started{false}, b_done{false}, b_ok{false};
+        std::jthread enable_thread([&] {
+            b_started = true;
+            b_ok = store.set_rbac_enforcement(true, "soleadmin").has_value();
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(b_started.load());
+        CHECK_FALSE(b_done.load());
+
+        // Simulate unassign_role's own delete + post-delete count under A —
+        // lands at 0, so this rolls back exactly as unassign_role's own
+        // guard would.
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "DELETE FROM rbac_store.principal_roles WHERE principal_type = "
+                                "'user' AND principal_id = 'soleadmin' AND role_name = "
+                                "'Administrator'",
+                                std::vector<std::string>{})
+                    .ok());
+        pg::PgResult remaining = pg::exec_params(
+            lease_a.get(),
+            "SELECT count(*) FROM rbac_store.principal_roles pr "
+            "JOIN auth.users u ON u.username = pr.principal_id "
+            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' AND u.is_active",
+            std::vector<std::string>{});
+        REQUIRE(remaining.ok());
+        REQUIRE(std::string(PQgetvalue(remaining.get(), 0, 0)) == "0");
+        REQUIRE(pg::exec_params(lease_a.get(), "ROLLBACK", std::vector<std::string>{}).ok());
+        lease_a.reset();
+
+        enable_thread.join();
+        CHECK(b_done.load());
+        CHECK(b_ok.load()); // A's delete never committed — soleadmin's grant is intact
+        CHECK(store.is_rbac_enabled());
+        CHECK(store.get_principal_roles("user", "soleadmin").size() == 1);
+    }
+
+    SECTION("ordering 2: a raw-connection enable holds the lock and commits (no delete); the "
+            "blocked real unassign_role then re-evaluates to 0 and refuses") {
+        auto lease_a = auth_db.pool().acquire();
+        REQUIRE(lease_a);
+        REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                                "JOIN auth.users u ON u.username = pr.principal_id "
+                                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                std::vector<std::string>{})
+                    .ok());
+
+        std::atomic<bool> b_started{false}, b_done{false}, b_ok{false};
+        std::string b_error;
+        std::jthread unassign_thread([&] {
+            b_started = true;
+            auto res = store.unassign_role("user", "soleadmin", "Administrator");
+            b_ok = res.has_value();
+            if (!res)
+                b_error = res.error();
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(b_started.load());
+        CHECK_FALSE(b_done.load());
+
+        // Mirror set_rbac_enforcement's enable-path writes exactly (the lock
+        // is already held above), then commit — soleadmin's grant is
+        // untouched by an enable.
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                                "('rbac_enabled', 'true') ON CONFLICT (key) DO UPDATE SET "
+                                "value = EXCLUDED.value",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                                "('write_generation','1') ON CONFLICT (key) DO UPDATE SET "
+                                "value = (rbac_store.rbac_meta.value::bigint + 1)::text",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+        lease_a.reset();
+
+        unassign_thread.join();
+        CHECK(b_done.load());
+        CHECK_FALSE(b_ok.load()); // re-evaluated to 0 authenticatable admins — refused
+        CHECK(is_rbac_last_admin_refusal(b_error));
+        CHECK(store.get_principal_roles("user", "soleadmin").size() == 1);
+    }
+}
+
+TEST_CASE("RbacStore A1(6b): a second authenticatable Administrator survives — "
+          "unassign-first makes a same-caller enable refuse (kCallerNotSurvivor); "
+          "enable-first lets BOTH commit (ACCEPTED post-transition residual, #4966 gap 1 — "
+          "the guard is point-in-time, not enduring; do not 'fix' this into a false "
+          "serialization claim)",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "caller");
+    seed_active_user(auth_db, "other");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off).
+    REQUIRE(auth_db->update_role("caller", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "caller", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"user", "other", "Administrator"}).has_value());
+
+    SECTION("unassign-first: the raw connection's delete of caller's own grant commits while "
+            "the real enable(caller) is blocked — it unblocks, re-finds caller absent, refuses") {
+        auto lease_a = auth_db.pool().acquire();
+        REQUIRE(lease_a);
+        REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                                "JOIN auth.users u ON u.username = pr.principal_id "
+                                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                std::vector<std::string>{})
+                    .ok());
+
+        std::atomic<bool> b_started{false}, b_done{false};
+        RbacEnforcementError::Kind b_error_kind{};
+        bool b_ok = false;
+        std::jthread enable_thread([&] {
+            b_started = true;
+            auto res = store.set_rbac_enforcement(true, "caller");
+            b_ok = res.has_value();
+            if (!res)
+                b_error_kind = res.error().kind;
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(b_started.load());
+        CHECK_FALSE(b_done.load());
+
+        // Mirror unassign_role's own delete of caller's grant — "other" still
+        // survives (count lands at 1, not 0), so this commits successfully.
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "DELETE FROM rbac_store.principal_roles WHERE principal_type = "
+                                "'user' AND principal_id = 'caller' AND role_name = "
+                                "'Administrator'",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+        lease_a.reset();
+
+        enable_thread.join();
+        CHECK(b_done.load());
+        CHECK_FALSE(b_ok); // caller's own grant is gone by the time enable re-locks the set
+        CHECK(b_error_kind == RbacEnforcementError::Kind::kCallerNotSurvivor);
+        CHECK_FALSE(store.is_rbac_enabled());
+        CHECK(store.get_principal_roles("user", "caller").empty());
+        CHECK(store.get_principal_roles("user", "other").size() == 1);
+    }
+
+    SECTION("enable-first: the raw connection's enable commits without touching caller's "
+            "grant while the real unassign_role(caller) is blocked — it unblocks, still finds "
+            "a survivor (other), and BOTH operations end up committed") {
+        auto lease_a = auth_db.pool().acquire();
+        REQUIRE(lease_a);
+        REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+                                "JOIN auth.users u ON u.username = pr.principal_id "
+                                "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
+                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                std::vector<std::string>{})
+                    .ok());
+
+        std::atomic<bool> b_started{false}, b_done{false}, b_ok{false};
+        std::jthread unassign_thread([&] {
+            b_started = true;
+            b_ok = store.unassign_role("user", "caller", "Administrator").has_value();
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(b_started.load());
+        CHECK_FALSE(b_done.load());
+
+        // Mirror set_rbac_enforcement's enable-path writes — caller's grant
+        // is untouched by an enable, so this commits with both rows intact.
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                                "('rbac_enabled', 'true') ON CONFLICT (key) DO UPDATE SET "
+                                "value = EXCLUDED.value",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease_a.get(),
+                                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                                "('write_generation','1') ON CONFLICT (key) DO UPDATE SET "
+                                "value = (rbac_store.rbac_meta.value::bigint + 1)::text",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+        lease_a.reset();
+
+        unassign_thread.join();
+        CHECK(b_done.load());
+        // BOTH commit: the enable (raw connection, representing the real
+        // production transaction) AND the unassign of caller's own grant —
+        // "other" alone remains, satisfying unassign_role's own guard. This
+        // is the accepted point-in-time residual (#4966 gap 1): the enable's
+        // guarantee held ONLY as observed inside ITS OWN transaction, not
+        // enduringly against a later unassign of the very grant that made it
+        // pass. Read the DURABLE flag directly rather than through
+        // store.is_rbac_enabled() — the raw connection's commit is a write
+        // this store instance's own cache never observed via
+        // publish_local_toggle, and asserting through the cache would
+        // couple this test to the ~1s refresh gate instead of to what it
+        // actually means to test: that the raw connection's transaction
+        // genuinely committed.
+        CHECK(b_ok);
+        {
+            auto lease = auth_db.pool().acquire();
+            REQUIRE(lease);
+            pg::PgResult r = pg::exec_params(
+                lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+                std::vector<std::string>{});
+            REQUIRE(r.ok());
+            REQUIRE(PQntuples(r.get()) == 1);
+            CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "true");
+        }
+        CHECK(store.get_principal_roles("user", "caller").empty());
+        CHECK(store.get_principal_roles("user", "other").size() == 1);
+    }
+}
+
+TEST_CASE("RbacStore: two concurrent set_rbac_enforcement calls serialize on the rbac_meta "
+          "row — one applied, one unchanged, exactly one generation bump",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off).
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+
+    std::atomic<int> changed_count{0};
+    std::atomic<int> unchanged_count{0};
+    std::atomic<int> ok_count{0};
+    auto call = [&] {
+        auto r = store.set_rbac_enforcement(true, "realadmin");
+        if (r.has_value()) {
+            ++ok_count;
+            if (r->changed)
+                ++changed_count;
+            else
+                ++unchanged_count;
+        }
+    };
+    std::jthread t1(call);
+    std::jthread t2(call);
+    t1.join();
+    t2.join();
+
+    CHECK(ok_count.load() == 2);
+    CHECK(changed_count.load() == 1);
+    CHECK(unchanged_count.load() == 1);
+    CHECK(store.is_rbac_enabled());
+    CHECK(std::to_string(std::stoll(gen_before) + 1) == read_write_generation_raw(auth_db.pool()));
+}
+
+TEST_CASE("RbacStore: set_rbac_enforcement fails CLOSED (kStoreFailure, not refusal) when the "
+          "durable rbac_enabled row is ABSENT — no write, no bump",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off) — irrelevant to THIS
+    // test's actual scenario (the row read fails before either guard runs),
+    // but kept so the setup does not accidentally start returning a
+    // guard refusal instead of the intended store failure.
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "realadmin", "Administrator"}).has_value());
+
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    const std::string gen_before = read_write_generation_raw(auth_db.pool());
+
+    auto result = store.set_rbac_enforcement(true, "realadmin");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == RbacEnforcementError::Kind::kStoreFailure);
+
+    // The row is still absent — the toggle deliberately does not REPAIR an
+    // absent row (it fails closed); the repair paths are set_rbac_enabled's
+    // own upsert and boot-time seed_defaults.
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+            std::vector<std::string>{});
+        REQUIRE(r.ok());
+        CHECK(PQntuples(r.get()) == 0);
+    }
+    CHECK(read_write_generation_raw(auth_db.pool()) == gen_before);
+}
+
+TEST_CASE("RbacStore: set_rbac_enabled reports store failure through std::expected",
+          "[rbac_store][pg]") {
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                .size = 1}};
+    RbacStore broken{bad};
+    REQUIRE_FALSE(broken.is_open());
+    auto result = broken.set_rbac_enabled(true);
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+}
+
+TEST_CASE("RbacStore: yuzu_server_rbac_enforcement_enabled gauge is published at set_metrics, "
+          "set_rbac_enabled, and set_rbac_enforcement",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics); // publishes at set_metrics — starts false
+    CHECK(metrics.gauge("yuzu_server_rbac_enforcement_enabled").value() == 0.0);
+
+    REQUIRE(store.set_rbac_enabled(true).has_value()); // publishes at set_rbac_enabled
+    CHECK(metrics.gauge("yuzu_server_rbac_enforcement_enabled").value() == 1.0);
+
+    REQUIRE(auth_db->upsert_user("localadmin", "hash", "salt", auth::Role::admin).has_value());
+    // Gate 7 Fix 1: disabling now ALSO requires the SOURCE authority
+    // (fleet-wide Administrator grant, required while RBAC is durably on).
+    REQUIRE(store.assign_role({"user", "localadmin", "Administrator"}).has_value());
+    auto result = store.set_rbac_enforcement(false, "localadmin"); // publishes at set_rbac_enforcement
+    REQUIRE(result.has_value());
+    CHECK(metrics.gauge("yuzu_server_rbac_enforcement_enabled").value() == 0.0);
+}
+
+// Gate 7 Fix 7 (quality-engineer + cpp-safety + unhappy-path): the test above
+// covers 3 of the 4 actual gauge-publish sites (set_metrics, set_rbac_enabled,
+// set_rbac_enforcement) but never attaches a MetricsRegistry to a replica that
+// ADOPTS via maybe_refresh_generation's own publish_enforcement_gauge() call
+// — the mechanism a follower replica uses to pick up a toggle it never
+// directly received. Uses the RBAC_STORE(replica_a) / separate-pool
+// RbacStore replica_b idiom (~line 2172) rather than RBAC_STORE_WITH_AUTH:
+// the durable change is driven through the UNGUARDED set_rbac_enabled (no
+// auth.users JOIN involved), so replica_b's adopt is a genuine cross-replica
+// pickup, not a refused/no-op call.
+TEST_CASE("RbacStore Gate7-Fix7: the gauge is published on replica_b's ADOPT path "
+          "(maybe_refresh_generation), the 4th publish site, not just a local write",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    // "Replica B": a separate store + pool against the SAME database.
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics_b;
+    replica_b.set_metrics(&metrics_b); // publishes at set_metrics — starts false
+    CHECK(metrics_b.gauge("yuzu_server_rbac_enforcement_enabled").value() == 0.0);
+
+    // Replica A durably enables RBAC — bumps write_generation in the same
+    // txn. Replica B has not observed this write via any code path yet.
+    REQUIRE(replica_a.set_rbac_enabled(true).has_value());
+    REQUIRE(replica_a.is_rbac_enabled());
+    // Replica B's own cached view is untouched by replica A's write — still
+    // false until it genuinely refreshes.
+    CHECK_FALSE(replica_b.is_rbac_enabled());
+    CHECK(metrics_b.gauge("yuzu_server_rbac_enforcement_enabled").value() == 0.0);
+
+    // Clear the 1s stampede gate so replica_b's next check genuinely attempts
+    // a refresh rather than serving its just-constructed cache.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Drives maybe_refresh_generation() -> the adopt branch's
+    // publish_enforcement_gauge() call, a GENUINE adopt (durable_gen is
+    // strictly ahead of replica_b's own flag_generation_, which is still 0).
+    CHECK(replica_b.is_rbac_enabled());
+    CHECK(metrics_b.gauge("yuzu_server_rbac_enforcement_enabled").value() == 1.0);
+}
+
+// A1 test 4.1(12) — BINDING regression test for the generation-gated
+// publication fix (RbacStore::publish_local_toggle + maybe_refresh_generation's
+// gated adopt, §2.1 "Generation-gated publication"). Pre-fix, a refresh
+// landing with an OLDER generation than what this replica's OWN commit
+// already advanced its cache to would still unconditionally overwrite
+// rbac_enabled_, regressing a replica's own just-published state.
+TEST_CASE("RbacStore: rbac_enabled adoption is generation-gated — a refresh carrying an OLDER "
+          "generation never regresses the cached flag",
+          "[rbac_store][pg]") {
+    // "replica_b" here names the SINGLE store under test playing the role of
+    // a replica observing its own stale re-read — the scenario needs only
+    // one RbacStore instance, not two (see the plan's own "implementer's
+    // choice" note on this test).
+    RBAC_STORE_WITH_AUTH(replica_b, auth_db);
+    seed_active_user(auth_db, "realadmin");
+    // Gate 7 Fix 1: enabling now ALSO requires the SOURCE authority (local
+    // admin role, required while RBAC is durably off).
+    REQUIRE(auth_db->update_role("realadmin", auth::Role::admin).has_value());
+    REQUIRE(replica_b.assign_role({"user", "realadmin", "Administrator"}).has_value());
+    REQUIRE(replica_b.set_rbac_enforcement(true, "realadmin").has_value());
+    REQUIRE(replica_b.is_rbac_enabled());
+
+    const std::string gen_at_g = read_write_generation_raw(auth_db.pool());
+
+    // Regress the DURABLE pair to (G-1, 'false') directly — simulating a
+    // refresh SELECT racing against an older, now-superseded snapshot (the
+    // schema CHECK only constrains the VALUE, never the generation, so this
+    // is a row shape a real stale read could legally observe).
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        const std::string gen_minus_1 = std::to_string(std::stoll(gen_at_g) - 1);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE rbac_store.rbac_meta SET value = $1 WHERE key = "
+                                "'write_generation'",
+                                std::vector<std::string>{gen_minus_1})
+                    .ok());
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE rbac_store.rbac_meta SET value = 'false' WHERE key = "
+                                "'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    // Scope-guarded restore. RBAC_STORE_WITH_AUTH's AuthDbPg is a fresh
+    // per-TEST_CASE ephemeral database (cheap insurance, not load-bearing —
+    // per the plan's own instruction to confirm fixture isolation before
+    // writing this test).
+    struct RestoreGuard {
+        yuzu::test::AuthDbPg& db;
+        std::string gen;
+        ~RestoreGuard() {
+            auto lease = db.pool().acquire();
+            if (!lease)
+                return;
+            (void)pg::exec_params(lease.get(),
+                                  "UPDATE rbac_store.rbac_meta SET value = $1 WHERE key = "
+                                  "'write_generation'",
+                                  std::vector<std::string>{gen});
+            (void)pg::exec_params(lease.get(),
+                                  "UPDATE rbac_store.rbac_meta SET value = 'true' WHERE key = "
+                                  "'rbac_enabled'",
+                                  std::vector<std::string>{});
+        }
+    } restore{auth_db, gen_at_g};
+
+    // Clear the 1s stampede gate so the next check genuinely attempts a
+    // refresh rather than serving the gated fast path.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // THE FIX: replica_b's own cached_generation_ is already at G (from its
+    // own set_rbac_enforcement commit above); the durable pair it now reads
+    // is (G-1, false) — strictly BEHIND — so the gated adopt in
+    // maybe_refresh_generation must refuse to regress the cached flag.
+    CHECK(replica_b.is_rbac_enabled());
+}
+
+// Gate 7 Fix 2 (cpp-safety, CRITICAL) — BINDING regression test: pre-fix,
+// publish_local_toggle gated its flag write on the SAME cached_generation_
+// perm_cache_ uses, which self-heals regardless of who bumped it — but
+// rbac_enabled_ does not self-heal, so an UNRELATED, flag-less writer
+// (assign_role) racing its own apply_local_generation() ahead of a toggle's
+// own publish_local_toggle() call made the toggle's publish look "behind"
+// and skipped the flag write ENTIRELY, restarted only by the interval of a
+// commit that had nothing to do with the toggle. Constructs the exact
+// interleaving deterministically via raw generation manipulation (same
+// technique as the test immediately above) rather than a genuine two-thread
+// race, since the real race window (between with_txn_for returning and
+// publish_local_toggle running) has no test hook to pause on.
+TEST_CASE("RbacStore Gate7-Fix2: an unrelated flag-less writer's generation bump never masks "
+          "a toggle's own publish_local_toggle call",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "flagwriter");
+    REQUIRE(auth_db->update_role("flagwriter", auth::Role::admin).has_value());
+    REQUIRE(store.assign_role({"user", "flagwriter", "Administrator"}).has_value());
+
+    // Advance the durable write_generation far AHEAD — simulating an
+    // UNRELATED writer's commit landing between a toggle's own COMMIT and
+    // its publish_local_toggle call (below). The schema CHECK only
+    // constrains rbac_enabled's VALUE, never the generation, so this is a
+    // row shape a real interleaving could legally produce.
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                                "('write_generation', '1000') ON CONFLICT (key) DO UPDATE SET "
+                                "value = EXCLUDED.value",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    // A REAL flag-less writer: assign_role's own apply_local_generation call
+    // (UNCONDITIONAL, unlike publish_local_toggle's gated one) advances this
+    // replica's cached_generation_ to 1001 in-process — the exact "raced
+    // ahead of the toggle" state pre-fix conflated with "the toggle's flag
+    // write is behind".
+    REQUIRE(store.assign_role({"user", "flagwriter", "ApiTokenManager"}).has_value());
+
+    // Regress write_generation back down so the TOGGLE's own upcoming commit
+    // lands at a generation strictly BELOW cached_generation_ (1001) but
+    // still strictly AHEAD of flag_generation_ (0 — nothing has published the
+    // flag on this replica yet).
+    {
+        auto lease = auth_db.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE rbac_store.rbac_meta SET value = '1' WHERE key = "
+                                "'write_generation'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+
+    REQUIRE_FALSE(store.is_rbac_enabled()); // still the pre-toggle default
+    auto result = store.set_rbac_enforcement(true, "flagwriter");
+    REQUIRE(result.has_value());
+    CHECK(result->changed);
+    // THE FIX: pre-fix, publish_local_toggle's single cached_generation_ gate
+    // (new_gen=2 < cached_generation_=1001) skipped the ENTIRE method,
+    // including rbac_enabled_.store() — this replica's cached view stayed
+    // FALSE despite the durable flag now being TRUE, for a full refresh
+    // interval. Post-fix, the flag write is gated on the DEDICATED
+    // flag_generation_ (still 0), so 2 >= 0 and it correctly publishes.
+    CHECK(store.is_rbac_enabled());
 }
