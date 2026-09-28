@@ -5,6 +5,11 @@
 #include "pg/pg_raii.hpp"
 #include "rbac_store_sql_helpers.hpp"
 
+#include <yuzu/server/auth_db.hpp> // is_valid_username — provision_first_admin's own
+                                    // pre-INSERT guard (rbac_admin_predicate.hpp already
+                                    // establishes this cross-inclusion is sanctioned for
+                                    // RBAC-adjacent code)
+
 #include <libpq-fe.h>
 
 #include <algorithm>
@@ -563,6 +568,106 @@ RbacAdminAuthorityOwner::regime_authority(const std::string& caller_username) co
                    local_admins->end()
                ? RbacRegimeAuthority::kAuthorized
                : RbacRegimeAuthority::kNotAuthorized;
+}
+
+namespace {
+// Same advisory-lock key as `AuthDB`'s `kSeedAdminLockSql` (auth_db.cpp,
+// anonymous-namespace, so not reachable from this translation unit — no
+// shared header exists between the two, the same duplicated-literal
+// precedent auth_db.cpp's own `kEngineReservedPrefix` comment documents for
+// itself). MUST match byte-for-byte: `provision_first_admin` and
+// `AuthDB::seed_admin_if_empty` serialize against EACH OTHER, and against
+// every other replica's concurrent `provision_first_admin` call, through
+// this exact lock key — a divergent literal here would compute a different
+// lock and let two processes race the "first account" INSERT concurrently.
+constexpr const char* kProvisionFirstAdminLockSql = "SELECT pg_advisory_xact_lock(2037545589, 1)";
+} // namespace
+
+// See the header's own doc comment for the full contract (ordering vs
+// `AuthDB::seed_admin_if_empty`, the HA "another replica already won"
+// no-op case, atomicity of account+grant). `is_valid_username` runs BEFORE
+// any query — this call now runs FIRST in `main.cpp`'s fresh-start seed
+// block (ahead of `seed_admin_if_empty`, which used to be the sole
+// validator), so a malformed config username must be caught here rather
+// than relying on a now-later, now-vestigial `seed_admin_if_empty` call to
+// catch it — an unvalidated INSERT here would otherwise poison `auth.users`
+// with a bad row before any validation ever ran, and every later boot would
+// keep hitting the same fatal path with the row already stuck in place.
+RbacAdminAuthorityOwner::ProvisionFirstAdminOutcome
+RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
+                                               const std::string& password_hash,
+                                               const std::string& salt_hex) const {
+    ProvisionFirstAdminOutcome result;
+    if (!is_valid_username(username)) {
+        result.err = "provision_first_admin: invalid username";
+        return result; // ok=false, provisioned=false — a genuine refusal, mirrors
+                        // seed_admin_if_empty's own InvalidUsername unexpected()
+    }
+
+    bool provisioned = false;
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult lock_res{PQexec(c, kProvisionFirstAdminLockSql)};
+        if (lock_res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        // Exact SQL text `AuthDB::seed_admin_if_empty` uses (auth_db.cpp) —
+        // deliberately the SAME shape, not a paraphrase, so the two stay
+        // byte-identical in intent even though they live in separate
+        // translation units with no shared header for it.
+        pg::PgResult res = pg::exec_params(
+            c,
+            "INSERT INTO auth.users (username, password_hash, salt_hex, role) "
+            "SELECT $1, $2, $3, 'admin' WHERE NOT EXISTS (SELECT 1 FROM auth.users) "
+            "RETURNING id",
+            std::vector<std::string>{username, password_hash, salt_hex});
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        if (PQntuples(res.get()) == 0) {
+            // Not the first account: another replica's provision_first_admin
+            // (or seed_admin_if_empty, though this call now always runs
+            // first in production) already won, or auth.users was never
+            // empty. Clean no-op, not an error — the transaction commits
+            // (or rolls back; either is harmless, nothing was written) with
+            // the advisory lock released either way.
+            return true;
+        }
+        provisioned = true;
+
+        // Same idempotent INSERT shape RbacStore::assign_role uses
+        // (rbac_store.cpp) — ON CONFLICT DO NOTHING here is a defensive
+        // belt, not load-bearing, since the auth.users INSERT above already
+        // established this is genuinely the first account.
+        pg::PgResult grant = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            std::vector<std::string>{"user", username, "Administrator"});
+        if (grant.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+
+        new_gen = bump_generation_in_txn(c);
+        if (!new_gen) {
+            if (err.empty())
+                err = "provision_first_admin: write_generation bump failed";
+            return false;
+        }
+        return true;
+    });
+
+    result.ok = ok;
+    result.provisioned = provisioned && ok;
+    if (result.provisioned)
+        result.username = username;
+    result.new_gen = new_gen;
+    result.err = err;
+    return result;
 }
 
 } // namespace yuzu::server

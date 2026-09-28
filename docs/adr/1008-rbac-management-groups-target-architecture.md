@@ -234,6 +234,99 @@ follow-up rather than silently left unstated:
    uniformly MFA-gated across every principal class today -- tracked as Priority C item 4.1 ("MFA
    step-up design for admin actions"), not a defect introduced by this delivery.
 
+**Delivery note (fresh-install bootstrap, 2026-09-28).** A second, narrower gap closes alongside
+A1's, and is a NEW DECISION, not a deviation from A1's delivery note above -- it supersedes
+nothing there. A1's delivery closed the enable-path escalation guard for an OPERATOR who is
+already authenticated and holds a session. It did not, and could not, address a genuinely FRESH
+install: `rbac_enabled` seeds `'false'` today, and before this delivery there was no way for a
+fresh install's first operator to end up with a durable RBAC Administrator grant, so flipping the
+seeded default to `'true'` would have locked out the first admin entirely -- every RBAC-gated
+route, including the assignment routes A1 ships, requires a durable grant that nothing existed to
+create at that point.
+
+This delivery closes that. `RbacAdminAuthorityOwner::provision_first_admin`
+(`rbac_admin_authority_owner.hpp:130-163`, `.cpp:596-671` -- the THIRD `RbacAdminAuthorityOwner`
+consumer, same delegation shape as `unassign_role`/`set_enforcement` above) inserts the
+configured admin's `auth.users` row -- the exact `WHERE NOT EXISTS (SELECT 1 FROM auth.users)`
+shape `AuthDB::seed_admin_if_empty` uses, under the SAME `kSeedAdminLockSql` advisory lock
+(auth_db.cpp:154) -- and grants that account `Administrator`, atomically in one transaction, ONLY
+when `auth.users` is genuinely empty; `RbacStore::provision_first_admin`
+(`rbac_store.hpp:472-489`, `.cpp:2156-2179`) is the thin public wrapper, mirroring
+`unassign_role`'s/`set_rbac_enforcement`'s own delegation pattern exactly. `main.cpp`'s
+fresh-start seed block (`main.cpp:1449-1547`) calls this BEFORE `AuthDB::seed_admin_if_empty`
+-- not merely "also", and not after -- because the ordering is forced, not a style choice:
+whichever of the two INSERTs runs second can never see auth.users empty (the first one already
+committed a row), so the account+grant must be created by `provision_first_admin`'s own INSERT,
+in ONE transaction, so a crash between account-creation and grant-creation can never strand an
+account with no grant and no later boot able to fix it (the table would no longer be empty).
+`seed_admin_if_empty` stays in `main.cpp` for its unrelated role there (the break-glass paths
+further down reference `auth_db` directly) but is now a guaranteed no-op in production.
+
+**The seeded-default flip itself is DEFERRED, not shipped in this delivery.** The bootstrap above
+makes flipping `rbac_store.cpp`'s seeded-default literal from `'false'` to `'true'`
+MECHANICALLY safe on its own (`ON CONFLICT (key) DO NOTHING`, `rbac_store.cpp` ~532-548, means it
+would only ever take effect on a database that has never run this code before -- an
+existing/upgrading install's row is already written and untouched by this INSERT, structurally
+unaffected either way). Attempting the flip surfaced that a large, separately-scoped swath of the
+EXISTING test suite implicitly depends on a freshly constructed `RbacStore` seeding `'false'`,
+rather than setting the flag explicitly where a test actually needs it off -- 64 of 331 test
+cases (115 of 6260 assertions) failed across `test_rbac_role_assignment.cpp`,
+`test_rbac_store.cpp`, `test_rbac_enforcement_toggle.cpp`, `test_engine_principal_integration.cpp`
+and `test_list_read_confinement.cpp` with the flip applied, in at least two distinct shapes: (1) a
+harness gap -- `RbacRoleHarness::make_caller_admin(bool rbac_on)`
+(`tests/unit/server/test_rbac_admin_surface_harness.hpp:366-389`) sets `rbac_enabled` explicitly
+only on its `rbac_on=true` branch, silently relying on the (now-wrong) seeded default for
+`rbac_on=false`; and (2) at least one test whose entire premise IS the invariant this delivery
+changes -- `tests/unit/server/test_rbac_store.cpp:524-527`, literally named
+`"RbacStore: RBAC disabled by default"`. Bringing that suite up to date -- and deciding, test by
+test, which of those two shapes (or another) each failure is -- is its own scoped, reviewed
+change, deliberately not absorbed into this delivery; `rbac_store.cpp`'s seeded-default literal
+stays `'false'` until that follow-up lands.
+
+D2's own original text already anticipated exactly this shape -- "that self-grant is itself an
+audited, named bootstrap event distinct from an ordinary assignment" (paragraph above) -- but the
+two are materially different mechanisms, not two readings of the same one, and this delivery does
+not reopen A1's own deviation 1 ("No self-grant bootstrap"). A1's self-grant, had it been built,
+would be a RUNTIME grant tied to an already-authenticated operator's OWN session and their own
+toggle action, carrying that path's session-cache-staleness hazards -- the exact ones Gate-5
+raised against it (paragraphs above, "The self-grant branch's own precondition needs the same
+discipline..."). This delivery is a BOOT-TIME, SESSION-LESS, single-transaction mechanism that
+runs before the server ever accepts a request -- no session, no cache, no caller to stale-read,
+and no toggle action at all (RBAC is never switched on by an operator here; the seeded-default
+flip, when it lands -- deferred in this delivery, see above -- will ship a fresh database already
+on with no operator toggle involved). A1's three deviations above (no self-grant bootstrap; no `auth.users` row
+lock under the toggle's own transaction; MFA step-up posture) all stand exactly as A1 left them,
+unaffected by this delivery.
+
+Observability: a fresh-install provision is logged once, at `spdlog::warn` level (folded into the
+existing "AUTH DATA RESET ON POSTGRES CUTOVER" line rather than a second, separate warning for
+what is now one event -- `main.cpp:1517-1525`); `Config::auth_fresh_start_seeded` (and the
+`yuzu_auth_fresh_start_reset_total` counter it drives, `server.cpp:3130-3163`) is now sourced from
+`provision_first_admin`'s outcome rather than `seed_admin_if_empty`'s, since the former is the
+operation that actually performs the fresh-start INSERT in production now -- the counter's own
+documented contract ("1 iff this boot seeded the sole admin user into an empty auth.users table")
+is unchanged, only which call detects the event. No real `audit_store` row is written for this
+event: `main.cpp` has no `AuditFn` audit callback available this early in boot (confirmed against
+`AuditStore::log()`, which always self-acquires its own pool lease with no connection/transaction
+-scoped write API to fold into `provision_first_admin`'s transaction) -- a deliberate, reviewed
+scope boundary for this delivery, not an oversight; a durable audit record for this specific event
+is not built.
+
+Also fixed in passing, in the same code path this note describes: `main.cpp`'s config-loaded
+identity-selection loop previously fell back to `cfg_users.front()` (silently promoting whatever
+the FIRST config entry was to Administrator) when no `Role::admin`-tagged entry was found in a
+hand-edited config file. That fallback is now a fatal boot refusal instead (`main.cpp:1476-1488`)
+-- the interactive `first_run_setup` flow (`auth.cpp`) always creates the admin account with
+`Role::admin` explicitly, so the fallback was reachable only via a hand-edited config, but it must
+still fail loudly rather than silently provision the wrong identity as the fleet's first
+Administrator.
+
+Explicitly out of scope for this delivery (Phase 1): the seeded-default flip itself (deferred, see
+above -- `rbac_enabled` still seeds `'false'`); `docs/user-manual/rbac.md` and any dashboard-facing
+documentation of a new default, which has no meaning to document until the flip actually ships;
+the dashboard itself; any new REST/MCP route (this is boot-time-only, with no API surface of its
+own).
+
 ### D3 -- One assignment chokepoint for every principal type and scope; deny at assignment level is a decided, not silent, extension of the frozen lattice
 
 **The decision is one write CHOKEPOINT, not one table.** Every role assignment or revocation --

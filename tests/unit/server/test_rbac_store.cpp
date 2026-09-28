@@ -4174,3 +4174,134 @@ TEST_CASE("RbacStore Gate7-Fix2: an unrelated flag-less writer's generation bump
     // flag_generation_ (still 0), so 2 >= 0 and it correctly publishes.
     CHECK(store.is_rbac_enabled());
 }
+
+// ── provision_first_admin (fresh-install RBAC-safe-by-default bootstrap) ─────
+//
+// `RbacStore::provision_first_admin` delegates to
+// `RbacAdminAuthorityOwner::provision_first_admin` (third owner consumer,
+// same shape as `unassign_role`/`set_rbac_enforcement` above). Uses
+// RBAC_STORE_WITH_AUTH (not the shared RBAC_STORE template) because this
+// call inserts into `auth.users` directly and needs that schema in the SAME
+// database — same reason the A2 last-Administrator guard tests above use it.
+// `RBAC_STORE_WITH_AUTH` deliberately does NOT call `seed_active_user`
+// itself, so `auth.users` is genuinely empty right after the macro expands —
+// exactly the fresh-install precondition every "first call" case below
+// depends on.
+
+TEST_CASE("RbacStore::provision_first_admin provisions the first admin "
+          "exactly once — a second call on the same now-non-empty store is a "
+          "clean no-op, never a duplicate grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    auto first = store.provision_first_admin("firstadmin", "hash", "salt");
+    REQUIRE(first.has_value());
+    CHECK(*first == true);
+    CHECK(store.get_principal_roles("user", "firstadmin").size() == 1);
+    CHECK(store.get_principal_roles("user", "firstadmin").front().role_name == "Administrator");
+
+    // Restart-idempotency: calling again (as main.cpp does unconditionally
+    // on every boot) with the SAME args must not re-provision or duplicate
+    // the grant.
+    auto second = store.provision_first_admin("firstadmin", "hash", "salt");
+    REQUIRE(second.has_value());
+    CHECK(*second == false);
+    CHECK(store.get_principal_roles("user", "firstadmin").size() == 1);
+
+    // A call with DIFFERENT args also cleanly no-ops — auth.users is no
+    // longer empty, so no second account and no second grant are created,
+    // regardless of what identity is passed.
+    auto third = store.provision_first_admin("seconduser", "hash2", "salt2");
+    REQUIRE(third.has_value());
+    CHECK(*third == false);
+    CHECK(store.get_principal_roles("user", "seconduser").empty());
+}
+
+TEST_CASE("RbacStore::provision_first_admin under real concurrency — two "
+          "calls racing a genuinely empty auth.users — exactly one "
+          "provisions, the other cleanly no-ops, exactly one grant exists",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    std::atomic<bool> provisioned1{false}, provisioned2{false};
+    std::atomic<bool> ok1{false}, ok2{false};
+    std::atomic<bool> done1{false}, done2{false};
+    // Mirrors the real-concurrency pattern above (unassign_role's own
+    // last-Administrator guard test): two genuine std::thread callers
+    // against the SAME RbacStore object, each racing the advisory-lock-
+    // guarded INSERT — no hand-held lock/puppeteered connection needed here,
+    // since the invariant under test (exactly one winner) is what the
+    // advisory lock itself is meant to guarantee, not one specific
+    // interleaving.
+    ScopedJoin t1{std::thread([&] {
+        auto r = store.provision_first_admin("raceadmin1", "hash1", "salt1");
+        ok1 = r.has_value();
+        if (r.has_value())
+            provisioned1 = *r;
+        done1 = true;
+    })};
+    ScopedJoin t2{std::thread([&] {
+        auto r = store.provision_first_admin("raceadmin2", "hash2", "salt2");
+        ok2 = r.has_value();
+        if (r.has_value())
+            provisioned2 = *r;
+        done2 = true;
+    })};
+    t1.join();
+    t2.join();
+    CHECK(done1.load());
+    CHECK(done2.load());
+
+    // Neither call is ever an ERROR — the loser's outcome is a clean no-op,
+    // not a failure (the HA conditioning this method exists to provide).
+    CHECK(ok1.load());
+    CHECK(ok2.load());
+
+    // Exactly one provisioned — never both (two Administrators from one
+    // fresh install) and never neither (the whole point of this bootstrap).
+    CHECK(provisioned1.load() != provisioned2.load());
+
+    // Exactly one auth.users row, exactly one Administrator grant, and they
+    // name the SAME winning identity.
+    const std::size_t admin1_grants = store.get_principal_roles("user", "raceadmin1").size();
+    const std::size_t admin2_grants = store.get_principal_roles("user", "raceadmin2").size();
+    CHECK(admin1_grants + admin2_grants == 1);
+    CHECK((provisioned1.load() ? admin1_grants : admin2_grants) == 1);
+}
+
+TEST_CASE("RbacStore::provision_first_admin cleanly no-ops when auth.users "
+          "is already non-empty — no account, no grant, not an error",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "existinguser");
+
+    auto result = store.provision_first_admin("newadmin", "hash", "salt");
+    REQUIRE(result.has_value());
+    CHECK(*result == false);
+    CHECK(store.get_principal_roles("user", "newadmin").empty());
+}
+
+TEST_CASE("RbacStore::provision_first_admin fails closed — ok=false with a "
+          "non-empty err — on a genuine store/query failure",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // DROP TABLE on a second connection (same technique as the A1/A2 admin-
+    // surface tests in test_rbac_role_assignment.cpp): auth.users is
+    // genuinely empty, so the account INSERT succeeds; the subsequent grant
+    // INSERT against rbac_store.principal_roles then fails at the query
+    // level, which must roll back the WHOLE transaction (account included —
+    // provision_first_admin's account+grant atomicity contract), not just
+    // report a partial success.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto result = store.provision_first_admin("failadmin", "hash", "salt");
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+}

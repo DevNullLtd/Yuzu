@@ -4,20 +4,22 @@
 /// The single ADR-0012 §3 cross-store query owner for all cross-schema
 /// "authenticatable Administrator" logic across `rbac_store` and `auth`. Hosts
 /// the A2 last-Administrator guard (`RbacStore::unassign_role` delegates
-/// here) and, as of the A1/A2 rebase (Step 2), the A1 RBAC enforcement
-/// enable/disable toggle's own cross-schema guard
-/// (`RbacStore::set_rbac_enforcement`/`check_caller_authorized_under_current_regime`
-/// delegate to `set_enforcement`/`regime_authority` below) — both share ONE
-/// copy of `kAuthenticatableAdminGrantsFrom`. Only `RbacStore` constructs it,
-/// because only `RbacStore` may apply the local cache generation after a
-/// confirmed commit. The fragment that defines "an authenticatable
-/// Administrator grant" lives ONLY in rbac_admin_authority_owner.cpp, so every
-/// consumer shares one copy. It borrows the pool and issues schema-qualified SQL
-/// on ONE lease: bounded acquire, no nested acquire, no external work inside a
-/// transaction — `regime_authority`'s own fresh read is the one exception
-/// that takes a single lease across two back-to-back autocommit statements
-/// rather than a transaction (see the .cpp for why that is a deliberately
-/// accepted, already-reviewed residual, not an oversight).
+/// here), the A1 RBAC enforcement enable/disable toggle's own cross-schema
+/// guard (`RbacStore::set_rbac_enforcement`/`check_caller_authorized_under_current_regime`
+/// delegate to `set_enforcement`/`regime_authority` below — both share ONE
+/// copy of `kAuthenticatableAdminGrantsFrom`), and, as of the fresh-install
+/// RBAC-safe-by-default bootstrap, the third consumer `provision_first_admin`
+/// (`RbacStore::provision_first_admin` delegates to it). Only `RbacStore`
+/// constructs it, because only `RbacStore` may apply the local cache
+/// generation after a confirmed commit. The fragment that defines "an
+/// authenticatable Administrator grant" lives ONLY in
+/// rbac_admin_authority_owner.cpp, so every consumer shares one copy. It
+/// borrows the pool and issues schema-qualified SQL on ONE lease: bounded
+/// acquire, no nested acquire, no external work inside a transaction —
+/// `regime_authority`'s own fresh read is the one exception that takes a
+/// single lease across two back-to-back autocommit statements rather than a
+/// transaction (see the .cpp for why that is a deliberately accepted,
+/// already-reviewed residual, not an oversight).
 ///
 /// Lock order (a change that inverts it can deadlock): the `rbac_store.rbac_meta`
 /// rbac_enabled row (`set_enforcement`'s explicit `FOR UPDATE` read takes it
@@ -29,8 +31,16 @@
 /// `set_enforcement`'s ENABLE direction only), then one `auth.users` row
 /// (unassign only), then the `rbac_meta` write_generation row. A path that
 /// holds an `auth.users` row lock and then touches those would invert it.
-/// This class never applies the local cache generation: the caller does that
-/// only after a confirmed commit.
+/// `provision_first_admin` is a DISJOINT lock path — it never touches the
+/// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
+/// INSERT of a NEW row (there is nothing existing to lock; the table is, by
+/// construction, empty at that point), so it cannot participate in the
+/// inversion this order guards against; its own ordering is just the
+/// `kSeedAdminLockSql` transaction-scoped advisory lock (serializing it
+/// against `AuthDB::seed_admin_if_empty`/other concurrent `provision_first_admin`
+/// callers across replicas) first, then whatever `bump_generation_in_txn`
+/// takes on the `write_generation` row. This class never applies the local
+/// cache generation: the caller does that only after a confirmed commit.
 
 #include "rbac_store.hpp" // RbacRegimeAuthority
 
@@ -116,6 +126,41 @@ public:
     /// durable `rbac_enabled` flag, then a membership check against
     /// whichever authority set that regime requires.
     [[nodiscard]] RbacRegimeAuthority regime_authority(const std::string& caller_username) const;
+
+    /// Outcome of `provision_first_admin`.
+    struct ProvisionFirstAdminOutcome {
+        bool ok{false};          ///< false ONLY on a genuine store/query failure (see `err`) —
+                                  ///< a validation refusal or the ordinary "not the first
+                                  ///< account" no-op both leave this true
+        bool provisioned{false}; ///< true iff THIS call actually created the account+grant
+        std::string username;    ///< the identity provisioned; meaningful iff `provisioned`
+        std::optional<std::uint64_t> new_gen; ///< present iff `provisioned` and commit confirmed
+        std::string err;
+    };
+
+    /// Third `RbacAdminAuthorityOwner` consumer (fresh-install RBAC-safe-by-
+    /// default bootstrap). ONE transaction: inserts the FIRST `auth.users`
+    /// row (the exact `WHERE NOT EXISTS (SELECT 1 FROM auth.users)` shape
+    /// `AuthDB::seed_admin_if_empty` uses, under the SAME
+    /// `kSeedAdminLockSql` advisory lock, auth_db.cpp) and, ONLY if that
+    /// INSERT actually returned a row, grants that exact username
+    /// `Administrator` and bumps generation — account and grant land
+    /// atomically, so a crash between the two can never leave an account
+    /// with no grant and no future boot able to fix it (the table would no
+    /// longer be empty). If the INSERT returns zero rows (another
+    /// replica/call already won, or the table was never empty), this is NOT
+    /// an error: `ok=true`, `provisioned=false`. `main.cpp` calls this
+    /// BEFORE `AuthDB::seed_admin_if_empty` — see that call site's own
+    /// comment for why the order is forced (this method must be the one
+    /// that actually creates the account, or its own `WHERE NOT EXISTS`
+    /// gate can never see an empty table). Rejects an invalid `username`
+    /// (the same `is_valid_username` check `seed_admin_if_empty` runs
+    /// first) before touching the database — reached first now, so it must
+    /// run here rather than rely on the now-later `seed_admin_if_empty`
+    /// call to catch it.
+    ProvisionFirstAdminOutcome provision_first_admin(const std::string& username,
+                                                      const std::string& password_hash,
+                                                      const std::string& salt_hex) const;
 
 private:
     friend class RbacStore;
