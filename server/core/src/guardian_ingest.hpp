@@ -91,11 +91,18 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics);
 // which is synchronous on the server (unlike the agent, async since #4666 PR-1/PR-2) -- a
 // stalled sink (an undrained pipe, a stuck network-mounted log path) blocked that thread. This
 // seam mirrors agents/core/src/log_handoff.hpp's async_logger/thread_pool/overrun_oldest
-// pattern, much more lightly: no teardown watchdog and no heartbeat/metrics tags are needed
-// here, because the server has no ShutdownDeadlineGuard/hard_exit machinery at all -- a single
-// SIGTERM already hard-exits after run() returns, bounding a wedged pool join exactly the way
-// the server's existing synchronous default logger is ALREADY bounded today under the same
-// fault (same hazard class, not a new one).
+// pattern, much more lightly: no teardown watchdog is built here -- ACCEPTED, not eliminated
+// (adversarial-review finding, 2026-09-28, corrects an earlier draft of this comment). The
+// server's hard-exit machinery (main.cpp's on_signal_hard_exit) is signal-DRIVEN, not
+// self-armed: the FIRST SIGINT/SIGTERM takes the graceful Server::stop() path (main.cpp's
+// g_signal_count check escalates only on a SECOND signal, already consumed by the first), so a
+// sink that stalls mid-drain leaves this pool's exit-time worker join bounded only by a SECOND
+// signal or the deployment's external stop deadline (systemd TimeoutStopSec=210s / Compose
+// stop_grace_period: 210s), never by "a single SIGTERM" alone. That exit-time join is a
+// genuinely new blocking point (the pre-existing synchronous default logger owns no worker to
+// join at teardown) -- accepted because the 210s external bound already exists and T_server is
+// a temporary #4606 benchmark diagnostic PR-7 retires; no heartbeat/metrics tags either
+// (out of scope for this PR).
 //
 // create_t_server_logger() is best-effort BY CONSTRUCTION (never EXIT_FAILURE, never refuses to
 // start): a thread-creation refusal is caught internally and logged via spdlog's default logger,

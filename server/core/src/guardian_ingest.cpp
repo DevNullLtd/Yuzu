@@ -111,10 +111,13 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
 // See the full design rationale on the declarations in guardian_ingest.hpp. This is
 // deliberately much lighter than agents/core/src/log_handoff.hpp's LogHandoff: one 1024-slot
-// queue, one worker thread, no teardown watchdog (the server has none at all today - a plain
-// SIGTERM hard-exits after run() returns, which already bounds a wedged pool join exactly the
-// way the pre-existing synchronous default logger is bounded under the same fault), no
-// heartbeat/metrics surfacing (out of scope for this PR).
+// queue, one worker thread, no teardown watchdog. This is an ACCEPTED exposure, not an
+// eliminated one (see guardian_ingest.hpp's full rationale, corrected 2026-09-28 by adversarial
+// review): the server's hard-exit machinery is signal-driven, not self-armed -- the first
+// SIGTERM takes the graceful stop() path, so a wedged pool join at exit is bounded only by a
+// SECOND signal or the deployment's external stop deadline (210s in both shipped
+// systemd/Compose configs), not "a plain SIGTERM" alone -- plus no heartbeat/metrics surfacing
+// (out of scope for this PR).
 namespace {
 
 // Message-count bound (mirrors log_handoff.hpp's kLogQueueCapacity, sized down: this backs
