@@ -165,9 +165,10 @@ std::filesystem::path golden_dir() { return std::filesystem::path(YUZU_TEST_GOLD
 
 // The normalisation applied to BOTH the freshly-rendered HTML and the stored
 // golden file before the byte-for-byte compare in `check_golden` below.
-// Rewrites exactly two patterns, applied in this order (the second only
-// matches what the first left behind, since a full timestamp's leading
-// "YYYY-MM-DD" would otherwise ALSO match the second pattern):
+// Rewrites exactly three patterns, applied in this order (each later pattern
+// only matches what the earlier ones left behind, since a full timestamp's
+// leading "YYYY-MM-DD" would otherwise ALSO match pattern 2, and pattern 2's
+// "YYYY-MM-DD" would otherwise ALSO contain pattern 3's bare "MM-DD" shape):
 //   1. an ISO-8601 UTC timestamp, "YYYY-MM-DDTHH:MM:SSZ" (the shape of every
 //      `kRecent`/`kOld` seed timestamp in this file, and so of every
 //      `last_seen`/`observed_at`/`first_seen`/history-row timestamp the
@@ -177,14 +178,27 @@ std::filesystem::path golden_dir() { return std::filesystem::path(YUZU_TEST_GOLD
 //      *calendar day*, so they carry today's/yesterday's real date with no
 //      time component — a second, independently wall-clock-dependent shape
 //      the seed timestamps above don't cover) -> the fixed token "<DATE>".
+//   3. a bare "MM-DD" day label with no year, anchored ">MM-DD<" (the
+//      signal-detail Activity chart and the overview Crashes-per-day chart
+//      both render `d.day.substr(5)` — the same `by_day` bucket's full
+//      "YYYY-MM-DD" minus its "YYYY-" prefix — as the small text label under
+//      each bar; unlike pattern 2's title-attribute date, this label has no
+//      surrounding digits or dashes, so the narrow ">...<" anchor is enough
+//      to avoid matching anything that isn't this exact day-label shape)
+//      -> "><MD><" (the substituted text keeps both boundary characters, so
+//      the surrounding markup — e.g. the following "</small>"/"</div>" close
+//      tag — is untouched).
 // Nothing else is rewritten — no whitespace collapsing, no other
-// substitution. A cell with neither shape is unaffected: regex_replace with
-// zero matches returns its input unchanged, so this is safe to call
+// substitution. A cell with none of these shapes is unaffected: regex_replace
+// with zero matches returns its input unchanged, so this is safe to call
 // unconditionally rather than threading a per-cell "has timestamps?" flag.
 std::string normalize_time(const std::string& in) {
     static const std::regex kIso8601Utc(R"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)");
     static const std::regex kBareDate(R"(\d{4}-\d{2}-\d{2})");
-    return std::regex_replace(std::regex_replace(in, kIso8601Utc, "<TS>"), kBareDate, "<DATE>");
+    static const std::regex kBareDayLabel(R"(>\d{2}-\d{2}<)");
+    return std::regex_replace(
+        std::regex_replace(std::regex_replace(in, kIso8601Utc, "<TS>"), kBareDate, "<DATE>"),
+        kBareDayLabel, "><MD><");
 }
 
 // Up to `ctx` bytes on each side of `pos` in `s`, clamped to `s`'s bounds —
