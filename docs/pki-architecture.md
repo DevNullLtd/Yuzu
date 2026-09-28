@@ -183,12 +183,26 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   lock for everyone else. Within one server process, concurrent publishes take a
   local lock first, so at most one pool connection waits on the table lock; any
   other publish (operator, import or startup) that cannot get the local lock
-  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not);
-  the operator-revoke paths additionally return `crl_republished:false` and write a
-  `ca.crl.published` failure audit. The import-chain, boot and freshness paths
-  write no `ca.crl.published` audit row, success or failure (#4829). A failure of
-  the freshness pass's own unpublished-revocation *check* is not a publish failure:
-  it is logged (warn, at most once a minute) and not counted (#4830). Repeated
+  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not) and
+  the finer-grained, reason-labelled `yuzu_server_ca_crl_publish_failure_reason_total{reason}`
+  sibling (#4830 — a bounded, closed cause set: `key_load`, `root_read_failed`,
+  `no_connection`, `lock_timeout`, `number_read_failed`, `degraded_revoked_read`,
+  `build_failed`, `insert_or_commit_failed`, `root_changed_twice`, `busy`,
+  `exception` — see `docs/user-manual/metrics.md`). **Every CRL publish now writes
+  a `ca.crl.published` audit row, success or failure (#4829)** — the two
+  operator-triggered paths (revoke, import-chain, each on REST/MCP/dashboard as
+  applicable) carry the caller's own request context and a `reason=` token
+  (`revoke` or `import_chain`); the three paths with no live request — startup,
+  the freshness re-publish, and the count-compare self-heal — are audited by
+  `CrlPublisher` itself under a `principal=system` row with `reason=startup`,
+  `reason=freshness`, or `reason=self_heal` respectively, so a self-heal that
+  resolves an earlier revoke-triggered failure row leaves its own
+  `result=success reason=self_heal` row as the resolution. A failure of the
+  freshness pass's own unpublished-revocation *check* is not a publish failure:
+  it is logged (warn, at most once a minute), not counted against either publish
+  counter, and instead increments the separate
+  `yuzu_server_ca_unpublished_revocation_check_failures_total` (#4830) — a
+  sustained non-zero rate means self-heal is effectively disabled. Repeated
   subordinate-CA imports can make publishes fail with "CA root changed" (logged
   distinctly; admin-only) until the imports stop.
 - **Self-heal.** Each CRL row records how many revoked certs it was built from
@@ -215,6 +229,16 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   and defeats the self-heal count). It does not affect numbering. During a rolling upgrade, a publish from an older binary does not take
   the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
   a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
+  `scripts/ha/ha-crl-publish-failover.sh` (WS-9, #4832) exercises the deterministic-lost-ack and
+  connection-reset cases live against a real Patroni cluster — but its deterministic-lost-ack case
+  catches the REVOCATION's own commit ack, not `publish_next_crl`'s CRL-publish transaction itself
+  (see the script's own CORRECTNESS NOTE); a recipe targeting the publish transaction specifically is
+  a disclosed follow-up (#5032). Its async-durability case confirms the `YUZU_PG_DURABILITY=async` toggle is
+  real and reachable but does not live-exercise the asynchronously-replicated-commit-loss residual
+  described above — that residual is asserted by this paragraph, not by a live repro. The
+  connection-reset case's own final self-heal-coverage assertion timed out once at 60s (after three
+  real script bugs preceding it were fixed) and has not yet been root-caused — a disclosed follow-up,
+  #5031, tracked alongside #5032 in `docs/ha-delivery-matrix.md`'s WS-6 row.
 
 **curl examples:**
 

@@ -2179,6 +2179,10 @@ SparkEngine::subscription_establishment(SubscriptionId id) const {
     SubscriptionEstablishment out{ait->second.armed_at, ait->second.established_at,
                                   ait->second.coverage};
     // An inert mechanism may have dropped a coverage transition; do not trust the cache.
+    // `.inert` here is deliberately the UNION of boot-inert and runtime-degraded (#4685) -
+    // matching spark_heartbeat.hpp's CSV, not Guardian's narrower boot-inert-only
+    // capability filter (guardian_engine.cpp), since either kind of gap means this
+    // mechanism cannot currently be trusted to have delivered a coverage transition.
     if (auto mit = mechanisms_.find(ait->second.spec.type);
         mit != mechanisms_.end() && mit->second->stats().inert)
         out.coverage = SparkCoverage::None;

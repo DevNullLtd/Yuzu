@@ -633,6 +633,29 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
+    /// TEST-ONLY (#4685): the outcome of the most recent Unsupported-branch classification
+    /// log reconcile_rule_locked emitted, plus a count of how many times that log has
+    /// genuinely fired (edge-triggered — that branch logs only on a change, never on a
+    /// retained/re-observed classification, see unsupported_rules_'s own doc comment).
+    /// Recorded directly at the point of emission, not observed via spdlog - same
+    /// cross-image hazard and the same object-member fix as
+    /// last_rearm_degrade_message_for_test above. `level` distinguishes the two
+    /// Unsupported causes #4685 asks the log to tell apart: Warn for a mechanism that IS
+    /// registered but refused to bind at start() (boot-inert - never emitted for a merely
+    /// runtime-degraded episode, which stays armable and never reaches this branch at
+    /// all), Info for a spark type with no mechanism registered on this host at all (the
+    /// routine cross-platform gap). `level == None` (the default) means no Unsupported
+    /// classification has logged yet this run. Locked, returned by value - same rationale
+    /// as the sibling accessors above. No production caller.
+    enum class UnsupportedLogLevel { None, Info, Warn };
+    struct UnsupportedLogRecord {
+        UnsupportedLogLevel level{UnsupportedLogLevel::None};
+        std::string rule_id;
+        SparkType type{};
+        std::uint64_t edge_count{0}; ///< how many genuine (logged) Unsupported edges so far
+    };
+    [[nodiscard]] UnsupportedLogRecord last_unsupported_log_for_test() const;
+
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
     /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
@@ -1022,6 +1045,8 @@ private:
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
     std::string last_rearm_degrade_message_for_test_;
+    /// TEST-ONLY (see last_unsupported_log_for_test); default level None = never logged.
+    UnsupportedLogRecord last_unsupported_log_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;

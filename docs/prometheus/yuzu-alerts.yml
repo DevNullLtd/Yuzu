@@ -1498,7 +1498,11 @@ groups:
             yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
             attempt failed (e.g. CA key load, build/sign, a database read or
             write, or a wait of more than 5s for the ca_store.ca_crl_versions lock
-            held by another publisher; see docs/user-manual/metrics.md).
+            held by another publisher; see docs/user-manual/metrics.md). For
+            which cause, check the reason-labelled sibling
+            yuzu_server_ca_crl_publish_failure_reason_total{reason} (#4830) —
+            a bounded breakdown (key_load, lock_timeout, no_connection, etc.)
+            alongside this unlabelled alert source.
             Consumers keep serving the last still-valid CRL, so this is not yet
             an outage, but a revocation made since the last successful publish
             is NOT yet in the public CRL — server-side enforcement (is_revoked())
@@ -3710,9 +3714,10 @@ groups:
   #     # macOS registers none of file/registry/service) is expected, not a regression. A
   #     # bare `> 0` would page on every legitimate cross-platform deploy. It is NOT
   #     # universally safe to ignore, though: classify() keys off the registered-AND-
-  #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
-  #     # registered-but-inert mechanism can also land a rule here on a platform where it
-  #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
+  #     # armable (not boot-inert) capability set (guardian_engine.cpp) - #4685 keeps a
+  #     # merely runtime-degraded mechanism armable, so only a registration failure or a
+  #     # boot-inert mechanism lands a rule here on a platform where it should have
+  #     # worked - see docs/user-manual/guaranteed-state.md's on-call note for
   #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
   #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
   #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to
