@@ -26,18 +26,114 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/sinks/sink.h>
+#include <spdlog/spdlog.h>
+
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
+using yuzu::server::detail::create_t_server_logger;
 using yuzu::server::detail::guardian_event_store_buckets;
 using yuzu::server::detail::ingest_guardian_response;
 using yuzu::server::detail::kGuardianEventStoreDurationMetric;
+using yuzu::server::detail::set_t_server_logger;
+using yuzu::server::detail::t_server_log_skipped_total_for_test;
 using yuzu::server::detail::warm_create_guardian_event_store_metric;
 
 namespace {
+
+// #4666 PR-4: RAII helper capturing the Guardian T_server diagnostic line by injecting a
+// SYNCHRONOUS test logger through guardian_ingest.hpp's set_t_server_logger() seam — never an
+// async one here, since an async test logger would race this test's own text() read against its
+// worker thread. Mirrors yuzu::test::LogCapture's stop()-before-text() contract, but swaps the
+// SEAM logger, not spdlog's process-wide default: restoring nullptr on destruction is a MUST,
+// not a nice-to-have (#4666 PR-4 spec) — without it the seam is left pointing at a capture whose
+// backing ostream is destroyed at scope end, and the NEXT TEST_CASE's T_server line would log
+// into freed memory.
+struct TServerLoggerCapture {
+    TServerLoggerCapture() {
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(oss_);
+        auto logger = std::make_shared<spdlog::logger>("test_t_server_capture", sink);
+        logger->set_level(spdlog::level::trace);
+        set_t_server_logger(std::move(logger));
+    }
+
+    /// Restore the seam to nullptr. Idempotent.
+    void stop() {
+        if (stopped_)
+            return;
+        set_t_server_logger(nullptr);
+        stopped_ = true;
+    }
+
+    /// Captured text so far. Only safe to call after stop() (see class doc) — same convention as
+    /// yuzu::test::LogCapture, even though this logger is synchronous and has no drain race of
+    /// its own: kept for parity so a reader does not need to hold two different rules in mind.
+    [[nodiscard]] std::string text() const { return oss_.str(); }
+
+    ~TServerLoggerCapture() { stop(); }
+
+    TServerLoggerCapture(const TServerLoggerCapture&) = delete;
+    TServerLoggerCapture& operator=(const TServerLoggerCapture&) = delete;
+    TServerLoggerCapture(TServerLoggerCapture&&) = delete;
+    TServerLoggerCapture& operator=(TServerLoggerCapture&&) = delete;
+
+private:
+    std::ostringstream oss_;
+    bool stopped_{false};
+};
+
+// #4666 PR-4 MUST #10: a spdlog sink whose log() call blocks until deliberately released, so a
+// TEST_CASE can prove T_server's async hand-off is REAL (the caller returns promptly while this
+// sink is still parked) rather than merely that the plumbing compiles. Installed via the actual
+// production construction path (create_t_server_logger()), not TServerLoggerCapture's
+// synchronous test double.
+class ParkingSink final : public spdlog::sinks::sink {
+public:
+    void log(const spdlog::details::log_msg& msg) override {
+        {
+            std::unique_lock<std::mutex> lock(gate_mu_);
+            gate_cv_.wait(lock, [this] { return released_.load(); });
+        }
+        std::lock_guard<std::mutex> out_lock(out_mu_);
+        out_ << std::string(msg.payload.data(), msg.payload.size());
+    }
+    void flush() override {}
+    void set_pattern(const std::string&) override {}
+    void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
+
+    /// Unblocks the log() call currently waiting (and every future one — a one-shot latch, not
+    /// a re-armable gate; this test only ever parks once).
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(gate_mu_);
+            released_ = true;
+        }
+        gate_cv_.notify_all();
+    }
+
+    [[nodiscard]] std::string text() const {
+        std::lock_guard<std::mutex> lock(out_mu_);
+        return out_.str();
+    }
+
+private:
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    std::atomic<bool> released_{false};
+    mutable std::mutex out_mu_;
+    std::ostringstream out_;
+};
 
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
 // below constructs its own GuaranteedStateStore against a clone of this schema
@@ -219,9 +315,10 @@ TEST_CASE("guardian ingest: event-store histogram splits by outcome status, skip
 TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on a non-observation "
           "Inserted event without disrupting ingest, and is skipped for observations",
           "[pg][guardian][ingest][diagnostics]") {
-    // guardian_ingest.cpp is compiled directly into the server test binary (not a separate
-    // shared library), so LogCapture's cross-image caveat (test_log_capture.hpp's banner)
-    // does not apply here — it reliably observes this file's spdlog calls.
+    // #4666 PR-4: T_server now resolves through the dedicated seam logger
+    // (guardian_ingest.hpp's set_t_server_logger()), not spdlog's process default, so this
+    // test uses TServerLoggerCapture (this file's own RAII helper, above) rather than
+    // yuzu::test::LogCapture for every T_server assertion below.
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -229,7 +326,7 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     // Ordinary rule violation, well-formed wire timestamp: rule_id != kObservationRuleId,
     // so the T_server block's try-block actually runs on this Inserted outcome (computes
     // recv_ns/committed_ns/store_ms and a valid agent_ns from ev.timestamp()).
-    yuzu::test::LogCapture cap1;
+    TServerLoggerCapture cap1;
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
     cap1.stop();
     CHECK(store.event_count() == 1);
@@ -254,7 +351,7 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     // Same, but with an out-of-range wire nanos field (untrusted agent input) — exercises
     // the bounds check that falls back to the agent_ns=-1 sentinel instead of computing a
     // value; must not crash/throw either.
-    yuzu::test::LogCapture cap2;
+    TServerLoggerCapture cap2;
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-r2", "rule-1", 1718000000, -1),
                              nullptr, nullptr);
     cap2.stop();
@@ -265,7 +362,7 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
     // A ruleless observation takes the OTHER arm of the gate (rule_id == kObservationRuleId
     // -> block skipped entirely) — no T_server line at all, proving the gate actually
     // discriminates rather than always/never firing.
-    yuzu::test::LogCapture cap3;
+    TServerLoggerCapture cap3;
     ingest_guardian_response(store, "agent-A", make_observation("__observation__-t-server", "svc.exe"),
                              nullptr, nullptr);
     cap3.stop();
@@ -274,7 +371,7 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
 
     // T_server is Inserted-only: an exact redelivery and a same-id/other-agent Conflict both reach
     // the store and neither may emit the line (a replay or a rejected event is not a fresh commit).
-    yuzu::test::LogCapture cap4;
+    TServerLoggerCapture cap4;
     ingest_guardian_response(store, "agent-A", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
     ingest_guardian_response(store, "agent-B", make_rule_event("evt-r1", "rule-1"), nullptr, nullptr);
     cap4.stop();
@@ -286,7 +383,7 @@ TEST_CASE("guardian ingest: #4606 criterion-10 T_server diagnostic block runs on
 
     // An ABSENT wire timestamp reads as seconds()==0; it must report the -1 sentinel, not a
     // fabricated epoch-0 instant (agent_ns=0).
-    yuzu::test::LogCapture cap5;
+    TServerLoggerCapture cap5;
     ingest_guardian_response(store, "agent-A",
                              make_rule_event("evt-r5", "rule-1", 0, 0, /*with_timestamp=*/false),
                              nullptr, nullptr);
@@ -313,7 +410,7 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
     // event_id, rule_id and agent_id are all free text on the wire (a rule id is operator-authored
     // and an event id embeds it): spaces and '=' would forge tokens, the newline would forge a
     // whole second line, and agent_id is only length-checked at registration.
-    yuzu::test::LogCapture cap;
+    TServerLoggerCapture cap;
     ingest_guardian_response(
         store, "agent A=1",
         make_rule_event("evt x=1 agent=victim\nGuardian T_server event_id=z", "rule 2 recv_ns=9"),
@@ -365,7 +462,7 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
     };
     const std::string id1 = base + "-1789930557755-101";
     const std::string id2 = base + "-1789930557755-102";
-    yuzu::test::LogCapture cap_long;
+    TServerLoggerCapture cap_long;
     ingest_guardian_response(store, "agent-A", make_rule_event(id1, "rule-1"), nullptr, nullptr);
     ingest_guardian_response(store, "agent-A", make_rule_event(id2, "rule-1"), nullptr, nullptr);
     cap_long.stop();
@@ -379,7 +476,7 @@ TEST_CASE("guardian ingest: #4606 T_server neutralises agent- and operator-suppl
 
     // Non-ASCII bytes never reach the line (a cut could otherwise leave invalid UTF-8, and U+2028
     // could split the record for a Unicode-aware consumer): each of the five bytes becomes '_'.
-    yuzu::test::LogCapture cap_na;
+    TServerLoggerCapture cap_na;
     ingest_guardian_response(store, "agent-A", make_rule_event("e\xC3\xA9\xE2\x80\xA8x", "rule-1"),
                              nullptr, nullptr);
     cap_na.stop();
@@ -439,4 +536,52 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         CHECK(cap.text().find("idempotent event redelivery (no re-observe) event_id=evt_r_1 "
                               "agent=agent_x_1 rule=rule_r_1") != std::string::npos);
     }
+}
+
+TEST_CASE("guardian ingest: #4666 PR-4 T_server's dedicated async logger never blocks the caller "
+          "on a stalled sink",
+          "[pg][guardian][ingest][diagnostics]") {
+    // This is the proof the async hand-off actually works, not just that the plumbing compiles
+    // (#4666 PR-4 spec MUST #10): a deliberately parked sink is installed through the REAL
+    // production construction path (create_t_server_logger() -- the actual async_logger +
+    // thread_pool + overrun_oldest, not TServerLoggerCapture's synchronous test double), then
+    // ingest_guardian_response's T_server call site is timed while that sink is still parked.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    // Null-safe branch first (MUST #8's "increments a plain counter" half, otherwise
+    // untested by anything in this file): with nothing installed on the seam, the T_server
+    // line is silently skipped and counted rather than falling back to any other logger.
+    set_t_server_logger(nullptr);
+    const auto skipped_before = t_server_log_skipped_total_for_test();
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-noseam", "rule-1"), nullptr,
+                             nullptr);
+    CHECK(store.event_count() == 1);
+    CHECK(t_server_log_skipped_total_for_test() == skipped_before + 1);
+
+    auto parking_sink = std::make_shared<ParkingSink>();
+    auto t_server_logger =
+        create_t_server_logger(std::vector<spdlog::sink_ptr>{parking_sink}, spdlog::level::info);
+    REQUIRE(t_server_logger != nullptr);
+    set_t_server_logger(t_server_logger);
+    yuzu::test::ScopeExit restore_seam{[] { set_t_server_logger(nullptr); }};
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ingest_guardian_response(store, "agent-A", make_rule_event("evt-park", "rule-1"), nullptr,
+                             nullptr);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(store.event_count() == 2); // evt-noseam (above) + evt-park
+    // Generous: the async hand-off only has to ENQUEUE (a bounded, lock-protected push), never
+    // wait on the sink itself. A genuinely blocking call here would hang for as long as the sink
+    // stays parked (this whole TEST_CASE would time out), not merely run slow — 2 s is far above
+    // any real enqueue cost and far below "the sink is still parked".
+    CHECK(elapsed < std::chrono::seconds(2));
+    CHECK(parking_sink->text().empty()); // nothing delivered yet — still parked
+
+    parking_sink->release();
+    REQUIRE(yuzu::test::spin_until([&] {
+        return parking_sink->text().find("Guardian T_server event_id=evt-park") !=
+               std::string::npos;
+    }));
 }

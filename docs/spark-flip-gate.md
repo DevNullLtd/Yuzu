@@ -1972,6 +1972,33 @@ F3 orphan-exit checks, and those ARE wired with a breadcrumb. The still-future `
 piece (server-side, PR-4 in the #4666 ladder) is untouched by either PR-1 or PR-2 and
 remains separately tracked.
 
+**Status update (2026-09-28): #4666 PR-4 has landed, closing the `T_server` piece named above —
+the precondition's server-side half is now addressed too, not only the agent side.**
+`server/core/src/guardian_ingest.{hpp,cpp}` gives the `T_server` line its own dedicated bounded
+async logger (`spdlog::async_logger`, a private 1024-slot `spdlog::details::thread_pool`,
+`overrun_oldest` — the same eviction policy PR-1/PR-2 use, sized down since this backs one
+diagnostic line rather than the whole process's logging), installed once at boot
+(`server/core/src/main.cpp`) over copies of the default logger's own sinks. This is a dedicated
+per-line change, unlike PR-1/PR-2's global default-logger swap on the agent: the server's other
+Guardian-ingest log lines on the same code path (idempotent-redelivery, event-collision/store-
+error, oversized-`detail_json`/parse-failure) are unaffected and stay on the ordinary
+synchronous default logger — only `T_server` itself, the one line the architect Gate 8 review
+adjudicated ACCEPT-WITH-PRECONDITION over, moved. Deliberately much lighter than PR-1's
+`LogHandoff`: no teardown watchdog (the server has no `ShutdownDeadlineGuard`/`hard_exit`
+machinery anywhere today — a plain `SIGTERM` already hard-exits after `run()` returns, bounding
+a wedged pool join exactly the way the server's other, still-synchronous log lines already are
+under the same fault) and no heartbeat/metrics surfacing (out of scope, matching PR-3's
+still-open agent-side equivalent). Construction/registration failure is best-effort by design —
+logged via the default logger and the line is silently skipped, never `EXIT_FAILURE`. Resource
+accounting: `docs/resource-ledgers/4666-t-server-async-logger.md`. With this PR-4 update, all
+five lines the 2026-09-20 precondition named (`T_detect`, `T_wire` on both paths, the Spark
+runtime's own arm-committed/late-arm/sweep-residue lines, and `T_server`) are non-blocking, so
+this precondition itself is now closed. The rest of the #4666 ladder (PR-3's agent-side
+heartbeat/metrics surfacing, PR-5's blocked-sink chaos driver/rig evidence, and PR-6/PR-7's
+`T_detect`/`T_wire`/`T_server` retirement once `gh issue view 4606` is closed) is tracked in the
+`spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md` plan record, not in this section —
+none of those remaining PRs gate this precondition or the F14 flip on their own.
+
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on
 `feat/4665-log-injection-neutralisation`, merge to `dev` still pending as of this entry): agent-side

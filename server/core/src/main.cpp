@@ -8,6 +8,7 @@
 
 #include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
 #include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
+#include "guardian_ingest.hpp"        // detail::create_t_server_logger / set_t_server_logger (#4666 PR-4)
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -1230,6 +1231,37 @@ int main(int argc, char* argv[]) {
         logger->set_level(spdlog::level::from_str(log_level));
         spdlog::set_default_logger(logger);
     }
+
+    // #4666 PR-4: dedicated bounded async logger for the Guardian T_server diagnostic line
+    // (guardian_ingest.cpp), so a stalled log sink can never block the gRPC ingest thread the
+    // same way the synchronous default logger above still can for every OTHER server log line.
+    // Built over COPIES of the (just-finalised) default logger's own sinks — owned shared_ptrs,
+    // so this stays valid even if the default logger is replaced later — which is also why its
+    // formatter/pattern need no separate wiring here: they reach this logger through those
+    // shared sinks once set_formatter()/set_pattern() run below. Registration is what needs to
+    // happen here, between the default-logger-set step above and the formatter/pattern calls
+    // below: it is what lets a runtime `--log-level` override reach this logger too (see
+    // guardian_ingest.hpp's own comment on create_t_server_logger() for why registration and
+    // formatting are NOT the same reason). Best-effort by construction — neither failure surface
+    // below (pool/thread construction, or a duplicate logger name on register_logger()) ever
+    // fails server boot; each just leaves the T_server line silently skipped.
+    try {
+        std::vector<spdlog::sink_ptr> t_server_sinks(spdlog::default_logger()->sinks());
+        if (auto t_server_logger = yuzu::server::detail::create_t_server_logger(
+                std::move(t_server_sinks), spdlog::level::from_str(log_level))) {
+            spdlog::register_logger(t_server_logger);
+            yuzu::server::detail::set_t_server_logger(std::move(t_server_logger));
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger ({}); the "
+                     "T_server diagnostic line will be skipped until the next restart",
+                     e.what());
+    } catch (...) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger (unknown "
+                     "exception); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+    }
+
     if (log_format == "json") {
         spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("server"));
     } else {
