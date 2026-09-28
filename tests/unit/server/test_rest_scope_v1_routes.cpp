@@ -420,6 +420,13 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview with a null ResultSetStore* abor
         h.sink.Post("/api/v1/scope/preview", R"({"expression":"NOT from_result_set:rs_anything"})");
     REQUIRE(r);
     CHECK(r->status == 503);
+    // #4981 adversarial-review finding 4: `unresolvable` is a PERMANENT
+    // condition (scope_eval_error.hpp's own doc comment — a required store
+    // isn't wired, a configuration error a retry cannot fix) — retry_after_ms
+    // must be null, not the same 5000ms hint a genuine transient degrade
+    // carries (see the db_degraded 503 test below).
+    auto body = nlohmann::json::parse(r->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
 }
 
 // ── [pg] — a real ResultSetStore, exercising the owner-check gate end-to-end ─
@@ -527,4 +534,8 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview 503s on a degraded result-set st
                          nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
     REQUIRE(r);
     CHECK(r->status == 503);
+    // #4981 adversarial-review finding 4: `db_degraded` is TRANSIENT — unlike
+    // the `unresolvable` case above, this one keeps the concrete 5000ms hint.
+    auto body = nlohmann::json::parse(r->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
 }

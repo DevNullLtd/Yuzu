@@ -12680,6 +12680,44 @@ TEST_CASE("MCP preview_scope_targets: a degraded result-set store 503-equivalent
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // #4981 adversarial-review finding 4: `db_degraded` is TRANSIENT — keeps
+    // the concrete retry hint (contrast the `unresolvable`/PERMANENT test
+    // immediately below, which must carry a null retry_after_ms instead).
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+}
+
+TEST_CASE("MCP preview_scope_targets: an unwired ResultSetStore* (unresolvable) carries a "
+          "null retry_after_ms — a PERMANENT condition, never the same transient hint a "
+          "genuine store degrade carries (#4981 adversarial-review finding 4)",
+          "[mcp][integration]") {
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    // result_set_store_for_test left at its default nullptr — the ladder's
+    // own alias-resolution sees no store, AND the closure below passes
+    // rs_store=nullptr into evaluate_scope — both agree, matching
+    // scope_eval_error.hpp's Kind::Unresolvable case exactly (a required
+    // store not wired, per scope_eval_error.hpp's own doc comment on that
+    // Kind value — a configuration error, not something a retry can fix).
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, nullptr, principal);
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":27,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"from_result_set:rs_anything"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("unresolvable") != std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
 // ── 22. Multiple sequential requests on same server ─────────────────────────

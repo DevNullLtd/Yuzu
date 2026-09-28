@@ -11440,7 +11440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, outcome.detail),
                                     "application/json");
                     return;
-                case yuzu::server::ScopePreviewOutcome::Kind::kEvaluationAborted:
+                case yuzu::server::ScopePreviewOutcome::Kind::kEvaluationAborted: {
                     if (outcome.detail == "owner_check_failed") {
                         // Existence-oracle-safe, mirrors rs_load_owned's own
                         // 404 body: a non-owner is indistinguishable from an
@@ -11457,19 +11457,45 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     // db_degraded / principal_unresolved / presence_degraded /
-                    // unresolvable — a degraded read the caller can retry,
-                    // never silently rendered as "0 matches" (that would
-                    // under-report the scope's real blast radius). Target =
-                    // the expression being previewed — every sibling failure
-                    // audit here carries a target (governance cons-F2).
+                    // unresolvable — never silently rendered as "0 matches"
+                    // (that would under-report the scope's real blast
+                    // radius). Target = the expression being previewed —
+                    // every sibling failure audit here carries a target
+                    // (governance cons-F2).
+                    //
+                    // #4981 adversarial-review finding 4: `principal_unresolved`
+                    // (no dispatching principal) and `unresolvable` (a
+                    // required store not wired — a configuration error) are
+                    // PERMANENT per scope_eval_error.hpp's own doc comments on
+                    // those two Kind values — a retry cannot fix either, so
+                    // they must NOT carry the same `retry_after_ms` hint as a
+                    // genuine transient degrade (`db_degraded`/
+                    // `presence_degraded`). Matches REST's identical split on
+                    // this same route and `approval_store_read_error_body`'s
+                    // (mcp_approval_error.hpp) precedent for
+                    // `list_pending_approvals`: the permanent arm omits
+                    // `retry_after_ms` entirely so `a4_error`'s default (-1 ->
+                    // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
-                    res.set_content(
-                        a4_error(kInternalError,
-                                 "scope evaluation unavailable: " + outcome.detail,
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
+                    const bool permanent = outcome.detail == "principal_unresolved" ||
+                                           outcome.detail == "unresolvable";
+                    if (permanent) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "this is a permanent condition and will NOT clear on "
+                                     "retry; escalate to an operator"),
+                            "application/json");
+                    } else {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    }
                     return;
+                }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
                     mcp_audit("success", expression);
                     res.set_content(

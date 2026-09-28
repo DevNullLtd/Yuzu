@@ -12515,7 +12515,7 @@ void RestApiV1::register_routes(
             res.status = 400;
             res.set_content(detail::a4_error(res, outcome.detail), "application/json");
             return;
-        case ScopePreviewOutcome::Kind::kEvaluationAborted:
+        case ScopePreviewOutcome::Kind::kEvaluationAborted: {
             if (outcome.detail == "owner_check_failed") {
                 // Existence-oracle-safe, mirrors load_owned's own 404 body
                 // (rest_api_v1.cpp's result-set routes): a non-owner is
@@ -12534,16 +12534,42 @@ void RestApiV1::register_routes(
                 return;
             }
             // db_degraded / principal_unresolved / presence_degraded /
-            // unresolvable — a degraded read the caller can retry, never
-            // silently rendered as "0 matches" (that would under-report the
-            // scope's real blast radius).
+            // unresolvable — never silently rendered as "0 matches" (that
+            // would under-report the scope's real blast radius).
+            //
+            // #4981 adversarial-review finding 4: `principal_unresolved`
+            // (no dispatching principal to owner-resolve against) and
+            // `unresolvable` (a required store not wired — a configuration
+            // error) are PERMANENT conditions per scope_eval_error.hpp's own
+            // doc comments on those two Kind values — a retry cannot fix
+            // either without an operator intervening first, so they must NOT
+            // carry the same `retry_after_ms: 5000` hint as a genuine
+            // transient degrade (`db_degraded`/`presence_degraded`). Matches
+            // the permanent-vs-transient split `approval_store_read_error_body`
+            // (mcp_approval_error.hpp) already applies for
+            // `list_pending_approvals`/`get_pending_approval_count`: the
+            // permanent arm omits `retry_after_ms` entirely so `a4_error`'s
+            // default (null) applies, the transient arm passes a concrete
+            // hint.
             res.status = 503;
-            res.set_content(detail::a4_error(res, "scope evaluation unavailable: " + outcome.detail,
-                                             {.retry_after_ms = 5000,
-                                              .remediation = "retry once the server reports "
-                                                             "ready"}),
-                            "application/json");
+            const bool permanent =
+                outcome.detail == "principal_unresolved" || outcome.detail == "unresolvable";
+            if (permanent) {
+                res.set_content(
+                    detail::a4_error(
+                        res, "scope evaluation unavailable: " + outcome.detail,
+                        {.remediation = "this is a permanent condition and will NOT clear on "
+                                        "retry; escalate to an operator"}),
+                    "application/json");
+            } else {
+                res.set_content(
+                    detail::a4_error(res, "scope evaluation unavailable: " + outcome.detail,
+                                     {.retry_after_ms = 5000,
+                                      .remediation = "retry once the server reports ready"}),
+                    "application/json");
+            }
             return;
+        }
         case ScopePreviewOutcome::Kind::kOk:
             res.set_content(ok_json(outcome.payload.dump()), "application/json");
             return;

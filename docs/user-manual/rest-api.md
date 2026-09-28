@@ -9687,7 +9687,7 @@ after the ladder evaluates, never the whole fleet.
 |---|---|
 | 400 | `expression` missing/empty, or fails to parse/validate |
 | 404 | A `from_result_set:<id>` atom references a result set that is absent, expired, or not owned by the caller (`RESULT_SET_NOT_FOUND`) — existence-oracle-safe, same body shape as the result-set routes' own `load_owned` 404; a server-side audit row is still written |
-| 503 | Scope evaluation degraded — a store preload (tag/props/result-set) failed, the cross-replica presence read failed, or the evaluator is unwired (`retry_after_ms: 5000`) — never silently under-reports the match set |
+| 503 | Scope evaluation aborted — never silently under-reports the match set. A store preload (tag/props/result-set) failed or the cross-replica presence read failed is TRANSIENT (`db_degraded`/`presence_degraded`, `retry_after_ms: 5000`); no dispatching principal was available or a required store isn't wired is PERMANENT (`principal_unresolved`/`unresolvable`, `retry_after_ms: null` — a retry cannot fix either); the evaluator itself being unwired (misconfiguration) also carries `retry_after_ms: null` |
 
 #### `POST /api/scope/estimate`
 
