@@ -517,6 +517,38 @@ TEST_CASE("Wave 10: ServerImpl's boot sequence actually calls "
     CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
+TEST_CASE("Wave 8: ServerImpl's boot sequence actually calls "
+          "seed_kill_switch_default_off(\"privacy_permissions\", ...) and fails the boot "
+          "closed on a seed error — source tripwire against server.cpp, since a full "
+          "ServerImpl construction is not practical at the unit level",
+          "[server][killswitch][source_tripwire]") {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(input.is_open());
+    const std::string source{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+
+    const auto marker = source.find("seed_kill_switch_default_off(\n                    \"privacy_permissions\"");
+    REQUIRE(marker != std::string::npos);
+    const auto block_end = source.find("\n        }\n", marker);
+    REQUIRE(block_end != std::string::npos);
+    const auto block = source.substr(marker, block_end - marker);
+
+    CHECK(block.find("\"privacy_permissions\"") != std::string::npos);
+
+    // The call is gated on the store existing and the boot not already
+    // having failed — never unconditional.
+    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
+                                          marker);
+    REQUIRE(guard_start != std::string::npos);
+    CHECK(guard_start < marker);
+    // The guard must be this call's own, not an earlier seed's.
+    CHECK(source.substr(guard_start, marker - guard_start).find("seed_kill_switch_default_off") ==
+          std::string::npos);
+
+    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+    CHECK(block.find("Refusing to start") != std::string::npos);
+}
+
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
