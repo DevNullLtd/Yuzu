@@ -599,13 +599,19 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's overrun_oldest genuinely evict
     //
     // Single producer thread, deliberately: the pool's single worker thread races the producer
     // loop for which message it dequeues first (parked in ParkingSink::log() for the duration),
-    // so which EARLY message ends up "in flight" -- and therefore immune to eviction -- is not
-    // deterministic. The assertions below are written to hold regardless of that race: the
-    // newest message is never evicted (eviction only ever targets the oldest), a solidly
-    // mid-range early message is evicted with overwhelming probability (>1500 messages are
-    // produced after it, against a 1024-slot queue), and the delivered count stays bounded near
-    // capacity rather than growing to the full 2000 -- ruling out both "nothing delivered" (a
-    // blocking-policy regression) and "everything delivered" (a silently-unbounded queue).
+    // so WHICH early message ends up "in flight" -- and therefore immune to eviction -- is not
+    // deterministic: worked out algebraically (cpp-safety Gate 8 finding, 2026-09-28), the
+    // in-flight seq can land anywhere in [0, kMessageCount - kTServerLogQueueCapacity] depending
+    // on exactly when the OS schedules that one dequeue, so asserting any ONE specific mid-range
+    // seq is absent is a genuine (if narrow) flake risk, not merely "overwhelmingly unlikely" --
+    // an earlier version of this test asserted exactly that and was corrected here. What IS
+    // provably true regardless of the race, and is asserted below instead: the newest message
+    // (produced dead last) is NEVER evicted, since eviction only ever targets the current queue
+    // head, which can never coincide with the just-pushed tail; and the delivered count stays
+    // bounded near capacity rather than growing to the full kMessageCount -- together ruling out
+    // "nothing delivered" (a blocking-policy regression), "everything delivered" (a
+    // silently-unbounded queue), and "newest silently dropped" (a discard-newest-style policy
+    // instead of overrun_oldest).
     auto parking_sink = std::make_shared<ParkingSink>();
     auto t_server_logger =
         create_t_server_logger(std::vector<spdlog::sink_ptr>{parking_sink}, spdlog::level::info);
@@ -619,7 +625,11 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's overrun_oldest genuinely evict
 
     // A blocking-policy regression would hang this loop for as long as the sink stays parked
     // (the TEST_CASE would time out under the harness's own deadline), not merely run slow.
-    CHECK(elapsed < std::chrono::seconds(5));
+    // Scaled by kSpinScale (test_helpers.hpp) like every other timing bound in this file: this
+    // exact unscaled-deadline mistake has recurred twice already in this test suite family under
+    // TSan/ASan, which this test's 2000-message producer loop is a materially heavier workload
+    // for than the sibling non-blocking test's 2 messages.
+    CHECK(elapsed < std::chrono::seconds(5) * yuzu::test::kSpinScale);
     CHECK(parking_sink->text().empty()); // still parked, nothing delivered yet
 
     parking_sink->release();
@@ -627,8 +637,7 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's overrun_oldest genuinely evict
         [&] { return parking_sink->text().find("seq=1999 END") != std::string::npos; }));
 
     const std::string delivered = parking_sink->text();
-    CHECK(delivered.find("seq=1999 END") != std::string::npos); // newest: never evicted
-    CHECK(delivered.find("seq=500 END") == std::string::npos);  // solidly old: evicted
+    CHECK(delivered.find("seq=1999 END") != std::string::npos); // newest: never evicted, no race
 
     // Bounded near capacity (1024 queued + at most 1 in-flight), not the full 2000 -- proves
     // eviction genuinely happened rather than the queue silently growing unbounded. Loose slack
