@@ -155,9 +155,9 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   constants, reproduced render-side instead of via a provider closure). Seam-closure now enforces
   **4 families**.
 - **WS-A4 PR-1 (`feat/split-a4-dex-dashboard`) closes the DEX half of the `dex` family's #4579 link
-  residual, adds its first public aggregate-only resource, and migrates three EXISTING resources
-  onto the sole fleet-read gate, pinning their aggregates to unconfined read per ADR-0017 INV-3 —
-  all landed together, plus a Gate 7 fix round on the same branch.** (1) **#4579's DEX half
+  residual and adds its first public aggregate-only resource — plus a three-round Gate 7 fix cycle
+  on the same branch that tried and reverted a fleet-read-gate migration on three EXISTING
+  resources, landing back on their original bare-permission gate.** (1) **#4579's DEX half
   CLOSED (issue stays OPEN** — its OTHER half, inverting `event_bus.hpp`'s SSE content-provider so
   no core `*_api.cpp` transitively reaches `<httplib.h>` and removing the `IMPL_HTTPLIB_ALLOWED`
   allowlist entry, is untouched by this branch): the pure DEX helpers
@@ -174,8 +174,10 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   CORE object (`dex_api.o`) references a symbol DEFINED in a PRESENTATION object
   (`dex_routes.cpp`'s `.o`) — the direction matters: presentation calling core is the seam's whole
   point, core linking against presentation is the violation this tripwire exists to catch — wired as
-  the `server-checks` suite's `dex link no presentation symbols` meson test, with its own selftest run
-  in `docs-lint.yml` (mutation-proven: moving a symbol back to `dex_routes.cpp` fails the test). (3)
+  the `server-checks` suite's `dex link no presentation symbols` meson test (registered on BOTH the
+  macOS/Linux CI legs, not push-only), with its own selftest run in `docs-lint.yml` (mutation-proven:
+  moving a symbol back to `dex_routes.cpp` fails the test), and hardened to prefer a compiler-matched
+  `nm` (`gcc-nm`/`llvm-nm`) with a clear diagnostic on an LTO-slim object it cannot read. (3)
   **New public resource**: `GET /api/v1/dex/catalogue` + MCP `get_dex_catalogue` — the Catalogue
   View 1 family cards (per-family monitored/health-score/event-count + an "Other (uncatalogued)"
   list), previously fragment-only; aggregate, no per-agent identity, no audit — closing the sibling
@@ -183,28 +185,40 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   branch (sec-5) additionally made a degraded fleet signal-summary read on this NEW resource 503
   rather than a fabricated healthy zero-event catalogue (`GuaranteedStateStore::
   dex_signal_summary_checked`, mirroring the pre-existing per-device `dex_device_signal_summary_
-  checked` #4855 pattern). (4) **Sole-gate migration onto the fleet-read chokepoint (Gate 7,
-  sec-1/sec-2), aggregates pinned to unconfined read per ADR-0017 INV-3**: `GET
-  /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET /api/v1/dex/overview` (REST + MCP)
-  — landed on this same branch gated on a bare `perm_fn`/`tier_allows` in front of a bespoke
-  per-file `DexVisibleFn`/`dex_visible_fn_` resolver, which made that resolver's confinement DORMANT
-  for a management-group-confined-only operator (403'd by the bare gate before the resolver ever
-  ran) and narrowed an elevated admin's read instead of leaving it unfiltered — migrated onto
-  `AuthRoutes::require_fleet_read` (ADR-0017) as the SOLE gate. Unlike `GET /api/v1/dex/perf/app/
-  devices` + MCP `list_dex_app_perf_devices` (an identified per-device fan-out these three routes
-  originally mirrored the precedent of), a Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
-  "aggregates GLOBAL-ONLY") found every field these three routes return — including their
-  device-list arrays — is a fleet-wide AGGREGATE with no per-caller SQL slice (ADR-0017 INV-3 / the
-  `software_catalog` ruling), so `require_fleet_read`'s composed scope is used ONLY to distinguish
-  unfiltered (global grant/elevated/RBAC-off — served) from ENGAGED (management-group or
-  service-scope — REFUSED, 403, never narrowed); the `DexVisibleFn`/`dex_visible_fn_` plumbing (REST
-  `rest_api_v1.{hpp,cpp}`, MCP `mcp_server.{hpp,cpp}`, the `dex_visible_fn` lambda + both wiring
-  sites in `server.cpp`) is deleted, not merely bypassed, and `signal_detail`'s `visible` parameter
-  is removed from the `DexApi` seam entirely (the `app`/`overview` methods keep theirs, unused by
-  these three callers, pending the PR-2 dashboard-rewire decision). Dashboard renderer rewire onto
-  these confinement semantics — an INV-3 violation of its own (the fragments still admit a confined
-  caller via `visible_set_fn`) — is still PR-2; its own tracking issue is TO BE FILED with this PR
-  (PR-2), not #4576, which closed only the device-lens half of a DIFFERENT deferral.
+  checked` #4855 pattern). (4) **Gate 7 fix cycle on three EXISTING resources — two designs tried
+  and reverted, landing back on base gating.** `GET /api/v1/dex/signals/{obs_type}`, `GET
+  /api/v1/dex/app`, and `GET /api/v1/dex/overview` (REST + MCP) landed on this branch gated on a
+  bare `perm_fn`/`tier_allows` in front of a bespoke per-file `DexVisibleFn`/`dex_visible_fn_`
+  resolver, which made that resolver's confinement DORMANT for a management-group-confined-only
+  operator (403'd by the bare gate before the resolver ever ran) and wrongly narrowed a
+  JIT-elevated administrator's read instead of leaving it unfiltered (sec-1/sec-2). Round 1 migrated
+  all three onto `AuthRoutes::require_fleet_read` (ADR-0017) as the sole gate. Round 2
+  (arch-1/sec8-1/sec8-2, "aggregates GLOBAL-ONLY") found every field these three routes return —
+  including their device-list arrays — is a fleet-wide aggregate with no per-caller SQL slice
+  (ADR-0017 INV-3 / the `software_catalog` ruling), so it added a 403 refusal for any admitted call
+  whose composed scope was ENGAGED rather than serving a narrowed list. **Round 3 (Fraser decision)
+  reverted both migrations**: `require_fleet_read`'s confinement bought nothing real for three
+  routes that can never serve a per-caller-narrowed answer, and the two-round detour cost more
+  review cycles than the bug it was fixing. All three routes are back on their ORIGINAL bare
+  `perm_fn` + `deny_fleet_wide_service_scoped` gate, byte-identical to `origin/dev` @ `257bfb338`.
+  The ONE change that survives from the whole cycle: the `DexVisibleFn`/`dex_visible_fn_` resolver
+  plumbing (REST `rest_api_v1.{hpp,cpp}`, MCP `mcp_server.{hpp,cpp}`, the `dex_visible_fn` lambda +
+  both wiring sites in `server.cpp`) is deleted, PERMANENTLY, not merely bypassed — it was dormant
+  for the confined caller it was meant to protect and actively wrong for an elevated admin, so there
+  was nothing worth keeping. `signal_detail`'s `visible` parameter was already removed from the
+  `DexApi` seam in round 1/2 and stays removed; `app`/`overview` ALSO lose their `visible`
+  parameters in round 3 (all production callers passed `nullptr`) — the underlying `build_dex_app_
+  model`/`build_dex_overview_model` BUILDER functions keep their own `visible` parameter for the
+  dashboard-rewire PR-2 to decide the fate of. Net behaviour vs base: identical for every caller
+  class on all three routes EXCEPT a JIT-elevated administrator, who now sees the full unfiltered
+  device list on `GET /api/v1/dex/app`/`GET /api/v1/dex/overview` (was narrowed to their base
+  identity's usually-empty grant) — REST only, since MCP bearer tokens cannot be elevated. Dashboard
+  renderer rewire is still PR-2 (unaffected by any of this cycle — its own tracking issue is TO BE
+  FILED with this PR, not #4576, which closed only the device-lens half of a DIFFERENT deferral);
+  the dashboard fragments gate on the SAME global `perm_fn` these three routes do (a confined
+  operator is denied there too), and separately narrow an ADMITTED caller's device list via the
+  permission-agnostic `Infrastructure:Read` `visible_set_fn` — the opposite residual from what an
+  earlier draft of this row claimed, corrected here (con-8).
 - **The `*_ui.cpp` audit-relocation premise below (and previously in the WS-A4 row) was FALSE — corrected
   here.** Verified against the tree: the behavioural-PII audit was NEVER in `*_ui.cpp` (those are pure
   render functions with zero audit calls); `emit_behavioral_audit` is already centralized in

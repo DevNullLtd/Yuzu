@@ -302,18 +302,27 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
-  - **Update (2026-09-28, WS-A4 PR-1 Gate 7 fix round):** `GET /api/v1/dex/signals/{obs_type}`,
-    `GET /api/v1/dex/app`, and `GET /api/v1/dex/overview` (REST + MCP) are pinned to UNCONFINED read
-    only, per this ADR's own `software_catalog` ruling above — every field they return
-    (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/`top_devices[]`/`top_apps[]`, etc.) is a
-    precomputed fleet-wide aggregate with no per-caller SQL slice, so `AuthRoutes::require_fleet_read`
-    stays the sole gate but an admitted call whose composed scope is ENGAGED (management-group
-    and/or service-scope) is REFUSED (403) rather than served a narrowed device list — the same
-    posture this ADR prescribes for `software_catalog`/`version_rollup`. The `/fragments/dex/overview`,
-    `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by
-    this fix round and still admit a confined caller via their own per-file `visible_set_fn`
-    resolver — an INV-3 violation of THIS entry's own rule, tracked for the dashboard-rewire
-    follow-up (PR-2).
+  - **Update (2026-09-28, WS-A4 PR-1 Gate 7 fix round, third revision — Fraser decision: revert to
+    base gating):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
+    /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
+    check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
+    Two intermediate designs were tried and reverted in review: pinning the three routes onto
+    `require_fleet_read` (round 1), then adding a 403 refusal for an admitted-but-scoped caller
+    (round 2). Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
+    `top_devices[]`/`top_apps[]`, etc.) is a query-time `GROUP BY` over agent-attributed rows —
+    **not** a precomputed rollup like `software_catalog`/`version_rollup` above, so the rationale
+    for pinning it global-only is different: it is simply **not yet confined per-caller** — an
+    INV-3-respecting per-caller SQL slice (a `WHERE agent_id IN (...)` narrowing derived from the
+    caller's visible set, applied INSIDE the aggregation, not a post-aggregate filter) has not been
+    built for these three queries yet. Filing that as its own tracking issue is future work, not
+    this fix round's scope. The `/fragments/dex/overview`, `/fragments/dex/app`, and
+    `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by this fix round: they also
+    gate on the SAME global `perm_fn` (a group-only operator is denied `403` there too, same as the
+    REST/MCP surfaces) — the residual is the OPPOSITE of a confined-caller leak: among callers who
+    DO hold the global grant, the fragments additionally narrow their device list by the
+    permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
+    row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
+    also owns deciding whether that narrowing is correct or itself a bug.
 
 ### Out of scope (global by design)
 

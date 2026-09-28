@@ -9,4 +9,9 @@
   catalogue. `GET /api/v1/dex/overview` and its MCP twin `get_dex_overview`
   additionally carry `connected_platforms`, `busiest_family`, and
   `busiest_family_events`, mirroring the fields the Overview hub's own
-  coverage tile and Explore card already show.
+  coverage tile and Explore card already show. `GET
+  /api/v1/dex/catalogue/group` and its MCP twin `get_dex_catalogue_group`
+  additionally carry `benign`, true for the one family whose window activity
+  is routine reports rather than incidents (the same flag the `/dex`
+  Catalogue drill's "Reports (window)" vs "Events (window)" label already
+  keys off).
