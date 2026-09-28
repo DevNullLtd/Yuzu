@@ -525,7 +525,14 @@ public:
         // `!guaranteed_state_store` guard's practical behaviour.
         // `guaranteed_state_store` above stays wired too, for the
         // rule/baseline MUTATORS this seam does not cover.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: closes the cross-transport MCP-tier bypass on the 4
+        // result-set write routes (create/pin/unpin/delete), which have no
+        // `perm_fn`/RBAC gate at all (ownership-only by design — see
+        // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
+        // dep; `{}` fails closed (503) for a TIERED caller and passes
+        // through for an untiered one — see TierPolicyFn's own contract.
+        TierPolicyFn tier_policy_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -620,7 +627,11 @@ public:
         std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
         // ADR-0031 WS-A4 (ninth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
+        // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
+        TierPolicyFn tier_policy_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

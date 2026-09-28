@@ -1249,6 +1249,7 @@ if build_server
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
+      'unit/server/test_rest_result_sets_tier_policy.cpp', # #5047: cross-transport MCP-tier belt on the 4 /api/v1/result-sets write routes
       'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -79,6 +80,26 @@ struct ListReadGate {
     /// The resolved session, so a caller doesn't have to re-resolve it.
     std::optional<auth::Session> session;
 };
+
+/// Callback shape for `AuthRoutes::require_tier_policy` (#5047) — closes the
+/// cross-transport gap where an MCP-tiered bearer token could skip the C8
+/// tier/approval belt on a route by calling REST instead of `/mcp/v1/`
+/// (result-set create/pin/unpin/delete were reachable via `auth_fn` +
+/// ownership only, no `perm_fn`/tier check at all). Session-taking, not
+/// request-resolving — mirrors `mfa_step_up.hpp`'s `StepUpFn`: the caller has
+/// already resolved `session` via its own `auth_fn`/`require_auth` call, so
+/// this does not re-authenticate.
+///
+/// Empty/default `{}` (unwired): pass-through (`true`) when the session's
+/// `mcp_tier` is empty (not an MCP token — nothing this belt enforces), but
+/// the CALL SITE must fail closed (503) when `mcp_tier` is non-empty and no
+/// function is wired — an unwired belt must never silently let a tiered
+/// bearer through on a route this PR specifically closes. Production always
+/// wires this from `AuthRoutes::require_tier_policy`; the unwired case is a
+/// test-harness/misconfiguration concern only.
+using TierPolicyFn =
+    std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
+                       const std::string& securable_type, const std::string& operation)>;
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -144,6 +165,31 @@ public:
     /// RBAC-aware permission check. Falls back to legacy admin/user check if RBAC is disabled.
     bool require_permission(const httplib::Request& req, httplib::Response& res,
                             const std::string& securable_type, const std::string& operation);
+
+    /// The MCP tier/approval belt (#5047) — extracted verbatim from
+    /// `require_permission`'s `mcp_tier` branch so a route that has its OWN
+    /// primary authorization gate (e.g. the result-set write routes' owner
+    /// check) can still apply the SAME tier/approval enforcement
+    /// `require_permission` gives every RBAC-gated route, without going
+    /// through RBAC. Takes an already-resolved `session` (not a request to
+    /// re-authenticate) — the caller has already run its own `auth_fn`/
+    /// `require_auth`.
+    ///
+    /// A no-op (`true`) for an empty `session.mcp_tier` (not an MCP token —
+    /// #4309 tracks the separate, already-accepted design question of
+    /// whether a plain RBAC session/untiered token should get SOME belt
+    /// here; this method does not attempt that). For a non-empty tier: denies
+    /// per `mcp::tier_allows`, then — mirroring `require_permission` exactly
+    /// — denies per `mcp::requires_approval` on every transport EXCEPT
+    /// `/mcp/v1/` (where the C8 ticket-then-recall gate in mcp_server.cpp is
+    /// the authoritative approval gate; re-denying here would break a valid
+    /// recall, consume-then-deny). "Tier enforcement applies on all
+    /// transports (MCP JSON-RPC and REST API) so a token cannot bypass the
+    /// tier by switching endpoints" (#520) — this method IS that promise,
+    /// callable from a route that isn't RBAC-gated at all.
+    bool require_tier_policy(const httplib::Request& req, httplib::Response& res,
+                             const auth::Session& session, const std::string& securable_type,
+                             const std::string& operation);
 
     /// Scoped RBAC-aware permission check for device-specific operations.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
