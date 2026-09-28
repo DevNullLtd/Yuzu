@@ -11450,9 +11450,17 @@ McpServer::HandlerFn McpServer::build_handler(
                             (void)audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
                                            "not found or not owned");
                         mcp_audit("failure", expression);
+                        // #4981 fix-round finding: was a bare error_response(...) with
+                        // no `data` object at all -- no correlation_id, no
+                        // retry_after_ms (not even null). Routed through the same
+                        // a4_error lambda the sibling db_degraded/principal_unresolved
+                        // arm below uses, so this permanent (non-retryable — the
+                        // referenced set doesn't exist or isn't owned by this
+                        // caller) failure carries a full A4 envelope too, per
+                        // agentic-first-principle.md A4.
                         res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "RESULT_SET_NOT_FOUND: result set not found"),
+                            a4_error(kInvalidParams,
+                                     "RESULT_SET_NOT_FOUND: result set not found"),
                             "application/json");
                         return;
                     }
@@ -11477,8 +11485,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // `retry_after_ms` entirely so `a4_error`'s default (-1 ->
                     // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
-                    const bool permanent = outcome.detail == "principal_unresolved" ||
-                                           outcome.detail == "unresolvable";
+                    // #4981 fix-round finding: was a raw string comparison against
+                    // outcome.detail, which cannot warn if a future 6th
+                    // ScopeEvalError::Kind value lands unclassified. Routed
+                    // through the shared, exhaustive scope_abort_is_permanent()
+                    // classifier (scope_eval_error.hpp) instead — see that
+                    // function's doc comment for why OwnerCheckFailed never
+                    // actually reaches here (handled above).
+                    const bool permanent = outcome.abort_kind &&
+                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
                     if (permanent) {
                         res.set_content(
                             a4_error(kInternalError,

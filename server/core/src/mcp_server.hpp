@@ -59,6 +59,7 @@
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
 #include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
+#include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam

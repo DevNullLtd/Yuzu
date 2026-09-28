@@ -2022,7 +2022,7 @@ void RestApiV1::register_routes(
     // Returns true iff the caller must return immediately (either a written
     // 401/redirect from auth_fn, or the 403 deny itself).
     auto deny_fleet_wide_service_scoped =
-        [auth_fn, audit_fn](const httplib::Request& req, httplib::Response& res,
+        [auth_fn, audit_fn, metrics_registry](const httplib::Request& req, httplib::Response& res,
                             const std::string& action, const std::string& target_type,
                             const std::string& audit_detail, const std::string& message,
                             const std::string& target_id = "",
@@ -2032,6 +2032,23 @@ void RestApiV1::register_routes(
             return true; // auth_fn already wrote the response (401/etc).
         if (session->token_scope_service.empty())
             return false;
+        // #4981 fix-round (sre finding): MCP's structural C8 default-deny gate
+        // (mcp_server.cpp, ServiceScopeClass::denied) increments
+        // yuzu_auth_service_scope_default_denied_total on the SAME class of
+        // denial reached via a completely different code path — this REST
+        // chokepoint denied fleet-wide reach to ~9 routes with no metric at
+        // all until now. Same metric name/path_class shape, `path_class="rest"`
+        // here instead of "mcp". `permission` is sometimes passed "" by a
+        // caller wanting a blanket deny with no single named securable (this
+        // PR's own scope/preview call is one) — "unspecified" avoids shipping
+        // an empty Prometheus label value.
+        if (metrics_registry) {
+            metrics_registry
+                ->counter("yuzu_auth_service_scope_default_denied_total",
+                         {{"permission", permission.empty() ? "unspecified" : permission},
+                          {"path_class", "rest"}})
+                .increment();
+        }
         // cid minted BEFORE the audit call (not after, as an earlier round
         // had it) so the persisted row carries the same id the response
         // header echoes — the OpenAPI spec's correlation_id field documents
@@ -12552,8 +12569,15 @@ void RestApiV1::register_routes(
             // default (null) applies, the transient arm passes a concrete
             // hint.
             res.status = 503;
+            // #4981 fix-round finding: was a raw string comparison against
+            // outcome.detail, which cannot warn if a future 6th
+            // ScopeEvalError::Kind value lands unclassified. Routed through
+            // the shared, exhaustive scope_abort_is_permanent() classifier
+            // (scope_eval_error.hpp) instead — see that function's doc
+            // comment for why OwnerCheckFailed never actually reaches here
+            // (handled above).
             const bool permanent =
-                outcome.detail == "principal_unresolved" || outcome.detail == "unresolvable";
+                outcome.abort_kind && scope_abort_is_permanent(*outcome.abort_kind);
             if (permanent) {
                 res.set_content(
                     detail::a4_error(

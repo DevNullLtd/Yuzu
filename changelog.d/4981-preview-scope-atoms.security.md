@@ -13,4 +13,8 @@
   read aborts (REST 503, MCP `kInternalError`, both with a retry hint) rather than under- or
   over-reporting the match set. Confinement (a management-group-confined caller's own visible
   devices) is now applied AFTER the ladder's fleet-wide evaluation, matching how a real dispatch
-  intersects against the operator's execute-visible set before sending.
+  intersects against the operator's execute-visible set before sending. Additionally, a
+  service-scoped API token is now denied outright (403) on both surfaces (closing the same
+  cross-service-reach gap #4980 closed on `create_result_set_from_inventory_query`), and a
+  preview no longer touches a referenced result set's TTL (`last_used_at`) as a side effect — it
+  is now a genuine read-only dry run.

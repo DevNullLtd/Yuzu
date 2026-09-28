@@ -218,7 +218,11 @@ struct ScopeV1Harness {
             /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
             /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr,
             /*license_store=*/nullptr, /*guaranteed_state_store=*/nullptr,
-            /*metrics_registry=*/nullptr, /*session_revoke_fn=*/{},
+            // #4981 fix-round: wired to the harness's own `metrics` member
+            // (already live for `registry` above) rather than nullptr, so a
+            // test can assert deny_fleet_wide_service_scoped's
+            // yuzu_auth_service_scope_default_denied_total increment.
+            /*metrics_registry=*/&metrics, /*session_revoke_fn=*/{},
             /*execution_event_bus=*/nullptr, /*result_set_store=*/result_set_store,
             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
             /*dex_perf_fn=*/{}, /*network_api=*/nullptr, /*lockout_clear_fn=*/{},
@@ -365,6 +369,33 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview denies a service-scoped token ou
     // assertion).
     auto body = nlohmann::json::parse(r->body);
     CHECK_FALSE(body["error"].contains("permission"));
+}
+
+// #4981 fix-round (sre finding): deny_fleet_wide_service_scoped — the shared
+// chokepoint the test above exercises — emitted no metric at all on the REST
+// 403 path, unlike MCP's structural C8 default-deny gate, which denies the
+// SAME preview_scope_targets tool to a service-scoped token via a completely
+// different code path and DOES increment
+// yuzu_auth_service_scope_default_denied_total (mcp_server.cpp, see
+// test_mcp_server.cpp's "MCP C8: a service-scoped token is denied by the
+// default-deny classification" test for its twin assertion). This route's
+// own call passes permission="" (a blanket deny with no single named
+// securable — see the "no `.permission` label" assertion above), so the
+// label falls back to the fixed literal "unspecified" rather than shipping
+// an empty Prometheus label value.
+TEST_CASE("scope v1: POST /api/v1/scope/preview's service-scoped 403 increments "
+          "yuzu_auth_service_scope_default_denied_total{path_class=\"rest\"}",
+          "[rest][scope][v1]") {
+    ScopeV1Harness h;
+    h.mock_token_scope_service = "printers";
+    auto r = h.sink.Post("/api/v1/scope/preview", R"({"expression":"arch == \"x64\""})");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+
+    CHECK(h.metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "unspecified"}, {"path_class", "rest"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("scope v1: POST /api/v1/scope/preview requires a non-empty expression",

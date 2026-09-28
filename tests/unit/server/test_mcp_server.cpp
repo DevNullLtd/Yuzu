@@ -12535,6 +12535,14 @@ TEST_CASE("MCP preview_scope_targets: NOT from_result_set:<id> over an absent se
     CHECK(bare_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(bare_body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
           std::string::npos);
+    // #4981 fix-round: owner_check_failed used to skip the A4 envelope
+    // entirely (a bare error_response with no `data` object at all). Now
+    // routed through the same a4_error lambda every sibling abort branch
+    // uses — correlation_id present, retry_after_ms null (a permanent
+    // condition: the referenced set doesn't exist or isn't owned by this
+    // caller, so a retry cannot fix it).
+    CHECK_FALSE(bare_body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(bare_body["error"]["data"]["retry_after_ms"].is_null());
 
     auto negated = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":23,)"
@@ -12550,6 +12558,8 @@ TEST_CASE("MCP preview_scope_targets: NOT from_result_set:<id> over an absent se
     CHECK(negated_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(negated_body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
           std::string::npos);
+    CHECK_FALSE(negated_body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(negated_body["error"]["data"]["retry_after_ms"].is_null());
 }
 
 // #4981 regression: the actual bug report — a NOT'd reference to an OWNED,
