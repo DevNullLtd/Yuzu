@@ -18749,10 +18749,17 @@ private:
         // one) and passed to both RestApiV1::set_scope_evaluate_fn and
         // McpServer::set_scope_evaluate_fn below, so REST and MCP cannot
         // silently diverge in which agents a preview matches.
+        // #4981 PR-3: `touch_referenced_result_sets = false` — a preview is a
+        // read-only dry run; it must resolve `from_result_set:` membership
+        // identically to a real dispatch WITHOUT extending a referenced
+        // owned set's TTL merely for being named in the check (real dispatch,
+        // via command_routes.cpp's Scope arm and wire_and_dispatch_confined,
+        // is unaffected and keeps the touch at its default `true`).
         auto scope_evaluate_fn = [this](const yuzu::scope::Expression& parsed,
                                         const std::string& principal) {
             return registry_.evaluate_scope(parsed, tag_store_.get(), custom_properties_store_.get(),
-                                            result_set_store_.get(), principal);
+                                            result_set_store_.get(), principal,
+                                            /*touch_referenced_result_sets=*/false);
         };
 
         rest_api_v1_ = std::make_unique<RestApiV1>();

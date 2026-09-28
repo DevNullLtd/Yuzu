@@ -341,3 +341,107 @@ TEST_CASE("preview_scope_targets: props.<key> resolves against a real CustomProp
     CHECK(outcome.payload["matched_count"] == 1);
     CHECK(outcome.payload["matched_agents"][0] == "agent-web");
 }
+
+// ── #4981 adversarial-review finding 2: preview must NOT touch a referenced ─
+// ── result set's TTL — readOnlyHint: true must stay truthful. ───────────────
+
+TEST_CASE("preview_scope_targets: never touches an owned result set's "
+          "last_used_at/ttl_at — mirrors server.cpp's ACTUAL scope_evaluate_fn "
+          "closure (touch_referenced_result_sets=false), the ONE binding both "
+          "REST POST /api/v1/scope/preview and MCP preview_scope_targets use "
+          "(#4981 adversarial-review finding 2)",
+          "[pg][scope][preview]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.name = "alice-preview-touch";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+
+    auto before = store.get(set->id);
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+
+    // #4981 PR-3: mirrors server.cpp's `scope_evaluate_fn` byte-for-byte
+    // (touch_referenced_result_sets=false) — NOT the default-true shape
+    // command_routes.cpp/wire_and_dispatch_confined use (see the control
+    // TEST_CASE immediately below).
+    auto preview_evaluate_scope_fn = [&](const yuzu::scope::Expression& expr,
+                                         const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal,
+                                       /*touch_referenced_result_sets=*/false);
+    };
+
+    auto outcome = preview_scope_targets("from_result_set:" + set->id, "alice", std::nullopt,
+                                         &store, preview_evaluate_scope_fn);
+    REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kOk);
+    CHECK(outcome.payload["matched_count"] == 1);
+
+    auto after = store.get(set->id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    // Byte-for-byte unchanged, not merely ">=" — a preview must never write
+    // to the store at all, not just "not visibly move the value".
+    CHECK(after->value().last_used_at == before->value().last_used_at);
+    CHECK(after->value().ttl_at == before->value().ttl_at);
+}
+
+TEST_CASE("preview_scope_targets: a real-dispatch-shaped evaluate_scope_fn (no 6th "
+          "argument — the unchanged binding command_routes.cpp's Scope arm and "
+          "wire_and_dispatch_confined use) still touches the referenced result set — "
+          "the touch-suppression fix affects ONLY preview's own closure, never real "
+          "dispatch (#4981 adversarial-review finding 2 control)",
+          "[pg][scope][preview]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.name = "alice-dispatch-touch";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+    const int64_t orig_ttl = set->ttl_at;
+    const int64_t orig_last_used = set->last_used_at;
+
+    // Same binding shape as the real dispatch ladder — no 6th argument, so
+    // touch_referenced_result_sets defaults to `true` (agent_registry.hpp).
+    auto dispatch_evaluate_scope_fn = [&](const yuzu::scope::Expression& expr,
+                                          const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal);
+    };
+
+    auto outcome = preview_scope_targets("from_result_set:" + set->id, "alice", std::nullopt,
+                                         &store, dispatch_evaluate_scope_fn);
+    REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kOk);
+
+    auto after = store.get(set->id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    // Same idiom as "ResultSetStore: touch extends TTL" in
+    // test_result_set_store.cpp — >= rather than strict > because a touch
+    // within the same wall-clock second as create is a legitimate no-op.
+    CHECK(after->value().ttl_at >= orig_ttl);
+    CHECK(after->value().last_used_at >= orig_last_used);
+}

@@ -17,10 +17,14 @@
 /// the WHOLE FLEET regardless of the set's real membership — a fleet-wide
 /// over-disclosure bug, not merely an undercount (#4981). Routing through the
 /// real ladder means a `from_result_set:`/`props.` atom now resolves
-/// IDENTICALLY to a real dispatch, including the owner-check gate and the
-/// (already-shipped, deliberate) result-set TTL-touch side effect
-/// `AgentRegistry::evaluate_scope` performs on every owned reference it
-/// resolves.
+/// IDENTICALLY to a real dispatch, including the owner-check gate — EXCEPT
+/// the result-set TTL-touch side effect a real dispatch's
+/// `AgentRegistry::evaluate_scope` call performs on every owned reference it
+/// resolves (#4981 PR-1 A4). This module's caller (server.cpp's shared
+/// `scope_evaluate_fn`) passes `touch_referenced_result_sets = false`, so a
+/// preview genuinely never mutates a result set's `last_used_at`/`ttl_at` —
+/// it stays a read-only dry run, and `preview_scope_targets` keeps its
+/// truthful `readOnlyHint: true` (#4981 PR-3).
 ///
 /// No httplib.h dependency.
 
