@@ -79,6 +79,14 @@ struct Harness {
     std::string session_scope_service;    // non-empty = service-scoped token
     std::string session_principal_kind{"human"};
 
+    // #5047 pair-pinning: the fake tier_policy_fn records the LAST
+    // (securable_type, operation) it was called with, so the tests below can
+    // assert the exact pair each route passes -- not just that a denial or
+    // pass-through occurred. Without this, swapping "Delete" for "Write" on
+    // the DELETE route would still pass every outcome-only assertion.
+    bool tier_policy_fn_called{false};
+    std::string last_tier_securable, last_tier_operation;
+
     explicit Harness(pg::PgPool& pool) {
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
@@ -103,8 +111,12 @@ struct Harness {
             return true;
         };
         TierPolicyFn tier_policy_fn =
-            [](const httplib::Request& req, httplib::Response& res, const auth::Session& session,
-               const std::string& securable_type, const std::string& operation) -> bool {
+            [this](const httplib::Request& req, httplib::Response& res,
+                  const auth::Session& session, const std::string& securable_type,
+                  const std::string& operation) -> bool {
+            tier_policy_fn_called = true;
+            last_tier_securable = securable_type;
+            last_tier_operation = operation;
             if (session.mcp_tier.empty())
                 return true;
             if (!mcp::tier_allows(session.mcp_tier, securable_type, operation)) {
@@ -183,6 +195,47 @@ CreateRequest simple_req(const std::string& owner) {
 }
 
 } // namespace
+
+TEST_CASE("REST /api/v1/result-sets: tier_policy_fn is called on all 4 write "
+          "routes with the EXACT (securable_type, operation) pair the MCP "
+          "twins carry in kToolSecurityRows — DELETE -> Infrastructure:Delete, "
+          "create/pin/unpin -> Infrastructure:Write (pins the pair, not just "
+          "the outcome — a wrong label would still pass every other test in "
+          "this file since readonly/operator deny either pair identically)",
+          "[pg][result_set][tier_policy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, tier_policy_result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    Harness h(pool);
+    // session_mcp_tier defaults to "" so every write reaches the store
+    // (round-trips cleanly) rather than being denied before tier_policy_fn's
+    // arguments can be inspected.
+
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets", R"({"name":"t"})", status);
+    REQUIRE(status == 201);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+    const auto id = created["data"]["id"].get<std::string>();
+
+    h.tier_policy_fn_called = false;
+    h.post("/api/v1/result-sets/" + id + "/pin", "", status);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.tier_policy_fn_called = false;
+    h.post("/api/v1/result-sets/" + id + "/unpin", "", status);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.tier_policy_fn_called = false;
+    h.del_raw("/api/v1/result-sets/" + id, status);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Delete");
+}
 
 TEST_CASE("REST /api/v1/result-sets: a supervised-tier bearer DELETE-ing its "
           "OWN result set is denied (403, approval-gated for supervised "
