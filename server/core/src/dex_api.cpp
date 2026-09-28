@@ -99,9 +99,8 @@ public:
 
     [[nodiscard]] DexSignalDetailModel signal_detail(const std::string& obs_type,
                                                      const std::string& window,
-                                                     const std::string& os_filter, int limit,
-                                                     const std::set<std::string>* visible)
-        const override {
+                                                     const std::string& os_filter,
+                                                     int limit) const override {
         DexSignalDetailModel out;
         if (!store_)
             return out;
@@ -109,16 +108,11 @@ public:
         const std::string os_scope = dex_normalize_os_filter(os_filter);
         out.subjects = store_->dex_signal_subjects(obs_type, since, limit, os_scope);
         out.by_os = store_->dex_signal_by_os(obs_type, since);
-        auto devs = store_->dex_signal_devices(obs_type, since, limit, os_scope);
-        out.devices.reserve(devs.size());
-        for (auto& d : devs) {
-            // ADR-0031 WS-A4 PR-1 decision 3: POST-limit filter (the store
-            // read above already applied `limit`) — see this method's own
-            // doc comment in dex_api.hpp for why the order matters.
-            if (visible && !visible->count(d.agent_id))
-                continue; // out-of-scope device -- never enumerate its id (admit-then-filter)
-            out.devices.push_back(std::move(d));
-        }
+        // WS-A4 PR-1 Gate 7 fix round: no per-row `visible` filter here — see
+        // this method's own doc comment in dex_api.hpp for why a post-limit
+        // filter was removed rather than kept (it left the sibling
+        // aggregates fleet-wide for every caller regardless of confinement).
+        out.devices = store_->dex_signal_devices(obs_type, since, limit, os_scope);
         out.by_day = store_->dex_signal_by_day(obs_type, since, os_scope);
         return out;
     }

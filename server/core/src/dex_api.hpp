@@ -50,12 +50,16 @@
 /// `dex_iso_since(dex_window_to_days(window))` and obtains the cross-store
 /// `DexFleet` denominator from an injected `FleetFn` — exactly as today's
 /// handlers do — so neither `since` nor `DexFleet` appears in this abstract
-/// interface. `visible` (the caller's ADR-0017 admit-then-filter set) DOES
-/// appear where a resource confines its device list: it is resolved from the
-/// authenticated request by the handler's `FleetReadFn` gate
-/// (`AuthRoutes::require_fleet_read`'s composed `VisibleSet`, WS-A4 PR-1 fix
-/// round) and threaded in, since it depends on the caller's identity, not
-/// the store.
+/// interface. `visible` (the caller's ADR-0017 admit-then-filter set)
+/// remains on `app`/`overview` for a NON-aggregate consumer that genuinely
+/// confines its own device list (today: none — the WS-A4 PR-1 Gate 7 fix
+/// round pinned the REST/MCP handlers to a GLOBAL-only
+/// `AuthRoutes::require_fleet_read` admit and now always pass `nullptr`
+/// here; see each method's own doc comment below for the constraint on any
+/// FUTURE non-null caller). `signal_detail` DROPPED its `visible` parameter
+/// entirely in that same fix round — see its own doc comment for why a
+/// per-row filter was never safe for that method's `subjects`/`by_os`/
+/// `by_day` aggregates in the first place.
 
 #include <optional>
 #include <set>
@@ -105,8 +109,22 @@ public:
     [[nodiscard]] virtual std::optional<GuardianObservationRow>
     observation(const std::string& agent_id, const std::string& event_id) const = 0;
 
-    /// GET /api/v1/dex/app?name= — per-app blast radius; `visible` confines the
-    /// affected-devices list (nullptr = unconfined / global Read).
+    /// GET /api/v1/dex/app?name= — per-app blast radius. `visible`, if
+    /// non-null, filters ONLY the returned `devices[]` ROWS — it does NOT,
+    /// and cannot, confine the crash/hang-count AGGREGATES this model also
+    /// carries (there is no per-caller SQL slice of a fleet-wide rollup).
+    /// ADR-0017 INV-3 / the `software_catalog` ruling: a caller with an
+    /// ENGAGED (confined) visible set must NOT pass it here — it would
+    /// either leak the aggregate fleet-wide while only narrowing the device
+    /// list (a caller could reasonably read the aggregate as "for my
+    /// devices"), or, if a future change also confined the aggregate, do so
+    /// per-caller in a way no other caller of the same underlying data would
+    /// agree with. The REST/MCP handlers (WS-A4 PR-1 Gate 7 fix round) never
+    /// reach this call with an engaged scope — they refuse it at the gate
+    /// (`refuse_confined_aggregate_read`/`refuse_confined_dex_aggregate`)
+    /// and always pass `nullptr`. This parameter survives ONLY for the
+    /// dashboard fragment rewire (PR-2, issue TBD) to decide the fate of —
+    /// do not widen its use before that decision is made.
     [[nodiscard]] virtual DexAppModel app(const std::string& process_name,
                                           const std::string& window,
                                           const std::set<std::string>* visible) const = 0;
@@ -135,8 +153,12 @@ public:
     /// GET /api/v1/dex/trends — cross-OS + per-family trend source data.
     [[nodiscard]] virtual DexTrendsModel trends(const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/overview — /dex landing fleet summary; `visible` confines
-    /// the top-devices list (nullptr = unconfined / global Read).
+    /// GET /api/v1/dex/overview — /dex landing fleet summary. `visible`, if
+    /// non-null, filters ONLY the returned top-devices ROWS — it does NOT,
+    /// and cannot, confine the health/score/distribution AGGREGATES this
+    /// model also carries. Same ADR-0017 INV-3 constraint, same PR-2-only
+    /// survival, as `app`'s `visible` parameter above — see its doc comment
+    /// for the full rationale. The REST/MCP handlers always pass `nullptr`.
     [[nodiscard]] virtual DexOverviewModel
     overview(const std::string& window, const std::set<std::string>* visible) const = 0;
 
@@ -151,33 +173,30 @@ public:
     [[nodiscard]] virtual std::vector<DexOsScope> scope(const std::string& window) const = 0;
 
     /// GET /api/v1/dex/signals/{obs_type}?os=&limit= — one signal type's
-    /// drill-down. `visible` confines the `devices[]` list (nullptr =
-    /// unconfined / global Read; present-EMPTY = deny-all rows), the SAME
-    /// admit-then-filter shape as `app`/`overview` above (ADR-0031 WS-A4
-    /// PR-1 decision 3 — closes the fleet-wide `devices[]` disclosure on
-    /// REST `GET /api/v1/dex/signals/{obs_type}` + MCP `get_dex_signal_detail`,
-    /// the two routes that previously called this method with no confinement
-    /// at all while the dashboard's own `/fragments/dex/catalogue/signal`
-    /// fragment already post-filtered its `devices[]` by the caller's
-    /// visible set).
-    ///
-    /// `limit` is applied to the store read FIRST (top-N most-affected
-    /// devices by event count), and `visible` filters THAT already-limited
-    /// set — never the reverse. This matches the pre-existing dashboard
-    /// fragment's own filter order (`dex_read_model.cpp`'s `app`/`overview`
-    /// builders filter post-limit the same way) so a byte-identical rendered
-    /// device list survives the rewire. The consequence: a confined caller
-    /// may see FEWER than `limit` devices even when more of their own
-    /// visible devices exhibit the signal — a device ranked outside the
-    /// store's top-`limit` is never fetched at all, so it cannot be
-    /// re-admitted by widening the visible set. Only `devices[]` is
-    /// filtered; `subjects`/`by_os`/`by_day` stay fleet-wide aggregates with
-    /// no per-agent identity (unchanged; whether THOSE aggregates should
-    /// also floor/confine is a separate, undecided follow-up).
+    /// drill-down: subjects/by_os/devices/by_day are ALL fleet-wide
+    /// aggregates (the `devices[]` "most-affected" list is a top-`limit`
+    /// ranking over the WHOLE fleet, not a per-agent row set a caller could
+    /// safely narrow). ADR-0031 WS-A4 PR-1 originally added a `visible`
+    /// parameter here (a post-limit per-row filter — see the removed doc
+    /// text this replaces, in git history) to close a fleet-wide
+    /// `devices[]` disclosure on REST `GET /api/v1/dex/signals/{obs_type}` +
+    /// MCP `get_dex_signal_detail`. The WS-A4 PR-1 Gate 7 fix round
+    /// (arch-1/sec8-1/sec8-2, Fraser decision: "aggregates GLOBAL-ONLY")
+    /// REMOVED it again: filtering only `devices[]` post-limit left the
+    /// `subjects`/`by_os`/`by_day` aggregates fleet-wide for EVERY caller
+    /// regardless of confinement (a leak, not a fix), and top-N-then-filter
+    /// also meant a confined caller could see FEWER than `limit` devices
+    /// while still not being told the aggregate above included excluded
+    /// devices — a shape ADR-0017 INV-3 / the `software_catalog` ruling
+    /// (docs/adr/0017-management-group-confinement-list-reads.md
+    /// ~:289-298) says a fleet-wide rollup must not offer at all. Both REST
+    /// and MCP now refuse ANY engaged (confined) `require_fleet_read` scope
+    /// outright (403 / permission-denied) before ever reaching this method,
+    /// so it is called only on an unfiltered (global) admit — there is
+    /// nothing left for a `visible` parameter to do here.
     [[nodiscard]] virtual DexSignalDetailModel
     signal_detail(const std::string& obs_type, const std::string& window,
-                  const std::string& os_filter, int limit,
-                  const std::set<std::string>* visible) const = 0;
+                  const std::string& os_filter, int limit) const = 0;
 };
 
 } // namespace yuzu::server

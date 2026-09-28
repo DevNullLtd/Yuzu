@@ -52,7 +52,7 @@
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 6-role set
-#include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
@@ -3773,7 +3773,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_guardian_rule_status", {"GuaranteedState", "Read"}},
     // get_guardian_device_guards uses scoped_perm_fn_ (require_scoped_permission),
     // which DOES apply a service-scoped token's own service-tag confinement per
-    // target — a real mechanism, same classification as get_dex_signal_detail below.
+    // target — a real mechanism, same classification as get_guardian_agent_status/
+    // get_guardian_device_compliance below (get_dex_signal_detail below is no
+    // longer `confined` — WS-A4 PR-1 Gate 7 fix round reclassified it `denied`,
+    // since it is a fleet-wide aggregate, not a per-device read).
     {"get_guardian_device_guards", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     // #2146 Batch B1 — fleet-wide rule CRUD/push mirror list_guardian_rules'
     // `denied` posture exactly (a Guard has no single owning device/service);
@@ -3792,14 +3795,30 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_guardian_device_compliance", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
-    {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
-    // #4035: MCP-only gaps, per-device -> confined (same class as
-    // get_dex_signal_detail/get_dex_group_app_perf above).
+    // WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1, Fraser decision: aggregates
+    // GLOBAL-ONLY): get_dex_signal_detail's devices[] list is a fleet-wide
+    // rollup with no per-caller filter (ADR-0017 INV-3) — its REST/handler
+    // twin now refuses ANY engaged `fleet_read_fn` scope outright (403), so a
+    // service-scoped token can never get a real filtered answer here.
+    // Reclassified from `confined` back to the default `denied`: C8 now
+    // blocks a service-scoped caller structurally, before the handler ever
+    // runs, rather than letting it reach a fleet_read_fn call that will
+    // always refuse it anyway.
+    {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
+    // #4035: MCP-only gaps, genuinely per-device -> confined (a real
+    // per-target scoped_perm_fn/fleet_read_fn confinement mechanism, unlike
+    // get_dex_signal_detail/get_dex_app/get_dex_overview above/below, which
+    // are fleet-wide aggregates pinned to unconfined read, not per-device
+    // reads).
     {"get_dex_device_score", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_device_app_perf", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
-    // #4035: 8 genuinely-new twins. app/overview each enumerate a device
-    // list and run their own deny_fleet_wide_service_scoped -> confined,
-    // matching get_dex_signal_detail/list_dex_perf_devices above.
+    // #4035: 8 genuinely-new twins. app/overview are fleet-wide AGGREGATES
+    // (ADR-0017 INV-3 / the software_catalog ruling) pinned to unconfined
+    // read (WS-A4 PR-1 Gate 7 fix round) -- reclassified from `confined` to
+    // the default `denied`, matching get_dex_signal_detail's flip above: a
+    // service-scoped caller's fleet_read_fn scope is always engaged (never
+    // TOP), so the handler's own confined-aggregate refusal would always
+    // 403 it anyway; C8 now blocks it structurally instead.
     // device_history/observation are per-device SCOPED -> confined, matching
     // get_dex_device_score/get_dex_device_app_perf above. apps/catalogue_group/
     // health/trends are pure aggregates -> default (denied), matching
@@ -3808,7 +3827,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // global_safe -- this table's convention keeps even aggregate DEX reads
     // structurally denied to a service-scoped token rather than reasoning
     // per-tool about "is this data really safe", so these follow suit).
-    {"get_dex_app", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_app", {"GuaranteedState", "Read"}},
     {"list_dex_apps", {"GuaranteedState", "Read"}},
     {"get_dex_catalogue", {"GuaranteedState", "Read"}},
     {"get_dex_catalogue_group", {"GuaranteedState", "Read"}},
@@ -3816,7 +3835,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_dex_observation", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_health", {"GuaranteedState", "Read"}},
     {"get_dex_trends", {"GuaranteedState", "Read"}},
-    {"get_dex_overview", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_dex_overview", {"GuaranteedState", "Read"}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
@@ -6655,10 +6674,16 @@ McpServer::HandlerFn McpServer::build_handler(
             // only the ITServiceOwner ROLE, never the token's own
             // service-tag scope, so perm_fn alone is not confinement for a
             // fleet-wide per-agent read with no per-agent parameter to scope
-            // against (the REST siblings of get_dex_signal_detail,
-            // list_dex_perf_devices, and list_network_devices all needed
-            // this same fix — Gate 8 review found the MCP twins share the
-            // gap the REST fix closed). Not GuaranteedState-exclusive: a
+            // against (the REST siblings of list_dex_perf_devices and
+            // list_network_devices needed this same fix — Gate 8 review
+            // found the MCP twins share the gap the REST fix closed).
+            // get_dex_signal_detail is NOT a current call site of this
+            // helper — WS-A4 PR-1 migrated it (and its REST twin) onto
+            // `fleet_read_fn_`/`require_fleet_read` instead, which now
+            // refuses ANY engaged confinement scope for this fleet-wide
+            // aggregate outright (ADR-0017 INV-3), making a service-scoped
+            // token's denial here moot for that tool specifically. Not
+            // GuaranteedState-exclusive: a
             // non-GuaranteedState caller (e.g. query_installed_software's
             // Inventory:Read, list_schedules' Schedule:Read) passes its own
             // securable to perm_fn right after this deny — this helper's
@@ -6679,6 +6704,56 @@ McpServer::HandlerFn McpServer::build_handler(
                 (void)yuzu::server::detail::try_persist_audit(
                     audit_fn, req, action, "denied", target_type, target_id, audit_detail);
                 res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                return true;
+            };
+
+            // WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser
+            // decision: "aggregates GLOBAL-ONLY") — MCP twin of the REST
+            // helper `refuse_confined_aggregate_read` (rest_api_v1.cpp),
+            // shared by `get_dex_signal_detail`/`get_dex_app`/
+            // `get_dex_overview` below. Those three return FLEET-WIDE
+            // AGGREGATES (health/scores/distribution/crash totals/
+            // top_apps/segments/busiest_family; signal-detail's subjects/
+            // by_os/by_day) that no store query can confine per-caller —
+            // ADR-0017 INV-3 / the `software_catalog` ruling
+            // (docs/adr/0017-management-group-confinement-list-reads.md
+            // ~:289-298) pins a shared fleet-wide rollup to a GLOBAL-only
+            // permission, never admit-then-filter. `fleet_read_fn_` stays
+            // the SOLE gate (never stacked with `tier_allows`/`perm_fn`),
+            // but an ADMITTED caller whose `gate.scope` is ENGAGED
+            // (management-group-only, a service-scoped token under
+            // RBAC-on, or any other narrowed principal) must be refused
+            // HERE — there is no per-row filter these three rollups could
+            // apply, so silently admitting a confined caller would either
+            // leak the whole fleet's aggregate (LIMIT-before-filter on
+            // devices[]/top_devices, sec8-2) or silently undercount it for
+            // that caller alone. A GLOBAL grant of the SAME permission
+            // WOULD admit unfiltered, so the message may honestly say so
+            // (access-control routed-concern clause 5 forbids naming a
+            // permission that would NOT, by itself, admit the caller — a
+            // global grant of GuaranteedState:Read does; MCP's `a4_error`
+            // has no structured `.permission` field, unlike REST's
+            // `A4ErrorOpts`, so this is stated in the message text
+            // instead). `require_fleet_read` only audits its OWN denials
+            // (`gate.admitted == false`) — an admitted-but-scoped outcome
+            // never reaches an audit call inside the gate itself, so this
+            // lambda is the SOLE emitter for that outcome; no double-audit
+            // risk.
+            auto refuse_confined_dex_aggregate =
+                [&](const authz::FleetReadGate& gate, const std::string& action) -> bool {
+                if (!gate.scope) // nullopt = unfiltered (TOP) — the caller may proceed.
+                    return false;
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", "", "",
+                    "aggregate DEX read requires unconfined GuaranteedState:Read "
+                    "(ADR-0017 INV-3)");
+                res.set_content(
+                    a4_error(kPermissionDenied,
+                            "this DEX view is a fleet-wide aggregate with no per-caller "
+                            "confinement boundary; it requires a global grant of "
+                            "GuaranteedState:Read (ADR-0017 INV-3) — a management-group- "
+                            "or service-scoped read cannot be served"),
+                    "application/json");
                 return true;
             };
 
@@ -11089,8 +11164,10 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "list_schedules") {
                 // Tier-before-RBAC/confinement (docs/mcp-server.md) — matches
                 // every sibling deny_fleet_wide_service_scoped call site
-                // (get_dex_signal_detail, list_dex_perf_devices,
-                // list_network_devices): tier_allows first, then the deny.
+                // (list_dex_perf_devices, list_network_devices — NOT
+                // get_dex_signal_detail, which WS-A4 PR-1 migrated onto
+                // `fleet_read_fn_`/`require_fleet_read` instead): tier_allows
+                // first, then the deny.
                 if (!tier_allows(tier, "Schedule", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
@@ -14623,6 +14700,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // the gate already wrote its own JSON-RPC error body
+                // ADR-0017 INV-3 / the software_catalog ruling: this tool's
+                // subjects/by_os/devices/by_day are a fleet-wide aggregate
+                // with no per-row filter — see refuse_confined_dex_aggregate's
+                // own doc comment for the full rationale.
+                if (refuse_confined_dex_aggregate(gate, "dex.signal.view"))
+                    return;
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -14650,12 +14733,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
                 // every OS). by_os stays cross-OS — it IS the split.
                 const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
-                // The gate's composed VisibleSet IS the confinement
-                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
-                // refused above if it were unwired.
-                std::optional<std::set<std::string>> vis;
-                if (gate.scope)
-                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                 // Behavioral-PII access audit — the devices[] list below names the
                 // agent_ids exhibiting this signal. Same verb/target as the REST
                 // and dashboard per-signal views (cross-surface SIEM parity).
@@ -14673,10 +14750,13 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // Routed through the DexApi seam (ADR-0031 WS-A4) — the four raw
                 // reads the REST twin also bundles, same obs_type/window/os/limit.
-                const auto detail =
-                    dex_api_->signal_detail(obs_type, param_str(args, "window", "7d"),
-                                            param_str(args, "os", ""), limit,
-                                            vis ? &*vis : nullptr);
+                // `refuse_confined_dex_aggregate` above already refused any
+                // engaged (confined) gate.scope — the read below is reached
+                // only on an unfiltered (global) admit, so `signal_detail` no
+                // longer takes a `visible` parameter (WS-A4 PR-1 Gate 7 fix
+                // round; see dex_api.hpp's own doc comment).
+                const auto detail = dex_api_->signal_detail(
+                    obs_type, param_str(args, "window", "7d"), param_str(args, "os", ""), limit);
                 JArr subjects;
                 for (const auto& s : detail.subjects) {
                     subjects.add(JObj()
@@ -14895,6 +14975,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // the gate already wrote its own JSON-RPC error body
+                // ADR-0017 INV-3: get_dex_app's crash/hang summary + faulting
+                // modules + exceptions are fleet-wide aggregates — see
+                // refuse_confined_dex_aggregate's own doc comment.
+                if (refuse_confined_dex_aggregate(gate, "dex.app.view"))
+                    return;
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -14909,13 +14994,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // The gate's composed VisibleSet IS the confinement
-                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
-                // refused above if it were unwired.
-                std::optional<std::set<std::string>> vis;
-                if (gate.scope)
-                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
-                const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
+                // `refuse_confined_dex_aggregate` above already refused any
+                // engaged (confined) gate.scope, so this call is reached only
+                // on an unfiltered (global) admit — pass nullptr rather than
+                // deriving a set from an always-nullopt scope. `DexApi::app`'s
+                // `visible` parameter itself stays (dashboard rewire, PR-2) —
+                // see its own doc comment in dex_api.hpp for the INV-3
+                // constraint on any future non-null caller.
+                const auto model = dex_api_->app(name, window, nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/app).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
@@ -15245,6 +15331,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
                 if (!gate.admitted)
                     return; // the gate already wrote its own JSON-RPC error body
+                // ADR-0017 INV-3: get_dex_overview's health/scores/
+                // distribution/top-devices are fleet-wide aggregates — see
+                // refuse_confined_dex_aggregate's own doc comment.
+                if (refuse_confined_dex_aggregate(gate, "dex.overview.view"))
+                    return;
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -15259,13 +15350,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // The gate's composed VisibleSet IS the confinement
-                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
-                // refused above if it were unwired.
-                std::optional<std::set<std::string>> vis;
-                if (gate.scope)
-                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
-                const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
+                // `refuse_confined_dex_aggregate` above already refused any
+                // engaged (confined) gate.scope, so this call is reached only
+                // on an unfiltered (global) admit — pass nullptr rather than
+                // deriving a set from an always-nullopt scope. `DexApi::
+                // overview`'s `visible` parameter itself stays (dashboard
+                // rewire, PR-2) — see its own doc comment in dex_api.hpp for
+                // the INV-3 constraint on any future non-null caller.
+                const auto model = dex_api_->overview(window, nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/overview).
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(

@@ -66,7 +66,7 @@ public:
     using ScopeFn = std::function<std::vector<yuzu::server::DexOsScope>(const std::string& window)>;
     using SignalDetailFn = std::function<yuzu::server::DexSignalDetailModel(
         const std::string& obs_type, const std::string& window, const std::string& os_filter,
-        int limit, const std::set<std::string>* visible)>;
+        int limit)>;
 
     FnDexApi(DeviceScoreFn device_score_fn = {}, DeviceHistoryFn device_history_fn = {},
              ObservationFn observation_fn = {}, AppFn app_fn = {}, AppsFn apps_fn = {},
@@ -205,11 +205,10 @@ public:
 
     [[nodiscard]] yuzu::server::DexSignalDetailModel
     signal_detail(const std::string& obs_type, const std::string& window,
-                 const std::string& os_filter, int limit,
-                 const std::set<std::string>* visible) const override {
+                 const std::string& os_filter, int limit) const override {
         if (!signal_detail_fn_)
             return {};
-        return signal_detail_fn_(obs_type, window, os_filter, limit, visible);
+        return signal_detail_fn_(obs_type, window, os_filter, limit);
     }
 
 private:

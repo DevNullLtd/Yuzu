@@ -1310,22 +1310,25 @@ TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route
     CHECK(res->status == 200);
 }
 
-// ADR-0031 WS-A4 PR-1 decision 3, migrated (WS-A4 PR-1 fix round,
-// sec-1/sec-2) onto the REAL AuthRoutes::require_fleet_read gate: devices[]
-// confinement is now the gate's own composed VisibleSet (ADR-0017's
-// authorize_list_read chokepoint), never a bespoke per-file resolver whose
-// admission the bare perm_fn gate it sat behind could make dormant.
-// Exercised the SAME way the fleet /status route's own [adr0017] tests
-// exercise authorize_list_read: real rbac_/mgmt_ bundles, real sessions via
+// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
+// "aggregates GLOBAL-ONLY", ADR-0017 INV-3 / the software_catalog ruling):
+// subjects/by_os/devices/by_day are ALL fleet-wide aggregates with no
+// per-caller SQL slice, so `require_fleet_read` admitting with an ENGAGED
+// (confined) scope must now be REFUSED (403), never served a narrowed
+// result — replacing the earlier "devices[] confined to the visible set"
+// posture this same test used to assert (ADR-0031 WS-A4 PR-1 decision 3,
+// now retired; see dex_api.hpp's `signal_detail` doc comment). Exercised
+// the SAME way the fleet /status route's own [adr0017] tests exercise
+// authorize_list_read: real rbac_/mgmt_ bundles, real sessions via
 // status_route_headers().
-TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visible set "
-          "(ADR-0017, real RBAC/ManagementGroup composition)",
+TEST_CASE("REST dex/signals/{obs_type}: a management-group-confined operator is refused "
+          "(aggregates are unconfined-only, ADR-0017 INV-3)",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h;
     h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    // RBAC off (default, legacy-open) -> unfiltered, both devices visible.
+    // RBAC off (default, legacy-open) -> AdmitAll (TOP), unfiltered.
     auto unconfined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
                                  h.status_route_headers());
     REQUIRE(unconfined);
@@ -1334,34 +1337,41 @@ TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visib
     REQUIRE(uj["data"]["devices"].is_array());
     CHECK(uj["data"]["devices"].size() == 2);
 
-    // A management-group-scoped grant confines to exactly {WS-1}: WS-2 must
-    // never appear anywhere in the body. carol has NO global grant of any
-    // kind, so the old (broken) perm_fn-stacked resolver would have denied
-    // her 403 before its own confinement ever ran.
     h.rbac_.set_rbac_enabled(true);
     REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
     REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    // A management-group-scoped (non-global) grant is ADMITTED but ENGAGED
+    // (AdmitScoped) -> refused 403, no device data anywhere in the body,
+    // and exactly one dex.signal.view|denied audit row this route itself
+    // emits (require_fleet_read's OWN denial audit never fires here, since
+    // it admitted).
     ManagementGroup g;
     g.name = "RegionA";
     g.membership_type = "static";
     auto gid = h.mgmt_.create_group(g);
     REQUIRE(gid.has_value());
-    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
     REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
     h.session_user = "carol";
     auto confined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
                                h.status_route_headers());
     REQUIRE(confined);
-    CHECK(confined->status == 200);
-    auto cj = nlohmann::json::parse(confined->body);
-    REQUIRE(cj["data"]["devices"].is_array());
-    CHECK(cj["data"]["devices"].size() == 1);
-    CHECK(cj["data"]["devices"][0]["agent_id"] == "WS-1");
+    CHECK(confined->status == 403);
+    CHECK(confined->body.find("WS-1") == std::string::npos);
     CHECK(confined->body.find("WS-2") == std::string::npos);
+    CHECK(confined->body.find("devices") == std::string::npos);
+    {
+        int denied_count = 0;
+        for (const auto& a : h.audit_log)
+            if (a.action == "dex.signal.view" && a.result == "denied")
+                ++denied_count;
+        CHECK(denied_count == 1);
+    }
 
     // A management group with zero members -> present-EMPTY visible set
-    // (INV-2), deny-all rows, never a substitute for unconfined; the
-    // response still succeeds (200), just with no devices.
+    // (INV-2) is STILL an engaged scope -> refused 403, same as any other
+    // confined caller (never a substitute for unconfined).
     ManagementGroup g2;
     g2.name = "EmptyRegion";
     g2.membership_type = "static";
@@ -1372,56 +1382,74 @@ TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visib
     auto empty_scope = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
                                   h.status_route_headers());
     REQUIRE(empty_scope);
-    CHECK(empty_scope->status == 200);
-    auto ej = nlohmann::json::parse(empty_scope->body);
-    CHECK(ej["data"]["devices"].empty());
-    // subjects stay a fleet-wide aggregate, unaffected by the device filter.
-    CHECK_FALSE(ej["data"]["subjects"].empty());
+    CHECK(empty_scope->status == 403);
+
+    // A GLOBAL grant (AdmitAll) is unfiltered fleet-wide -> 200, both devices.
+    REQUIRE(h.rbac_.assign_role({"user", "erin", "GsReader"}).has_value()); // GLOBAL grant
+    h.session_user = "erin";
+    auto global_grant = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                                   h.status_route_headers());
+    REQUIRE(global_grant);
+    CHECK(global_grant->status == 200);
+    auto gj = nlohmann::json::parse(global_grant->body);
+    REQUIRE(gj["data"]["devices"].is_array());
+    CHECK(gj["data"]["devices"].size() == 2);
 
     // Exactly one dex.signal.view SUCCESS audit row for each of the three
-    // successful calls above -- the visibility filter narrows devices[],
-    // never the (route's own, harness-visible) success-audit count.
+    // 200s above (RBAC-off, empty-scope's sibling global-grant call, and the
+    // final global-grant call) -- confinement REFUSES rather than narrows,
+    // so the success count tracks 200s only.
     int success_count = 0;
     for (const auto& a : h.audit_log)
         if (a.action == "dex.signal.view" && a.result == "success")
             ++success_count;
-    CHECK(success_count == 3);
+    CHECK(success_count == 2);
 }
 
-// POST-limit, not pre-limit (dex_api.hpp's own doc comment on signal_detail):
-// the store read applies `limit` FIRST; `visible` filters the already-limited
-// top-N, so a device outside that cut is never re-admitted by widening
-// `visible`.
-TEST_CASE("REST dex/signals/{obs_type}: visible filters POST-limit, not pre-limit",
+// qa-3 (Gate 7 fix round): an elevated session with ZERO underlying RBAC
+// grants is admitted unfiltered (TOP), exercised through the DEX handler
+// itself rather than only via GET /guaranteed-state/status's own elevated
+// regression test — this pins the SAME SEC-7-class regression at the
+// surface this fix round actually touches.
+TEST_CASE("REST dex/signals/{obs_type}: an elevated session is admitted unfiltered without "
+          "any RBAC grant",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h;
-    // WS-1 gets two events (wins a limit=1 cut over WS-2's one event, per
-    // dex_signal_devices' "COUNT(*) DESC, agent_id ASC" ordering).
-    h.seed_obs("p1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
-    h.seed_obs("p2", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:05:00Z");
-    h.seed_obs("p3", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
-
     h.rbac_.set_rbac_enabled(true);
-    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
-    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
-    ManagementGroup g;
-    g.name = "RegionB";
-    g.membership_type = "static";
-    auto gid = h.mgmt_.create_group(g);
-    REQUIRE(gid.has_value());
-    REQUIRE(h.mgmt_.add_member(*gid, "WS-2").has_value());
-    REQUIRE(h.mgmt_.assign_role({*gid, "user", "erin", "GsReader"}).has_value());
-    h.session_user = "erin";
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&limit=1",
-                          h.status_route_headers());
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.elevated_status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
-    // WS-2 legitimately has an event and IS in the visible set, but never
-    // made the store's top-1 cut -- so devices[] is empty, not "WS-2".
-    CHECK(j["data"]["devices"].empty());
+    REQUIRE(j["data"]["devices"].is_array());
+    CHECK(j["data"]["devices"].size() == 2);
 }
+
+// sec8-3 (Gate 7 fix round): a service-scoped token under RBAC ON is
+// ADMITTED (an ITServiceOwner-style global grant) but its scope is narrowed
+// to the service tag (ENGAGED, never TOP) -- the exact gap sec8-1 named:
+// previously this reached DexApi with a real (if incomplete) filter; now
+// it is refused outright, same as any other confined caller.
+//
+// NOT tested here against a live 403, by necessity: `RestGsHarness`
+// constructs its shared `auth_routes_` with `tag_store=nullptr` (see the
+// harness ctor above) — `require_fleet_read`'s service-scope axis needs a
+// real `TagStore` to resolve `agents_with_tag`, so ANY service-scoped
+// token under RBAC-on 503s here regardless of this fix (a pre-existing
+// harness gap, not introduced by this round; `test_response_execution_
+// authz_pg_helper.hpp`'s rig has the identical `tag_store=nullptr`). Real
+// coverage of `require_fleet_read`'s own service-scope-engaged admission
+// (a real `TagStore`, real narrowed `VisibleSet`) lives in
+// `test_authz_gates.cpp`'s `[service_scope]`-tagged cases; the refusal
+// THIS fix round added — `refuse_confined_aggregate_read` denying ANY
+// engaged `gate.scope`, regardless of which axis engaged it — is proven
+// with real RBAC/ManagementGroup composition by the sibling
+// "management-group-confined operator is refused" test above, which
+// exercises the identical `gate.scope`-engaged code path.
 
 // WS-A4 PR-1 fix round: a genuinely UNWIRED fleet_read_fn is the route's OWN
 // misconfiguration and must fail closed (503), never fall back to an
@@ -2541,19 +2569,21 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance)'s closure evidence for the ADR-0017 World A
-// confinement gap, migrated (WS-A4 PR-1 fix round, sec-1/sec-2) onto the REAL
-// AuthRoutes::require_fleet_read gate — see GET
-// /api/v1/dex/signals/{obs_type}'s equivalent test above for the full
-// rationale (same defect class, same fix, same real-RBAC pattern).
-TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
-          "(ADR-0017, real RBAC/ManagementGroup composition)",
+// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
+// "aggregates GLOBAL-ONLY", ADR-0017 INV-3): the crash/hang summary is a
+// fleet-wide aggregate — an ADMITTED-but-ENGAGED (confined) scope is now
+// REFUSED (403), never served a narrowed result. Replaces the earlier
+// "devices[] confined to the visible set" posture (ADR-0031 WS-A4 PR-1
+// decision 3, retired — see GET /api/v1/dex/signals/{obs_type}'s
+// equivalent test for the full rationale).
+TEST_CASE("REST dex/app: a management-group-confined operator is refused "
+          "(aggregates are unconfined-only, ADR-0017 INV-3)",
           "[pg][rest][dex][app][scope]") {
     RestGsHarness h;
     h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    // RBAC off (default, legacy-open): both devices are visible.
+    // RBAC off (default, legacy-open): AdmitAll (TOP), unfiltered.
     auto unconfined =
         h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(unconfined);
@@ -2561,13 +2591,12 @@ TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
     auto uj = nlohmann::json::parse(unconfined->body);
     CHECK(uj["data"]["devices"].size() == 2);
 
-    // A management-group-scoped grant confines to WS-1 only: WS-2 must
-    // NEVER appear, even though the aggregate crash COUNT still reflects
-    // the whole fleet (the SCOPING NOTE's tracked, separate,
-    // aggregate-numerator follow-up — not this fix's scope).
     h.rbac_.set_rbac_enabled(true);
     REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
     REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    // A management-group-scoped (non-global) grant -> AdmitScoped (ENGAGED)
+    // -> refused 403, no device data anywhere in the body.
     ManagementGroup g;
     g.name = "RegionA";
     g.membership_type = "static";
@@ -2579,18 +2608,20 @@ TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
     auto confined =
         h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(confined);
-    CHECK(confined->status == 200);
-    auto cj = nlohmann::json::parse(confined->body);
-    REQUIRE(cj["data"]["devices"].is_array());
-    CHECK(cj["data"]["devices"].size() == 1);
-    CHECK(cj["data"]["devices"][0]["agent_id"].get<std::string>() == "WS-1");
-    for (const auto& d : cj["data"]["devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+    CHECK(confined->status == 403);
+    CHECK(confined->body.find("WS-1") == std::string::npos);
+    CHECK(confined->body.find("devices") == std::string::npos);
+    {
+        int denied_count = 0;
+        for (const auto& a : h.audit_log)
+            if (a.action == "dex.app.view" && a.result == "denied")
+                ++denied_count;
+        CHECK(denied_count == 1);
+    }
 
-    // A management group with zero members -> present-EMPTY visible set:
-    // devices[] is empty, never a 403/404 — matching the fragment's own
-    // admit-then-filter posture (ADR-0017 INV-2: engaged-empty is a
-    // legitimate, distinct outcome from "unfiltered").
+    // A management group with zero members -> present-EMPTY visible set is
+    // STILL an engaged scope -> refused 403, same as above (never a
+    // substitute for unconfined, ADR-0017 INV-2).
     ManagementGroup g2;
     g2.name = "EmptyRegion";
     g2.membership_type = "static";
@@ -2601,9 +2632,38 @@ TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
     auto empty_scope =
         h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(empty_scope);
-    CHECK(empty_scope->status == 200);
-    auto ej = nlohmann::json::parse(empty_scope->body);
-    CHECK(ej["data"]["devices"].empty());
+    CHECK(empty_scope->status == 403);
+
+    // A GLOBAL grant (AdmitAll) is unfiltered fleet-wide -> 200, both devices.
+    REQUIRE(h.rbac_.assign_role({"user", "erin", "GsReader"}).has_value()); // GLOBAL grant
+    h.session_user = "erin";
+    auto global_grant =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
+    REQUIRE(global_grant);
+    CHECK(global_grant->status == 200);
+    auto gj = nlohmann::json::parse(global_grant->body);
+    CHECK(gj["data"]["devices"].size() == 2);
+}
+
+// qa-3 (Gate 7 fix round): the same elevated coverage GET
+// /api/v1/dex/signals/{obs_type} has, exercised through get_dex_app's own
+// handler. (sec8-3's service-scoped-token-under-RBAC-ON case is NOT
+// re-tested here for the same `tag_store=nullptr` harness-limitation
+// reason documented on the sibling test above /dex/signals/{obs_type}'s
+// equivalent case.)
+TEST_CASE("REST dex/app: an elevated session is admitted unfiltered without any RBAC grant",
+          "[pg][rest][dex][app][scope]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all",
+                          h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["devices"].size() == 2);
 }
 
 TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
@@ -2798,13 +2858,15 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance)'s closure evidence for the ADR-0017 World A
-// confinement gap on GET /api/v1/dex/overview's top_devices[], migrated
-// (WS-A4 PR-1 fix round, sec-1/sec-2) onto the REAL
-// AuthRoutes::require_fleet_read gate — same defect class and same fix as
-// GET /api/v1/dex/app above.
-TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
-          "(ADR-0017, real RBAC/ManagementGroup composition)",
+// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
+// "aggregates GLOBAL-ONLY", ADR-0017 INV-3): the health/score/distribution
+// summary is a fleet-wide aggregate — an ADMITTED-but-ENGAGED (confined)
+// scope is now REFUSED (403), never served a narrowed result. Replaces the
+// earlier "top_devices[] confined to the visible set" posture (ADR-0031
+// WS-A4 PR-1 decision 3, retired — see GET /api/v1/dex/app's equivalent
+// test for the full rationale).
+TEST_CASE("REST dex/overview: a management-group-confined operator is refused "
+          "(aggregates are unconfined-only, ADR-0017 INV-3)",
           "[pg][rest][dex][overview][scope]") {
     RestGsHarness h;
     h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
@@ -2820,6 +2882,7 @@ TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set
     h.rbac_.set_rbac_enabled(true);
     REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
     REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
     ManagementGroup g;
     g.name = "RegionA";
     g.membership_type = "static";
@@ -2830,13 +2893,58 @@ TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set
     h.session_user = "carol";
     auto confined = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
     REQUIRE(confined);
-    CHECK(confined->status == 200);
-    auto cj = nlohmann::json::parse(confined->body);
-    REQUIRE(cj["data"]["top_devices"].is_array());
-    CHECK(cj["data"]["top_devices"].size() == 1);
-    CHECK(cj["data"]["top_devices"][0]["agent_id"].get<std::string>() == "WS-1");
-    for (const auto& d : cj["data"]["top_devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+    CHECK(confined->status == 403);
+    CHECK(confined->body.find("WS-1") == std::string::npos);
+    CHECK(confined->body.find("top_devices") == std::string::npos);
+    {
+        int denied_count = 0;
+        for (const auto& a : h.audit_log)
+            if (a.action == "dex.overview.view" && a.result == "denied")
+                ++denied_count;
+        CHECK(denied_count == 1);
+    }
+
+    // A management group with zero members -> present-EMPTY visible set is
+    // STILL an engaged scope -> refused 403 (ADR-0017 INV-2).
+    ManagementGroup g2;
+    g2.name = "EmptyRegion";
+    g2.membership_type = "static";
+    auto gid2 = h.mgmt_.create_group(g2);
+    REQUIRE(gid2.has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid2, "user", "dave", "GsReader"}).has_value());
+    h.session_user = "dave";
+    auto empty_scope = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
+    REQUIRE(empty_scope);
+    CHECK(empty_scope->status == 403);
+
+    // A GLOBAL grant (AdmitAll) is unfiltered fleet-wide -> 200, both devices.
+    REQUIRE(h.rbac_.assign_role({"user", "erin", "GsReader"}).has_value()); // GLOBAL grant
+    h.session_user = "erin";
+    auto global_grant = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
+    REQUIRE(global_grant);
+    CHECK(global_grant->status == 200);
+    auto gj = nlohmann::json::parse(global_grant->body);
+    CHECK(gj["data"]["top_devices"].size() == 2);
+}
+
+// qa-3 (Gate 7 fix round): the same elevated coverage GET
+// /api/v1/dex/signals/{obs_type} and GET /api/v1/dex/app have, exercised
+// through get_dex_overview's own handler. (sec8-3's service-scoped-token-
+// under-RBAC-ON case is NOT re-tested here for the same `tag_store=nullptr`
+// harness-limitation reason documented on the /dex/signals/{obs_type}
+// sibling test.)
+TEST_CASE("REST dex/overview: an elevated session is admitted unfiltered without any RBAC grant",
+          "[pg][rest][dex][overview][scope]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "elevated_user";
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("e2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all", h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["top_devices"].size() == 2);
 }
 
 TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "
