@@ -30,7 +30,7 @@ using json = nlohmann::json;
 
 // The pure scoring formula (#4855 extraction) — everything dex_device_score
 // below did with `device_signals` once it had them, factored out so the ONE
-// checked store read the score builder above performs (closing the #4855 torn
+// checked store read the score builder below performs (closing the #4855 torn
 // read between score + signals) can feed this directly instead of forcing a
 // second read just to get a score.
 int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {

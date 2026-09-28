@@ -187,7 +187,12 @@ struct DexSignalGroup {
 // (declarations) from dex_routes.hpp (PR #4582 FIX 4) so dex_read_model.cpp can
 // call dex_signal_groups() without including dex_routes.hpp (which pulls
 // <httplib.h>); dex_routes.hpp re-includes this header, so its own callers are
-// unaffected. Definitions are unchanged in their .cpp.
+// unaffected. Definitions were LATER relocated too (ADR-0031 WS-A4 PR-1 F1
+// fix, closing the #4579 link residual's DEX half, Fable review
+// 2026-09-28): `dex_signal_groups`/`dex_catalogued_type_count`/
+// `dex_family_index`/`dex_obs_platforms` are now DEFINED in core's
+// `dex_types.cpp`, not `dex_routes.cpp` — so a core TU calling them no
+// longer links against presentation at all.
 
 /// The catalogued signal types, grouped for display — the server-side mirror of
 /// the agent catalogue (keep in sync; the paired drift-net tests bite).
@@ -207,7 +212,11 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 //    DexSignalCount only; no store, no httplib) — relocated from dex_routes.hpp
 //    (PR #4582 FIX 4) so dex_read_model.cpp can call them without that
 //    httplib-coupled header. dex_routes.hpp re-includes this header, so its
-//    own callers are unaffected; definitions are unchanged in their .cpp.
+//    own callers are unaffected. Definitions were LATER relocated too (same
+//    ADR-0031 WS-A4 PR-1 F1 fix as above): `dex_family_is_benign`/
+//    `dex_family_rollup`/`dex_family_weights`/`dex_severity_points`/
+//    `dex_preset_mult`/`dex_family_health_deduction` are now DEFINED in
+//    core's `dex_types.cpp`, not `dex_routes.cpp`.
 
 /// True for the ONE hand-picked family (name-matched, not data-driven) whose
 /// members are routine reports (boot/uptime), never deducted from health and

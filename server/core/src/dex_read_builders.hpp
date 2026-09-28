@@ -17,14 +17,16 @@
 /// presentation TU — that is what keeps the abstract seam header store-type-free
 /// (enforced by check-seam-closure.py's abstract-header probe).
 ///
-/// LINK RESIDUAL (WS-B2, #4579) — CLOSED (ADR-0031 WS-A4 PR-1 F1 fix, Fable
+/// LINK RESIDUAL (WS-B2, #4579's DEX HALF — the issue's OTHER half, the
+/// `event_bus.hpp`→`<httplib.h>` SSE-sink inversion, stays OPEN and is
+/// untouched here) — CLOSED (ADR-0031 WS-A4 PR-1 F1 fix, Fable
 /// review 2026-09-28): "CORE-ONLY" here now means link-clean too — all nine
 /// builders AND `dex_device_score`/`dex_score_from_signals` below are DEFINED
 /// in `dex_read_model.cpp` (core); the presentation TU `dex_routes.cpp` no
 /// longer defines either. A core-only link target resolves cleanly. Enforced
 /// going forward by the `dex` family entry in the link-level symbol tripwire
-/// (`scripts/ci/check_core_presentation_link.py`, `suite:server` test
-/// `dex_link_no_presentation_symbols`).
+/// (`scripts/ci/check_core_presentation_link.py`, meson test `'dex link no
+/// presentation symbols'`, suites `server`+`server-checks`).
 
 #include <optional>
 #include <set>

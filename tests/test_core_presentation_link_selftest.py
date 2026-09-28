@@ -66,10 +66,13 @@ CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "check_core_presentation_link.py"
 # --- also trips it (`assertEqual` prints both sides).
 EXPECTED_FAMILIES = {
     "dex": {
-        "core": ["dex_api", "dex_read_model", "dex_types", "dex_window"],
+        "core": ["dex_api", "dex_read_model", "dex_types", "dex_window", "rest_api_v1",
+                 "mcp_server"],
         "presentation": ["dex_routes"],
     },
 }
+
+SEAM_CLOSURE_PATH = REPO_ROOT / "scripts" / "ci" / "check-seam-closure.py"
 
 
 def _load_checker():
@@ -80,16 +83,46 @@ def _load_checker():
     return mod
 
 
+def _load_seam_closure():
+    spec = importlib.util.spec_from_file_location("check_seam_closure", SEAM_CLOSURE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _require_toolchain() -> bool:
+    # qa-4 (WS-A4 PR-1 Gate 7 fix round): a bare SkipTest on a missing
+    # compiler/`nm` exits 0 from unittest's own perspective, and this
+    # selftest runs under docs-lint.yml (suite: 'docs'), which has no build
+    # dependency and so has no reason to guarantee either tool is present -
+    # a runner image drifting to lack a C++ compiler would silently stop
+    # exercising these probes forever, reading as a clean pass. Set
+    # YUZU_REQUIRE_TOOLCHAIN=1 (docs-lint.yml does) to convert that into a
+    # real, loud test FAILURE instead of a silent skip.
+    return os.environ.get("YUZU_REQUIRE_TOOLCHAIN") == "1"
+
+
 def _find_cxx() -> str:
     for candidate in (os.environ.get("CXX"), "c++", "g++", "clang++"):
         if candidate and shutil.which(candidate):
             return candidate
+    if _require_toolchain():
+        raise AssertionError(
+            "no C++ compiler found on PATH and YUZU_REQUIRE_TOOLCHAIN=1 - "
+            "this must be a real failure, not a silent skip"
+        )
     raise unittest.SkipTest("no C++ compiler found on PATH")
 
 
 def _find_nm() -> str:
     nm = shutil.which("nm")
     if not nm:
+        if _require_toolchain():
+            raise AssertionError(
+                "no 'nm' found on PATH and YUZU_REQUIRE_TOOLCHAIN=1 - this must be "
+                "a real failure, not a silent skip"
+            )
         raise unittest.SkipTest("no 'nm' found on PATH")
     return nm
 
@@ -117,6 +150,30 @@ class TestFamiliesFrozen(unittest.TestCase):
             "check_core_presentation_link.py's FAMILIES changed - update "
             "EXPECTED_FAMILIES here in the SAME reviewed change if the "
             "widening/narrowing is intentional",
+        )
+
+    def test_every_link_check_family_is_also_a_seam_closure_family(self) -> None:
+        # arch-4 (WS-A4 PR-1 Gate 7 fix round): this link-level tripwire is
+        # the LINK-closure twin of check-seam-closure.py's INCLUDE-closure
+        # walk (see this checker's own module docstring) - a family enrolled
+        # here with no matching entry over there would be checking link
+        # cleanliness for a family whose include closure nobody enforces,
+        # which is backwards (the link check exists to close a gap the
+        # include check left, not to run standalone). Every key in THIS
+        # module's FAMILIES must also be a key in check-seam-closure.py's own
+        # FAMILIES dict - a superset relationship, not equality, since
+        # check-seam-closure.py enrols families (e.g. `guardian`, `workflow`)
+        # this link-level check has no reason to duplicate until they hit
+        # the same defect class `dex` did.
+        link_mod = _load_checker()
+        seam_mod = _load_seam_closure()
+        missing = set(link_mod.FAMILIES) - set(seam_mod.FAMILIES)
+        self.assertEqual(
+            set(),
+            missing,
+            f"check_core_presentation_link.py enrols {sorted(missing)}, which "
+            f"check-seam-closure.py's own FAMILIES dict does not know about - "
+            f"every link-check family must also be a seam-closure family",
         )
 
 
@@ -166,11 +223,18 @@ class TestPositiveFireProbe(unittest.TestCase):
         # Negative control for the probe above: same two-object shape, but
         # "core" calls nothing "presentation" defines - proves a clean run
         # is discrimination, not a checker that always returns no violations.
+        # Calls a THIRD, unrelated extern (never defined by either object in
+        # this test) so "core" has a normal, non-vacuous undefined-symbol
+        # shape - a totally self-contained core function would instead trip
+        # the vacuous-pass guard 2 (TestVacuousPassGuards), which is a
+        # correct, separate outcome this negative control must not collide
+        # with.
         _compile_stem(
             self.cxx,
             self.build_dir,
             "clean_core",
-            "void clean_core_fn() {}\n",
+            "extern void some_other_unrelated_extern();\n"
+            "void clean_core_fn() { some_other_unrelated_extern(); }\n",
         )
         _compile_stem(
             self.cxx,
@@ -208,6 +272,101 @@ class TestPositiveFireProbe(unittest.TestCase):
         try:
             self.mod.FAMILIES = {
                 "e2e": {"core": ["e2e_core"], "presentation": ["e2e_pres"]}
+            }
+            rc = self.mod.run_check(self.build_dir, verbose=False)
+        finally:
+            self.mod.FAMILIES = original_families
+        self.assertEqual(1, rc)
+
+
+class TestVacuousPassGuards(unittest.TestCase):
+    # arch-4/xp-2 (WS-A4 PR-1 Gate 7 fix round): both guards must fire BEFORE
+    # `check_family` reports "0 violations" on an input that could never have
+    # produced a real violation in the first place (an empty `nm` read on
+    # either side of the comparison).
+    def setUp(self) -> None:
+        self.mod = _load_checker()
+        self.cxx = _find_cxx()
+        self.nm = _find_nm()
+        self._tmp = tempfile.TemporaryDirectory(prefix="core_pres_link_selftest_")
+        self.build_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_presentation_defining_zero_symbols_raises_vacuous_pass_error(self) -> None:
+        # "presentation" is an empty TU (no functions at all) - `nm
+        # --defined-only` reports nothing for it, so `presentation_defined`
+        # would be empty and EVERY core object would trivially "pass"
+        # regardless of what it actually calls.
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_core",
+            "extern void something_external();\n"
+            "void vacuous_core_fn() { something_external(); }\n",
+        )
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_pres_empty",
+            "// deliberately empty - no functions, no symbols\n",
+        )
+        with self.assertRaises(self.mod.VacuousPassError) as ctx:
+            self.mod.check_family(
+                self.build_dir,
+                self.nm,
+                "vacuous_probe_1",
+                {"core": ["vacuous_core"], "presentation": ["vacuous_pres_empty"]},
+            )
+        self.assertIn("ZERO symbols", str(ctx.exception))
+
+    def test_core_object_with_zero_undefined_symbols_raises_vacuous_pass_error(self) -> None:
+        # "core" is a self-contained TU that calls nothing external at all -
+        # `nm --undefined-only` reports nothing for it, so it would trivially
+        # "pass" (nothing to intersect against presentation_defined) even if
+        # this were the WRONG object (mis-stemmed, stripped, empty).
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_core_empty",
+            "void vacuous_core_empty_fn() {}\n",
+        )
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_pres_normal",
+            "void vacuous_pres_normal_fn() {}\n",
+        )
+        with self.assertRaises(self.mod.VacuousPassError) as ctx:
+            self.mod.check_family(
+                self.build_dir,
+                self.nm,
+                "vacuous_probe_2",
+                {"core": ["vacuous_core_empty"], "presentation": ["vacuous_pres_normal"]},
+            )
+        self.assertIn("ZERO undefined symbols", str(ctx.exception))
+
+    def test_run_check_reports_nonzero_exit_on_a_vacuous_family(self) -> None:
+        # End-to-end: run_check() must propagate the guard as a failure
+        # (nonzero exit), never let it escape as an uncaught exception or a
+        # silent pass.
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_e2e_core",
+            "void vacuous_e2e_core_fn() {}\n",
+        )
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "vacuous_e2e_pres",
+            "void vacuous_e2e_pres_fn() {}\n",
+        )
+        original_families = self.mod.FAMILIES
+        try:
+            self.mod.FAMILIES = {
+                "vacuous_e2e": {"core": ["vacuous_e2e_core"], "presentation": ["vacuous_e2e_pres"]}
             }
             rc = self.mod.run_check(self.build_dir, verbose=False)
         finally:

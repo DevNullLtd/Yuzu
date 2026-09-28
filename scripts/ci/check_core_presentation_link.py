@@ -31,10 +31,18 @@ against presentation, exactly the shape this family split exists to prevent.
 
 WHY THIS RUNS AFTER A BUILD, UNLIKE check-seam-closure.py: this check needs
 the compiled `.o` files to run `nm` over - it cannot run as a pure
-source-tree walk. It is wired as a meson `test()` in `suite:server`
-(tests/meson.build's `dex_link_no_presentation_symbols`), not a
-docs-lint.yml step, so it gates every build-and-test CI job rather than the
-build-free docs-lint job check-seam-closure.py runs in.
+source-tree walk. It is wired as a meson `test()`, name `'dex link no
+presentation symbols'` (tests/meson.build, `suite: ['server',
+'server-checks']`), not a docs-lint.yml step. MSVC has no `nm` and emits
+`.obj` not `.cpp.o`, so the test() entry itself does not exist on that
+toolchain (`if cxx.get_id() != 'msvc'` in tests/meson.build) - it gates
+every build-and-test CI job where the toolchain is GCC/Clang (Linux, macOS)
+rather than the build-free docs-lint job check-seam-closure.py runs in.
+CI-2 (2026-09-28): the Linux leg's non-pg Test step selected its
+`server-checks`-suite tests by an explicit NAME list, which had never named
+this test, so it silently never ran there despite existing in the build -
+fixed by adding it to that list (ci.yml); the macOS leg already ran it
+(no by-name filter, full `meson test`).
 
 SOUNDNESS, matching check-seam-closure.py's own stated posture: this is a
 sound-for-its-stated-claim link-symbol check, not a full static analysis.
@@ -87,6 +95,12 @@ FAMILIES: dict[str, dict[str, list[str]]] = {
             "dex_read_model",  # store-reaching builders + the MCP-only-gap builder
             "dex_types",       # PURE catalogue/health computation (PR-1 F1 fix)
             "dex_window",      # PURE window/OS-filter resolvers (PR-1 F1 fix)
+            "rest_api_v1",     # WS-A4 PR-1 Gate 7 fix round: the three REST DEX
+                                # aggregate handlers call the seam directly (dex_api),
+                                # never dex_routes.cpp - enrolled so a future revert
+                                # to a store-backed/dex_routes.cpp-linked call here is
+                                # itself caught, not just the seam's own core TUs.
+            "mcp_server",      # same rationale as rest_api_v1 above, for the MCP twins.
         ],
         "presentation": [
             "dex_routes",      # the httplib-coupled /dex dashboard TU
@@ -173,6 +187,19 @@ def demangle(nm_path: str, symbol: str) -> str:
         return symbol
 
 
+class VacuousPassError(Exception):
+    """Raised when the check's own inputs could produce a false-green PASS
+    regardless of what the checked objects actually contain - governance
+    finding arch-4/xp-2 (WS-A4 PR-1 Gate 7 fix round): an empty `nm` read on
+    EITHER side (a mis-stemmed object, a stripped binary, a build-system
+    change that stops emitting the symbol table this check depends on) would
+    otherwise silently pass with zero violations found, indistinguishable
+    from a genuinely clean family. Both guards below fire BEFORE the
+    intersection is computed, so a vacuous input is reported as its own
+    failure, never folded into "0 violations."
+    """
+
+
 def check_family(build_dir: Path, nm_path: str, family: str, spec: dict[str, list[str]]) -> list[Violation]:
     core_objs = {stem: find_object(build_dir, stem) for stem in spec["core"]}
     presentation_objs = {stem: find_object(build_dir, stem) for stem in spec["presentation"]}
@@ -182,9 +209,38 @@ def check_family(build_dir: Path, nm_path: str, family: str, spec: dict[str, lis
         for sym in object_symbols(nm_path, obj, undefined_only=False):
             presentation_defined.setdefault(sym, stem)
 
+    # Vacuous-pass guard 1: the presentation side defines NOTHING. Every
+    # violation this check can find requires a presentation object to
+    # DEFINE the colliding symbol - an empty `presentation_defined` set
+    # makes every core object's undefined-symbol set trivially "clean"
+    # regardless of its real content, exactly the false-green shape a
+    # stripped/mis-stemmed/empty presentation object would produce.
+    if not presentation_defined:
+        raise VacuousPassError(
+            f"family '{family}': its presentation object(s) "
+            f"({', '.join(sorted(presentation_objs))}) define ZERO symbols between "
+            f"them - this check cannot distinguish 'genuinely clean' from 'read "
+            f"nothing' and refuses to report a pass either way"
+        )
+
     violations: list[Violation] = []
     for stem, obj in core_objs.items():
-        for sym in object_symbols(nm_path, obj, undefined_only=True):
+        undefined = object_symbols(nm_path, obj, undefined_only=True)
+        # Vacuous-pass guard 2: a core object with ZERO undefined symbols is
+        # not a normal, tightly-self-contained TU in this codebase (every
+        # enrolled core object calls at minimum libstdc++/libc symbols) - it
+        # is the signature of `nm` reading the wrong/empty object, and it
+        # would otherwise pass this family's check by definition (nothing to
+        # intersect against presentation_defined).
+        if not undefined:
+            raise VacuousPassError(
+                f"family '{family}': core object '{stem}.cpp.o' has ZERO "
+                f"undefined symbols - this is not a normal TU shape (every "
+                f"enrolled core object calls at least libc/libstdc++) and would "
+                f"trivially 'pass' this check with nothing to compare; likely a "
+                f"mis-stemmed or empty object"
+            )
+        for sym in undefined:
             hit = presentation_defined.get(sym)
             if hit is not None:
                 violations.append(Violation(family, sym, stem, hit))
@@ -198,7 +254,16 @@ def run_check(build_dir: Path, verbose: bool = False) -> int:
 
     all_violations: list[Violation] = []
     for family, spec in FAMILIES.items():
-        violations = check_family(build_dir, nm_path, family, spec)
+        try:
+            violations = check_family(build_dir, nm_path, family, spec)
+        except VacuousPassError as exc:
+            print(f"::error::check_core_presentation_link: {exc}", file=sys.stderr)
+            print(
+                "check_core_presentation_link: FAILED - vacuous-pass guard tripped "
+                "(see error above); refusing to report a pass on an empty read",
+                file=sys.stderr,
+            )
+            return 1
         all_violations.extend(violations)
         if verbose and not violations:
             print(

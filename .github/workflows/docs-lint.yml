@@ -126,6 +126,12 @@ jobs:
       # probing the link-symbol logic exactly like the include-closure
       # self-test above does for its own gate.
       - name: Core/presentation link gate self-test (ADR-0031 WS-A4 PR-1 F1 fix)
+        # qa-4 (WS-A4 PR-1 Gate 7 fix round): docs-lint's runner image is
+        # guaranteed a C++ compiler + `nm` (ubuntu-24.04) — require the
+        # selftest to FAIL loudly, not silently SkipTest-and-pass, if that
+        # ever stops being true.
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
         run: python3 tests/test_core_presentation_link_selftest.py
 
       # Governance-ledger linter self-test. NOTE: the linter itself
