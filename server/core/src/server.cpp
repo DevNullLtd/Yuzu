@@ -3153,9 +3153,10 @@ public:
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
         // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
-        // Administrator bootstrap, which now performs this INSERT and runs
-        // BEFORE `seed_admin_if_empty`; see `Config::auth_fresh_start_seeded`'s
-        // doc comment) — true iff the sole admin row was actually inserted
+        // Administrator bootstrap, and the SOLE production seeder now —
+        // `seed_admin_if_empty` has no production caller; see
+        // `Config::auth_fresh_start_seeded`'s doc comment) — true iff the
+        // sole admin row was actually inserted
         // into a genuinely-empty `auth.users` table this boot. A no-op
         // (table already populated, the common case on every restart)
         // leaves this at 0. No labels: the event is binary and rare enough

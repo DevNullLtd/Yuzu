@@ -4357,20 +4357,18 @@ TEST_CASE("RbacStore::provision_first_admin genuinely blocks on the shared "
     std::atomic<bool> done{false};
     std::atomic<bool> ok{false};
     std::atomic<bool> provisioned{false};
-    std::thread worker([&] {
+    // ScopedJoin (not a bare std::thread + ad-hoc joiner): if a REQUIRE below
+    // throws while the worker is still genuinely blocked on lease_a's held
+    // advisory lock, before_join releases lease_a first, so the worker can
+    // finish and the join below never waits out a lock_timeout (same pattern
+    // as the last-Administrator-guard tests above, e.g. line ~1177).
+    ScopedJoin worker{std::thread([&] {
         auto r = store.provision_first_admin("blockedadmin", "hash", "salt");
         ok = r.has_value();
         if (r.has_value())
             provisioned = *r;
         done = true;
-    });
-    struct ThreadJoiner {
-        std::thread& t;
-        ~ThreadJoiner() {
-            if (t.joinable())
-                t.join();
-        }
-    } joiner{worker};
+    }), [&] { lease_a.reset(); }};
 
     // Prove the worker is GENUINELY blocked on connection A's held lock —
     // not merely slow to start.

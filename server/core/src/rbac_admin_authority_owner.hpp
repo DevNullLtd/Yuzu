@@ -151,15 +151,14 @@ public:
     /// with no grant and no future boot able to fix it (the table would no
     /// longer be empty). If the INSERT returns zero rows (another
     /// replica/call already won, or the table was never empty), this is NOT
-    /// an error: `ok=true`, `provisioned=false`. `main.cpp` calls this
-    /// BEFORE `AuthDB::seed_admin_if_empty` — see that call site's own
-    /// comment for why the order is forced (this method must be the one
-    /// that actually creates the account, or its own `WHERE NOT EXISTS`
-    /// gate can never see an empty table). Rejects an invalid `username`
-    /// (the same `is_valid_username` check `seed_admin_if_empty` runs
-    /// first) before touching the database — reached first now, so it must
-    /// run here rather than rely on the now-later `seed_admin_if_empty`
-    /// call to catch it.
+    /// an error: `ok=true`, `provisioned=false`. `main.cpp` calls this as
+    /// the SOLE production seeder — `AuthDB::seed_admin_if_empty` is not
+    /// called there at all (see that method's own doc comment for why it
+    /// stays exported regardless, for AuthDB's own tests). Rejects an
+    /// invalid `username` (the same `is_valid_username` check
+    /// `seed_admin_if_empty` also runs) before touching the database — this
+    /// is the only production validator now that `seed_admin_if_empty` has
+    /// no production caller.
     ProvisionFirstAdminOutcome provision_first_admin(const std::string& username,
                                                       const std::string& password_hash,
                                                       const std::string& salt_hex) const;

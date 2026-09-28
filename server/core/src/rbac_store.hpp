@@ -476,8 +476,9 @@ public:
     /// the same advisory lock `AuthDB::seed_admin_if_empty` uses) and grants
     /// that account `Administrator`, atomically in one transaction — see
     /// `RbacAdminAuthorityOwner::provision_first_admin`'s own doc comment
-    /// for the full contract, including why callers MUST invoke this
-    /// BEFORE `AuthDB::seed_admin_if_empty` rather than after.
+    /// for the full contract. This is the SOLE production seeder;
+    /// `AuthDB::seed_admin_if_empty` has no production caller at all (it
+    /// stays exported only for AuthDB's own unit tests).
     ///
     /// Returns `true` iff THIS call actually provisioned the account+grant,
     /// `false` on the ordinary no-op (not the first account — not an

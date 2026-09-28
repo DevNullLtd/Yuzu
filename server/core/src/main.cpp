@@ -1367,9 +1367,9 @@ int main(int argc, char* argv[]) {
     //      into auth_mgr above) must be persisted once, atomically with its
     //      Administrator RBAC grant, via RbacStore::provision_first_admin()
     //      (TOCTOU-free against a second server instance racing first
-    //      boot); AuthDB::seed_admin_if_empty() runs right after it purely
-    //      for its own historical account-only contract and is now a
-    //      guaranteed production no-op.
+    //      boot); AuthDB::seed_admin_if_empty() is NOT called here at all
+    //      (a redundant second no-op call was removed — see its own header
+    //      comment for why it stays exported regardless).
     //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
     //      --auth-mode=sso-only break-glass validation, all of which run
     //      (and may exit) before Server::create() is ever called.

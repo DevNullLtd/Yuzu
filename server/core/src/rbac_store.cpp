@@ -533,10 +533,10 @@ void RbacStore::seed_defaults() {
     // run this code before (a genuine fresh install) — an existing
     // install's row is already written and untouched by this INSERT.
     // Still 'false' here: main.cpp's fresh-start bootstrap
-    // (`RbacStore::provision_first_admin`, called before
-    // `AuthDB::seed_admin_if_empty`) already guarantees a fresh install's
-    // first operator ends up with a durable Administrator grant before the
-    // server ever starts serving, so flipping this literal to 'true' would
+    // (`RbacStore::provision_first_admin`, the sole production seeder)
+    // already guarantees a fresh install's first operator ends up with a
+    // durable Administrator grant before the server ever starts serving,
+    // so flipping this literal to 'true' would
     // be MECHANICALLY safe on its own — but a large, separately-scoped
     // swath of the existing test suite implicitly depends on a freshly
     // constructed RbacStore seeding 'false' (rather than setting the flag
@@ -2166,17 +2166,24 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
     const RbacAdminAuthorityOwner::ProvisionFirstAdminOutcome outcome =
         RbacAdminAuthorityOwner{pool_}.provision_first_admin(username, password_hash, salt_hex);
     if (!outcome.ok) {
-        // `outcome.err` is empty only when `with_txn_for` fails BEFORE the
-        // lambda ever runs (pool-acquire timeout, connect backoff) — the
-        // lambda's own failure branches always set `err`. Thread
-        // `pool_.last_error()` into the fallback so this case is
-        // distinguishable from a genuine in-transaction SQL failure rather
-        // than reporting the same opaque literal for both (Gate 5 chaos
-        // finding, governance round 2026-09-28).
+        // `outcome.err` is empty when `run_in_txn` (via `with_txn_for`)
+        // returns false without the lambda itself having set it. That
+        // covers a PRE-lambda failure (pool-acquire timeout, connect
+        // backoff, BEGIN failure) AND a POST-lambda failure the lambda
+        // never observes: the PQTRANS_INTRANS abort-guard, or a later
+        // `PgTxn::commit()` failure (`PgTxn` holds only a bare `PGconn*`,
+        // no `PgPool&`, so it cannot call `set_error`). In the commit-
+        // failure case the mutation may already be durably committed
+        // server-side (ack loss — see the pre-flight/post-write comment
+        // above) even though this branch reports failure. `pool_.last_error()`
+        // is best-effort extra detail, not a reliable diagnosis of which of
+        // these occurred, so the fallback message names the symptom
+        // ("transaction did not complete") rather than a specific cause.
         if (outcome.err.empty()) {
             const std::string pool_err = pool_.last_error();
-            return std::unexpected(pool_err.empty() ? "provision_first_admin failed: pool "
-                                                       "acquire failed (no further detail)"
+            return std::unexpected(pool_err.empty() ? "provision_first_admin failed: "
+                                                       "transaction did not complete "
+                                                       "(no further detail)"
                                                      : "provision_first_admin failed: " + pool_err);
         }
         return std::unexpected(outcome.err);

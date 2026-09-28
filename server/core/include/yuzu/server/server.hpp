@@ -146,13 +146,13 @@ struct Config {
     // provisioned the sole admin user + their fleet-wide Administrator
     // grant this boot (a genuinely-empty `auth.users` — fresh start /
     // Postgres cutover). Sourced from `provision_first_admin`'s outcome,
-    // NOT `AuthDB::seed_admin_if_empty`'s — `provision_first_admin` is now
-    // the operation that actually performs the fresh-start INSERT
-    // (main.cpp's fresh-start bootstrap block runs it BEFORE
-    // `seed_admin_if_empty`, which is a guaranteed no-op by the time it
-    // runs); the flag's own meaning ("did this boot seed the sole admin
-    // user into an empty auth.users table") is unchanged, only which call
-    // detects it. Threaded through Config rather than set directly on a
+    // NOT `AuthDB::seed_admin_if_empty`'s — `provision_first_admin` is the
+    // SOLE production seeder now (main.cpp's fresh-start bootstrap block
+    // performs the fresh-start INSERT there; `seed_admin_if_empty` has no
+    // production caller at all); the flag's own meaning ("did this boot
+    // seed the sole admin user into an empty auth.users table") is
+    // unchanged, only which call detects it. Threaded through Config rather
+    // than set directly on a
     // metrics registry because this happens before `Server::create()`
     // constructs `ServerImpl` (and therefore before `metrics_` exists) —
     // ServerImpl's ctor reads this once to pre-seed

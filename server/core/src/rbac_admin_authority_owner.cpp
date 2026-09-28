@@ -583,16 +583,15 @@ namespace {
 constexpr const char* kProvisionFirstAdminLockSql = "SELECT pg_advisory_xact_lock(2037545589, 1)";
 } // namespace
 
-// See the header's own doc comment for the full contract (ordering vs
-// `AuthDB::seed_admin_if_empty`, the HA "another replica already won"
-// no-op case, atomicity of account+grant). `is_valid_username` runs BEFORE
-// any query — this call now runs FIRST in `main.cpp`'s fresh-start seed
-// block (ahead of `seed_admin_if_empty`, which used to be the sole
-// validator), so a malformed config username must be caught here rather
-// than relying on a now-later, now-vestigial `seed_admin_if_empty` call to
-// catch it — an unvalidated INSERT here would otherwise poison `auth.users`
-// with a bad row before any validation ever ran, and every later boot would
-// keep hitting the same fatal path with the row already stuck in place.
+// See the header's own doc comment for the full contract (the HA "another
+// replica already won" no-op case, atomicity of account+grant).
+// `is_valid_username` runs BEFORE any query — this is the SOLE production
+// validator now, since `main.cpp` no longer calls
+// `AuthDB::seed_admin_if_empty` at all (that method's production caller was
+// removed; it stays exported only for AuthDB's own unit tests) — an
+// unvalidated INSERT here would otherwise poison `auth.users` with a bad
+// row before any validation ever ran, and every later boot would keep
+// hitting the same fatal path with the row already stuck in place.
 RbacAdminAuthorityOwner::ProvisionFirstAdminOutcome
 RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
                                                const std::string& password_hash,
@@ -629,9 +628,9 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
         }
         if (PQntuples(res.get()) == 0) {
             // Not the first account: another replica's provision_first_admin
-            // (or seed_admin_if_empty, though this call now always runs
-            // first in production) already won, or auth.users was never
-            // empty. Clean no-op, not an error — the transaction commits
+            // call already won (seed_admin_if_empty has no production
+            // caller and cannot be the winner here), or auth.users was
+            // never empty. Clean no-op, not an error — the transaction commits
             // (or rolls back; either is harmless, nothing was written) with
             // the advisory lock released either way.
             return true;
