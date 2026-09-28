@@ -3049,8 +3049,11 @@ unfiltered.**
    demonstrably already has — a different, informational claim. `GET /api/v1/inventory/software` no
    longer illustrates this (#3290 retired its after-gate deny entirely, migrating the route onto
    `require_fleet_read`). **NO LIVE EXAMPLE CURRENTLY EXISTS:** an exhaustive check of every remaining
-   `deny_fleet_wide_service_scoped` call site — all 20 in `rest_api_v1.cpp` and, as of #3290 Phase 2
-   bucket 1a, all 5 remaining in `mcp_server.cpp` — found every REST site fires BEFORE its route's
+   `deny_fleet_wide_service_scoped` call site — 24 in `rest_api_v1.cpp` and 13 in `mcp_server.cpp`
+   (live counts as of the WS-A4 PR-1 Gate 7 fix round; grep `deny_fleet_wide_service_scoped(` against
+   each file, excluding the shared lambda's own definition — these counts drift as routes are added
+   or migrated onto `require_fleet_read`, and are not a maintained invariant) — found every REST site
+   fires BEFORE its route's
    `perm_fn`, not after (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s
    migration checklist). `deny_service_scoped_schedule` (previously 4 sites, `permission` param
    defaulting empty) and the one MCP site whose surrounding `perm_fn` fired first

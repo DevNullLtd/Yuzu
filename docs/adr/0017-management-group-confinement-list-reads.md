@@ -302,6 +302,18 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+  - **Update (2026-09-28, WS-A4 PR-1 Gate 7 fix round):** `GET /api/v1/dex/signals/{obs_type}`,
+    `GET /api/v1/dex/app`, and `GET /api/v1/dex/overview` (REST + MCP) are pinned to UNCONFINED read
+    only, per this ADR's own `software_catalog` ruling above — every field they return
+    (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/`top_devices[]`/`top_apps[]`, etc.) is a
+    precomputed fleet-wide aggregate with no per-caller SQL slice, so `AuthRoutes::require_fleet_read`
+    stays the sole gate but an admitted call whose composed scope is ENGAGED (management-group
+    and/or service-scope) is REFUSED (403) rather than served a narrowed device list — the same
+    posture this ADR prescribes for `software_catalog`/`version_rollup`. The `/fragments/dex/overview`,
+    `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by
+    this fix round and still admit a confined caller via their own per-file `visible_set_fn`
+    resolver — an INV-3 violation of THIS entry's own rule, tracked for the dashboard-rewire
+    follow-up (PR-2).
 
 ### Out of scope (global by design)
 
