@@ -48,6 +48,7 @@ skill claims anything is "done."
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
 | Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **38** securable types × **8** ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it — and `Rotate`, P2 #11 SOC 2 CC6.3, ApiToken-specific self-service human-token rotation, seeded only to `Administrator`/`ApiTokenManager`, deliberately distinct from `Write`) | Shipped (Phase 3 + P2 #11) | `rbac_store.cpp`'s `seed_defaults` `types` array (`std::array<std::string_view, 38>`) — **the A&A-program 23**: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing, EnginePrincipal (#2376 — cut away from the over-broad Security:Read); **plus 15 landed via unrelated feature work, tracked here only so the count stays correct, not because they're A&A surface**: `PluginConfig`/`PluginSecret`/`UploadGrant` (plugin config/secret/upload-grant plane, PR1.5/1.6), `PowerManagement` (Wave 6 W1B), `Workflow`/`ProductPack`/`Directory` (#4028-#4032 api-parity FK-seeding fixes — these three were already gating live routes via string comparison before being seeded here, so RBAC-enabled deployments silently couldn't grant them until the fix), `TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig` (#4028 Settings-read-twins, split by sensitivity), `Enrollment`/`OidcConfig` (#4031 admin-only config reads), `Forensics`/`Decommission` (Wave 7 forensics class + ADR-0024 Decision 9 erasure gate); ops: Read/Write/Execute/Delete/Approve/Push/Attest/Rotate. **Re-verify this count by grepping the array before quoting it** — see the routed doc's own "line-number anchors decay faster than status" caution just below; the same caution applies to counts. |
+| **RBAC admin plane** — turning enforcement on/off and assigning roles to human users. **Partial**: enable toggle + fleet-wide human role assignment shipped; custom-role CRUD, a config/CLI enable path and an SSO/break-glass path are NOT. RBAC still **ships OFF** and every fresh install is legacy-open until an operator flips it. | **Enable toggle + assignment SHIPPED on `dev` 2026-09-25..27; custom-role CRUD MISSING** — on `dev` only, **not** in `release/v0.14.0-rc1`, which predates all three PRs | **A2 #4985** (09-26): `POST/DELETE /api/v1/rbac/roles/{name}/assignments` + MCP `assign_rbac_role`/`unassign_rbac_role`; gated on the shared durable-admin predicate `is_rbac_administrator()` (takes a required `RbacAdminSurface{kRest,kMcp}`; an MCP-tier bearer token is denied on REST), NOT `require_permission`; assignable roles are a closed list of 6 (`rbac_assignable_roles.hpp`: Administrator, PlatformEngineer, Operator, ApiTokenManager, Viewer, Reviewer — `ITServiceOwner` rejected, it needs a management-group scope this surface lacks; unassign is deliberately not so restricted); last-Administrator guard runs in the same txn as the DELETE, in `RbacAdminAuthorityOwner` (`rbac_admin_authority_owner.{hpp,cpp}`, the ADR-0012 §3 query owner). **A1 #5030** (09-27): `PUT /api/v1/rbac/enforcement` + MCP `set_rbac_enforcement` (`Security:Write`, supervised tier, step-up on the REST route); caller-inclusive guard — refused unless the caller holds authority under BOTH the durably-true source regime (403) and the destination regime (409); new gauge/counter + `YuzuRbacEnforcementChanged`/`YuzuRbacEnforcementDisabled` alerts. **A3 #4986** (09-25): the access-review export/campaign carries `rbac_enforcement: enabled\|disabled\|degraded` (`degraded` = closed/unwired store, so an outage is never read as "ungoverned"); the CSV gained a breaking leading `# rbac_enforcement=<value>` line. **Still absent, verified 2026-09-28:** `RbacStore::create_role`/`set_permission`/`remove_permission` have ZERO production callers (custom roles need direct `psql` against `rbac_store`; `docs/user-manual/rbac.md` "Custom Roles (Planned)"); no `[rbac]` config key or CLI flag (#388); only a LOCAL `admin` account can pass the enable guard, so an SSO-only fleet cannot enable RBAC; no break-glass if enabling strands the operator (#4203). **`RbacStore::set_rbac_enabled()` still has no production caller** — A1 goes through `RbacAdminAuthorityOwner`, so a grep for that name gives a false "no enable path". History: never a regression — `RbacStore` arrived in PR #203 (2026-03-18) with no wiring. Ref: `docs/user-manual/rbac.md` "Enabling RBAC", `docs/adr/1008-rbac-management-groups-target-architecture.md` |
 | Self-target principal-destruction guard (#397/#403) | Shipped | `settings_routes.cpp:434,1830,2488-2504` (3 call sites); design in `docs/auth-architecture.md` §self-target |
 | OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp:189` `generate_code_verifier()`, L194 `compute_code_challenge()`, L385 `code_verifier` post, L766 `/.well-known/openid-configuration` discovery, L542/L623 JWKS fetch + JWT signature verify |
 | Directory Sync — AD/Entra users + groups + role mapping via Microsoft Graph v1.0 | Shipped | `directory_sync.cpp:336,509,556,608` calls `https://graph.microsoft.com/v1.0/users`, `/groups`, `/groups/{id}/members`; persisted `directory_group_role_mappings` + `directory_sync_status` tables (`directory_sync.cpp:147`). NOTE: `oidc_provider.cpp:248` only parses the JWT `groups` claim — Graph integration is the separate Directory Sync subsystem. |
@@ -165,6 +166,18 @@ retired, PR #2394) — Section 1's persistent-store row, the hard-invariants lis
 and workflow steps 1–2 were de-SQLite'd; (4) the Open hardening backlog issue
 states. **Every other "SHIPPED" cell still rests on the `ef4582be` stamp — treat
 those as up to ~6 weeks stale and re-grep the symbol before relying on it.**
+
+**Targeted refresh 2026-09-28 against `origin/dev` @ `257bfb338` — NOT a
+wholesale re-verification.** Re-verified only: (1) the RBAC admin plane — the
+new Section 1 row, from `rbac_store.cpp`, `rbac_assignable_roles.hpp`,
+`rest_api_v1.cpp` and `mcp_server.cpp` on that tree, plus a repo-wide grep
+showing `create_role`/`set_permission`/`remove_permission`/`set_rbac_enabled`
+still have no production caller; (2) the RBAC seed counts — 7 roles / 8 ops /
+38 securable types (matches `seed_defaults`); (3) the Open hardening backlog
+issue states below. None of the P0/P1/P2 status cells were re-read; they still
+rest on the stamps above. **`release/v0.14.0-rc1` predates A1/A2/A3**, so a
+statement about "what ships in 0.14.0" must be checked against that branch, not
+`dev`.
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of an item in this gap matrix MUST update that item's status
@@ -749,6 +762,24 @@ interlock, **#2376** grant-graph topology floor, **#2396** login/PG-degrade,
 robustness, **#2407** pre-auth body cap. What remains below is all OPEN and
 security- or evidence-relevant.)
 
+- **RBAC admin-plane cluster** (all OPEN, verified 2026-09-28) — these are the
+  residuals of the Section 1 "RBAC admin plane" row, and the most consequential
+  open auth items because RBAC still ships OFF: **#388** no `[rbac]` config key
+  or CLI enable (the oldest report, v0.10.0); **#4203** no break-glass — enabling
+  can strand an operator behind 403s, and an SSO-only fleet cannot pass the
+  enable guard at all; **#1496** the RBAC-enable visibility lockout (a user with
+  no management-group role sees no agents); **#4966** the last-Administrator
+  guard does not cover account deactivation and does not recognise SSO admins
+  (two documented residuals of A2); **#2809** a deliberately revoked built-in
+  grant is silently restored at next boot (`seed_defaults` has no tombstone);
+  **#4972** the access-review `rbac_enforcement` stamp has no freshness /
+  degraded-since signal; **#4202** the `rbac.md` toggle text (the enable-path
+  half is now corrected on `dev`; re-check before closing). Custom-role CRUD has
+  no issue of its own here — it is the "Planned" section of `rbac.md`.
+- **#4785** — stale role/securable-count twins outside this skill:
+  `SECURITY.md` (the one a prospect reads), `docs/enterprise-parity-plan.md`,
+  `docs/capability-map.md`, and the `.codex` copy of this skill (which is
+  maintained separately from this file).
 - **#2485** — engine-principal authorization doc-overstatement. The "scoped"
   half was already corrected in `.claude/routed-concerns-access-control.md`
   (it now describes grants as fleet-wide, not "scoped" — exact wording varies

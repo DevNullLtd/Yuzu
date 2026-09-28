@@ -1022,6 +1022,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy; read-only)"},
         {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy; read-only)"},
         {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags (read-only)"},
+        // privacy_permissions
+        {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
         // system_hardening
         {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm

@@ -90,6 +90,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
 ]

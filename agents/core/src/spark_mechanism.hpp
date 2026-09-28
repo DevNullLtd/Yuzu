@@ -167,7 +167,8 @@ struct SparkMechanismStats {
     ///    OpenSCManager denied; the IOCP/threadpool could not be created), so every
     ///    watch() is refused. Known at start(), NOT at arm(), which is why it lands at rung 1
     ///    rather than waiting on #2084's armed-but-deaf liveness (governance Gate-3
-    ///    cross-platform + Gate-6 sre, reached independently).
+    ///    cross-platform + Gate-6 sre, reached independently). Mirrored by `boot_inert`
+    ///    below (#4685).
     ///  - RUNTIME: Registry (its sweeper, the sole producer of late commits and health
     ///    edges; #2012 PR-B1) and File (its IOCP worker; #4658) raise it after three
     ///    consecutive failed passes and clear it on the next successful pass, both while
@@ -183,8 +184,28 @@ struct SparkMechanismStats {
     /// (the Linux mechanism clears `started_`, the Windows one clears `scm_ok_`) and
     /// invalidates every tracked coverage, so `stats().inert` stays false and `service` stays
     /// in the heartbeat CSV; spark_service.cpp keeps it out of this bit so a dead poll thread
-    /// is not misread as a bind failure at start().
+    /// is not misread as a bind failure at start(). `inert` stays the UNION of both cases —
+    /// what the heartbeat CSV (spark_heartbeat.hpp) and the subscription_establishment()
+    /// coverage overlay (spark_engine.cpp) both read, since either kind of gap means "not
+    /// currently serviceable" for their purposes.
     bool inert{false};
+    /// TRUE for the BOOT-TIME case above ONLY (#4685) — start() could not bind this
+    /// mechanism's OS facility, so every watch() is refused; a mechanism mid a RUNTIME
+    /// episode still accepts watch() and serves it once a pass next succeeds, so it is
+    /// NOT boot-inert. Declared AFTER `inert` deliberately: every stats() implementation
+    /// (spark_file.cpp, spark_registry.cpp, spark_service.cpp) uses a designated
+    /// initializer, and C++20 requires designated-initializer order to match declaration
+    /// order. The sole consumer today is Guardian's capability filter
+    /// (guardian_engine.cpp's reconcile_rule_locked): arming against `!boot_inert` rather
+    /// than `!inert` keeps a rule ARMED through a transient runtime-degraded episode
+    /// instead of misclassifying it Unsupported and stranding it there with no
+    /// re-reconcile on recovery (the bug this field exists to close). Invariant
+    /// `boot_inert => inert` holds per mechanism but is never asserted across the two
+    /// independently-read atomics that back these fields (matches the skew-tolerance
+    /// contract above) — each mechanism's stats() instead derives both fields from the
+    /// SAME two local atomic reads, so the implication holds within one returned
+    /// snapshot without needing a lock or a cross-field assert.
+    bool boot_inert{false};
 };
 
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
