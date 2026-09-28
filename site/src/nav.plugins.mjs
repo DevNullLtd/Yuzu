@@ -44,6 +44,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/platform_security/README', slug: 'plugins/platform_security', title: 'platform_security' },
   { file: 'agents/plugins/power_health/README', slug: 'plugins/power_health', title: 'power_health' },
   { file: 'agents/plugins/printing/README', slug: 'plugins/printing', title: 'printing' },
+  { file: 'agents/plugins/privacy_permissions/README', slug: 'plugins/privacy_permissions', title: 'privacy_permissions' },
   { file: 'agents/plugins/processes/README', slug: 'plugins/processes', title: 'processes' },
   { file: 'agents/plugins/procfetch/README', slug: 'plugins/procfetch', title: 'procfetch' },
   { file: 'agents/plugins/quarantine/README', slug: 'plugins/quarantine', title: 'quarantine' },

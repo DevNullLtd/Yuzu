@@ -463,10 +463,10 @@ struct UsageFoldResult {
  * Atomically apply an enable/disable edge: the `usage_enabled` flag,
  * `usage_paused_at`, and an `usage_generation` bump, all in ONE
  * checked_transaction. This is `usage`'s own path around the generic
- * `apply_source_enabled_transition`'s discarded-write gap (#2490, shared by
- * every OTHER TAR source and NOT fixed here) -- a failed persist refuses the
- * transition outright rather than report success while the flag silently
- * did not move. The generation bump happens on EVERY edge (not only
+ * `apply_source_enabled_transition`'s path (which also commits atomically since
+ * #1654; the usage edge additionally bumps the generation) -- a failed persist
+ * refuses the transition outright rather than report success while the flag
+ * silently did not move. The generation bump happens on EVERY edge (not only
  * enable): it is what forces `usage_lifecycle_state` to read
  * PendingBaseline the instant this source is next enabled, even across a
  * pause during which nothing else touched the baseline.
