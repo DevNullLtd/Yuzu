@@ -139,7 +139,18 @@ std::string iso_ago(std::chrono::seconds dur) {
 // Anchors: one event 30 minutes ago (inside EVERY window, incl. 24h), one 3
 // days ago (inside "7d"/"all", OUTSIDE "24h"). Computed once so every seed +
 // assertion in this file agrees on the exact same literal timestamps.
-const std::string kRecent = iso_ago(std::chrono::minutes(30));
+//
+// kRecent is clamped to TODAY (UTC): the by-day charts bucket by calendar
+// date, so a run between 00:00 and 00:30 UTC would otherwise push the recent
+// event into yesterday's bucket and shift the golden markup (the date
+// normaliser hides the label, not the bucket count).
+std::chrono::seconds recent_offset() {
+    const auto now = std::chrono::system_clock::now();
+    const auto since_midnight = std::chrono::duration_cast<std::chrono::seconds>(
+        now - std::chrono::floor<std::chrono::days>(now));
+    return std::min<std::chrono::seconds>(std::chrono::minutes(30), since_midnight);
+}
+const std::string kRecent = iso_ago(recent_offset());
 const std::string kOld = iso_ago(std::chrono::hours(24 * 3));
 
 // ── Full-output golden-file layer ───────────────────────────────────────
