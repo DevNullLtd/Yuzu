@@ -577,7 +577,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp"
     ],
     "changelog": [
-      "changelog.d/wave8-pr8.3-local_security_policy.added.md"
+      "changelog.d/5069-local_security_policy.added.md"
     ],
     "definitions": [
       "content/definitions/local_security_policy.yaml"
