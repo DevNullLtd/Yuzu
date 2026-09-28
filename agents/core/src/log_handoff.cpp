@@ -646,10 +646,14 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
                             error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
                         }
                     } catch (...) {
-                        // The fault-injection throw above, or std::bad_alloc from
-                        // spawn_detached's own single payload allocation: the permit is
-                        // released by unwinding (it was never moved out in either case).
-                        // Drop and count this diagnostic. Never throw into spdlog.
+                        // The fault-injection throw above releases the permit by unwinding
+                        // the local. std::bad_alloc from spawn_detached's own single
+                        // payload allocation releases it the same way, but from the
+                        // lambda-argument temporary instead: by the time spawn_detached
+                        // is entered, the permit is already moved into that argument
+                        // (argument evaluation precedes the call), so this catch does not
+                        // touch the local `permit` again either way. Drop and count this
+                        // diagnostic. Never throw into spdlog.
                         error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
