@@ -8081,6 +8081,68 @@ TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown fa
     CHECK(unknown->body.find("-32602") != std::string::npos);
 }
 
+// ADR-0031 WS-A4 PR-1 / Fraser decision 1: get_dex_catalogue -- the Catalogue
+// View 1 family cards. Cross-checks the SAME shape GET /api/v1/dex/catalogue
+// serves (both call dex_api_->catalogue(...) / dex_catalogue_json, Rule 1).
+TEST_CASE("MCP DEX: get_dex_catalogue returns the family cards, bad os -> invalid params",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":977,"params":{"name":"get_dex_catalogue","arguments":{"os":"all","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["os"] == "all");
+    CHECK(payload["window"] == "all");
+    CHECK(payload["total_types"].get<int>() > 0);
+    bool saw_app_reliability = false;
+    for (const auto& f : payload["families"])
+        if (f["name"] == "App reliability")
+            saw_app_reliability = true;
+    CHECK(saw_app_reliability);
+    // Aggregate exemption -- no per-agent identity anywhere in the payload.
+    CHECK(body["result"]["content"][0]["text"].get<std::string>().find("WS-1") ==
+         std::string::npos);
+
+    auto bad_os = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":978,"params":{"name":"get_dex_catalogue","arguments":{"os":"solaris"}}})");
+    REQUIRE(bad_os);
+    CHECK(bad_os->body.find("-32602") != std::string::npos);
+}
+
+// tools/list must advertise get_dex_catalogue with an inputSchema/outputSchema
+// (the generic malformed-schema net at "tool families cover exactly the
+// tools/list surface" above already proves every kTools[] entry parses; this
+// targets the specific tool by name).
+TEST_CASE("MCP DEX: get_dex_catalogue is listed with schemas", "[mcp][dex]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    bool found = false;
+    for (const auto& t : tools) {
+        if (t["name"] != "get_dex_catalogue")
+            continue;
+        found = true;
+        REQUIRE(t.contains("inputSchema"));
+        REQUIRE(t.contains("outputSchema"));
+        REQUIRE(t.contains("annotations"));
+        CHECK(t["annotations"]["readOnlyHint"].get<bool>());
+        CHECK_FALSE(t["annotations"]["destructiveHint"].get<bool>());
+        CHECK(t["annotations"]["idempotentHint"].get<bool>());
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);

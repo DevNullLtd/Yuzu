@@ -315,6 +315,13 @@ struct RestGsHarness {
     /// exercising its fail-closed-503 path (mirrors wire_scoped_perm above).
     bool wire_list_read_fn_{true};
 
+    /// ADR-0031 WS-A4 PR-1: false → leave `dex_api_local` null even when the
+    /// store is open, exercising GET /api/v1/dex/catalogue's (and every
+    /// sibling DEX route's) "!dex_api -> 503" guard — the SAME guard a null
+    /// store already exercises in test_dex_api.cpp at the seam level; this
+    /// toggle proves the REST handler's OWN null check, independent of that.
+    bool wire_dex_api_{true};
+
     // Declared LAST (was first): sink's registered handlers capture `this` and
     // dereference owner members (auth_routes_, rbac_/mgmt_ bundles, api, ...)
     // declared above — CLAUDE.md's test-conventions rule ("fixtures must
@@ -344,9 +351,13 @@ struct RestGsHarness {
                            // still constructed and REQUIRE'd open either way, so a
                            // revert-to-raw-store still finds a live, answerable store at
                            // the SAME id but a DIFFERENT answer than the double gives.
-                           std::shared_ptr<yuzu::server::GuardianApi> guardian_api_override = nullptr)
+                           std::shared_ptr<yuzu::server::GuardianApi> guardian_api_override = nullptr,
+                           // ADR-0031 WS-A4 PR-1: false -> dex_api_local stays null even
+                           // with a live store, exercising every DEX REST route's own
+                           // "!dex_api -> 503" guard (see wire_dex_api_'s doc comment).
+                           bool wire_dex_api = true)
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
-          wire_list_read_fn_(wire_list_read_fn) {
+          wire_list_read_fn_(wire_list_read_fn), wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -534,7 +545,7 @@ struct RestGsHarness {
         // exercise the SEAM path (production wires it identically). Gated on
         // store presence exactly like server.cpp — null store → null api → 503.
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
-        if (store)
+        if (store && wire_dex_api_)
             dex_api_local = yuzu::server::make_local_dex_api(
                 store.get(), [this]() { return dex_fleet_override_; });
 
@@ -2420,6 +2431,72 @@ TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no aud
     auto missing = h.sink.Get("/api/v1/dex/catalogue/group");
     REQUIRE(missing);
     CHECK(missing->status == 400);
+}
+
+// ADR-0031 WS-A4 PR-1 / Fraser decision 1: GET /api/v1/dex/catalogue -- the
+// Catalogue View 1 family cards. Same aggregate posture as apps/catalogue-
+// group/health/trends above (no audit, no per-device confinement -- it emits
+// no agent_ids at all, asserted below).
+TEST_CASE("REST dex/catalogue: family cards, 200 shape, no agent_id anywhere, no audit",
+          "[pg][rest][dex][catalogue]") {
+    RestGsHarness h;
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.dex_fleet_override_.windows_online = 1;
+    h.dex_fleet_override_.connected_os = {"windows"};
+
+    auto res = h.sink.Get("/api/v1/dex/catalogue?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["os"].get<std::string>() == "all");
+    CHECK(j["data"]["window"].get<std::string>() == "all");
+    CHECK(j["data"]["total_types"].get<int>() > 0);
+    REQUIRE(j["data"]["families"].is_array());
+    bool saw_app_reliability = false;
+    for (const auto& f : j["data"]["families"])
+        if (f["name"].get<std::string>() == "App reliability") {
+            saw_app_reliability = true;
+            CHECK(f["events"].get<int64_t>() >= 1);
+        }
+    CHECK(saw_app_reliability);
+    // Aggregate exemption: no per-agent identity anywhere in the response.
+    CHECK(res->body.find("agent_id") == std::string::npos);
+    CHECK(res->body.find("WS-1") == std::string::npos);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex/catalogue: invalid os / window -> 400, missing dex_api -> 503",
+          "[pg][rest][dex][catalogue]") {
+    {
+        RestGsHarness h;
+        auto bad_os = h.sink.Get("/api/v1/dex/catalogue?os=solaris");
+        REQUIRE(bad_os);
+        CHECK(bad_os->status == 400);
+
+        auto bad_window = h.sink.Get("/api/v1/dex/catalogue?window=banana");
+        REQUIRE(bad_window);
+        CHECK(bad_window->status == 400);
+    }
+    {
+        // wire_dex_api=false -- dex_api_local stays null even with a live store.
+        RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                        /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
+                        /*wire_list_read_fn=*/true, /*guardian_api_override=*/nullptr,
+                        /*wire_dex_api=*/false);
+        auto res = h.sink.Get("/api/v1/dex/catalogue");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+}
+
+TEST_CASE("REST dex/catalogue: permission denied -> 403 before any audit",
+          "[pg][rest][dex][catalogue]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/dex/catalogue");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST dex/health: composite score suppressed with no reporting agents, no audit",
