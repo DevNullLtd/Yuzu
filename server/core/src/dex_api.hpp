@@ -52,8 +52,10 @@
 /// handlers do — so neither `since` nor `DexFleet` appears in this abstract
 /// interface. `visible` (the caller's ADR-0017 admit-then-filter set) DOES
 /// appear where a resource confines its device list: it is resolved from the
-/// authenticated request by the handler (`resolve_dex_visible`) and threaded
-/// in, since it depends on the caller's identity, not the store.
+/// authenticated request by the handler's `FleetReadFn` gate
+/// (`AuthRoutes::require_fleet_read`'s composed `VisibleSet`, WS-A4 PR-1 fix
+/// round) and threaded in, since it depends on the caller's identity, not
+/// the store.
 
 #include <optional>
 #include <set>

@@ -264,36 +264,22 @@ public:
     // make_local_dex_api in server.cpp) — so no fleet provider is threaded into
     // register_routes anymore. (DexRoutes' dashboard fragments still use their
     // own fleet provider directly; that rewire is deferred, ISSUE #4576.)
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `DexRoutes::register_routes`'s own `resolve_visible` (dex_routes.cpp)
-    /// already applies to confine `/fragments/dex/app`'s and
-    /// `/fragments/dex/overview`'s device-id lists to the caller's management-group
-    /// scope (ADR-0017 World A) — GET /api/v1/dex/app and GET /api/v1/dex/overview
-    /// enumerate the identical affected/top-devices lists and MUST apply the same
-    /// confinement, not just the sibling service-scoped-token deny belt
-    /// (`deny_fleet_wide_service_scoped`). GET /api/v1/dex/signals/{obs_type} joins
-    /// them for the SAME reason (ADR-0031 WS-A4 PR-1 decision 3): its devices[] list
-    /// is fleet-wide, identity-linked, and has no other per-device authz. Two
-    /// independent belts are required together, per the SCOPING NOTE on the
-    /// `dex_visible_fn` provider in server.cpp: this fn closes the
-    /// management-group-confined-OPERATOR axis, `deny_fleet_wide_service_scoped`
-    /// closes the service-scoped-API-token axis — neither substitutes for the
-    /// other. `nullopt` = unfiltered (global read / RBAC off); engaged (incl.
-    /// empty) = filter to exactly these agents.
-    ///
-    /// **ADR-0033 clause (2) — UNWIRED is NOT "unfiltered".** For these three
-    /// routes this derivation is the ROUTE'S ONLY per-device authorization
-    /// (`perm_fn` above is a bare global gate, inert against management-group
-    /// confinement) — so an unwired `DexVisibleFn` (empty `std::function`, the
-    /// route's OWN misconfiguration) must never resolve as `nullopt`/unfiltered:
-    /// the call-site resolver (`RestApiV1::register_routes`'s `resolve_dex_visible`)
-    /// distinguishes "fn not wired at all" from "fn wired and answered nullopt" and
-    /// the route REFUSES the former with an audited 500, never substituting
-    /// anything. This inverts this field's own PRE-existing "unwired == no
-    /// confinement" contract (dating to #4035) — that was the exact defect this
-    /// fix closes; do not revert to it.
-    using DexVisibleFn =
-        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    // #4035 hardening (governance) introduced a bespoke `DexVisibleFn`
+    // resolver for GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+    // /api/v1/dex/signals/{obs_type} — retired (WS-A4 PR-1 fix round, sec-1):
+    // the bare `perm_fn(GuaranteedState:Read)` gate in front of it used
+    // `RbacStore::check_permission`, which resolves GLOBAL roles only and
+    // never consults `ManagementGroupStore` — a management-group-confined-
+    // only operator was 403'd by `perm_fn` before this resolver ever ran, so
+    // the confinement it computed was dormant on every admitted call (sec-1),
+    // and an elevated admin got the BASE identity's narrowed/empty set
+    // instead of an unfiltered read (sec-2). All three routes now gate SOLELY
+    // on `FleetReadFn` (`AuthRoutes::require_fleet_read`, ADR-0017) — the same
+    // admit-then-filter chokepoint `GET /api/v1/dex/perf/app/devices` + MCP
+    // `list_dex_app_perf_devices` already use for an identified per-device
+    // fan-out — and derive their `devices[]`/`top_devices[]` confinement from
+    // the gate's own composed `VisibleSet` (`gate.scope`), never a second,
+    // independently-derived resolver.
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -482,13 +468,6 @@ public:
         // Response:Read scope resolver (see ResponseVisibleSetFn's doc
         // comment above). Trailing optional dep; `{}` = legacy-open.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
-        // see DexVisibleFn's doc comment above. Trailing optional dep; `{}` now
-        // makes GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
-        // /api/v1/dex/signals/{obs_type} FAIL CLOSED (audited 500) rather than
-        // degrade to "no confinement" — this is the route's ONLY per-device
-        // authz, so an unwired resolver must refuse, never substitute.
-        DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam (replaces
         // the former AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort provider
         // for GET /api/v1/dex/perf/compare) — the SAME instance the /auto VERIFY
@@ -615,11 +594,6 @@ public:
         // #4033: see the production overload's doc comment above; identical
         // trailing-optional-dep, legacy-open-when-unwired contract.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
-        // see the production overload's doc comment above (DexVisibleFn);
-        // identical trailing-optional-dep, fail-closed-audited-500-when-unwired
-        // contract.
-        DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: see the production overload's doc comment
         // above; identical trailing-optional-dep, 503-when-unwired contract.
         std::shared_ptr<const VerifyApi> verify_api = nullptr,

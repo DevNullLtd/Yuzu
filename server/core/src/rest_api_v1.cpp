@@ -1267,7 +1267,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/signals/{obs_type}": {
-      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, gated via AuthRoutes::require_fleet_read (the canonical ADR-0017 admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check; WS-A4 PR-1 fix round, closes sec-1/sec-2). One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data) and is confined to the caller's fleet-read scope (management-group or service-scope) via the gate's own composed VisibleSet — an unfiltered global grant sees every device, a confined caller sees only their own; every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "403": {"description": "Caller lacks GuaranteedState:Read (no grant at all, including no management-group grant)."}, "503": {"description": "Route misconfigured (fleet_read_fn unwired) or authorization store unavailable, service unavailable, OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}": {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) also 503s (retry_after_ms 2000, no Sec-Audit-Failed) rather than rendering a fabricated healthy 100 with no signals. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the dex.device.view audit row could not persist (Sec-Audit-Failed: true), OR the DEX signal-summary store read degraded (#4855; retryable, retry_after_ms 2000).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1315,13 +1315,13 @@ const std::string& openapi_spec() {
         // compile time. #4035's 8 new DEX twins start a fresh literal segment.
         R"json(,
     "/dex/app": {
-      "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. The devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's management-group scope exactly like the dashboard fragment (ADR-0017); the crash/hang/module/exception counts remain fleet-wide aggregates. Every call emits a dex.app.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "App blast-radius drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, gated via AuthRoutes::require_fleet_read (the canonical ADR-0017 admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check; WS-A4 PR-1 fix round, closes sec-1/sec-2). Crash/hang summary, faulting modules, exception codes, and the affected-device list for one application (process image name) — the REST twin of the /fragments/dex/app dashboard drill. The devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's fleet-read scope (management-group or service-scope) via the gate's own composed VisibleSet; the crash/hang/module/exception counts remain fleet-wide aggregates. Every call emits a dex.app.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Process image name, e.g. notepad.exe."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "App drill object (process_name, window, crashes, hangs, signals, distinct_devices, first_seen, last_seen, modules[], exceptions[], devices[])"}, "400": {"description": "missing name, or invalid window"}, "403": {"description": "Caller lacks GuaranteedState:Read (no grant at all, including no management-group grant)."}, "503": {"description": "Route misconfigured (fleet_read_fn unwired) or authorization store unavailable, service unavailable, OR the dex.app.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/apps": {
       "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window, ranked by activity — the REST twin of the /fragments/dex/apps dashboard tab. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.apps[].{subject, crashes, hangs, distinct_devices, last_seen})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/catalogue": {
-      "get": {"summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})"}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited. A degraded fleet signal-summary read (store closed / pool-acquire timeout / query error) 503s (retry_after_ms 2000) rather than rendering a fabricated healthy, zero-event catalogue (WS-A4 PR-1 fix round, closes sec-5).", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})"}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable, or the fleet signal-summary read degraded (retry_after_ms 2000)"}}}
     },
     "/dex/catalogue/group": {
       "get": {"summary": "Signal-family drill (Catalogue View 2)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One signal family's member signals: per-type monitored/not-collected state, coverage platforms, event count + blast radius, plus the family's own health-score slice — the REST twin of the /fragments/dex/catalogue/group dashboard drill (see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Exact family name, e.g. 'App reliability'."}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Family drill object (group_name, os, window, monitored_count, total_type_count, health_score|null, active_events, max_signal_devices, types[].{obs_type, monitored, coverage_platforms, count, distinct_devices, last_seen})"}, "400": {"description": "missing name, or invalid window"}, "404": {"description": "no such signal family"}, "503": {"description": "service unavailable"}}}
@@ -1333,7 +1333,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Cross-OS comparison + per-family day-by-day trend", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cross-OS scope cards plus per-family event counts for every day in the window (the small-multiples/heatmap source data) — the REST twin of the /fragments/dex/trends dashboard tab. No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Trends object (window, total_catalogued_types, windows_reporting, crash_free_pct|null, os_cards[].{platform, live, distinct_types, total_events}, days[], families[].{name, total, counts[]})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/overview": {
-      "get": {"summary": "Fleet DEX overview (the /dex landing page's summary)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list — the REST twin of the /fragments/dex/overview dashboard hub. The top_devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's management-group scope exactly like the dashboard fragment (ADR-0017); every other field remains a fleet-wide aggregate. Every call emits a dex.overview.view audit event and a service-scoped API token is denied outright (403). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Overview object (window, overall_experience, device_score, app_score, network_score, great, fair, poor, unscored, coverage_monitored, coverage_total, crash_free_pct|null, windows_reporting, crashes_per_1k_device_days|null, total_crashes, devices_impacted, total_online, active_signal_types, health_score|null, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[]). unscored (#4855) counts connected devices whose per-device score could not be computed (no store, or a degraded per-device read) -- a non-zero value means partial coverage, not a healthier fleet than reported."}, "400": {"description": "invalid window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.overview.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Fleet DEX overview (the /dex landing page's summary)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, gated via AuthRoutes::require_fleet_read (the canonical ADR-0017 admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check; WS-A4 PR-1 fix round, closes sec-1/sec-2). Per-device experience score distribution + the Device/App/Network composite, the measured crash-free rate, top apps, and the most-affected-devices list — the REST twin of the /fragments/dex/overview dashboard hub. The top_devices array names affected agent_ids (individual-identifying behavioral data) and is confined to the caller's fleet-read scope (management-group or service-scope) via the gate's own composed VisibleSet; every other field remains a fleet-wide aggregate. Every call emits a dex.overview.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Overview object (window, overall_experience, device_score, app_score, network_score, great, fair, poor, unscored, coverage_monitored, coverage_total, crash_free_pct|null, windows_reporting, crashes_per_1k_device_days|null, total_crashes, devices_impacted, total_online, active_signal_types, health_score|null, os_reporting_count, segments[], crashes_by_day[], top_apps[], top_devices[], os_table[]). unscored (#4855) counts connected devices whose per-device score could not be computed (no store, or a degraded per-device read) -- a non-zero value means partial coverage, not a healthier fleet than reported."}, "400": {"description": "invalid window"}, "403": {"description": "Caller lacks GuaranteedState:Read (no grant at all, including no management-group grant)."}, "503": {"description": "Route misconfigured (fleet_read_fn unwired) or authorization store unavailable, service unavailable, OR the dex.overview.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}/history": {
       "get": {"summary": "Per-device raw signal history", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. The distinct signal-HISTORY capability from GET /dex/devices/{id} above (same device, different data: every observation row, not just the rollup score) — the REST twin of the /fragments/dex/device dashboard drill. Individual-identifying behavioral data, so every call emits a dex.device.view audit event (the SAME verb GET /dex/devices/{id} uses; the dashboard fragment audits this exact capability under this exact verb too). FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that row cannot persist.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "History object (agent_id, window, crashes, hangs, signals, distinct_apps, last_seen, history[].{event_id, observed_at, obs_type, subject, reason, symbolic, component, metric})"}, "400": {"description": "invalid window"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable OR the dex.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1906,7 +1906,6 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
     std::shared_ptr<const GuardianApi> guardian_api) {
@@ -1925,7 +1924,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
-                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
+                    std::move(verify_api), std::move(device_api),
                     std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api));
 }
 
@@ -1950,7 +1949,6 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexVisibleFn dex_visible_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
     std::shared_ptr<const GuardianApi> guardian_api) {
@@ -2065,44 +2063,13 @@ void RestApiV1::register_routes(
         return true;
     };
 
-    // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
-    // resolves the caller's management-group-visible agent set for confining
-    // a fleet-wide DEX device list (ADR-0017 World A) — mirrors
-    // DexRoutes::resolve_visible (dex_routes.cpp) exactly, so GET
-    // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
-    // /api/v1/dex/signals/{obs_type} confine their devices[]/top_devices[]
-    // lists the SAME way the equivalent dashboard fragments already do. This
-    // is a SECOND, independent belt alongside deny_fleet_wide_service_scoped
-    // above — that closes the service-scoped-API-token axis, this closes the
-    // management-group-confined-OPERATOR axis; neither substitutes for the
-    // other (see the SCOPING NOTE on server.cpp's dex_visible_fn provider).
-    //
-    // Return shape is a NESTED optional (ADR-0033 clause 2 — "unwired" and
-    // "wired, answered unfiltered" are NOT the same outcome for a route where
-    // this derivation is the ONLY per-device authz):
-    //   - outer `nullopt`  -> `dex_visible_fn` is UNWIRED (misconfiguration).
-    //     The caller MUST refuse (audited 500), never substitute nullopt or
-    //     present-empty.
-    //   - outer engaged, inner `nullopt` -> wired and answered "unfiltered"
-    //     (RBAC off, or the caller holds the global permission). Legitimate;
-    //     serve unconfined.
-    //   - outer engaged, inner engaged (incl. empty) -> filter to exactly
-    //     these agents.
-    // The no-session branch (`auth_fn` can't resolve a session on a request
-    // that already cleared `perm_fn`) is treated as the wired-unfiltered
-    // case, not as unwired — same posture as before this fix, and out of
-    // this fix's scope (it is not the "unwired resolver" class the ADR-0033
-    // clause is about).
-    auto resolve_dex_visible = [auth_fn, dex_visible_fn](const httplib::Request& req)
-        -> std::optional<std::optional<std::set<std::string>>> {
-        if (!dex_visible_fn)
-            return std::nullopt; // UNWIRED — caller must refuse
-        httplib::Response throwaway;
-        auto sess = auth_fn(req, throwaway);
-        if (!sess)
-            return std::optional<std::set<std::string>>{std::nullopt}; // no session to filter by
-        return dex_visible_fn(sess->username);
-    };
+    // #4035 hardening (governance)'s bespoke `resolve_dex_visible` resolver
+    // for GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+    // /api/v1/dex/signals/{obs_type} is RETIRED (WS-A4 PR-1 fix round,
+    // sec-1/sec-2): see RestApiV1::DexVisibleFn's retirement comment
+    // (rest_api_v1.hpp) for why. All three routes now gate SOLELY on
+    // `fleet_read_fn` and derive their confinement from `gate.scope` —
+    // see the route registrations below.
 
     // PR1.9c: the caller-carrying sibling of the above. Same resolution, same
     // fail-closed posture — it just stops throwing the identity away.
@@ -14617,31 +14584,39 @@ void RestApiV1::register_routes(
     // the route regex) so malformed input yields a clear 400 rather than a silent
     // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
     // read-model has no such observations — it is not an entity-not-found).
+    //
+    // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto `fleet_read_fn`
+    // (`AuthRoutes::require_fleet_read`, ADR-0017) as the SOLE gate — never
+    // stacked with `perm_fn` (its own doc comment has the BLOCKING
+    // falsifier) — mirroring the EXACT precedent `GET
+    // /api/v1/dex/perf/app/devices` + MCP `list_dex_app_perf_devices` set for
+    // an identified per-device fan-out. The former bare `perm_fn` gate
+    // resolved via `RbacStore::check_permission` (GLOBAL roles only), so a
+    // management-group-confined-only operator was 403'd before the old
+    // `resolve_dex_visible` resolver ever ran (its confinement was dormant on
+    // every admitted call), and an elevated admin got the BASE identity's
+    // narrowed/empty set instead of the unfiltered read elevation earns.
+    // `require_fleet_read` closes both: elevated/engine/mcp_tier/service-
+    // scope branches are handled internally, and the composed `gate.scope`
+    // IS the confinement — never a second, independently-derived resolver.
+    // Following the precedent's OWN posture exactly (grep it): no
+    // `deny_fleet_wide_service_scoped` call here either — `require_fleet_read`
+    // already denies (or narrows) a service-scoped session on its own axis.
     sink.Get(R"(/api/v1/dex/signals/([^/]+))",
-             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api, resolve_dex_visible](
+             [audit_fn, fleet_read_fn, dex_api](
                  const httplib::Request& req, httplib::Response& res) {
-                 // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
-                 // closed on GET /guaranteed-state/events): the devices[] array
-                 // below names every agent_id exhibiting this signal, fleet-wide,
-                 // with no per-agent shape to scope a per-target check against.
-                 // require_permission's service-token branch checks only the
-                 // ITServiceOwner ROLE, never the token's own service-tag scope,
-                 // so perm_fn alone would let a token scoped to one service read
-                 // every agent's signal history for any obs_type. Denied here,
-                 // ahead of/independent from perm_fn.
-                 //
-                 // target_id left empty (not the raw obs_type route match): this
-                 // fires BEFORE the obs_type charset/length validation below, so
-                 // the raw match is not yet safe to embed in an audit detail
-                 // string (unvalidated control characters could forge audit-log
-                 // lines).
-                 if (deny_fleet_wide_service_scoped(
-                         req, res, "dex.signal.view", "ObsType",
-                         "fleet-wide DEX signal drill-down denied to a service-scoped token",
-                         "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
+                 if (!fleet_read_fn) {
+                     spdlog::error("dex.signal.view: fleet_read_fn unwired — misconfigured call "
+                                   "site; failing closed");
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
-                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                     return;
+                 }
+                 // require_fleet_read is the SOLE gate — see this route's own
+                 // header comment for why it must never be stacked with perm_fn.
+                 auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
+                 if (!gate.admitted)
+                     return; // the gate already wrote the A4 error body + status.
                  if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
@@ -14681,24 +14656,14 @@ void RestApiV1::register_routes(
                  // catalogue drilldown. by_os stays cross-OS (it IS the split).
                  const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
                  const std::string os_scope = dex_normalize_os_filter(os_raw);
-                 // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: resolve
-                 // the caller's visible-agent set BEFORE the success audit —
-                 // this derivation is the route's ONLY per-device authz
-                 // (perm_fn above is a bare global gate, inert against
-                 // management-group confinement), so an UNWIRED resolver must
-                 // REFUSE, audited, rather than silently serve fleet-wide (a
-                 // wired resolver answering nullopt — RBAC off / global read —
-                 // is the legitimate unfiltered case and is NOT this branch).
-                 const auto vis_result = resolve_dex_visible(req);
-                 if (!vis_result) {
-                     res.status = 500;
-                     res.set_content(
-                         detail::a4_error(res, "DEX visibility resolver not configured"),
-                         "application/json");
-                     audit_fn(req, "dex.signal.view", "failure", "ObsType", obs_type,
-                              "DEX visibility resolver unwired");
-                     return;
-                 }
+                 // The gate's composed VisibleSet IS the confinement (ADR-0017 +
+                 // ADR-0033 clause 2 — nullopt=unfiltered, engaged incl. empty =
+                 // filter to exactly these agents); require_fleet_read already
+                 // refused above if it were unwired, so there is no separate
+                 // "unwired resolver" branch left to check here.
+                 std::optional<std::set<std::string>> vis;
+                 if (gate.scope)
+                     vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                  // Behavioral-PII access audit: the devices[] list below names the
                  // agent_ids exhibiting this signal. Emit the same verb the
                  // dashboard per-signal view does so a SIEM filter catches both.
@@ -14729,10 +14694,6 @@ void RestApiV1::register_routes(
                  // ADR-0031 WS-A4: the four raw signal-detail reads, bundled by
                  // the DexApi seam (the impl derives since + normalizes os the
                  // same way; os_scope below still feeds the response "os" field).
-                 // `vis_result` is guaranteed engaged past the refuse-if-unwired
-                 // check above; its inner optional is nullopt for the
-                 // legitimate unfiltered case.
-                 const auto& vis = *vis_result;
                  const DexSignalDetailModel detail =
                      dex_api->signal_detail(obs_type, window, os_raw, limit, vis ? &*vis : nullptr);
                  JArr subjects;
@@ -15859,21 +15820,32 @@ void RestApiV1::register_routes(
 
     // GET /dex/app?name=&window= -- app blast-radius (crash/hang summary +
     // faulting modules + exceptions + affected devices). Fleet-wide
-    // identity-linked device list -> deny_fleet_wide_service_scoped +
-    // fail-closed success audit (dex.app.view), per the posture note above.
-    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
-                                 resolve_dex_visible](const httplib::Request& req,
-                                                      httplib::Response& res) {
+    // identity-linked device list.
+    //
+    // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto `fleet_read_fn`
+    // (`AuthRoutes::require_fleet_read`, ADR-0017) as the SOLE gate — see
+    // GET /api/v1/dex/signals/{obs_type}'s route comment above for the full
+    // rationale (same defect class, same precedent, same fix). No
+    // `deny_fleet_wide_service_scoped` call — `require_fleet_read` already
+    // handles the service-scoped axis internally, matching the precedent.
+    sink.Get("/api/v1/dex/app", [audit_fn, fleet_read_fn, dex_api](const httplib::Request& req,
+                                                                    httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
-        if (deny_fleet_wide_service_scoped(
-                req, res, "dex.app.view", "GuaranteedState",
-                "fleet-wide DEX app affected-devices list denied to a service-scoped token",
-                "service-scoped tokens may not read the fleet-wide DEX app affected-devices "
-                "list"))
+        if (!fleet_read_fn) {
+            spdlog::error("dex.app.view: fleet_read_fn unwired — misconfigured call site; "
+                          "failing closed; cid={}",
+                          cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
             return;
-        if (!perm_fn(req, res, "GuaranteedState", "Read"))
-            return;
+        }
+        // require_fleet_read is the SOLE gate — see this route's own header
+        // comment for why it must never be stacked with perm_fn.
+        auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
+        if (!gate.admitted)
+            return; // the gate already wrote the A4 error body + status.
         if (!dex_api) {
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
@@ -15895,24 +15867,12 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         }
-        // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
-        // confine the affected-devices list to the caller's management-group
-        // scope (ADR-0017 World A) — the service-scoped-token axis is already
-        // closed above by deny_fleet_wide_service_scoped; this closes the
-        // independent confined-OPERATOR axis the equivalent /fragments/dex/app
-        // fragment already applies via resolve_visible (dex_routes.cpp).
-        // Resolved BEFORE the success audit (ADR-0033 clause 2): this
-        // derivation is the route's ONLY per-device authz, so an UNWIRED
-        // resolver must refuse, audited, before any success row is emitted.
-        const auto vis_result = resolve_dex_visible(req);
-        if (!vis_result) {
-            res.status = 500;
-            res.set_content(detail::error_json_a4(500, "DEX visibility resolver not configured", cid),
-                            "application/json");
-            audit_fn(req, "dex.app.view", "failure", "GuaranteedState", "",
-                     "DEX visibility resolver unwired");
-            return;
-        }
+        // The gate's composed VisibleSet IS the confinement (ADR-0017 +
+        // ADR-0033 clause 2); require_fleet_read already refused above if it
+        // were unwired.
+        std::optional<std::set<std::string>> vis;
+        if (gate.scope)
+            vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
         if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.app.view", "success",
                                            "GuaranteedState", "",
                                            "REST DEX app affected-devices read cid=" + cid)) {
@@ -15926,7 +15886,6 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
             return;
         }
-        const auto& vis = *vis_result;
         const auto model = dex_api->app(name, window, vis ? &*vis : nullptr);
         res.set_content(ok_json(dex_app_json(model)), "application/json");
     });
@@ -15994,6 +15953,20 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const auto model = dex_api->catalogue(os, window);
+                 // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet
+                 // signal-summary read must never render as a healthy,
+                 // zero-event catalogue -- 503, same posture as GET
+                 // /api/v1/dex/devices/{id}'s #4855 degrade branch.
+                 if (model.degraded) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "DEX store read degraded", cid,
+                                               /*retry_after_ms=*/2000,
+                                               "the DEX signal-summary store could not be read; "
+                                               "retry shortly"),
+                         "application/json");
+                     return;
+                 }
                  res.set_content(ok_json(dex_catalogue_json(model)), "application/json");
              });
 
@@ -16098,23 +16071,32 @@ void RestApiV1::register_routes(
              });
 
     // GET /dex/overview?window= -- the /dex landing page's fleet summary.
-    // Fleet-wide identity-linked top-devices list -> deny_fleet_wide_service_scoped
-    // + fail-closed success audit (dex.overview.view), per the posture note above.
+    // Fleet-wide identity-linked top-devices list.
+    //
+    // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto `fleet_read_fn`
+    // (`AuthRoutes::require_fleet_read`, ADR-0017) as the SOLE gate — see
+    // GET /api/v1/dex/signals/{obs_type}'s route comment above for the full
+    // rationale. No `deny_fleet_wide_service_scoped` call — `require_fleet_read`
+    // already handles the service-scoped axis internally.
     sink.Get("/api/v1/dex/overview",
-             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
-              resolve_dex_visible](const httplib::Request& req,
-                                   httplib::Response& res) {
+             [audit_fn, fleet_read_fn, dex_api](const httplib::Request& req,
+                                                httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (deny_fleet_wide_service_scoped(
-                         req, res, "dex.overview.view", "GuaranteedState",
-                         "fleet-wide DEX overview top-devices list denied to a service-scoped "
-                         "token",
-                         "service-scoped tokens may not read the fleet-wide DEX overview "
-                         "top-devices list"))
+                 if (!fleet_read_fn) {
+                     spdlog::error("dex.overview.view: fleet_read_fn unwired — misconfigured "
+                                   "call site; failing closed; cid={}",
+                                   cid);
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
                      return;
-                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                     return;
+                 }
+                 // require_fleet_read is the SOLE gate — see this route's own
+                 // header comment for why it must never be stacked with perm_fn.
+                 auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
+                 if (!gate.admitted)
+                     return; // the gate already wrote the A4 error body + status.
                  if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
@@ -16130,22 +16112,12 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
-                 // decision 3: confine the top-devices list to the caller's
-                 // management-group scope (ADR-0017 World A) — same
-                 // independent second belt as GET /api/v1/dex/app above.
-                 // Resolved BEFORE the success audit (ADR-0033 clause 2), same
-                 // reasoning as the /dex/app route above.
-                 const auto vis_result = resolve_dex_visible(req);
-                 if (!vis_result) {
-                     res.status = 500;
-                     res.set_content(
-                         detail::error_json_a4(500, "DEX visibility resolver not configured", cid),
-                         "application/json");
-                     audit_fn(req, "dex.overview.view", "failure", "GuaranteedState", "",
-                              "DEX visibility resolver unwired");
-                     return;
-                 }
+                 // The gate's composed VisibleSet IS the confinement
+                 // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
+                 // refused above if it were unwired.
+                 std::optional<std::set<std::string>> vis;
+                 if (gate.scope)
+                     vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                  if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.overview.view",
                                                     "success", "GuaranteedState", "",
                                                     "REST DEX overview top-devices read cid=" +
@@ -16160,7 +16132,6 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const auto& vis = *vis_result;
                  const auto model = dex_api->overview(window, vis ? &*vis : nullptr);
                  res.set_content(ok_json(dex_overview_json(model)), "application/json");
              });

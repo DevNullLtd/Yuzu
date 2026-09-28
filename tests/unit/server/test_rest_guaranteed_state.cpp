@@ -286,32 +286,18 @@ struct RestGsHarness {
     // at request time, letting a test mutate it after construction.
     yuzu::server::DexFleet dex_fleet_override_;
 
-    // #4035 hardening (governance): the visible-agent-set resolver for GET
-    // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
-    // /api/v1/dex/signals/{obs_type} (ADR-0017 World A confinement — ind. of
-    // the service-scoped-token deny belt above). nullopt (default) =
-    // unfiltered, matching every EXISTING test in this file — this is the
-    // WIRED-and-answered-nullopt case (RBAC off / global read), which stays
-    // legitimate under ADR-0031 WS-A4 PR-1 decision 3/ADR-0033 clause 2. A
-    // test proving confinement sets this to a specific agent set before
-    // issuing the request. See `wire_dex_visible_fn_` below for the
-    // GENUINELY-unwired case (an empty `DexVisibleFn`), which now REFUSES
-    // (audited 500) instead — this field alone cannot model that.
-    std::optional<std::set<std::string>> dex_visible_override_;
-
-    // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: false → register
-    // GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
-    // /api/v1/dex/signals/{obs_type} with a genuinely EMPTY `DexVisibleFn`
-    // (mirrors `wire_exec_visible` above), exercising the "unwired resolver
-    // → audited 500" fail-closed path. Default true preserves every
-    // existing test's unfiltered/confined behaviour via
-    // `dex_visible_override_` above. UNLIKE `dex_visible_override_`, this is
-    // baked in at CONSTRUCTION time (register_routes runs in the
-    // constructor body) — set it via the constructor's trailing
-    // `wire_dex_visible_fn` argument, never by mutating this member after
-    // `RestGsHarness h;` default-constructs (too late; register_routes has
-    // already run with the default `true`).
-    bool wire_dex_visible_fn_{true};
+    // #4035 hardening (governance)'s bespoke DexVisibleFn resolver + its
+    // `dex_visible_override_`/`wire_dex_visible_fn_` test knobs are RETIRED
+    // (WS-A4 PR-1 fix round): GET /api/v1/dex/app, GET /api/v1/dex/overview,
+    // and GET /api/v1/dex/signals/{obs_type} now gate SOLELY on the REAL
+    // `fleet_read_fn` below (`AuthRoutes::require_fleet_read`) — the SAME
+    // production chokepoint the fleet /status route's `list_read_fn`
+    // already exercises. A test proving confinement/elevation/unwired now
+    // drives the REAL rbac_/mgmt_ bundles + `status_route_headers()` family
+    // exactly like the /status route's own [adr0017] tests, rather than a
+    // per-file stand-in resolver — see those tests for the pattern.
+    // `wire_fleet_read_fn_` below models the genuinely-unwired case.
+    bool wire_fleet_read_fn_{true};
 
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
@@ -374,14 +360,17 @@ struct RestGsHarness {
                            // with a live store, exercising every DEX REST route's own
                            // "!dex_api -> 503" guard (see wire_dex_api_'s doc comment).
                            bool wire_dex_api = true,
-                           // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: false ->
-                           // register the DEX confinement routes with a genuinely EMPTY
-                           // DexVisibleFn (see wire_dex_visible_fn_'s doc comment). Baked
+                           // WS-A4 PR-1 fix round: false -> register GET /api/v1/dex/app,
+                           // GET /api/v1/dex/overview, and GET
+                           // /api/v1/dex/signals/{obs_type} with a genuinely EMPTY
+                           // FleetReadFn (see wire_fleet_read_fn_'s doc comment). Baked
                            // in at construction like wire_exec_visible above (register_routes
                            // runs in THIS constructor body) — setting the member after
                            // construction is too late, so this MUST be a constructor arg.
-                           bool wire_dex_visible_fn = true)
-        : wire_dex_visible_fn_(wire_dex_visible_fn), wire_live_deps(live_deps),
+                           // Named distinctly from wire_list_read_fn above (a DIFFERENT
+                           // chokepoint, the fleet /status route's own gate).
+                           bool wire_fleet_read_fn = true)
+        : wire_fleet_read_fn_(wire_fleet_read_fn), wire_live_deps(live_deps),
           wire_exec_visible(with_exec_visible), wire_list_read_fn_(wire_list_read_fn),
           wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -509,6 +498,21 @@ struct RestGsHarness {
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {
             return auth_routes_->require_list_read(req, res, type, op);
+        };
+
+        // WS-A4 PR-1 fix round: GET /api/v1/dex/app, GET
+        // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}'s
+        // SOLE gate — a REAL AuthRoutes::require_fleet_read call (same
+        // auth_routes_ instance the fleet /status route's list_read_fn
+        // already uses), mirroring ServerImpl::require_fleet_read's own
+        // std::expected -> FleetReadGate translation exactly (server.cpp).
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            auto result = auth_routes_->require_fleet_read(req, res, type, op);
+            if (!result)
+                return {}; // admitted=false, res already written
+            return {true, result->visible_for_query()};
         };
 
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>. Returns
@@ -651,7 +655,13 @@ struct RestGsHarness {
                                 : RestApiV1::ExecVisibleFn{},
                             wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
                                                : RestApiV1::ListReadFn{},
-                            /*fleet_read_fn=*/{},
+                            // WS-A4 PR-1 fix round: the SOLE gate on GET
+                            // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+                            // /api/v1/dex/signals/{obs_type} (see fleet_read_fn's
+                            // own comment above). wire_fleet_read_fn_=false
+                            // models the genuinely-unwired resolver.
+                            wire_fleet_read_fn_ ? RestApiV1::FleetReadFn{fleet_read_fn}
+                                                : RestApiV1::FleetReadFn{},
                             // #4033: this harness doesn't exercise GET
                             // /api/v1/devices or the agent-count preview —
                             // unwired defaults (fail-closed / legacy-open
@@ -661,22 +671,6 @@ struct RestGsHarness {
                             // register_routes param is retired — the DEX handlers
                             // get the fleet via the DexApi seam (dex_api_local
                             // above, wired with dex_fleet_override_).
-                            // #4035 hardening (governance): reads
-                            // dex_visible_override_ LIVE at request time
-                            // (ignores `username` — this stub doesn't model
-                            // per-username resolution, only whether the
-                            // caller's set is engaged).
-                            // wire_dex_visible_fn_=false models the
-                            // genuinely-unwired resolver (ADR-0031 WS-A4
-                            // PR-1 decision 3) — an empty `DexVisibleFn`,
-                            // never a synonym for dex_visible_override_'s
-                            // nullopt (which is the wired-and-unfiltered
-                            // case).
-                            wire_dex_visible_fn_
-                                ? RestApiV1::DexVisibleFn{[this](const std::string&) {
-                                      return dex_visible_override_;
-                                  }}
-                                : RestApiV1::DexVisibleFn{},
                             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing
                             // GET /api/v1/dex/perf/compare (see verify_api_'s doc
                             // comment above).
@@ -689,14 +683,16 @@ struct RestGsHarness {
                             guardian_api_local);
     }
 
-    // The fleet /status route's real AuthRoutes::require_list_read gate needs
-    // an actual authenticated request — unlike every other route in this
-    // harness, still gated by the stub auth_fn/perm_fn above (the
-    // session_user stub field does NOT reach this route). Mints a cookie
-    // session for the CURRENT session_user/session_role and returns headers
-    // carrying it; a test that reassigns session_user before calling this
-    // (the DenyAll/AdmitAll/AdmitScoped [adr0017] cases) gets a session for
-    // the new principal.
+    // The fleet /status route's real AuthRoutes::require_list_read gate (and,
+    // since the WS-A4 PR-1 fix round, GET /api/v1/dex/app, GET
+    // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}'s real
+    // AuthRoutes::require_fleet_read gate) needs an actual authenticated
+    // request — unlike every other route in this harness, still gated by the
+    // stub auth_fn/perm_fn above (the session_user stub field does NOT reach
+    // either gate). Mints a cookie session for the CURRENT
+    // session_user/session_role and returns headers carrying it; a test that
+    // reassigns session_user before calling this (the DenyAll/AdmitAll/
+    // AdmitScoped [adr0017] cases) gets a session for the new principal.
     std::unordered_map<std::string, std::string> status_route_headers() {
         REQUIRE(!session_user.empty());
         REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
@@ -1287,52 +1283,74 @@ TEST_CASE("REST gs.events: a service-scoped token MAY still read its own agent v
 // /network/devices all served fleet-wide identity-linked per-agent rows under
 // a bare global gate, confining nothing for a service-scoped token. ──────────
 
-TEST_CASE("REST dex/signals/{obs_type}: service-scoped token → 403, denial audited",
+// WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto the REAL
+// AuthRoutes::require_fleet_read gate — this route now resolves its OWN
+// session from headers via fleet_read_fn, so a stub session has no way to
+// carry a service scope onto it (same posture as GET
+// /api/v1/guaranteed-state/status's own service-scoped-token denial test;
+// see status_route_headers()'s doc comment for the KNOWN, documented gap
+// this shares with that route: require_fleet_read's OWN denial audit is a
+// separate AuthRoutes::audit_log call this harness's audit_log vector
+// cannot see).
+TEST_CASE("REST dex/signals/{obs_type}: service-scoped token → 403, no data",
           "[pg][rest][dex][signals][rbac]") {
     RestGsHarness h;
-    h.session_token_scope_service = "printers";
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed",
+                          h.service_scoped_token_headers("printers"));
     REQUIRE(res);
     CHECK(res->status == 403);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.signal.view");
-    CHECK(h.audit_log[0].result == "denied");
-    CHECK(h.audit_log[0].target_id.empty()); // unvalidated obs_type never embedded
+    CHECK(res->body.find("devices") == std::string::npos);
 }
 
 TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route",
           "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
 }
 
-// ADR-0031 WS-A4 PR-1 decision 3: GET /api/v1/dex/signals/{obs_type}'s
-// devices[] list previously ALWAYS passed visible=nullptr to the DexApi
-// seam regardless of the caller's management-group scope, unlike its own
-// /fragments/dex/catalogue/signal dashboard fragment (which post-filters by
-// the caller's visible set). Same defect class + same fix as GET
-// /api/v1/dex/app / GET /api/v1/dex/overview above.
+// ADR-0031 WS-A4 PR-1 decision 3, migrated (WS-A4 PR-1 fix round,
+// sec-1/sec-2) onto the REAL AuthRoutes::require_fleet_read gate: devices[]
+// confinement is now the gate's own composed VisibleSet (ADR-0017's
+// authorize_list_read chokepoint), never a bespoke per-file resolver whose
+// admission the bare perm_fn gate it sat behind could make dormant.
+// Exercised the SAME way the fleet /status route's own [adr0017] tests
+// exercise authorize_list_read: real rbac_/mgmt_ bundles, real sessions via
+// status_route_headers().
 TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "(ADR-0017, real RBAC/ManagementGroup composition)",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h;
     h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    // Wired resolver returning nullopt (default = RBAC off / global read):
-    // legitimate unfiltered case, both devices visible.
-    auto unconfined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    // RBAC off (default, legacy-open) -> unfiltered, both devices visible.
+    auto unconfined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                                 h.status_route_headers());
     REQUIRE(unconfined);
     CHECK(unconfined->status == 200);
     auto uj = nlohmann::json::parse(unconfined->body);
     REQUIRE(uj["data"]["devices"].is_array());
     CHECK(uj["data"]["devices"].size() == 2);
 
-    // Confined to exactly {WS-1}: WS-2 must never appear anywhere in the body.
-    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
-    auto confined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    // A management-group-scoped grant confines to exactly {WS-1}: WS-2 must
+    // never appear anywhere in the body. carol has NO global grant of any
+    // kind, so the old (broken) perm_fn-stacked resolver would have denied
+    // her 403 before its own confinement ever ran.
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+    auto confined = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                               h.status_route_headers());
     REQUIRE(confined);
     CHECK(confined->status == 200);
     auto cj = nlohmann::json::parse(confined->body);
@@ -1341,10 +1359,18 @@ TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visib
     CHECK(cj["data"]["devices"][0]["agent_id"] == "WS-1");
     CHECK(confined->body.find("WS-2") == std::string::npos);
 
-    // Present-EMPTY visible set -> deny-all rows, never a substitute for
-    // unconfined; the response still succeeds (200), just with no devices.
-    h.dex_visible_override_ = std::set<std::string>{};
-    auto empty_scope = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    // A management group with zero members -> present-EMPTY visible set
+    // (INV-2), deny-all rows, never a substitute for unconfined; the
+    // response still succeeds (200), just with no devices.
+    ManagementGroup g2;
+    g2.name = "EmptyRegion";
+    g2.membership_type = "static";
+    auto gid2 = h.mgmt_.create_group(g2);
+    REQUIRE(gid2.has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid2, "user", "dave", "GsReader"}).has_value());
+    h.session_user = "dave";
+    auto empty_scope = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                                  h.status_route_headers());
     REQUIRE(empty_scope);
     CHECK(empty_scope->status == 200);
     auto ej = nlohmann::json::parse(empty_scope->body);
@@ -1354,7 +1380,7 @@ TEST_CASE("REST dex/signals/{obs_type}: devices[] confined to the caller's visib
 
     // Exactly one dex.signal.view SUCCESS audit row for each of the three
     // successful calls above -- the visibility filter narrows devices[],
-    // never the audit count.
+    // never the (route's own, harness-visible) success-audit count.
     int success_count = 0;
     for (const auto& a : h.audit_log)
         if (a.action == "dex.signal.view" && a.result == "success")
@@ -1375,8 +1401,20 @@ TEST_CASE("REST dex/signals/{obs_type}: visible filters POST-limit, not pre-limi
     h.seed_obs("p2", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:05:00Z");
     h.seed_obs("p3", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    h.dex_visible_override_ = std::set<std::string>{"WS-2"};
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&limit=1");
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionB";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-2").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "erin", "GsReader"}).has_value());
+    h.session_user = "erin";
+
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&limit=1",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1385,56 +1423,50 @@ TEST_CASE("REST dex/signals/{obs_type}: visible filters POST-limit, not pre-limi
     CHECK(j["data"]["devices"].empty());
 }
 
-// ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause (2): a genuinely UNWIRED
-// resolver (empty DexVisibleFn) is the route's OWN misconfiguration, distinct
-// from a WIRED resolver answering nullopt -- it must REFUSE (audited 500),
-// never silently serve fleet-wide. Applies identically to GET
-// /api/v1/dex/app and GET /api/v1/dex/overview (next two cases).
-TEST_CASE("REST dex/signals/{obs_type}: unwired visibility resolver refuses, audited failure",
+// WS-A4 PR-1 fix round: a genuinely UNWIRED fleet_read_fn is the route's OWN
+// misconfiguration and must fail closed (503), never fall back to an
+// unfiltered/fleet-wide read. Applies identically to GET /api/v1/dex/app and
+// GET /api/v1/dex/overview (next two cases). No headers, no audit row:
+// mirrors the precedent (GET /api/v1/dex/perf/app/devices, see
+// test_rest_dex_app_perf_devices.cpp) exactly -- the route checks
+// `!fleet_read_fn` BEFORE ever resolving a session, so it never reaches the
+// route's own audit_fn either.
+TEST_CASE("REST dex/signals/{obs_type}: unwired fleet_read_fn fails closed (503)",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
                     /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
                     /*wire_list_read_fn=*/true, /*guardian_api_override=*/nullptr,
-                    /*wire_dex_api=*/true, /*wire_dex_visible_fn=*/false);
+                    /*wire_dex_api=*/true, /*wire_fleet_read_fn=*/false);
     h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
     REQUIRE(res);
-    CHECK(res->status == 500);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.signal.view");
-    CHECK(h.audit_log[0].result == "failure");
-    // No success row -- the route refused before ever reaching the read.
-    for (const auto& a : h.audit_log)
-        CHECK_FALSE(a.result == "success");
+    CHECK(res->status == 503);
+    CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST dex/app: unwired visibility resolver refuses, audited failure",
+TEST_CASE("REST dex/app: unwired fleet_read_fn fails closed (503)",
           "[pg][rest][dex][app][scope]") {
     RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
                     /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
                     /*wire_list_read_fn=*/true, /*guardian_api_override=*/nullptr,
-                    /*wire_dex_api=*/true, /*wire_dex_visible_fn=*/false);
+                    /*wire_dex_api=*/true, /*wire_fleet_read_fn=*/false);
     h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
     REQUIRE(res);
-    CHECK(res->status == 500);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.app.view");
-    CHECK(h.audit_log[0].result == "failure");
+    CHECK(res->status == 503);
+    CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST dex/overview: unwired visibility resolver refuses, audited failure",
+TEST_CASE("REST dex/overview: unwired fleet_read_fn fails closed (503)",
           "[pg][rest][dex][overview][scope]") {
     RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
                     /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
                     /*wire_list_read_fn=*/true, /*guardian_api_override=*/nullptr,
-                    /*wire_dex_api=*/true, /*wire_dex_visible_fn=*/false);
+                    /*wire_dex_api=*/true, /*wire_fleet_read_fn=*/false);
     auto res = h.sink.Get("/api/v1/dex/overview?window=all");
     REQUIRE(res);
-    CHECK(res->status == 500);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.overview.view");
-    CHECK(h.audit_log[0].result == "failure");
+    CHECK(res->status == 503);
+    CHECK(h.audit_log.empty());
 }
 
 TEST_CASE("REST dex/perf/devices: service-scoped token → 403, denial audited",
@@ -2478,7 +2510,8 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     h.seed_obs("a1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("a2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    auto res =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -2494,46 +2527,57 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(audited);
 
     // missing required name -> 400
-    auto missing = h.sink.Get("/api/v1/dex/app?window=all");
+    auto missing = h.sink.Get("/api/v1/dex/app?window=all", h.status_route_headers());
     REQUIRE(missing);
     CHECK(missing->status == 400);
 
-    // service-scoped token -> 403, denied audit only
+    // WS-A4 PR-1 fix round: service-scoped token -> 403, via the REAL
+    // require_fleet_read gate (see GET /api/v1/dex/signals/{obs_type}'s
+    // equivalent test above for the KNOWN audit-visibility gap this shares).
     RestGsHarness h2;
-    h2.session_token_scope_service = "printers";
-    auto denied = h2.sink.Get("/api/v1/dex/app?name=chrome.exe");
+    auto denied = h2.sink.Get("/api/v1/dex/app?name=chrome.exe",
+                              h2.service_scoped_token_headers("printers"));
     REQUIRE(denied);
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap — GET /api/v1/dex/app's devices[] list previously ALWAYS
-// passed visible=nullptr to the shared builder regardless of the caller's
-// management-group scope, unlike its own /fragments/dex/app dashboard
-// fragment (which confines via resolve_visible). A management-group-confined
-// operator could read affected agent_ids fleet-wide through this route even
-// though the equivalent dashboard fragment would have hidden them.
+// #4035 hardening (governance)'s closure evidence for the ADR-0017 World A
+// confinement gap, migrated (WS-A4 PR-1 fix round, sec-1/sec-2) onto the REAL
+// AuthRoutes::require_fleet_read gate — see GET
+// /api/v1/dex/signals/{obs_type}'s equivalent test above for the full
+// rationale (same defect class, same fix, same real-RBAC pattern).
 TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "(ADR-0017, real RBAC/ManagementGroup composition)",
           "[pg][rest][dex][app][scope]") {
     RestGsHarness h;
     h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    // Unconfined (default, matches production RBAC-off / global-read): both
-    // devices are visible.
-    auto unconfined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    // RBAC off (default, legacy-open): both devices are visible.
+    auto unconfined =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(unconfined);
     CHECK(unconfined->status == 200);
     auto uj = nlohmann::json::parse(unconfined->body);
     CHECK(uj["data"]["devices"].size() == 2);
 
-    // Confined to WS-1 only (simulating a management-group-scoped operator):
-    // WS-2 must NEVER appear, even though the aggregate crash COUNT still
-    // reflects the whole fleet (the SCOPING NOTE's tracked, separate,
+    // A management-group-scoped grant confines to WS-1 only: WS-2 must
+    // NEVER appear, even though the aggregate crash COUNT still reflects
+    // the whole fleet (the SCOPING NOTE's tracked, separate,
     // aggregate-numerator follow-up — not this fix's scope).
-    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
-    auto confined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+    auto confined =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(confined);
     CHECK(confined->status == 200);
     auto cj = nlohmann::json::parse(confined->body);
@@ -2543,12 +2587,19 @@ TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
     for (const auto& d : cj["data"]["devices"])
         CHECK(d["agent_id"].get<std::string>() != "WS-2");
 
-    // Confined to a DISJOINT set (simulating an operator with no visibility
-    // into either device): devices[] is empty, never a 403/404 — matching
-    // the fragment's own admit-then-filter posture (ADR-0017 INV-2: engaged-
-    // empty is a legitimate, distinct outcome from "unfiltered").
-    h.dex_visible_override_ = std::set<std::string>{};
-    auto empty_scope = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    // A management group with zero members -> present-EMPTY visible set:
+    // devices[] is empty, never a 403/404 — matching the fragment's own
+    // admit-then-filter posture (ADR-0017 INV-2: engaged-empty is a
+    // legitimate, distinct outcome from "unfiltered").
+    ManagementGroup g2;
+    g2.name = "EmptyRegion";
+    g2.membership_type = "static";
+    auto gid2 = h.mgmt_.create_group(g2);
+    REQUIRE(gid2.has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid2, "user", "dave", "GsReader"}).has_value());
+    h.session_user = "dave";
+    auto empty_scope =
+        h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all", h.status_route_headers());
     REQUIRE(empty_scope);
     CHECK(empty_scope->status == 200);
     auto ej = nlohmann::json::parse(empty_scope->body);
@@ -2663,6 +2714,26 @@ TEST_CASE("REST dex/catalogue: permission denied -> 403 before any audit",
     CHECK(h.audit_log.empty());
 }
 
+// Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary read
+// must never render as a healthy, zero-event catalogue (health 100) -- 503,
+// mirroring GET /api/v1/dex/devices/{id}'s #4855 degrade posture. DROP TABLE
+// forces the fleet-wide read to degrade while the store itself stays open.
+TEST_CASE("REST dex/catalogue: degraded fleet signal-summary read -> 503, never a "
+          "healthy zero-event catalogue",
+          "[pg][rest][dex][catalogue][degraded]") {
+    RestGsHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.sink.Get("/api/v1/dex/catalogue");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
 TEST_CASE("REST dex/health: composite score suppressed with no reporting agents, no audit",
           "[pg][rest][dex][health]") {
     RestGsHarness h;
@@ -2703,7 +2774,7 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     h.seed_obs("f1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("f2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/overview?window=all");
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -2719,32 +2790,45 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
             audited = true;
     CHECK(audited);
 
+    // WS-A4 PR-1 fix round: service-scoped token -> 403, via the REAL
+    // require_fleet_read gate.
     RestGsHarness h2;
-    h2.session_token_scope_service = "printers";
-    auto denied = h2.sink.Get("/api/v1/dex/overview");
+    auto denied = h2.sink.Get("/api/v1/dex/overview", h2.service_scoped_token_headers("printers"));
     REQUIRE(denied);
     CHECK(denied->status == 403);
 }
 
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap on GET /api/v1/dex/overview's top_devices[] — same defect
-// class and same fix as GET /api/v1/dex/app above.
+// #4035 hardening (governance)'s closure evidence for the ADR-0017 World A
+// confinement gap on GET /api/v1/dex/overview's top_devices[], migrated
+// (WS-A4 PR-1 fix round, sec-1/sec-2) onto the REAL
+// AuthRoutes::require_fleet_read gate — same defect class and same fix as
+// GET /api/v1/dex/app above.
 TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "(ADR-0017, real RBAC/ManagementGroup composition)",
           "[pg][rest][dex][overview][scope]") {
     RestGsHarness h;
     h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("t2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all");
+    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
     REQUIRE(unconfined);
     CHECK(unconfined->status == 200);
     auto uj = nlohmann::json::parse(unconfined->body);
     REQUIRE(uj["data"]["top_devices"].is_array());
     CHECK(uj["data"]["top_devices"].size() == 2);
 
-    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
-    auto confined = h.sink.Get("/api/v1/dex/overview?window=all");
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+    auto confined = h.sink.Get("/api/v1/dex/overview?window=all", h.status_route_headers());
     REQUIRE(confined);
     CHECK(confined->status == 200);
     auto cj = nlohmann::json::parse(confined->body);
@@ -3846,7 +3930,8 @@ TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, S
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
@@ -3864,7 +3949,8 @@ TEST_CASE("REST dex/signals/{obs_type}: throwing audit → 503, A4, Sec-Audit-Fa
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_throws = true; // caught by the shared helper, must still fail closed
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
@@ -3898,7 +3984,8 @@ TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + ret
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -3928,7 +4015,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     h.seed_obs("m1", "MAC-1", "process.crashed", "Safari", "macos", "2026-06-10T12:00:00Z");
 
     // Windows lens: subjects/devices/by_day all Windows-only, never MAC-1/Safari.
-    auto win = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=windows");
+    auto win = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=windows",
+                          h.status_route_headers());
     REQUIRE(win);
     CHECK(win->status == 200);
     auto jw = nlohmann::json::parse(win->body);
@@ -3945,7 +4033,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     CHECK(jw["data"]["by_os"].size() == 2);      // by_os stays cross-OS even under a filter
 
     // macOS lens: subjects/devices/by_day all macOS-only.
-    auto mac = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=macos");
+    auto mac = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=macos",
+                          h.status_route_headers());
     REQUIRE(mac);
     auto jm = nlohmann::json::parse(mac->body);
     CHECK(jm["data"]["os"].get<std::string>() == "macos");
@@ -3957,7 +4046,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
     CHECK(jm["data"]["by_day"][0]["count"].get<int64_t>() == 1);
 
     // No os param = all-OS (backward compatible).
-    auto all = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto all = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(all);
     auto ja = nlohmann::json::parse(all->body);
     CHECK(ja["data"]["os"].get<std::string>() == "all");
@@ -3967,7 +4057,8 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
 TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",
           "[pg][rest][dex][signals]") {
     RestGsHarness h; // empty store
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -3981,7 +4072,10 @@ TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty ar
 
 TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all");
+    // require_fleet_read runs BEFORE the obs_type charset/length validation
+    // (WS-A4 PR-1 fix round) — a real session is needed to reach that 400
+    // at all now, exactly like the fleet /status route's own gate.
+    auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
     // Validation precedes audit — a rejected malformed request leaves no trace
@@ -3991,21 +4085,28 @@ TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[pg]
 
 TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][signals]") {
     RestGsHarness h;
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3");
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
+// WS-A4 PR-1 fix round: `grant_perms`/perm_fn no longer gates this route at
+// all (require_fleet_read is the SOLE gate) — this test now proves the REAL
+// RBAC deny (no GuaranteedState:Read grant anywhere) still runs before any
+// audit, mirroring GET /api/v1/guaranteed-state/status's own DenyAll test.
+TEST_CASE("REST dex: no GuaranteedState:Read grant anywhere denies with 403, before any audit",
           "[pg][rest][dex][rbac]") {
     RestGsHarness h;
-    h.grant_perms = false; // perm_fn denies → 403
-    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    h.rbac_.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
+    h.session_user = "nobody";
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all",
+                          h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 403);
-    // No audit emission on a denied request — the permission check is the first
-    // statement in the handler, before the dex.signal.view audit.
+    // No audit emission on a denied request — require_fleet_read's own
+    // denial precedes the route's dex.signal.view audit (which never runs).
     CHECK(h.audit_log.empty());
 }
 

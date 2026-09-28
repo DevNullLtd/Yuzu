@@ -14621,37 +14621,21 @@ private:
             if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
             return std::set<std::string>(v->begin(), v->end());
         };
-        // #4035 review fix (colleague review, BLOCKING): get_dex_app's/
-        // get_dex_overview's REST v1 + MCP twins previously reused the
-        // pre-existing `visible_set_fn` below (Infrastructure:Read global
-        // bypass + ManagementGroupStore::get_visible_agents, which is
-        // PERMISSION-AGNOSTIC — see that lambda's own doc comment) as their
-        // ADR-0017 confinement belt. That resolver returns every agent
-        // visible via ANY management-group role the caller holds, not just
-        // GuaranteedState:Read — so a caller with GuaranteedState:Read on
-        // one group and any unrelated role on a second group would see the
-        // second group's device ids/crash data leak into these two DEX
-        // reads. Deliberately a NEW resolver rather than fixing
-        // `visible_set_fn` in place: that lambda is also shared by the
-        // pre-existing `/fragments/dex/app`+`/fragments/dex/overview`
-        // dashboard fragments and an unrelated inventory-devices resolver,
-        // so changing it has a wider blast radius than this fix should
-        // take on — same shape as `response_visible_set_fn` above (D3),
-        // just scoped to GuaranteedState:Read instead of Response:Read.
-        auto dex_visible_fn = [this](const std::string& username)
-            -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "GuaranteedState", "Read");
-            if (global_read) return std::nullopt;
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "GuaranteedState", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
-        };
+        // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
+        // bypass + `RbacStore::visible_agents_for_permission` join) is
+        // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): GET /api/v1/dex/app,
+        // GET /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
+        // (REST + MCP) now gate SOLELY on `fleet_read_fn` below
+        // (`AuthRoutes::require_fleet_read`, ADR-0017) and derive their
+        // confinement from its own composed `VisibleSet` — this resolver's
+        // bare `check_permission` global-read bypass meant a management-
+        // group-confined-only operator was 403'd by the old `perm_fn` gate
+        // in front of it before this resolver ever ran, so its confinement
+        // was dormant on every admitted call; `require_fleet_read` composes
+        // the SAME `RbacStore::authorize_list_read` chokepoint correctly,
+        // with elevated/engine/mcp_tier/service-scope branches handled
+        // internally. See RestApiV1::DexVisibleFn's retirement comment
+        // (rest_api_v1.hpp) for the full rationale.
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -19033,15 +19017,11 @@ private:
             // DexApi seam's own FleetFn (wired into make_local_dex_api below),
             // not through a register_routes param. The `dex_fleet_fn` local is
             // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
-            // #4035 review fix (colleague review, BLOCKING): a DEDICATED
-            // GuaranteedState:Read-scoped resolver (defined above, see its
-            // own doc comment) — NOT the SAME visible_set_fn
-            // DexRoutes::register_routes above uses, despite this comment's
-            // own earlier (incorrect) claim that they should be identical.
-            // visible_set_fn's permission-agnostic join would leak a
-            // multi-role operator's OTHER groups' device ids into GET
-            // /api/v1/dex/app / GET /api/v1/dex/overview.
-            dex_visible_fn,
+            // The former `dex_visible_fn` register_routes arg is RETIRED
+            // (WS-A4 PR-1 fix round) — GET /api/v1/dex/app, GET
+            // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
+            // now confine solely via `fleet_read_fn` above (see this file's
+            // "#4035 review fix's bespoke `dex_visible_fn` resolver" comment).
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
@@ -19312,13 +19292,10 @@ private:
             // matching the pre-seam per-route !guaranteed_state_store/
             // !baseline_store guards exactly.
             mcp_server_->set_guardian_api(guardian_api);
-            // #4035 review fix (colleague review, BLOCKING): the SAME
-            // dedicated GuaranteedState:Read-scoped resolver wired into the
-            // REST registration's trailing dex_visible_fn param above (see
-            // that variable's doc comment) — NOT visible_set_fn, whose
-            // permission-agnostic join does not actually confine to this
-            // securable's grants.
-            mcp_server_->set_dex_visible_fn(dex_visible_fn);
+            // The former `mcp_server_->set_dex_visible_fn(dex_visible_fn)`
+            // wiring is RETIRED (WS-A4 PR-1 fix round) — `fleet_read_fn_`
+            // (wired via set_fleet_read_fn above) is now the SOLE gate for
+            // get_dex_app/get_dex_overview/get_dex_signal_detail too.
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

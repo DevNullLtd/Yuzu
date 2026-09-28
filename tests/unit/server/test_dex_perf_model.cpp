@@ -742,7 +742,7 @@ struct RestPerfHarness {
                             /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
                             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, /*fleet_read_fn=*/{},
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
-                            /*dex_visible_fn=*/{}, /*verify_api=*/nullptr,
+                            /*verify_api=*/nullptr,
                             /*device_api=*/nullptr, /*dex_api=*/nullptr, dex_perf_api_local);
     }
 };

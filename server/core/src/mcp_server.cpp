@@ -14596,27 +14596,33 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_dex_signal_detail") {
-                if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto
+                // `fleet_read_fn_` (`AuthRoutes::require_fleet_read`,
+                // ADR-0017) as the SOLE gate — never stacked with
+                // `tier_allows`/`perm_fn` (the BLOCKING defect
+                // `require_fleet_read`'s own doc comment warns against;
+                // `require_fleet_read` already covers `mcp_tier` internally,
+                // same precedent as `list_dex_app_perf_devices`). The former
+                // bare `perm_fn` gate resolved via `RbacStore::check_permission`
+                // (GLOBAL roles only), so a management-group-confined-only
+                // operator was 403'd before the old `dex_visible_fn_`
+                // resolver ever ran; an elevated admin got the BASE
+                // identity's narrowed/empty set instead of the unfiltered
+                // read elevation earns. No `deny_fleet_wide_service_scoped`
+                // call either — `require_fleet_read` already handles the
+                // service-scoped axis internally, matching the precedent.
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_dex_signal_detail: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                // Fleet-wide identity-linked disclosure, same gap as the REST
-                // sibling GET /api/v1/dex/signals/{obs_type} (SEC-3 class):
-                // devices[] below names every agent_id exhibiting this
-                // signal, no per-agent parameter to scope a per-target check
-                // against. target_id left empty: this fires before the
-                // obs_type charset/length validation below, so the raw
-                // param is not yet safe to embed in an audit detail string.
-                if (deny_fleet_wide_service_scoped(
-                        "dex.signal.view", "ObsType",
-                        "fleet-wide DEX signal drill-down denied to a service-scoped token "
-                        "(MCP get_dex_signal_detail)",
-                        "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
-                    return;
-                if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                    return;
+                // require_fleet_read is the SOLE gate — see this block's own
+                // comment for why it must never be stacked with tier_allows/perm_fn.
+                auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return; // the gate already wrote its own JSON-RPC error body
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -14644,26 +14650,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
                 // every OS). by_os stays cross-OS — it IS the split.
                 const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
-                // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: resolve
-                // the caller's visible-agent set BEFORE the success audit —
-                // this derivation is the tool's ONLY per-device authz
-                // (perm_fn above is a bare global gate), so an UNSET
-                // `dex_visible_fn_` must REFUSE, audited, rather than
-                // silently serve fleet-wide (a SET resolver answering
-                // nullopt — RBAC off / global read — is the legitimate
-                // unfiltered case and is NOT this branch; see DexVisibleFn's
-                // doc comment, mcp_server.hpp).
-                if (!dex_visible_fn_) {
-                    (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, "dex.signal.view", "failure", "ObsType", obs_type,
-                        "DEX visibility resolver unwired (MCP get_dex_signal_detail)");
-                    res.set_content(
-                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
-                        "application/json");
-                    return;
-                }
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_(session->username);
+                // The gate's composed VisibleSet IS the confinement
+                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
+                // refused above if it were unwired.
+                std::optional<std::set<std::string>> vis;
+                if (gate.scope)
+                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                 // Behavioral-PII access audit — the devices[] list below names the
                 // agent_ids exhibiting this signal. Same verb/target as the REST
                 // and dashboard per-signal views (cross-surface SIEM parity).
@@ -14880,29 +14872,29 @@ McpServer::HandlerFn McpServer::build_handler(
             // equivalent GET route for the per-capability rationale.
 
             if (tool_name == "get_dex_app") {
-                if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
-                    return;
-                }
                 const auto name = param_str(args, "name");
                 if (name.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "name is required"),
                                     "application/json");
                     return;
                 }
-                // Fleet-wide identity-linked disclosure -- affected-devices
-                // list, same class as get_dex_signal_detail above.
-                if (deny_fleet_wide_service_scoped(
-                        "dex.app.view", "GuaranteedState",
-                        "fleet-wide DEX app affected-devices list denied to a service-scoped "
-                        "token (MCP get_dex_app)",
-                        "service-scoped tokens may not read the fleet-wide DEX app "
-                        "affected-devices list"))
+                // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto
+                // `fleet_read_fn_` (`AuthRoutes::require_fleet_read`,
+                // ADR-0017) as the SOLE gate — see get_dex_signal_detail's
+                // block comment above for the full rationale (same defect
+                // class, same precedent, same fix). No
+                // `deny_fleet_wide_service_scoped` call — `require_fleet_read`
+                // already handles the service-scoped axis internally.
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_dex_app: fleet_read_fn_ unwired — misconfigured call "
+                                  "site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
-                if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return; // the gate already wrote its own JSON-RPC error body
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -14917,26 +14909,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
-                // decision 3 / ADR-0033 clause 2: confine the affected-devices
-                // list to the caller's management-group scope (ADR-0017 World
-                // A) -- deny_fleet_wide_service_scoped above closes the
-                // service-scoped-token axis only; this is the independent
-                // confined-OPERATOR axis the REST twin now also applies (see
-                // rest_api_v1.cpp's GET /dex/app handler). This derivation is
-                // the tool's ONLY per-device authz, so an UNSET
-                // `dex_visible_fn_` must REFUSE, audited, before any success
-                // row is emitted -- never substitute nullopt/unfiltered.
-                if (!dex_visible_fn_) {
-                    (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, "dex.app.view", "failure", "GuaranteedState", "",
-                        "DEX visibility resolver unwired (MCP get_dex_app)");
-                    res.set_content(
-                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
-                        "application/json");
-                    return;
-                }
-                const std::optional<std::set<std::string>> vis = dex_visible_fn_(session->username);
+                // The gate's composed VisibleSet IS the confinement
+                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
+                // refused above if it were unwired.
+                std::optional<std::set<std::string>> vis;
+                if (gate.scope)
+                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                 const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/app).
@@ -15014,6 +14992,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto model = dex_api_->catalogue(os, window);
+                // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet
+                // signal-summary read must never render as a healthy,
+                // zero-event catalogue -- an error, matching the REST
+                // twin's 503 and get_dex_device_score's degrade branch.
+                if (model.degraded) {
+                    mcp_audit("failure", "DEX signal-summary store read degraded");
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_catalogue_json(model), kObjectOutputSchema)),
@@ -15239,23 +15229,22 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_dex_overview") {
-                if (!tier_allows(tier, "GuaranteedState", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                // WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto
+                // `fleet_read_fn_` (`AuthRoutes::require_fleet_read`,
+                // ADR-0017) as the SOLE gate — see get_dex_signal_detail's
+                // block comment above for the full rationale. No
+                // `deny_fleet_wide_service_scoped` call — `require_fleet_read`
+                // already handles the service-scoped axis internally.
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_dex_overview: fleet_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                // Fleet-wide identity-linked disclosure -- top-devices list,
-                // same class as get_dex_app above.
-                if (deny_fleet_wide_service_scoped(
-                        "dex.overview.view", "GuaranteedState",
-                        "fleet-wide DEX overview top-devices list denied to a service-scoped "
-                        "token (MCP get_dex_overview)",
-                        "service-scoped tokens may not read the fleet-wide DEX overview "
-                        "top-devices list"))
-                    return;
-                if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return; // the gate already wrote its own JSON-RPC error body
                 if (!dex_api_) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
@@ -15270,22 +15259,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
-                // decision 3 / ADR-0033 clause 2: confine the top-devices list
-                // to the caller's management-group scope (ADR-0017 World A) --
-                // same independent second belt as get_dex_app above, same
-                // refuse-if-unwired posture (this derivation is the tool's
-                // ONLY per-device authz).
-                if (!dex_visible_fn_) {
-                    (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, req, "dex.overview.view", "failure", "GuaranteedState", "",
-                        "DEX visibility resolver unwired (MCP get_dex_overview)");
-                    res.set_content(
-                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
-                        "application/json");
-                    return;
-                }
-                const std::optional<std::set<std::string>> vis = dex_visible_fn_(session->username);
+                // The gate's composed VisibleSet IS the confinement
+                // (ADR-0017 + ADR-0033 clause 2); require_fleet_read already
+                // refused above if it were unwired.
+                std::optional<std::set<std::string>> vis;
+                if (gate.scope)
+                    vis = std::set<std::string>(gate.scope->begin(), gate.scope->end());
                 const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/overview).
