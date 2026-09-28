@@ -17,6 +17,60 @@ using json = nlohmann::json;
 
 // ── MCP-only gap #1: per-device DEX score ────────────────────────────────────
 
+// `dex_score_from_signals`/`dex_device_score` are declared in
+// `dex_read_builders.hpp` — relocated VERBATIM from the presentation TU
+// `dex_routes.cpp` (ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28),
+// closing the WS-B2 "LINK RESIDUAL" #4579 that header's own doc comment
+// flagged: this core TU (via `build_dex_device_score_model` below) and the
+// presentation TU's own Overview renderer (`dex_device_score` call in
+// `dex_routes.cpp`) were BOTH calling functions defined in `dex_routes.cpp` --
+// invisible to the include-closure seam gate, which only checks headers, not
+// link targets. `dex_routes.cpp`'s own caller is unaffected (ODR-safe
+// relocation, not a duplication; no logic changes).
+
+// The pure scoring formula (#4855 extraction) — everything dex_device_score
+// below did with `device_signals` once it had them, factored out so the ONE
+// checked store read the score builder above performs (closing the #4855 torn
+// read between score + signals) can feed this directly instead of forcing a
+// second read just to get a score.
+int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {
+    double total = 0.0;
+    for (const auto& fw : dex_family_weights()) {
+        const DexSignalGroup* g = nullptr;
+        for (const auto& grp : dex_signal_groups())
+            if (std::string(grp.name) == fw.name) {
+                g = &grp;
+                break;
+            }
+        if (!g)
+            continue;
+        const DexFamilyRollup rr = dex_family_rollup(*g, device_signals);
+        if (rr.benign || rr.events <= 0) // benign reports (boot/uptime) never deduct
+            continue;
+        // Per-device impact: this device's events in the family, gently scaled
+        // (1 event = partial; kCap+ events = full severity). Illustrative cap,
+        // pending calibration (like the perf baseline).
+        constexpr double kCap = 5.0;
+        const double impact = std::min(1.0, static_cast<double>(rr.events) / kCap);
+        total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
+    }
+    return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
+}
+
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since) {
+    if (!store)
+        return -1;
+    // #4855: a degraded read must never render as a signal-free, perfectly
+    // healthy device — use the type-distinguishable checked twin and refuse
+    // to score (-1, "unscored") rather than fabricate a 100 from an empty
+    // container indistinguishable from "genuinely no signals".
+    const auto device_signals = store->dex_device_signal_summary_checked(agent_id, since);
+    if (!device_signals)
+        return -1;
+    return dex_score_from_signals(*device_signals);
+}
+
 DexDeviceScoreModel build_dex_device_score_model(GuaranteedStateStore* store,
                                                  const std::string& agent_id,
                                                  const std::string& window,

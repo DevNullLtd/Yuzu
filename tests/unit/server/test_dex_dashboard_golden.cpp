@@ -47,6 +47,7 @@
  * without the env var to verify. `check_golden`'s own doc comment states the
  * ONE normalisation pattern applied to both sides before comparing.
  */
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"

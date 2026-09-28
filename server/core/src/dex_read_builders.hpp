@@ -17,11 +17,14 @@
 /// presentation TU — that is what keeps the abstract seam header store-type-free
 /// (enforced by check-seam-closure.py's abstract-header probe).
 ///
-/// LINK RESIDUAL (WS-B2, tracked #4579): "CORE-ONLY" here means include-only —
-/// the nine builders are DEFINED in `dex_read_model.cpp` (core), but the
-/// `dex_device_score` declaration below is still DEFINED in the presentation
-/// `dex_routes.cpp`. So a core-only link target does not yet resolve cleanly;
-/// #4579 enumerates the symbols to re-home. Inert in today's single-binary build.
+/// LINK RESIDUAL (WS-B2, #4579) — CLOSED (ADR-0031 WS-A4 PR-1 F1 fix, Fable
+/// review 2026-09-28): "CORE-ONLY" here now means link-clean too — all nine
+/// builders AND `dex_device_score`/`dex_score_from_signals` below are DEFINED
+/// in `dex_read_model.cpp` (core); the presentation TU `dex_routes.cpp` no
+/// longer defines either. A core-only link target resolves cleanly. Enforced
+/// going forward by the `dex` family entry in the link-level symbol tripwire
+/// (`scripts/ci/check_core_presentation_link.py`, `suite:server` test
+/// `dex_link_no_presentation_symbols`).
 
 #include <optional>
 #include <set>
@@ -41,9 +44,11 @@ class GuaranteedStateStore;
 /// Per-device DEX experience score (0–100) — the canonical severity-weighted
 /// composite; -1 when `store` is null. A store-reaching read helper the
 /// builders (device score / overview) and several route/lens TUs share.
-/// Relocated from dex_routes.hpp (PR #4582 FIX 4) so dex_read_model.cpp can call
-/// it without that httplib-coupled header; dex_routes.hpp re-includes this
-/// header, so its own callers are unaffected.
+/// Declaration relocated from dex_routes.hpp (PR #4582 FIX 4); the DEFINITION
+/// relocated from `dex_routes.cpp` to `dex_read_model.cpp` (ADR-0031 WS-A4
+/// PR-1 F1 fix, closing the LINK RESIDUAL noted above) — `dex_routes.hpp`
+/// re-includes this header, so its own callers (the Overview renderer) are
+/// unaffected.
 int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
                      const std::string& since);
 
@@ -51,8 +56,8 @@ int dex_device_score(const GuaranteedStateStore* store, const std::string& agent
 /// has a device's signal summary in hand. Store-free; lets
 /// `build_dex_device_score_model` derive score + signals from the SAME
 /// checked read (closing the #4855 torn-read window) instead of a second,
-/// independent store call. Also DEFINED in `dex_routes.cpp` (LINK RESIDUAL
-/// above applies here too).
+/// independent store call. DEFINED in `dex_read_model.cpp` alongside
+/// `dex_device_score` (LINK RESIDUAL above, now closed).
 int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals);
 
 DexDeviceScoreModel build_dex_device_score_model(GuaranteedStateStore* store,

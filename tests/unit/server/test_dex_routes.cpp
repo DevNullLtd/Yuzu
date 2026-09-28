@@ -9,6 +9,7 @@
  *   - agent-reported values are HTML-escaped (no stored XSS)
  *   - route gating: authed renders / unauth → 302 / perm-denied → 403 before audit
  */
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
