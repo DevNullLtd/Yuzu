@@ -9645,16 +9645,17 @@ caller's confinement (see **Permission** below) is intersected in
 AFTERWARD, mirroring how a real dispatch intersects against the operator's
 `Execution:Execute` visible set before sending.
 
-A `tag:<key>` atom in the expression still resolves from the persistent tag
-store **only** — unlike a real dispatch, which also falls back to a
-connected agent's own live self-report — see
+A `tag:<key>` atom in the expression now resolves **identically** to a real
+dispatch (#4981): the persistent tag store first, falling back to a
+locally-connected agent's own live self-report only when the store has no
+row for that agent — a presence-only cross-replica agent has no live
+session to fall back to, so it still resolves store-only for such agents,
+same as real dispatch. See
 [Tag source precedence](../asset-tagging-guide.md). `POST /api/scope/estimate`
-below does not share this tag-source limitation (it resolves through the
-same store-first-with-fallback path a real dispatch uses); it also resolves
-`from_result_set:` against the owner, but a failed owner-check there
-degrades to "zero members" rather than aborting the whole evaluation like
-this route's ladder does — a separate, still-open fail-open gap, tracked
-`#5003`, not fixed by `#4981`.
+below also resolves `from_result_set:` against the owner, but a failed
+owner-check there degrades to "zero members" rather than aborting the whole
+evaluation like this route's ladder does — a separate, still-open fail-open
+gap, tracked `#5003`, not fixed by `#4981`.
 
 **Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the

@@ -23,12 +23,14 @@
 #include "pg/pg_raii.hpp"
 #include "result_set_store.hpp"
 #include "scope_engine.hpp"
+#include "tag_store.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
+#include "test_tag_store_pg_helper.hpp"
 
 #include "agent.pb.h"
 
@@ -444,4 +446,40 @@ TEST_CASE("preview_scope_targets: a real-dispatch-shaped evaluate_scope_fn (no 6
     // within the same wall-clock second as create is a legitimate no-op.
     CHECK(after->value().ttl_at >= orig_ttl);
     CHECK(after->value().last_used_at >= orig_last_used);
+}
+
+// ── #4981 adversarial-review finding 3: preview's tag:<key> resolution now ──
+// ── matches dispatch exactly, including the live scopable_tags fallback for ─
+// ── a locally-connected agent the TagStore has no row for. ──────────────────
+
+TEST_CASE("preview_scope_targets: tag:<key> falls back to a locally-connected agent's "
+          "live scopable_tags when the TagStore has no row for that agent — identical "
+          "to a real dispatch, closing the stale doc claim that preview was "
+          "store-only (#4981 adversarial-review finding 3)",
+          "[pg][scope][preview]") {
+    yuzu::test::TagStorePg tag_bundle;
+    TagStore& tags = *tag_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    // agent-live has a live scopable_tags claim but NO TagStore row at all
+    // (e.g. a gateway-proxied or not-yet-synced agent, #3295); agent-bare has
+    // neither.
+    auto live = info("agent-live");
+    (*live.mutable_scopable_tags())["env"] = "prod";
+    (void)registry.register_agent(live);
+    (void)registry.register_agent(info("agent-bare"));
+
+    auto evaluate_scope_fn = [&](const yuzu::scope::Expression& expr,
+                                 const std::string& principal) {
+        return registry.evaluate_scope(expr, &tags, nullptr, nullptr, principal);
+    };
+
+    auto outcome = preview_scope_targets(R"(tag:env == "prod")", "alice", std::nullopt, nullptr,
+                                         evaluate_scope_fn);
+    REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kOk);
+    CHECK(outcome.payload["matched_count"] == 1);
+    CHECK(outcome.payload["matched_agents"][0] == "agent-live");
 }
