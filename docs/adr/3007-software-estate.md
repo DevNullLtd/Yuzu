@@ -42,7 +42,7 @@ from.
 The platform already collects installed-application data once a day through a standing
 mechanism built for exactly this purpose. Rather than stand up a second, parallel collection
 system for the additional software categories this decision adds, that existing mechanism is
-**widened** to gather all of them in the same daily pass, as one report. There is exactly one
+**widened** to gather all of them in the same pass, as one report. There is exactly one
 route by which software facts reach the platform's central record, and one route by which they
 leave it for a reader. A new discovery capability added later is a new category folded into the
 same one path — never a second path.
@@ -51,10 +51,46 @@ This also means every existing consumer of today's inventory — the current que
 per-device view — continues to work unmodified while the inventory underneath it grows. Nothing
 is deprecated to make room for this; it is grown in place.
 
+### Collection starts on each machine, on that machine's own clock
+
+Collection is not dispatched by the server. It is a standing behaviour of the platform's own agent
+on each machine: when the agent connects, it starts its collection routine, which keeps its own
+local timetable of when the next pass is due. That timetable survives restarts and time spent
+offline. A newly enrolled machine does its first full pass within minutes, so it appears in the
+inventory the same day; after that it follows its group's settings (below). A machine that misses
+its window — a laptop asleep overnight, say — catches up soon after it next comes online, spread
+out per machine so that a building's worth of laptops powering on together does not arrive in one
+burst.
+
+The server's role is to publish each machine's collection settings and, when an operator asks, to
+request an immediate pass. It never schedules or dispatches routine collection itself, and so
+never depends on a machine being online at a particular instant.
+
+### Every discovery mechanism runs and fails on its own
+
+A pass runs several independent discovery mechanisms — one for registered applications, one for
+installer records, one for platform-store packages, and so on. Each runs on its own terms:
+
+- A failure, a timeout or an oversized result in one mechanism never stops the others from
+  reporting.
+- A mechanism that stops responding is given up on after its own time limit, and is not attempted
+  again until it has recovered, so one stuck mechanism cannot pile work up on the machine.
+- Mechanisms run at most two at a time; the heaviest — verifying the integrity of installed
+  programs — always runs last, on its own.
+- When a mechanism cannot report cleanly, its last-known data is kept, never wiped, so a passing
+  failure never looks like software being uninstalled. That data carries the time it was last
+  confirmed, and once it has gone unconfirmed for three missed cycles or 24 hours, whichever is
+  longer, it is marked unconfirmed everywhere it appears.
+- Where a mechanism has never run on a machine, the inventory says so explicitly — "not
+  collected" — rather than showing an empty field that could be read as "nothing installed".
+
+Registered-applications collection is the backbone of the inventory and cannot be switched off
+for an individual group.
+
 ### Report what changed, not the whole picture every time
 
 A host reports its full software picture once, the first time it is seen. After that, on each
-daily pass, it reports nothing at all if nothing has changed, and reports only the specific
+pass, it reports nothing at all if nothing has changed, and reports only the specific
 additions and removals when something has. The platform verifies, on its side, that what it holds
 for a host and what the host believes it last confirmed still agree; any disagreement triggers one
 full resend to re-synchronise, automatically, without operator involvement. The fleet is not
@@ -85,6 +121,37 @@ can extend, so that "the same software" reads as the same software across the fl
 which host or which operating system reported it. Coverage is measured, not assumed: entries that
 cannot yet be matched are visible as such, not hidden.
 
+### Collection settings belong to management groups
+
+How often machines collect, in which window, and which discovery mechanisms are switched on is set
+per management group, not once for the whole fleet:
+
+- **Inheritance.** A group without its own settings inherits its parent's; the root of the group
+  tree holds the fleet-wide default. A machine that belongs to groups on different branches takes
+  its settings from the highest-priority of those groups. Priorities are set only by fleet
+  administrators; groups without one rank lowest, and ties resolve the same way every time — the
+  more specific group first, then the older. Every machine's effective settings, and the group
+  they came from, are visible in the operator interface and the API.
+- **Authority.** An administrator of a group may change the settings of that group and the groups
+  beneath it, and no others. Only fleet administrators change the fleet-wide default. Every change
+  is recorded with its before and after values. A mechanism's existing emergency kill switch
+  overrides any group's settings.
+- **Bounds.** The interval is between one hour and seven days. A time window can be set only for
+  daily-or-longer intervals, and is read in each machine's local time unless the group pins a
+  specific timezone — useful for machines whose clocks run on UTC while serving a local business.
+  Settings that contradict themselves are refused when saved, so no machine ever receives an
+  impossible instruction.
+- **Default.** Once a day, inside an overnight window of 01:00–05:00 local time, with every
+  lightweight mechanism on and integrity verification off until it has been proven within its
+  resource budget on real hardware.
+- **Delivery.** Settings reach machines durably: a machine that was offline when its settings
+  changed picks them up when it next reconnects. A change takes effect at each machine's next
+  pass. Saving settings never itself triggers collection — otherwise one fleet-wide change would
+  become one unpaced, fleet-wide collection.
+
+The settings live alongside the inventory itself, on the platform's software page, with the same
+controls available through the API.
+
 ### Read access: paged, incremental, and exportable — nothing pushed out
 
 The consolidated inventory is available to read in three ways, matching how downstream systems
@@ -100,26 +167,42 @@ three read paths are pull — something reads from this platform on its own sche
 does not push software-inventory data out to another system on its own initiative. That remains a
 deliberate boundary; see Non-goals.
 
-### An operator can force a check — a chosen group freely, the whole fleet only under a stronger gate
+Every entry is exported with its status — current, unconfirmed, or from a switched-off mechanism —
+and the time it was last confirmed; per machine, a mechanism that has never run shows as "not
+collected". Nothing drops out of the feed merely because it has gone unconfirmed, so a consumer
+that treats absence as removal never mistakes a stale entry for an uninstall. A consumer that
+wants only current entries can filter for them.
+
+### An operator can force a check — paced, and gated by who is asking
 
 Waiting for the next scheduled pass is not always acceptable — an operator investigating an
-incident, or verifying a rollout, needs current data now. This decision adds that capability at
-two tiers, deliberately unequal in how much authority each needs.
+incident, or verifying a rollout, needs current data now. Any administrator may ask for an
+immediate pass across machines they administer: a selection narrowed with the fleet's own search
+and filter tools, or an entire group they administer. Only fleet administrators may ask for the
+whole fleet. Checking an entire group, or the entire fleet, requires an explicit confirmation —
+never a default, and never an empty filter silently meaning "everything" — and is recorded as the
+larger action it is.
 
-The ordinary path is a check against a group an operator has first narrowed with the fleet's own
-search and filter tools — by tag, by hostname pattern, by operating system, by how long since a
-host last reported — bounded by a fixed ceiling on how large that narrowed group may be in one
-request. This needs no more authority than an ordinary inventory query already does.
+There is no ceiling on how many machines one check may cover. Instead, every on-demand check is
+paced: machines report back spread out over time, under one platform-wide rate set from the
+platform's measured capacity rather than by an administrator, so several checks running at once
+share that capacity instead of stacking load. Before a check starts, the operator sees how many
+machines it covers and roughly how long results will take. Each group has at most one check
+running at a time — a repeated request joins the one already running — while checks on different
+groups run side by side.
 
-A whole-fleet check — every managed host, no narrowing — is also available, but only behind a
-stronger gate: it requires an explicit, separate confirmation (never a default, and never an empty
-filter silently meaning "everything"), is restricted to a higher-privilege role than the ordinary
-path needs, and is recorded as the higher-consequence action it is. It still delivers through the
-same spread-out pacing this platform already uses for its regular collection, never all at once —
-gating *who* may trigger it and requiring them to clearly mean it is the control for this tier; the
-platform does not additionally shrink a properly-authorised whole-fleet request down to the
-bounded tier's size. Both tiers share the same cooldown and one-request-at-a-time discipline, so
-neither can be used to repeatedly overload the fleet regardless of who is asking.
+An on-demand check always runs every mechanism switched on for those machines. A question about a
+single mechanism — "did this runtime update land?" — is answered by running that mechanism
+directly as an ordinary instruction, which returns its answer to the operator but never alters
+the inventory. That is what the mechanisms exist independently for.
+
+### Visibility into what collection costs and where it fails
+
+Every machine's report states, for each mechanism, whether it succeeded, how long it took and how
+much it read. The platform turns that into fleet-wide health — for each mechanism, the share of
+machines where it is timing out, unconfirmed or switched off — with alerting, and shows which
+machines are slowest for each mechanism. Collection cost on the fleet is something an operator can
+see, not something discovered when users complain.
 
 ### Everything here stays inside the core platform
 
@@ -129,21 +212,21 @@ or requires such a module to exist, now or later.
 
 ## What the dataset looks like
 
-Every row below is collected in the same single daily pass described above, from the same host,
-and lands in the same consolidated record. "Collected" is the cadence at which the platform
-learns about it; "Stored" is where a reader finds it today.
+Every row below is gathered in the same single pass described above, from the same host, and
+lands in the same consolidated record. "Collected" is how often the platform learns about it;
+"Stored" is where a reader finds it today.
 
 | Data captured | How it's found | Windows | macOS | Linux | Collected | Stored |
 |---|---|:---:|:---:|:---:|---|---|
-| Registered applications (name, publisher, version, install date) | Read from the operating system's own record of installed software | ✅ | ✅ | ✅ | Configurable, default daily; changes only | Fleet software inventory |
-| Installer package records (product identifier, install location, how to uninstall) | Read from the operating system's installer subsystem | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
-| Platform-store packaged applications | Read from the operating system's own app-package registry | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
-| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | Read from each package manager's own installed-package listing | ✅ | ✅ | — | Configurable, default daily; changes only | Fleet software inventory |
-| Containerised/sandboxed application formats (Linux) | Read from each format's own installed-application listing | — | — | ✅ | Configurable, default daily; changes only | Fleet software inventory |
-| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | Read from each runtime's own installation record | ✅ | ✅ | ✅ | Configurable, default daily; changes only | Fleet software inventory |
-| Device drivers | Read from the operating system's own driver registry | ✅ | — | ✅ | Configurable, default daily; changes only | Fleet software inventory |
-| Optional operating-system feature set (Windows) | Read from the operating system's own feature-management interface | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
-| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | Verified against the operating system's own signing mechanism | ✅ | ✅ | Partial | Configurable, default daily; changes only | Fleet software inventory |
+| Registered applications (name, publisher, version, install date) | Read from the operating system's own record of installed software | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Installer package records (product identifier, install location, how to uninstall) | Read from the operating system's installer subsystem | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Platform-store packaged applications | Read from the operating system's own app-package registry | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | Read from each package manager's own installed-package listing | ✅ | ✅ | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Containerised/sandboxed application formats (Linux) | Read from each format's own installed-application listing | — | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | Read from each runtime's own installation record | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Device drivers | Read from the operating system's own driver registry | ✅ | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Optional operating-system feature set (Windows) | Read from the operating system's own feature-management interface | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | Verified against the operating system's own signing mechanism | ✅ | ✅ | Partial | Per group, off by default until proven; changes only | Fleet software inventory |
 | Change history (install / upgrade / removal, with a timestamp) | Derived by the platform itself, by comparing each day's report to the last | ✅ | ✅ | ✅ | Continuous, as detected | Fleet software change record (bounded retention) |
 | Normalised identity (a common product/vendor/version reading, mapped from the raw values above) | Matched by the platform against its own maintained reference list | ✅ | ✅ | ✅ | Recomputed periodically | Fleet software inventory |
 
@@ -157,38 +240,39 @@ Non-goals.
 The table below is not a schema — it is what an entry looks like once collected, consolidated,
 and normalised, shown with representative, made-up values rather than a real fleet's data.
 
-| Host | Product | Publisher | Version | Discovered by | First seen | Last confirmed |
-|---|---|---|---|---|---|---|
-| WKS-LDN-0231 | 7-Zip | Igor Pavlov | 23.01 | Registered-application record + installer package record (both agree) | 2026-03-11 | 2026-09-28 |
-| WKS-LDN-0231 | Slack | Slack Technologies | 4.39.2 | Platform-store package record | 2026-06-02 | 2026-09-28 |
-| WKS-BER-1042 | Visual Studio Code | Microsoft | 1.94.1 | Alternate package-manager record | 2026-01-14 | 2026-09-27 |
-| SRV-DB-07 | PostgreSQL client tools | PostgreSQL Global Development Group | 16.4 | Registered-application record | 2025-11-30 | 2026-09-28 |
-| WKS-LDN-0231 | .NET Runtime | Microsoft | 8.0.8 | Runtime installation record | 2026-02-20 | 2026-09-28 |
+| Host | Product | Publisher | Version | Discovered by | First seen | Last confirmed | Status |
+|---|---|---|---|---|---|---|---|
+| WKS-LDN-0231 | 7-Zip | Igor Pavlov | 23.01 | Registered-application record + installer package record (both agree) | 2026-03-11 | 2026-09-28 | Current |
+| WKS-LDN-0231 | Slack | Slack Technologies | 4.39.2 | Platform-store package record | 2026-06-02 | 2026-09-28 | Current |
+| WKS-BER-1042 | Visual Studio Code | Microsoft | 1.94.1 | Alternate package-manager record | 2026-01-14 | 2026-09-24 | Unconfirmed |
+| SRV-DB-07 | PostgreSQL client tools | PostgreSQL Global Development Group | 16.4 | Registered-application record | 2025-11-30 | 2026-09-28 | Current |
+| WKS-LDN-0231 | .NET Runtime | Microsoft | 8.0.8 | Runtime installation record | 2026-02-20 | 2026-09-28 | Current |
 
-A corresponding change-history entry for the same fleet might read: *WKS-LDN-0231 — 7-Zip upgraded
+WKS-BER-1042's package-manager mechanism has not reported cleanly since 2026-09-24, so its last
+known entry is kept but marked unconfirmed rather than removed. Per machine, a mechanism that has
+never run shows plainly — for example, *SRV-DB-07 — integrity verification: not collected* (off by
+default). A corresponding change-history entry for the same fleet might read: *WKS-LDN-0231 — 7-Zip upgraded
 from 22.01 to 23.01 — 2026-07-04.* An export in any of the four formats above carries the same
 information as this table, shaped for its own use — JSON and CSV as machine-readable rows, XLSX as
 a workbook, PDF as a formatted report.
 
 ## Timing and delivery model
 
-- **Collection cadence:** once per managed host per day by default, spread across the day rather
-  than all at once, so the fleet does not report in a single burst. Both the interval and the time
-  window it runs within are administrator-configurable — an organisation that wants collection
-  confined to a specific quiet period can set that window instead of accepting the platform's own
-  spread across the full day. Changing it is itself a gated action, restricted the same way the
-  whole-fleet check above is, since it trades fleet visibility latency against endpoint load and is
-  not a decision to leave to routine access. Available equally through the operator interface and
-  the API.
+- **Collection cadence:** set per management group (see Decision). By default once a day inside
+  an overnight window of 01:00–05:00 machine-local time, each machine at its own point within the
+  window so the fleet never reports in one burst. A new machine collects within minutes of
+  enrolling; a machine that misses its window catches up soon after it next comes online, spread
+  out per machine.
 - **What's sent:** nothing, if nothing changed since the last report; only the specific
   differences, if something did; a complete picture only the first time a host is seen, or if the
   platform and the host ever need to re-synchronise.
-- **On-demand check:** available at any time. Against an operator-chosen, bounded group of hosts,
-  with a fixed ceiling on group size, it needs no more authority than an ordinary inventory query.
-  Against the whole fleet, it needs an explicit confirmation and a higher-privilege role, and still
-  delivers through the same spread-out pacing as the daily cadence rather than all at once. Both
-  forms share a cooldown between requests so neither can be used to repeatedly overload the
-  fleet.
+- **On-demand check:** available at any time to administrators over the machines they administer
+  (a filtered selection or a whole group), and to fleet administrators over the whole fleet. No
+  size ceiling: every check is paced under one platform-wide rate; whole-group and whole-fleet
+  checks need explicit confirmation; each group has at most one check running at a time.
+- **When a mechanism can't report:** its last-known data stays, marked with the time it was last
+  confirmed, and is flagged unconfirmed after three missed cycles or 24 hours, whichever is
+  longer.
 - **Change visibility:** a detected change is reflected in the platform's change record within the
   same reporting cycle that surfaced it; there is no separate, faster path for change events.
 - **No continuous stream:** this is a periodic-plus-on-demand model, not a continuous real-time
@@ -201,9 +285,12 @@ a workbook, PDF as a formatted report.
 it. Every existing reader of today's inventory keeps working. A new software category is future
 work added to the same pass, not a new integration point. An organisation's own tooling can treat
 this platform as a dependable, poll-on-its-own-schedule source of software truth, without this
-platform needing to know anything about that tooling. An operator who genuinely needs the whole
-fleet re-checked, or a collection cadence that suits their own environment, can have both — behind
-authority strong enough that neither becomes a routine, casual control. And whoever consumes the
+platform needing to know anything about that tooling. One broken or stuck discovery mechanism
+degrades only its own slice of the picture, visibly, instead of silently taking the whole
+inventory down with it. Each group of machines can be collected on a rhythm that suits it, set by
+the people who run those machines, within bounds and under a default the fleet's administrators
+control, and any administrator can refresh exactly the machines they are responsible for, at a
+pace the platform can absorb. And whoever consumes the
 result — a person or another system — can have it in whichever of the four formats already fits
 their own workflow, from either the interface or the API.
 
@@ -241,12 +328,19 @@ beyond what already applies to machine-level inventory data applies to it.
   places holding overlapping software facts, two things to keep consistent, and no clean way to
   retire the old one without breaking its existing readers. Growing the one that exists avoids
   all of that.
+- **The server dispatching a scheduled instruction for each discovery mechanism.** Considered in
+  depth and rejected. A server-dispatched schedule reaches only machines that happen to be online
+  at the moment it fires; a laptop asleep at that moment simply misses the run, with no catch-up.
+  Each mechanism would need its own schedule, every run would return its full output rather than
+  just what changed, and the results would land in a store built to hold transient command
+  responses rather than a system of record. Collection that starts on the machine, on the
+  machine's own clock, avoids all four problems while keeping each mechanism independent.
 - **Pushing this inventory out to other systems as an integration.** Rejected for now: it makes
   this platform responsible for authenticating to, and staying compatible with, an unbounded set
   of external systems it does not control. A pull-only read surface puts that integration
   responsibility where it belongs — with the system doing the integrating — and can be revisited
   later if a genuine need for an outward push is demonstrated.
-  \- **Continuous, real-time collection instead of daily-plus-on-demand.** Rejected for this phase:
+- **Continuous, real-time collection instead of daily-plus-on-demand.** Rejected for this phase:
   the operational cost of continuous collection across an entire fleet is substantial, and nothing
   in the stated need — an accurate, current, on-request-checkable inventory — requires
   sub-daily latency. The daily-plus-on-demand model meets the need at a fraction of the cost, and
