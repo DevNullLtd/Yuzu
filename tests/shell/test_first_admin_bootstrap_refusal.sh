@@ -197,11 +197,19 @@ else
   row="$(psql "$CHILD_DSN_BOOT" -qtAc \
     "SELECT principal || '|' || principal_role || '|' || target_type || '|' || target_id || '|' || result FROM audit_store.audit_events WHERE action = 'rbac.bootstrap.first_admin';")"
   role="$(psql "$CHILD_DSN_BOOT" -qtAc "SELECT role FROM auth.users WHERE username = 'admin';")"
-  if [ "$row" = "system|system|User|admin|success" ] && [ "$role" = "admin" ]; then
+  # The legacy auth.users.role column alone doesn't prove the RBAC grant
+  # landed -- provision_first_admin exists specifically to guarantee BOTH
+  # the account AND the durable Administrator principal_roles row in one
+  # transaction (unlike the older seed_admin_if_empty, which only ever
+  # touched the account). Check the grant row directly so a regression that
+  # drops/swallows the principal_roles INSERT still fails this test.
+  grant_count="$(psql "$CHILD_DSN_BOOT" -qtAc \
+    "SELECT count(*) FROM rbac_store.principal_roles WHERE principal_type = 'user' AND principal_id = 'admin' AND role_name = 'Administrator';")"
+  if [ "$row" = "system|system|User|admin|success" ] && [ "$role" = "admin" ] && [ "$grant_count" = "1" ]; then
     echo "ok   - fresh-install bootstrap: durable rbac.bootstrap.first_admin audit row + admin grant"
     pass=$((pass+1))
   else
-    echo "FAIL - fresh-install bootstrap audit/role (row='$row' want='system|system|User|admin|success'; role='$role' want='admin')"
+    echo "FAIL - fresh-install bootstrap audit/role/grant (row='$row' want='system|system|User|admin|success'; role='$role' want='admin'; grant_count='$grant_count' want=1)"
     fail=$((fail+1))
   fi
 fi
