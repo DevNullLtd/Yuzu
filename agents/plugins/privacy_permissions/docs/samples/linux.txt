@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-25 · euid 0 · leg-hash 341fe04ec441
+== action=permissions
+permissions|linux|org.example.CamApp|camera|allowed|yes|-|-
+permissions|linux|org.example.MicApp|microphone|denied|no|-|-
+permissions|linux|org.example.MapApp|location|allowed|EXACT,0|-|-
+permissions|linux|org.example.NoLocApp|location|denied|NONE,0|-|-
+permissions|linux|-|full_disk_access|unsupported|-|-|-
+[result_status] OK / FULL /
