@@ -149,8 +149,15 @@ Verified: `[log_handoff]` green (12101 assertions/15 cases, the new U10 case inc
   deliberate exception introduced by #5023 (the `ShutdownDeadlineGuard` row's reused watchdog has its own
   contract): the detached stderr-emit thread. It cannot be RAII-joined because a
   thread stuck in a blocked write can never be joined; its ownership proof is in that row (shared_ptr
-  capture, by-value line, no spdlog state, no `mu`, no stdio lock, code that is never unloaded); the
-  detached-thread pattern itself has precedent in agent-core (`subprocess_runner.cpp`'s `reap_async`);
+  capture, by-value line, no spdlog state, no `mu`, no stdio lock, code that is never unloaded); it is
+  launched via `io_detail::spawn_detached` (`guardian_io_executor.hpp`), the same primitive
+  `shutdown_deadline_guard.hpp` and `guardian_state_reader.hpp` already use for their own detached
+  workers, chosen over a raw `std::thread(...).detach()` (the shape `subprocess_runner.cpp`'s
+  `reap_async` still uses) because it closes a `detach()`-can-throw gap PR #5051's review found in the
+  original form: `detach()` itself can throw per the standard, and a still-joinable temporary's
+  destructor then calls `std::terminate()` during unwind, before a surrounding `catch` runs;
+  `spawn_detached` creates the thread ALREADY detached, so there is no joinable object and no separate
+  `detach()` call to throw;
   its one resource that IS releasable, the `emit_in_flight` slot, is released by a single RAII `Permit`
   destructor rather than by hand at each exit. No raw `new`/`delete`, no manual thread join outside
   `~thread_pool()`'s own (spdlog-owned, unmodified) join, no borrowed `string_view`/`span` stored past

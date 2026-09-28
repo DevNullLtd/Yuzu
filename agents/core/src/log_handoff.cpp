@@ -1,5 +1,6 @@
 #include "log_handoff.hpp"
 
+#include "guardian_io_executor.hpp"    // io_detail::spawn_detached
 #include "hard_exit.hpp"              // hard_exit()
 #include "shutdown_deadline_guard.hpp" // ShutdownDeadlineGuard
 
@@ -617,17 +618,38 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
                         // unloaded; and it holds no stdio lock (default_stderr_emit uses a
                         // raw write), so a normal exit() cannot wait on it and the process
                         // ends it.
-                        std::thread([permit = std::move(permit), fn, emit_count,
-                                     text = std::move(emit_message)]() {
-                            try {
-                                (fn ? fn : &default_stderr_emit)(emit_count, text);
-                            } catch (...) {
-                            }
-                        }).detach();
+                        //
+                        // Launched via io_detail::spawn_detached (guardian_io_executor.hpp),
+                        // not a bare std::thread(...).detach(): the thread is created
+                        // ALREADY DETACHED, so there is no joinable std::thread object
+                        // whose destructor could terminate, and no separate detach() call
+                        // that could itself throw mid-unwind -- a real gap a plain
+                        // std::thread(...).detach() has (spawn_detached's own header
+                        // comment states why: detach() can throw per the standard, and a
+                        // still-joinable temporary's destructor terminates before a
+                        // surrounding catch gets control). spawn_detached returns false
+                        // only if the OS refused to create the thread; either way its
+                        // payload -- and the Permit it captured -- is destroyed
+                        // synchronously before we see the result, so the slot is released
+                        // exactly once regardless of which path fires below.
+                        const bool launched = io_detail::spawn_detached(
+                            [permit = std::move(permit), fn, emit_count,
+                             text = std::move(emit_message)]() {
+                                try {
+                                    (fn ? fn : &default_stderr_emit)(emit_count, text);
+                                } catch (...) {
+                                }
+                            });
+                        if (!launched) {
+                            // The OS refused to create the thread: the permit was already
+                            // released (see above). Drop and count this diagnostic.
+                            error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
+                        }
                     } catch (...) {
-                        // The OS refused the thread (or an allocation failed): the permit
-                        // has already been released by unwinding; drop and count this
-                        // diagnostic. Never throw into spdlog.
+                        // The fault-injection throw above, or std::bad_alloc from
+                        // spawn_detached's own single payload allocation: the permit is
+                        // released by unwinding (it was never moved out in either case).
+                        // Drop and count this diagnostic. Never throw into spdlog.
                         error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
