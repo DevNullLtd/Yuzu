@@ -672,6 +672,25 @@ namespace {
 constexpr const char* kEnrollmentStoreUnavailableHtml =
     "<div class=\"feedback-error\">Enrollment store unavailable - state unknown. "
     "Retry shortly.</div>";
+
+/// `count=N ids=a,b,c` for a bulk enrollment audit row: the count is the size of
+/// the RETURNING set (authoritative), the id list is capped so a fleet-wide bulk
+/// cannot bloat one audit row.
+std::string bulk_audit_detail(const std::vector<std::string>& ids) {
+    constexpr std::size_t kMaxListed = 20;
+    std::string d = "count=" + std::to_string(ids.size());
+    if (!ids.empty()) {
+        d += " ids=";
+        for (std::size_t i = 0; i < ids.size() && i < kMaxListed; ++i) {
+            if (i)
+                d += ',';
+            d += ids[i];
+        }
+        if (ids.size() > kMaxListed)
+            d += ",...";
+    }
+    return d;
+}
 } // namespace
 
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
@@ -5252,13 +5271,16 @@ void SettingsRoutes::register_routes(
             if (!ttl_s.empty())
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
+            audit_fn_(req, "enrollment.token_create", "denied", "EnrollmentToken", "",
+                      "invalid_numeric_parameter");
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
             return;
         }
 
-        auto ttl = ttl_hours > 0 ? std::chrono::seconds(ttl_hours * 3600) : std::chrono::seconds(0);
+        auto ttl = ttl_hours > 0 ? std::chrono::seconds(static_cast<std::int64_t>(ttl_hours) * 3600)
+                                 : std::chrono::seconds(0);
 
         auto session = auth_fn_(req, res);
         if (!session)
@@ -5268,6 +5290,13 @@ void SettingsRoutes::register_routes(
             // Fail closed: nothing was minted. 503 for an outage; 400 for a value
             // the store bounds reject (over-long label, negative max_uses, ...).
             const bool bad_input = created.error() == StoreError::InvalidInput;
+            // Audit posture: set-and-proceed (AuditFn is void), like every
+            // neighbouring settings mutation. token_id/label/limits only — NEVER
+            // the raw token, which does not exist yet on this path.
+            audit_fn_(req, "enrollment.token_create", bad_input ? "denied" : "failure",
+                      "EnrollmentToken", "",
+                      std::string(bad_input ? "invalid_input" : "store_unavailable") +
+                          " by=" + session->username);
             res.status = bad_input ? 400 : 503;
             res.set_header("HX-Trigger",
                            bad_input
@@ -5277,6 +5306,11 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // token_id ONLY in the audit row (8 hex of the hash) — the raw token is
+        // shown once in the response and must never reach the audit store.
+        audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
+                  "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         res.set_content(render_tokens_fragment(created->raw_token), "text/html; charset=utf-8");
@@ -5287,14 +5321,24 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         auto token_id = req.matches[1].str();
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
         auto revoked = auth_mgr_->revoke_enrollment_token(token_id);
         if (!revoked) {
+            audit_fn_(req, "enrollment.token_revoke",
+                      revoked.error() == StoreError::InvalidInput ? "denied" : "failure",
+                      "EnrollmentToken", token_id, "store_error by=" + session->username);
             res.status = revoked.error() == StoreError::InvalidInput ? 400 : 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - token NOT revoked","level":"error"}})");
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
+        // An unknown token_id is a no-op the operator should be able to see.
+        audit_fn_(req, "enrollment.token_revoke", *revoked ? "success" : "denied",
+                  "EnrollmentToken", token_id,
+                  std::string(*revoked ? "" : "token_not_found ") + "by=" + session->username);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
@@ -5321,6 +5365,8 @@ void SettingsRoutes::register_routes(
             if (!ttl_s.empty())
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
+            audit_fn_(req, "enrollment.token_create_batch", "denied", "EnrollmentToken", "",
+                      "invalid_numeric_parameter");
             res.status = 400;
             res.set_content(detail::a4_error(res, "invalid numeric parameter"),
                             "application/json");
@@ -5328,17 +5374,21 @@ void SettingsRoutes::register_routes(
         }
 
         if (count < 1 || count > 10000) {
+            audit_fn_(req, "enrollment.token_create_batch", "denied", "EnrollmentToken", "",
+                      "count_out_of_range");
             res.status = 400;
             res.set_content(detail::a4_error(res, "count must be 1-10000"), "application/json");
             return;
         }
 
-        auto ttl = ttl_hours > 0 ? std::chrono::seconds(ttl_hours * 3600) : std::chrono::seconds(0);
+        auto ttl = ttl_hours > 0 ? std::chrono::seconds(static_cast<std::int64_t>(ttl_hours) * 3600)
+                                 : std::chrono::seconds(0);
 
         auto session = auth_fn_(req, res);
         if (!session)
             return;
         std::vector<std::string> tokens;
+        std::vector<std::string> token_ids; // audit set: ids only, never raw tokens
         tokens.reserve(static_cast<std::size_t>(count));
         for (int i = 0; i < count; ++i) {
             const auto tok_label = label.empty() ? std::format("batch-{}", i + 1)
@@ -5348,18 +5398,33 @@ void SettingsRoutes::register_routes(
             if (!created) {
                 // Fail closed. Tokens minted before the failure are real and valid;
                 // return them so the operator can use or revoke them.
-                res.status = created.error() == StoreError::InvalidInput ? 400 : 503;
-                res.set_content(
-                    nlohmann::json({{"error", {{"code", res.status},
-                                               {"message", "enrollment token could not be persisted"}}},
-                                    {"count", tokens.size()},
-                                    {"tokens", tokens}})
-                        .dump(),
-                    "application/json");
+                const bool bad_input = created.error() == StoreError::InvalidInput;
+                audit_fn_(req, "enrollment.token_create_batch", bad_input ? "denied" : "failure",
+                          "EnrollmentToken", "",
+                          std::string(bad_input ? "invalid_input" : "store_unavailable") +
+                              " by=" + session->username + " requested=" + std::to_string(count) +
+                              " minted_before_failure=" + std::to_string(tokens.size()));
+                res.status = bad_input ? 400 : 503;
+                // A4 envelope, extended with the tokens that WERE minted before the
+                // failure (they are real and valid; the operator can use or revoke).
+                auto body = nlohmann::json::parse(
+                    detail::a4_error(res, "enrollment token could not be persisted"),
+                    nullptr, /*allow_exceptions=*/false);
+                if (!body.is_object())
+                    body = nlohmann::json::object();
+                body["count"] = tokens.size();
+                body["tokens"] = tokens;
+                res.set_content(body.dump(), "application/json");
                 return;
             }
+            token_ids.push_back(created->token_id);
             tokens.push_back(std::move(created->raw_token));
         }
+
+        audit_fn_(req, "enrollment.token_create_batch", "success", "EnrollmentToken", "",
+                  "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
+                      bulk_audit_detail(token_ids));
 
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
                         "application/json");
@@ -5660,28 +5725,23 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session)
             return;
-        auto listed = auth_mgr_->list_pending_agents();
-        if (!listed) {
+        // ONE atomic UPDATE .. WHERE status='pending' RETURNING: a row a concurrent
+        // admin denied (or another replica moved) between "list" and "act" is never
+        // overwritten, and the count/audit set is exactly what THIS call moved.
+        auto moved = auth_mgr_->approve_all_pending_agents(session->username);
+        if (!moved) {
+            audit_fn_(req, "enrollment.bulk_approve", "failure", "Agent", "",
+                      "store_unavailable by=" + session->username);
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing approved","level":"error"}})");
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
-        int count = 0;
-        bool store_failed = false;
-        for (const auto& a : *listed) {
-            if (a.status == auth::PendingStatus::pending) {
-                if (!auth_mgr_->approve_pending_agent(a.agent_id, session->username)) {
-                    store_failed = true;
-                    break;
-                }
-                ++count;
-            }
-        }
-        if (store_failed)
-            res.status = 503;
-        spdlog::info("Bulk approved {} pending agent(s)", count);
+        const auto count = moved->size();
+        audit_fn_(req, "enrollment.bulk_approve", "success", "Agent", "",
+                  "by=" + session->username + " " + bulk_audit_detail(*moved));
+        spdlog::info("Bulk approved {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) approved","level":"success"}})");
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5694,28 +5754,20 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session)
             return;
-        auto listed = auth_mgr_->list_pending_agents();
-        if (!listed) {
+        auto moved = auth_mgr_->deny_all_pending_agents(session->username);
+        if (!moved) {
+            audit_fn_(req, "enrollment.bulk_deny", "failure", "Agent", "",
+                      "store_unavailable by=" + session->username);
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing denied","level":"error"}})");
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
-        int count = 0;
-        bool store_failed = false;
-        for (const auto& a : *listed) {
-            if (a.status == auth::PendingStatus::pending) {
-                if (!auth_mgr_->deny_pending_agent(a.agent_id, session->username)) {
-                    store_failed = true;
-                    break;
-                }
-                ++count;
-            }
-        }
-        if (store_failed)
-            res.status = 503;
-        spdlog::info("Bulk denied {} pending agent(s)", count);
+        const auto count = moved->size();
+        audit_fn_(req, "enrollment.bulk_deny", "success", "Agent", "",
+                  "by=" + session->username + " " + bulk_audit_detail(*moved));
+        spdlog::info("Bulk denied {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) denied","level":"warning"}})");
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5729,13 +5781,21 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session)
                       return;
-                  if (!auth_mgr_->approve_pending_agent(agent_id, session->username)) {
+                  auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
+                  if (!approved) {
+                      audit_fn_(req, "enrollment.approve",
+                                approved.error() == StoreError::InvalidInput ? "denied" : "failure",
+                                "Agent", agent_id, "store_error by=" + session->username);
                       res.status = 503;
                       res.set_header("HX-Trigger",
                                      R"({"showToast":{"message":"Enrollment store unavailable - agent NOT approved","level":"error"}})");
                       res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                       return;
                   }
+                  audit_fn_(req, "enrollment.approve", *approved ? "success" : "denied", "Agent",
+                            agent_id,
+                            std::string(*approved ? "" : "agent_not_found ") +
+                                "by=" + session->username);
                   res.set_header("HX-Trigger",
                                  R"({"showToast":{"message":"Agent approved","level":"success"}})");
                   res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5749,13 +5809,21 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session)
                       return;
-                  if (!auth_mgr_->deny_pending_agent(agent_id, session->username)) {
+                  auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
+                  if (!denied) {
+                      audit_fn_(req, "enrollment.deny",
+                                denied.error() == StoreError::InvalidInput ? "denied" : "failure",
+                                "Agent", agent_id, "store_error by=" + session->username);
                       res.status = 503;
                       res.set_header("HX-Trigger",
                                      R"({"showToast":{"message":"Enrollment store unavailable - agent NOT denied","level":"error"}})");
                       res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                       return;
                   }
+                  audit_fn_(req, "enrollment.deny", *denied ? "success" : "denied", "Agent",
+                            agent_id,
+                            std::string(*denied ? "" : "agent_not_found ") +
+                                "by=" + session->username);
                   res.set_header("HX-Trigger",
                                  R"({"showToast":{"message":"Agent denied","level":"warning"}})");
                   res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5766,8 +5834,21 @@ void SettingsRoutes::register_routes(
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
-                    if (!auth_mgr_->remove_pending_agent(agent_id))
+                    auto session = auth_fn_(req, res);
+                    if (!session)
+                        return;
+                    auto removed = auth_mgr_->remove_pending_agent(agent_id);
+                    if (!removed) {
+                        audit_fn_(req, "enrollment.remove",
+                                  removed.error() == StoreError::InvalidInput ? "denied" : "failure",
+                                  "Agent", agent_id, "store_error by=" + session->username);
                         res.status = 503;
+                    } else {
+                        audit_fn_(req, "enrollment.remove", *removed ? "success" : "denied",
+                                  "Agent", agent_id,
+                                  std::string(*removed ? "" : "agent_not_found ") +
+                                      "by=" + session->username);
+                    }
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 

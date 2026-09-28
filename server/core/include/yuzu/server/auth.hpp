@@ -461,6 +461,13 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// Maximum length of any free-text field the enrollment/pending store accepts
+/// (label, hostname, os, arch, agent_version, acting principal). The store
+/// REJECTS longer values (`StoreError::InvalidInput`); the Register/ProxyRegister
+/// handlers TRUNCATE agent-supplied descriptive fields to this cap first
+/// (`sanitize_enrollment_text`), so an over-long hostname never strands an agent.
+inline constexpr std::size_t kMaxEnrollmentTextLength = 256;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };
@@ -987,6 +994,16 @@ public:
     approve_pending_agent(const std::string& agent_id, const std::string& principal);
     [[nodiscard]] std::expected<bool, StoreError>
     deny_pending_agent(const std::string& agent_id, const std::string& principal);
+
+    /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE
+    /// STATEMENT moves in one atomic `UPDATE .. WHERE status='pending' RETURNING`,
+    /// so a row a concurrent admin denied/approved (or another replica moved) is
+    /// never overwritten. Returns the agent_ids THIS call transitioned — the
+    /// authoritative count and audit set.
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending_agents(const std::string& principal);
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending_agents(const std::string& principal);
 
     /// Remove a pending agent entry (hard delete). `true` = the row existed.
     [[nodiscard]] std::expected<bool, StoreError> remove_pending_agent(const std::string& agent_id);

@@ -457,9 +457,26 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             }
 
             // -- W1.4 / #827 atomic consume (mirror of AgentServiceImpl) ------
-            auto consumed = auth_mgr_.consume_and_enroll(
-                enrollment_token, info.agent_id(), info.hostname(), info.platform().os(),
-                info.platform().arch(), info.agent_version());
+            // WS-6 6.2: shape pre-check BEFORE the consume (pre-auth Postgres
+            // amplification: a caller-supplied junk token must not cost a write
+            // txn). A shape-invalid token cannot exist, so it is answered exactly
+            // like a well-formed token that matched nothing: a synthetic
+            // `not_found` flows through the SAME rejection block below (same
+            // metric, audit row, analytics event and uniform public message), and
+            // is therefore not an oracle. Descriptive fields are sanitised, not
+            // rejected (see sanitize_enrollment_text).
+            std::expected<auth::ConsumeEnrollResult, StoreError> consumed =
+                yuzu::server::enrollment_token_shape_valid(enrollment_token)
+                    ? auth_mgr_.consume_and_enroll(
+                          enrollment_token, info.agent_id(),
+                          yuzu::server::sanitize_enrollment_text(info.hostname()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                    : std::expected<auth::ConsumeEnrollResult, StoreError>{
+                          auth::ConsumeEnrollResult{
+                              .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
+                              .token_error = auth::EnrollmentTokenError::not_found}};
             if (!consumed) {
                 spdlog::error("[gateway] Register: enrollment consume failed for agent {}",
                               info.agent_id());
@@ -621,8 +638,11 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
                              matched_rule);
                 auto enrolled_auto = auth_mgr_.ensure_enrolled(
-                    info.agent_id(), info.hostname(), info.platform().os(), info.platform().arch(),
-                    info.agent_version(), "auto-approve:" + matched_rule);
+                    info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                    yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
                 if (!enrolled_auto) {
                     spdlog::error("[gateway] Register: auto-approve enroll failed for agent {}",
                                   info.agent_id());
@@ -646,8 +666,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
 
                 if (!pending_status) {
                     auto added = auth_mgr_.add_pending_agent(
-                        info.agent_id(), info.hostname(), info.platform().os(),
-                        info.platform().arch(), info.agent_version());
+                        info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
                     if (!added) {
                         spdlog::error("[gateway] Register: add_pending failed for agent {}",
                                       info.agent_id());

@@ -35,6 +35,7 @@
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
+#include "enrollment_token_rejection.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_mgmt_stub_pool.hpp" // #4672: build_gateway_forward_terminal_failure
@@ -2811,6 +2812,13 @@ struct BareServiceHarness {
         auth_db = std::make_unique<yuzu::test::AuthDbPgShared>();
         auth_mgr.set_auth_db(auth_db->get());
     }
+    // A PRIVATE database (not the process-shared clone) for tests that must
+    // break the schema (DDL would poison every later shared-fixture test).
+    std::unique_ptr<yuzu::test::AuthDbPg> auth_db_isolated;
+    void attach_isolated_auth_db() {
+        auth_db_isolated = std::make_unique<yuzu::test::AuthDbPg>();
+        auth_mgr.set_auth_db(auth_db_isolated->get());
+    }
 };
 
 /// MEMBER ORDER LOAD-BEARING, same contract as TrackerScope above: the dtor
@@ -3121,4 +3129,203 @@ TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",
     CHECK(yuzu::server::is_typed_inventory_source("app_perf"));
     CHECK(yuzu::server::is_typed_inventory_source("device_ci"));
     CHECK(yuzu::server::is_typed_inventory_source("software_licensing"));
+}
+
+// ── WS-6 6.2 — token SHAPE pre-check + descriptive-field sanitising ─────────
+
+TEST_CASE("enrollment_token_shape_valid: exactly 64 lowercase hex, nothing else",
+          "[agent_service][enrollment][shape]") {
+    using yuzu::server::enrollment_token_shape_valid;
+    const std::string good(64, 'a');
+    CHECK(enrollment_token_shape_valid(good));
+    CHECK(enrollment_token_shape_valid("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    CHECK_FALSE(enrollment_token_shape_valid(""));
+    CHECK_FALSE(enrollment_token_shape_valid(std::string(63, 'a')));
+    CHECK_FALSE(enrollment_token_shape_valid(std::string(65, 'a')));
+    CHECK_FALSE(enrollment_token_shape_valid(std::string(64, 'A')));         // uppercase
+    CHECK_FALSE(enrollment_token_shape_valid(std::string(63, 'a') + "g"));   // non-hex
+    CHECK_FALSE(enrollment_token_shape_valid(std::string(63, 'a') + " "));
+    std::string with_nul = good;
+    with_nul[10] = '\0';
+    CHECK_FALSE(enrollment_token_shape_valid(with_nul));
+}
+
+TEST_CASE("sanitize_enrollment_text: drops NULs, truncates on a UTF-8 boundary",
+          "[agent_service][enrollment][shape]") {
+    using yuzu::server::sanitize_enrollment_text;
+    const auto cap = yuzu::server::auth::kMaxEnrollmentTextLength;
+    CHECK(sanitize_enrollment_text("host-1") == "host-1");
+    CHECK(sanitize_enrollment_text(std::string{"a\0b\0c", 5}) == "abc");
+    CHECK(sanitize_enrollment_text(std::string(cap, 'x')) == std::string(cap, 'x'));
+    CHECK(sanitize_enrollment_text(std::string(cap + 500, 'x')).size() == cap);
+    // A 2-byte code point straddling the cap must be dropped whole, never split:
+    // (cap-1) ASCII bytes + U+00E9 (0xC3 0xA9) => 257 bytes; cut back to cap-1.
+    const std::string straddle = std::string(cap - 1, 'x') + "\xC3\xA9";
+    const auto cut = sanitize_enrollment_text(straddle);
+    CHECK(cut == std::string(cap - 1, 'x'));
+    // A code point that fits exactly is kept.
+    const std::string fits = std::string(cap - 2, 'x') + "\xC3\xA9";
+    CHECK(sanitize_enrollment_text(fits) == fits);
+}
+
+namespace {
+/// Register request for a first-time agent with a caller-chosen token and
+/// hostname/os (the fields under test).
+apb::RegisterRequest make_token_register(const std::string& agent_id, const std::string& token,
+                                         const std::string& hostname = "host",
+                                         const std::string& os = "linux") {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname(hostname);
+    req.mutable_info()->mutable_platform()->set_os(os);
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.mutable_info()->set_agent_version("0.0.0-test");
+    req.set_enrollment_token(token);
+    return req;
+}
+
+/// Junk tokens, each invalid for a DIFFERENT shape reason.
+std::vector<std::pair<std::string, std::string>> bad_shape_tokens() {
+    std::string with_nul(64, 'a');
+    with_nul[5] = '\0';
+    return {{"uppercase", std::string(64, 'A')},
+            {"63 chars", std::string(63, 'a')},
+            {"65 chars", std::string(65, 'a')},
+            {"non-hex", std::string(63, 'a') + "z"},
+            {"embedded NUL", with_nul},
+            {"human junk", "clearly-invalid-token"}};
+}
+} // namespace
+
+TEST_CASE("Register: a shape-invalid token gets the uniform rejection WITHOUT reaching the "
+          "consume store call (WS-6 6.2)",
+          "[pg][agent_service][register][enrollment][shape]") {
+    BareServiceHarness h;
+    h.attach_isolated_auth_db();
+    h.auth_mgr.set_metrics_registry(&h.metrics);
+
+    // Break ONLY the token table. The pending-agents fast-path read still works, so
+    // every outcome below is decided by the shape check vs the consume call.
+    {
+        auto lease = h.auth_db_isolated->pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(), "DROP TABLE auth.enrollment_tokens",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    for (const auto& [why, token] : bad_shape_tokens()) {
+        INFO("shape-invalid token: " << why);
+        auto req = make_token_register("shape-agent", token);
+        apb::RegisterResponse resp;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        // The UNIFORM rejection — not UNAVAILABLE, which a consume attempt against the
+        // broken table would have produced.
+        REQUIRE(status.ok());
+        CHECK_FALSE(resp.accepted());
+        CHECK(resp.enrollment_status() == "denied");
+        CHECK(resp.reject_reason() ==
+              std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
+    }
+    // Same audit/metric class as a well-formed token that matched nothing.
+    CHECK(h.metrics
+              .counter("yuzu_enrollment_token_rejected_total", {{"variant", "not_found"}})
+              .value() == static_cast<double>(bad_shape_tokens().size()));
+    // No consume-op degrade was ever counted: the store call was never made.
+    CHECK(h.metrics
+              .counter("yuzu_auth_enrollment_store_degrade_total",
+                       {{"op", "consume"}, {"reason", "query_error"}})
+              .value() == 0.0);
+
+    // Control: a WELL-FORMED (but unknown) token does reach the consume call, which
+    // fails closed on the broken table -> gRPC UNAVAILABLE, never accepted=false.
+    auto ok_shape = make_token_register("shape-agent", std::string(64, 'a'));
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &ok_shape, &resp);
+    CHECK(status.error_code() == grpc::StatusCode::UNAVAILABLE);
+    CHECK(h.metrics
+              .counter("yuzu_auth_enrollment_store_degrade_total",
+                       {{"op", "consume"}, {"reason", "query_error"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("ProxyRegister: a shape-invalid token gets the uniform rejection WITHOUT reaching the "
+          "consume store call (WS-6 6.2)",
+          "[pg][agent_service][register][enrollment][gateway][shape]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    BareServiceHarness h;
+    h.attach_isolated_auth_db();
+    h.auth_mgr.set_metrics_registry(&h.metrics);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    {
+        auto lease = h.auth_db_isolated->pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(), "DROP TABLE auth.enrollment_tokens",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    for (const auto& [why, token] : bad_shape_tokens()) {
+        INFO("shape-invalid token: " << why);
+        auto req = make_token_register("gw-shape-agent", token);
+        apb::RegisterResponse resp;
+        auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+        REQUIRE(status.ok());
+        CHECK_FALSE(resp.accepted());
+        CHECK(resp.enrollment_status() == "denied");
+        CHECK(resp.reject_reason() ==
+              std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
+    }
+    CHECK(h.metrics
+              .counter("yuzu_enrollment_token_rejected_total", {{"variant", "not_found"}})
+              .value() == static_cast<double>(bad_shape_tokens().size()));
+    CHECK(h.metrics
+              .counter("yuzu_auth_enrollment_store_degrade_total",
+                       {{"op", "consume"}, {"reason", "query_error"}})
+              .value() == 0.0);
+
+    auto ok_shape = make_token_register("gw-shape-agent", std::string(64, 'a'));
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &ok_shape, &resp);
+    CHECK(status.error_code() == grpc::StatusCode::UNAVAILABLE);
+}
+
+TEST_CASE("Register: over-long / NUL-bearing descriptive fields are SANITISED, not refused "
+          "(token path and pending path) (WS-6 6.2)",
+          "[pg][agent_service][register][enrollment][shape]") {
+    BareServiceHarness h;
+    h.attach_auth_db();
+    const std::string long_host(1000, 'h');
+    const std::string nul_os{"li\0nux", 6};
+
+    // Token path: a valid single-use token still enrolls the agent.
+    auto raw = mint_enrollment_token(h.auth_mgr, "sanitize", /*max_uses=*/1, std::chrono::hours(1));
+    auto req = make_token_register("sanitize-token-agent", raw, long_host, nul_os);
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+
+    // Pending path: an unenrolled, token-less agent is queued (not INVALID_ARGUMENT).
+    auto req2 = make_token_register("sanitize-pending-agent", "", long_host, nul_os);
+    apb::RegisterResponse resp2;
+    auto status2 = h.svc.Register(/*context=*/nullptr, &req2, &resp2);
+    REQUIRE(status2.ok());
+    CHECK_FALSE(resp2.accepted());
+    CHECK(resp2.enrollment_status() == "pending");
+
+    auto rows = h.auth_mgr.list_pending_agents();
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    for (const auto& a : *rows) {
+        INFO("agent " << a.agent_id);
+        CHECK(a.hostname == std::string(yuzu::server::auth::kMaxEnrollmentTextLength, 'h'));
+        CHECK(a.os == "linux"); // NUL dropped, not truncated-at-NUL
+    }
+
+    // agent_id keeps its HARD reject (identity, not description).
+    auto req3 = make_token_register(std::string("bad\0id", 6), "", "h", "linux");
+    apb::RegisterResponse resp3;
+    auto status3 = h.svc.Register(/*context=*/nullptr, &req3, &resp3);
+    CHECK(status3.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
 }

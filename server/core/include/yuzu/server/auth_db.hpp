@@ -709,7 +709,7 @@ public:
     /// agent_version, principal) accepted by the enrollment/pending store.
     /// `agent_id` uses `auth::kMaxAgentIdLength`, the raw token
     /// `auth::kMaxEnrollmentTokenLength`.
-    static constexpr std::size_t kMaxEnrollmentTextLength = 256;
+    static constexpr std::size_t kMaxEnrollmentTextLength = auth::kMaxEnrollmentTextLength;
 
     /// Upper bound on a token TTL (~100 years). `0` = never expires.
     static constexpr std::int64_t kMaxEnrollmentTtlSeconds = 3'153'600'000;

@@ -2445,6 +2445,19 @@ std::expected<bool, StoreError> AuthManager::deny_pending_agent(const std::strin
     });
 }
 
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::approve_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_approve",
+        [&](yuzu::server::AuthDB& db) { return db.approve_all_pending(principal); });
+}
+
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::deny_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_deny", [&](yuzu::server::AuthDB& db) { return db.deny_all_pending(principal); });
+}
+
 std::expected<bool, StoreError> AuthManager::remove_pending_agent(const std::string& agent_id) {
     return enrollment_store_call<bool>(
         "remove", [&](yuzu::server::AuthDB& db) { return db.remove_pending(agent_id); });

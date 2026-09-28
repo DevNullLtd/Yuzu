@@ -3007,7 +3007,7 @@ public:
                           "counter");
         for (auto op : {"create_token", "consume", "list_tokens", "revoke_token", "add_pending",
                         "ensure_enrolled", "pending_status", "list_pending", "approve", "deny",
-                        "remove"})
+                        "bulk_approve", "bulk_deny", "remove"})
             for (auto reason : {"no_store", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_auth_enrollment_store_degrade_total",
                                  {{"op", op}, {"reason", reason}});

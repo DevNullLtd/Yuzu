@@ -242,9 +242,26 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // consume_enrollment_token which performs the check-and-increment
             // under one unique_lock and reports the typed outcome so we can
             // audit the lost-race case with attribution.
-            auto consumed = auth_mgr_.consume_and_enroll(
-                enrollment_token, info.agent_id(), info.hostname(), info.platform().os(),
-                info.platform().arch(), info.agent_version());
+            // WS-6 6.2: shape pre-check BEFORE the consume (pre-auth Postgres
+            // amplification: a caller-supplied junk token must not cost a write
+            // txn). A shape-invalid token cannot exist, so it is answered exactly
+            // like a well-formed token that matched nothing: a synthetic
+            // `not_found` flows through the SAME rejection block below (same
+            // metric, audit row, analytics event and uniform public message), and
+            // is therefore not an oracle. Descriptive fields are sanitised, not
+            // rejected (see sanitize_enrollment_text).
+            std::expected<auth::ConsumeEnrollResult, StoreError> consumed =
+                yuzu::server::enrollment_token_shape_valid(enrollment_token)
+                    ? auth_mgr_.consume_and_enroll(
+                          enrollment_token, info.agent_id(),
+                          yuzu::server::sanitize_enrollment_text(info.hostname()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                    : std::expected<auth::ConsumeEnrollResult, StoreError>{
+                          auth::ConsumeEnrollResult{
+                              .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
+                              .token_error = auth::EnrollmentTokenError::not_found}};
             if (!consumed) {
                 spdlog::error("Register: enrollment consume failed for agent {}", info.agent_id());
                 return enrollment_store_status(consumed.error());
@@ -431,8 +448,11 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 // Persist enrollment so reconnections skip enrollment entirely.
                 // Returns false if admin-denied — admin denials outrank auto-approve.
                 auto enrolled_auto = auth_mgr_.ensure_enrolled(
-                    info.agent_id(), info.hostname(), info.platform().os(), info.platform().arch(),
-                    info.agent_version(), "auto-approve:" + matched_rule);
+                    info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                    yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
                 if (!enrolled_auto) {
                     spdlog::error("Register: auto-approve enroll failed for agent {}",
                                   info.agent_id());
@@ -458,8 +478,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 if (!pending_status) {
                     // First time seeing this agent -- add to pending queue
                     auto added = auth_mgr_.add_pending_agent(
-                        info.agent_id(), info.hostname(), info.platform().os(),
-                        info.platform().arch(), info.agent_version());
+                        info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
                     if (!added) {
                         spdlog::error("Register: add_pending failed for agent {}", info.agent_id());
                         return enrollment_store_status(added.error());

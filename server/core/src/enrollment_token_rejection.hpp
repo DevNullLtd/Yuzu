@@ -32,9 +32,59 @@
 
 #include <grpcpp/support/status.h>
 
+#include <string>
 #include <string_view>
 
 namespace yuzu::server {
+
+/// Exact wire shape of an enrollment token: 64 lowercase hex characters (a
+/// 32-byte CSPRNG value through `AuthManager::bytes_to_hex`). THE single
+/// predicate for both Register and ProxyRegister (WS-6 6.2): a token that fails
+/// it cannot exist, so the handlers reject it WITHOUT touching the store — an
+/// unauthenticated caller must not be able to turn arbitrary junk into a Postgres
+/// write transaction each (pre-auth amplification). No negative cache: the check
+/// is O(64) and stateless. A shape-invalid token is answered EXACTLY like a
+/// well-formed token that matched nothing (`not_found` audit/metric class,
+/// the uniform public message) so the shape check is not an oracle.
+[[nodiscard]] inline bool enrollment_token_shape_valid(std::string_view token) noexcept {
+    if (token.size() != 64)
+        return false;
+    for (const char c : token) {
+        const bool digit = c >= '0' && c <= '9';
+        const bool lower_hex = c >= 'a' && c <= 'f';
+        if (!digit && !lower_hex)
+            return false;
+    }
+    return true;
+}
+
+/// Sanitize an AGENT-SUPPLIED descriptive string (hostname / os / arch /
+/// agent_version, and the "auto-approve:<rule>" attribution) before it reaches
+/// the enrollment store: drop embedded NUL bytes and truncate to
+/// `auth::kMaxEnrollmentTextLength` on a UTF-8 code-point boundary. The store
+/// REJECTS out-of-bounds text (`StoreError::InvalidInput`); doing that at
+/// Register would turn a long or odd hostname into a permanent INVALID_ARGUMENT
+/// that strands an otherwise-legitimate agent forever. These fields are
+/// descriptive only (identity is `agent_id`, which keeps its hard reject), so
+/// lossy sanitising is the safe direction. Shared by Register + ProxyRegister.
+[[nodiscard]] inline std::string sanitize_enrollment_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() < auth::kMaxEnrollmentTextLength ? s.size()
+                                                          : auth::kMaxEnrollmentTextLength);
+    for (const char c : s) {
+        if (c != '\0')
+            out.push_back(c);
+    }
+    if (out.size() > auth::kMaxEnrollmentTextLength) {
+        std::size_t cut = auth::kMaxEnrollmentTextLength;
+        // Back off any UTF-8 continuation bytes (10xxxxxx) so we never split a
+        // multi-byte character.
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0U) == 0x80U)
+            --cut;
+        out.resize(cut);
+    }
+    return out;
+}
 
 /// gRPC status for a failed enrollment/pending store call (WS-6 6.2), shared by
 /// the direct Register and gateway ProxyRegister handlers. A store outage maps
