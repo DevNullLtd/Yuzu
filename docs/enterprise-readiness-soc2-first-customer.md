@@ -183,28 +183,33 @@ affected; this is a single-route regression-and-fix, not a reopening of
 the flip's broader closure. Correction also recorded in the route
 inventory doc itself.
 
-**Addendum — `POST /api/v1/scope/preview` / MCP `preview_scope_targets` service-scope
-gap, closed (CC6.1/CC6.3, #4981, 2026-09-28).** This route did not exist at the time
-of the 2026-08-18 service-scope sweep (`docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`)
+**Addendum — `POST /api/v1/scope/preview` service-scope gap, closed (CC6.1/CC6.3,
+#4981, 2026-09-28).** This REST route did not exist at the time of the 2026-08-18
+service-scope sweep (`docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`)
 that produced the closed route inventory above — it was added on 2026-09-12
 (`b00d3cadc`), after the sweep, and was never audited into it. It shipped from day
 one without the deny-first pattern the sweep established for every sibling
 result-set route: a service-scoped API token was admitted and its match set
 silently narrowed, rather than denied outright, the same shape #4980 (the addendum
 above) fixed on a different route. **For any assessment covering 2026-09-12 through
-#4981's merge, treat `scope/preview`/`preview_scope_targets` as NOT covered by the
-flip's confinement guarantee above.** #4981 also fixed a separate, more severe,
-non-service-scope defect on the same route: a bespoke per-agent attribute resolver
-did not evaluate `from_result_set:`/`props.` scope atoms, so a negated reference
-(`NOT from_result_set:<id>`) silently matched the caller's entire visible fleet
-regardless of the referenced set's real membership — a preview tool giving a
-misleadingly broad blast-radius answer before a real dispatch. Both are now closed:
-the route is denied outright via the shared `deny_fleet_wide_service_scoped`
-chokepoint (REST) / the pre-existing structural C8 default-deny (MCP), and the match
-evaluation now runs through the same fail-closed ladder real dispatch uses. The
-sibling, deliberately out-of-scope gap on `/api/scope/estimate` (owner-check failure
-there degrades to "zero members" rather than aborting) remains open, tracked as
-#5003. Correction also recorded in the route inventory doc itself.
+#4981's merge, treat `POST /api/v1/scope/preview` (REST only) as NOT covered by the
+flip's confinement guarantee above.** The MCP twin, `preview_scope_targets`, is NOT
+part of this gap — it has existed since 2026-03-25 and has been structurally denied
+to a service-scoped token since C8's default-deny landed on 2026-08-18 (the same day
+as the sweep), via its `kToolSecurity` entry's default `ServiceScopeClass::denied`;
+#4981 made no service-scope change on the MCP side. #4981 also fixed a separate,
+more severe, non-service-scope defect shared by BOTH surfaces: a bespoke per-agent
+attribute resolver did not evaluate `from_result_set:`/`props.` scope atoms, so a
+negated reference (`NOT from_result_set:<id>`) silently matched the caller's entire
+visible fleet regardless of the referenced set's real membership — a preview tool
+giving a misleadingly broad blast-radius answer before a real dispatch. That defect,
+and the REST service-scope gap, are both now closed: the REST route is denied
+outright via the shared `deny_fleet_wide_service_scoped` chokepoint (MCP's own,
+pre-existing structural C8 default-deny needed no change), and the match evaluation
+on both surfaces now runs through the same fail-closed ladder real dispatch uses.
+The sibling, deliberately out-of-scope gap on `/api/scope/estimate` (owner-check
+failure there degrades to "zero members" rather than aborting) remains open, tracked
+as #5003. Correction also recorded in the route inventory doc itself.
 
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —

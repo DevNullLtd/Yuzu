@@ -2988,15 +2988,20 @@ fail-closed evaluation ladder a real dispatch uses.
 
 **Who this affects:** anyone who has called either surface with an expression containing
 `from_result_set:` or `props.`. If you relied on the old (incorrect) match set for either atom
-kind — most plausibly a negated `NOT from_result_set:<id>` that was, in practice, matching your
-whole visible fleet — re-check any automation built on that response before upgrading; the
-corrected match set will generally be narrower and more accurate to what a real dispatch of the
-same expression would actually target.
+kind, re-check any automation built on that response before upgrading — the direction of the
+correction depends on how the atom was used: a negated `NOT from_result_set:<id>` was, in
+practice, matching your whole visible fleet, and the corrected match set will generally be
+narrower and more accurate to what a real dispatch of the same expression would actually
+target; a plain (non-negated) `from_result_set:`/`props.<key>` atom always evaluated false under
+the old resolver, so its match set was previously stuck at 0 and the corrected set will
+generally be broader, now actually populated with real members.
 
 **New error responses a strict client should handle:**
-- **403** — a service-scoped API token now gets denied outright on both surfaces, rather than
-  admitted with a silently narrowed match set (closing the same cross-service-reach gap #4980
-  closed on a sibling result-set route).
+- **403 (REST only)** — a service-scoped API token calling `POST /api/v1/scope/preview` now gets
+  denied outright, rather than admitted with a silently narrowed match set (closing the same
+  cross-service-reach gap #4980 closed on a sibling result-set route). MCP `preview_scope_targets`
+  is unaffected by this change — it already denied a service-scoped token outright before this
+  release.
 - **404** `RESULT_SET_NOT_FOUND` (REST) / `kInvalidParams` (MCP) — a `from_result_set:<id>`
   referencing a result set that is absent, expired, or not owned by the caller now aborts,
   instead of silently matching nothing (or, negated, everything).

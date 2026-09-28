@@ -67,17 +67,20 @@ this row's own date. #4980 closed it again with a dedicated
 `deny_fleet_wide_service_scoped` call that no longer depends on which
 underlying gate this route uses.
 
-**Correction (#4981, 2026-09-28):** `POST /api/v1/scope/preview` / MCP
-`preview_scope_targets` is not a row in this sweep because it did not exist yet —
-it was added 2026-09-12 (`b00d3cadc`), after this sweep's 2026-08-18 cutoff, and
-was never retroactively audited into it. It shipped without the deny-first pattern
-this sweep established: a service-scoped token was admitted and narrowed rather
-than denied. #4981 closed it with the same `deny_fleet_wide_service_scoped`
-chokepoint rows 17-24 already use. Exposure window: 2026-09-12 through #4981's
-merge. See the SOC 2 readiness doc's matching addendum for the full writeup
-(this route's fix also closed an unrelated, more severe from_result_set:/props.
-scope-atom evaluation defect on the same route, out of scope for this
-service-scope-focused inventory).
+**Correction (#4981, 2026-09-28):** `POST /api/v1/scope/preview` (REST only — see
+below for MCP) is not a row in this sweep because it did not exist yet — it was
+added 2026-09-12 (`b00d3cadc`), after this sweep's 2026-08-18 cutoff, and was never
+retroactively audited into it. It shipped without the deny-first pattern this sweep
+established: a service-scoped token was admitted and narrowed rather than denied.
+#4981 closed it with the same `deny_fleet_wide_service_scoped` chokepoint rows
+17-24 already use. Exposure window: 2026-09-12 through #4981's merge. The MCP twin,
+`preview_scope_targets`, is a DIFFERENT case, not part of this correction: it has
+existed since 2026-03-25 and was already structurally denied to a service-scoped
+token from 2026-08-18 onward (the same day as this sweep) via C8's default-deny —
+#4981 made no service-scope change on the MCP side. See the SOC 2 readiness doc's
+matching addendum for the full writeup (this route's fix also closed an unrelated,
+more severe from_result_set:/props. scope-atom evaluation defect shared by both
+surfaces, out of scope for this service-scope-focused inventory).
 
 ## MCP (`mcp_server.cpp`) — sweep result: 0 findings
 
