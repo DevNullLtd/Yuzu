@@ -259,8 +259,25 @@ whichever of the two INSERTs runs second can never see auth.users empty (the fir
 committed a row), so the account+grant must be created by `provision_first_admin`'s own INSERT,
 in ONE transaction, so a crash between account-creation and grant-creation can never strand an
 account with no grant and no later boot able to fix it (the table would no longer be empty).
-`seed_admin_if_empty` stays in `main.cpp` for its unrelated role there (the break-glass paths
-further down reference `auth_db` directly) but is now a guaranteed no-op in production.
+`seed_admin_if_empty` stays as the very next call in `main.cpp`'s fresh-start block (the
+short-lived `auth_db` object it runs against is also needed further down, for the unrelated
+break-glass paths that reference it directly) but is now a guaranteed no-op **within a
+single-version fleet** — `provision_first_admin` has already inserted the row by the time it
+runs, so its own `WHERE NOT EXISTS` sees a non-empty table and correctly declines to write.
+
+**Residual: mixed-version first boot is NOT covered by that guarantee.** Both functions share
+the same advisory lock (`kSeedAdminLockSql`/`kProvisionFirstAdminLockSql`, byte-identical), which
+serializes ordering but not WHICH one wins. If an old-binary replica (pre-dating this change)
+races a new-binary replica against the same genuinely-empty database, the old binary's
+`seed_admin_if_empty` can win the lock first and commit the account with NO Administrator grant
+-- `provision_first_admin` then sees a non-empty table on its own turn and cleanly no-ops,
+permanently (the table is never empty again). This delivery ships with `rbac_enabled` still
+seeded `'false'` (see below), so a stranded account of this shape still authenticates via the
+legacy `role='admin'` field and can self-heal by assigning itself Administrator through the
+ordinary A2 route before RBAC enforcement is ever turned on -- but the guarantee above is
+explicitly scoped to a same-version fleet, and a version-skew-safe repair protocol (or an
+explicit refusal to first-boot under version skew) is required work before the deferred
+seeded-default flip ships, tracked alongside it in #5055.
 
 **The seeded-default flip itself is DEFERRED, not shipped in this delivery.** The bootstrap above
 makes flipping `rbac_store.cpp`'s seeded-default literal from `'false'` to `'true'`

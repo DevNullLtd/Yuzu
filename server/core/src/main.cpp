@@ -1362,11 +1362,14 @@ int main(int argc, char* argv[]) {
     //
     // main.cpp DOES still need its own short-lived AuthDB here, for two
     // reasons that both run BEFORE Server::create() exists to ask:
-    //   1. Fresh-start admin seeding (below) — auth.users is empty on a
+    //   1. Fresh-start admin bootstrap (below) — auth.users is empty on a
     //      brand-new Postgres database, so the config-file admin (loaded
-    //      into auth_mgr above) must be persisted once via
-    //      seed_admin_if_empty(), which is TOCTOU-free against a second
-    //      server instance racing first boot.
+    //      into auth_mgr above) must be persisted once, atomically with its
+    //      Administrator RBAC grant, via RbacStore::provision_first_admin()
+    //      (TOCTOU-free against a second server instance racing first
+    //      boot); AuthDB::seed_admin_if_empty() runs right after it purely
+    //      for its own historical account-only contract and is now a
+    //      guaranteed production no-op.
     //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
     //      --auth-mode=sso-only break-glass validation, all of which run
     //      (and may exit) before Server::create() is ever called.
@@ -1482,6 +1485,19 @@ int main(int argc, char* argv[]) {
             // only via a hand-edited config file — but it must still fail
             // loudly here, not silently provision the wrong identity as the
             // fleet's first Administrator.
+            //
+            // Deliberately unconditional — this refusal fires on EVERY boot
+            // that reaches this shape, including a database that already
+            // has admins and where nothing would actually be provisioned
+            // (seed_user's only use is passing an identity to
+            // provision_first_admin/seed_admin_if_empty below, both of
+            // which no-op harmlessly on a non-empty auth.users regardless).
+            // Gating the refusal on auth.users emptiness would need a new
+            // read before this point; kept simple and fail-loud instead —
+            // an operator who hand-edits config to remove the admin-role
+            // entry (e.g. moving fully to SSO) gets a clear, immediately
+            // recoverable boot error rather than a config file that quietly
+            // stops doing what it used to do.
             spdlog::error("Fatal: no admin-role user found in the loaded config; refusing to "
                           "provision a non-admin account as Administrator.");
             return EXIT_FAILURE;

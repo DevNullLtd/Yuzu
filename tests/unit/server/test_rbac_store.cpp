@@ -4200,6 +4200,17 @@ TEST_CASE("RbacStore::provision_first_admin provisions the first admin "
     CHECK(store.get_principal_roles("user", "firstadmin").size() == 1);
     CHECK(store.get_principal_roles("user", "firstadmin").front().role_name == "Administrator");
 
+    // Pin the auth.users row contents themselves, not just the grant — a
+    // column-order regression in provision_first_admin's INSERT (e.g.
+    // hash/salt swapped, or role not 'admin') would otherwise pass every
+    // assertion in this file while shipping an unusable/non-admin account.
+    auto row = auth_db->get_user("firstadmin");
+    REQUIRE(row.has_value());
+    CHECK(row->username == "firstadmin");
+    CHECK(row->role == auth::Role::admin);
+    CHECK(row->hash_hex == "hash");
+    CHECK(row->salt_hex == "salt");
+
     // Restart-idempotency: calling again (as main.cpp does unconditionally
     // on every boot) with the SAME args must not re-provision or duplicate
     // the grant.
@@ -4269,6 +4280,71 @@ TEST_CASE("RbacStore::provision_first_admin under real concurrency — two "
     CHECK((provisioned1.load() ? admin1_grants : admin2_grants) == 1);
 }
 
+TEST_CASE("RbacStore::provision_first_admin races AuthDB::seed_admin_if_empty "
+          "cleanly — the two share one advisory lock, so exactly one account "
+          "is ever created regardless of which entry point wins",
+          "[rbac_store][pg]") {
+    // Pins the actual cross-method serialization K5/C3 (adversarial review,
+    // 2026-09-28) flagged as untested: the concurrency test above only ever
+    // races provision_first_admin against itself, through one TU's lock
+    // literal — this races it against the OTHER entry point, through the
+    // OTHER TU's literal (auth_db.cpp's kSeedAdminLockSql), which is the
+    // actual shape a mixed-version rolling-restart first boot produces (see
+    // docs/adr/1008's fresh-install bootstrap delivery note, "Residual:
+    // mixed-version first boot"). This test does NOT close that residual —
+    // it documents today's correct half (no duplicate account is ever
+    // created) and would catch a future drift between the two lock literals.
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    std::atomic<bool> ok1{false}, ok2{false};
+    ScopedJoin t1{std::thread([&] {
+        auto r = store.provision_first_admin("newpath", "hash1", "salt1");
+        ok1 = r.has_value();
+    })};
+    ScopedJoin t2{std::thread([&] {
+        auto r = auth_db->seed_admin_if_empty("legacypath", "hash2", "salt2");
+        ok2 = r.has_value();
+    })};
+    t1.join();
+    t2.join();
+    CHECK(ok1.load());
+    CHECK(ok2.load());
+
+    // Exactly one account exists, whichever entry point won.
+    const bool new_exists = auth_db->get_user("newpath").has_value();
+    const bool legacy_exists = auth_db->get_user("legacypath").has_value();
+    CHECK(new_exists != legacy_exists);
+
+    // If provision_first_admin won, it also wrote the Administrator grant;
+    // if the legacy seed_admin_if_empty won instead, NO grant exists — the
+    // exact stranded-account shape the ADR residual note now discloses.
+    if (new_exists) {
+        CHECK(store.get_principal_roles("user", "newpath").size() == 1);
+    } else {
+        CHECK(store.get_principal_roles("user", "legacypath").empty());
+    }
+}
+
+TEST_CASE("RbacStore::provision_first_admin refuses an invalid username "
+          "before touching auth.users — no account, no grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // is_valid_username runs first in the owner (rbac_admin_authority_owner.cpp),
+    // mirroring AuthDB::seed_admin_if_empty's own InvalidUsername refusal —
+    // this entry point now runs BEFORE that one in production, so the same
+    // guard must exist here too rather than relying on the now-vestigial
+    // second call to ever catch it.
+    auto result = store.provision_first_admin("not a valid username!", "hash", "salt");
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+    // get_user validates its own input and refuses to even look up a
+    // syntactically-invalid username (InvalidUsername, not UserNotFound) —
+    // either way, no such account exists.
+    CHECK(auth_db->get_user("not a valid username!").error() == AuthDBError::InvalidUsername);
+    CHECK(store.get_principal_roles("user", "not a valid username!").empty());
+}
+
 TEST_CASE("RbacStore::provision_first_admin cleanly no-ops when auth.users "
           "is already non-empty — no account, no grant, not an error",
           "[rbac_store][pg]") {
@@ -4304,4 +4380,11 @@ TEST_CASE("RbacStore::provision_first_admin fails closed — ok=false with a "
     auto result = store.provision_first_admin("failadmin", "hash", "salt");
     REQUIRE_FALSE(result.has_value());
     CHECK_FALSE(result.error().empty());
+
+    // Prove the rollback, not just the error return: the earlier
+    // auth.users INSERT must not survive the later grant-INSERT failure —
+    // a regression that split account and grant into separate transactions
+    // would otherwise leave "failadmin" stranded with no grant while this
+    // test still passed on the error check alone.
+    CHECK(auth_db->get_user("failadmin").error() == AuthDBError::UserNotFound);
 }
