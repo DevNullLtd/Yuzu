@@ -9661,7 +9661,14 @@ gap, tracked `#5003`, not fixed by `#4981`.
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the
 syntax-only validate route above, so a management-group-confined caller's
 `matched_agents`/`matched_count` are narrowed to their own visible devices
-after the ladder evaluates, never the whole fleet.
+after the ladder evaluates, never the whole fleet. **A service-scoped API
+token is denied outright (403)** before the fleet-read gate or the
+evaluation ladder ever run — same cross-service-reach reasoning as `POST
+/api/v1/result-sets/from-inventory-query` (#4980): a `from_result_set:<id>`/
+`props.<key>` atom resolves against the *minting operator's* identity
+(`session->username`), not the token's own restricted scope, so admitting
+and merely narrowing the output (what `fleet_read_fn` alone would do) would
+let a service token probe or own-check a result set it never minted.
 
 **Request body:** `{"expression": "..."}`
 
@@ -9686,6 +9693,7 @@ after the ladder evaluates, never the whole fleet.
 | Status | Reason |
 |---|---|
 | 400 | `expression` missing/empty, or fails to parse/validate |
+| 403 | Service-scoped API token — denied outright, before the fleet-read gate or evaluation ladder ever run (#4980-class cross-service-reach fix). No `.permission` field in the error body: a service-scoped caller holding `Infrastructure:Read` is still denied, so naming it would be a false self-remediation claim |
 | 404 | A `from_result_set:<id>` atom references a result set that is absent, expired, or not owned by the caller (`RESULT_SET_NOT_FOUND`) — existence-oracle-safe, same body shape as the result-set routes' own `load_owned` 404; a server-side audit row is still written |
 | 503 | Scope evaluation aborted — never silently under-reports the match set. A store preload (tag/props/result-set) failed or the cross-replica presence read failed is TRANSIENT (`db_degraded`/`presence_degraded`, `retry_after_ms: 5000`); no dispatching principal was available or a required store isn't wired is PERMANENT (`principal_unresolved`/`unresolvable`, `retry_after_ms: null` — a retry cannot fix either); the evaluator itself being unwired (misconfiguration) also carries `retry_after_ms: null` |
 
