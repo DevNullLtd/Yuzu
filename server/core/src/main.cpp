@@ -1733,8 +1733,15 @@ int main(int argc, char* argv[]) {
     // -- Batch token generation mode (exits without starting server) ----------
 
     if (generate_tokens > 0) {
-        auto ttl = gen_ttl_hours > 0 ? std::chrono::seconds(gen_ttl_hours * 3600)
-                                     : std::chrono::seconds(0);
+        // int64 cast: gen_ttl_hours * 3600 can overflow a 32-bit int for a
+        // maliciously/accidentally huge --token-ttl-hours (signed overflow is UB,
+        // not just wrong) — same class of fix as settings_routes.cpp's enrollment
+        // handlers (WS-6 6.2 commit 4). AuthDB::create_token rejects an
+        // out-of-bounds ttl regardless (kMaxEnrollmentTtlSeconds), so this is
+        // belt-and-braces, not a behaviour change for any realistic value.
+        auto ttl = gen_ttl_hours > 0
+                       ? std::chrono::seconds(static_cast<std::int64_t>(gen_ttl_hours) * 3600)
+                       : std::chrono::seconds(0);
 
         // WS-6 6.2: tokens live in Postgres (shared by every replica), so mint
         // through the same auth store the server uses. No auth store => fail
