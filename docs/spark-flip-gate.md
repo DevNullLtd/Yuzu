@@ -1685,8 +1685,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (g)(1) of `docs/spark-stage2-guardian-consumer-design.md` and in the operator manual. `inert`
   is reached about 150 ms of backoff after the first failure at the default cadence (R5.7 (g)(4)),
   so once Spark is live an episode does not need to be long to open the window.
-- **CONFIRMED and FIXED, branch `fix/4685-guardian-boot-inert-split` (not yet merged to `dev` as
-  of this entry).** `SparkMechanismStats` gained an additive `boot_inert` field (declared after
+- **CONFIRMED and FIXED, merged to `dev` via PR #5021 (`257bfb338`).**
+  `SparkMechanismStats` gained an additive `boot_inert` field (declared after
   `inert` for designated-initializer order): TRUE only for the BOOT-TIME case (`start()` could not
   bind the mechanism's OS facility, every `watch()` refused), FALSE for a TRANSIENT
   runtime-degraded episode (Registry's sweeper / File's worker, three consecutive failed passes).
@@ -1712,8 +1712,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   in #2084) is still missing - this fix adds no new telemetry. Registry parity for every test.
 - Owner: fixed ahead of PR-5 by the author of the #4685 fix series, not deferred to the PR-5 (F14
   flip) author as this entry originally assumed.
-- Milestone: #4685 itself - fix landed on `fix/4685-guardian-boot-inert-split`; merge to `dev`
-  still pending as of this entry.
+- Milestone: #4685 itself - fixed and merged via PR #5021.
 - Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer
   blocked by this entry once the branch above merges. What changed: the pre-fix "capability set
   keys off the UNION `inert`" defect (Detection signal/Operator action/Compensating control above)
@@ -1990,7 +1989,7 @@ driver.
 
 **NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
 #4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
-not re-reconciled on recovery) is now SATISFIED - fixed on `fix/4685-guardian-boot-inert-split`
+not re-reconciled on recovery) is now SATISFIED - fixed and merged via PR #5021
 (the additive `boot_inert` field, `guardian_engine.cpp`'s capability filter narrowed to
 `!boot_inert`); see its section 5 entry, now closed. The
 per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
