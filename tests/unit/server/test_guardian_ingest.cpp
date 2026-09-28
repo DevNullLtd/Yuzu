@@ -624,7 +624,7 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's overrun_oldest genuinely evict
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // A blocking-policy regression would hang this loop for as long as the sink stays parked
-    // (the TEST_CASE would time out under the harness's own deadline), not merely run slow.
+    // (the TEST_CASE would time out under the harness's own deadline), not merely run slowly.
     // Scaled by kSpinScale (test_helpers.hpp) like every other timing bound in this file: this
     // exact unscaled-deadline mistake has recurred twice already in this test suite family under
     // TSan/ASan, which this test's 2000-message producer loop is a materially heavier workload
