@@ -75,6 +75,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -134,8 +135,20 @@ def find_build_dir(explicit: str | None) -> Path:
     )
 
 
+#: The core library target's own object directory (UP-10) - restricting the
+#: object lookup to here, rather than an `rglob` over the whole build tree,
+#: avoids ever picking up a stale or duplicate object compiled into a
+#: DIFFERENT target's `.p` directory (e.g. a future test binary that also
+#: compiles one of these same source files) - `find_object` below now
+#: errors clearly if the wanted object is missing or duplicated even within
+#: this single, narrower directory, rather than silently matching whichever
+#: copy `rglob` happened to find first across the whole tree.
+CORE_TARGET_OBJ_DIR = Path("server") / "core" / "libyuzu_server_core.a.p"
+
+
 def find_object(build_dir: Path, stem: str) -> Path:
-    """Locate the single compiled object for a source stem under build_dir.
+    """Locate the single compiled object for a source stem under the core
+    library target's own object directory (see CORE_TARGET_OBJ_DIR).
 
     Meson names an object `src_<stem>.cpp.o` (or `.obj` on the MSVC backend)
     inside its target's `*.p`/`.p` directory - match on the exact basename
@@ -143,27 +156,54 @@ def find_object(build_dir: Path, stem: str) -> Path:
     file's name (there is none today, but a future one should not silently
     match the wrong object).
     """
+    obj_dir = build_dir / CORE_TARGET_OBJ_DIR
+    if not obj_dir.is_dir():
+        raise SystemExit(
+            f"check_core_presentation_link: core target object directory "
+            f"{obj_dir} does not exist - build yuzu_server_core first "
+            f"(`meson compile -C <builddir> yuzu_server_core`)"
+        )
     wanted = {f"src_{stem}.cpp.o", f"src_{stem}.cpp.obj"}
-    matches = [p for p in build_dir.rglob("*.o*") if p.name in wanted]
+    matches = [p for p in obj_dir.iterdir() if p.name in wanted]
     if not matches:
         raise SystemExit(
             f"check_core_presentation_link: no compiled object for '{stem}' under "
-            f"{build_dir} (matched none of {sorted(wanted)}) - build "
+            f"{obj_dir} (matched none of {sorted(wanted)}) - build "
             f"yuzu_server_core first (`meson compile -C <builddir> yuzu_server_core`)"
         )
     if len(matches) > 1:
         raise SystemExit(
             f"check_core_presentation_link: ambiguous object for '{stem}' under "
-            f"{build_dir}: {sorted(str(m) for m in matches)}"
+            f"{obj_dir}: {sorted(str(m) for m in matches)}"
         )
     return matches[0]
 
 
+#: An LTO "slim" object (produced under `-flto` when the toolchain defers
+#: real codegen to the link step) carries essentially no real symbol table -
+#: `nm` on one, WITHOUT the LTO plugin loaded, sees only this GCC-internal
+#: marker symbol (ci8-1/UP-9). Reading such an object with a plain `nm`
+#: lacking `/usr/lib/bfd-plugins/liblto_plugin.so` would otherwise present
+#: as "defines/references nothing", which the vacuous-pass guards below
+#: already catch generically - but a bare "ZERO symbols" message gives no
+#: hint that the FIX is "use gcc-nm/pass --plugin", not "the object is
+#: broken". This name is checked for explicitly so that failure mode gets
+#: its own, actionable diagnostic instead.
+LTO_SLIM_MARKER = "__gnu_lto_slim"
+
+
 def object_symbols(nm_path: str, obj_path: Path, undefined_only: bool) -> set[str]:
     flag = "--undefined-only" if undefined_only else "--defined-only"
-    proc = subprocess.run(
-        [nm_path, flag, str(obj_path)], capture_output=True, text=True, check=True
-    )
+    args = [nm_path, flag]
+    if not undefined_only:
+        # xp8-1: `--extern-only` (`-g`) on the DEFINED-only read only - an
+        # undefined reference is external by construction, but a defined-
+        # symbol read without it can surface a TU-local symbol (e.g. an
+        # empty translation unit's Mach-O local `ltmp0`) that this check
+        # has no business comparing against another object's undefined set.
+        args.append("--extern-only")
+    args.append(str(obj_path))
+    proc = subprocess.run(args, capture_output=True, text=True, check=True)
     syms: set[str] = set()
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -173,7 +213,46 @@ def object_symbols(nm_path: str, obj_path: Path, undefined_only: bool) -> set[st
         # The mangled symbol is always the last whitespace-separated field -
         # mangled C++ names never contain a space, so this is exact.
         syms.add(line.split()[-1])
+    if syms and syms <= {LTO_SLIM_MARKER}:
+        raise VacuousPassError(
+            f"LTO slim object unreadable: '{obj_path}' carries only the "
+            f"'{LTO_SLIM_MARKER}' marker symbol - `nm` cannot read a real "
+            f"symbol table from an LTO-slim object without the LTO plugin "
+            f"loaded. Use gcc-nm (or pass --plugin=<path to liblto_plugin.so> "
+            f"to nm) instead of a plain `nm`."
+        )
     return syms
+
+
+def select_nm(build_dir: Path) -> str:
+    """Prefer a compiler-matched `nm` (ci8-1/UP-9): a plain `nm` cannot read
+    an LTO-slim object's real symbol table without the LTO plugin loaded,
+    which `gcc-nm`/`llvm-nm` load automatically. Falls back to plain `nm`
+    when the compiler-matched variant is not installed - LTO-slim inputs
+    then surface via the dedicated LTO_SLIM_MARKER diagnostic above rather
+    than a silent vacuous pass.
+    """
+    compiler_id = None
+    try:
+        proc = subprocess.run(
+            ["meson", "introspect", "--compilers", str(build_dir)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        info = json.loads(proc.stdout)
+        compiler_id = info.get("host", {}).get("cpp", {}).get("id")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError):
+        pass  # fall through to plain nm below - not fatal, just less precise
+    preferred = {"gcc": "gcc-nm", "clang": "llvm-nm"}.get(compiler_id or "")
+    if preferred:
+        found = shutil.which(preferred)
+        if found:
+            return found
+    found = shutil.which("nm")
+    if not found:
+        raise SystemExit("check_core_presentation_link: 'nm' not found on PATH")
+    return found
 
 
 def demangle(nm_path: str, symbol: str) -> str:
@@ -248,9 +327,7 @@ def check_family(build_dir: Path, nm_path: str, family: str, spec: dict[str, lis
 
 
 def run_check(build_dir: Path, verbose: bool = False) -> int:
-    nm_path = shutil.which("nm")
-    if not nm_path:
-        raise SystemExit("check_core_presentation_link: 'nm' not found on PATH")
+    nm_path = select_nm(build_dir)
 
     all_violations: list[Violation] = []
     for family, spec in FAMILIES.items():

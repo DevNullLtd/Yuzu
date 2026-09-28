@@ -218,6 +218,11 @@ void check_golden(const std::string& cell, const std::string& html) {
         REQUIRE(out.good());
         out << actual;
         out.close();
+        // safe-2/cpp8-2: a write/flush failure (disk full, a quota, an I/O
+        // error surfacing only at close()) must not read as a silent
+        // successful regeneration — check AFTER close(), not just after
+        // open(), so this failure mode is caught too.
+        REQUIRE(out.good());
         FAIL_CHECK("YUZU_UPDATE_GOLDEN=1: (re)wrote " << path.string()
              << " -- re-run WITHOUT YUZU_UPDATE_GOLDEN to verify it now matches.");
         return;

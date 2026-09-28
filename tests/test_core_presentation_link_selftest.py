@@ -55,6 +55,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "check_core_presentation_link.py"
@@ -127,12 +128,28 @@ def _find_nm() -> str:
     return nm
 
 
-def _compile_stem(cxx: str, build_dir: Path, stem: str, source: str) -> None:
-    """Compile `source` (a tiny synthetic .cpp body) into build_dir/src_<stem>.cpp.o,
-    matching the object naming this script's find_object() looks for."""
-    src_path = build_dir / f"{stem}.cpp"
+def _core_obj_dir(mod, build_dir: Path) -> Path:
+    """UP-10: find_object() now looks ONLY inside the core library target's
+    own object directory, not the whole build tree - mirror that here so
+    every fixture this file compiles is actually where find_object() will
+    look for it."""
+    d = build_dir / mod.CORE_TARGET_OBJ_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _compile_stem(cxx: str, build_dir: Path, stem: str, source: str, mod=None) -> None:
+    """Compile `source` (a tiny synthetic .cpp body) into
+    build_dir/<CORE_TARGET_OBJ_DIR>/src_<stem>.cpp.o, matching both the
+    object naming AND the object LOCATION this script's find_object() looks
+    for (UP-10). `mod` defaults to a fresh `_load_checker()` call when the
+    caller doesn't already have one handy."""
+    if mod is None:
+        mod = _load_checker()
+    out_dir = _core_obj_dir(mod, build_dir)
+    src_path = out_dir / f"{stem}.cpp"
     src_path.write_text(source)
-    obj_path = build_dir / f"src_{stem}.cpp.o"
+    obj_path = out_dir / f"src_{stem}.cpp.o"
     subprocess.run(
         [cxx, "-c", "-std=c++17", "-o", str(obj_path), str(src_path)],
         check=True,
@@ -374,6 +391,55 @@ class TestVacuousPassGuards(unittest.TestCase):
         self.assertEqual(1, rc)
 
 
+class TestLtoSlimDetection(unittest.TestCase):
+    # ci8-1/UP-9: a real `-flto` build produces objects `nm` cannot read a
+    # real symbol table from without the LTO plugin, surfacing as an
+    # object whose only symbol is GCC's `__gnu_lto_slim` marker. Building a
+    # genuine LTO-slim object here would tie this selftest to a specific
+    # compiler/flag combination succeeding in whatever environment runs it
+    # (docs-lint.yml has no build dependency) - mocking `subprocess.run`'s
+    # `nm` output tests the DETECTION logic directly and portably, the same
+    # boundary `object_symbols` itself draws (it doesn't care how the `nm`
+    # output was produced, only what it says).
+    def setUp(self) -> None:
+        self.mod = _load_checker()
+
+    def test_lto_slim_marker_only_raises_vacuous_pass_error(self) -> None:
+        fake_proc = subprocess.CompletedProcess(
+            args=["nm"], returncode=0, stdout="0000000000000000 t __gnu_lto_slim\n", stderr=""
+        )
+        with mock.patch.object(subprocess, "run", return_value=fake_proc):
+            with self.assertRaises(self.mod.VacuousPassError) as ctx:
+                self.mod.object_symbols("nm", Path("/fake/obj.cpp.o"), undefined_only=False)
+        self.assertIn("LTO slim", str(ctx.exception))
+        self.assertIn("gcc-nm", str(ctx.exception))
+
+    def test_lto_slim_marker_alongside_real_symbols_does_not_raise(self) -> None:
+        # The marker CAN legitimately appear alongside genuine symbols on
+        # some toolchain versions - only a symbol set that is ENTIRELY the
+        # marker (nothing else readable) is the unreadable-object signal.
+        fake_proc = subprocess.CompletedProcess(
+            args=["nm"],
+            returncode=0,
+            stdout=(
+                "0000000000000000 t __gnu_lto_slim\n"
+                "0000000000000010 T _Z7real_fnv\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(subprocess, "run", return_value=fake_proc):
+            syms = self.mod.object_symbols("nm", Path("/fake/obj.cpp.o"), undefined_only=False)
+        self.assertIn("_Z7real_fnv", syms)
+
+    def test_ordinary_symbols_do_not_raise(self) -> None:
+        fake_proc = subprocess.CompletedProcess(
+            args=["nm"], returncode=0, stdout="0000000000000000 T _Z7real_fnv\n", stderr=""
+        )
+        with mock.patch.object(subprocess, "run", return_value=fake_proc):
+            syms = self.mod.object_symbols("nm", Path("/fake/obj.cpp.o"), undefined_only=False)
+        self.assertEqual({"_Z7real_fnv"}, syms)
+
+
 class TestFindObject(unittest.TestCase):
     def setUp(self) -> None:
         self.mod = _load_checker()
@@ -383,24 +449,43 @@ class TestFindObject(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_missing_object_raises(self) -> None:
-        with self.assertRaises(SystemExit):
+    def test_core_target_dir_missing_raises(self) -> None:
+        # UP-10: find_object() looks ONLY inside CORE_TARGET_OBJ_DIR - if
+        # that directory itself was never built, it must say so clearly
+        # rather than reporting a generic "no compiled object" (which reads
+        # as "you forgot the file", not "you forgot the whole build").
+        with self.assertRaises(SystemExit) as ctx:
             self.mod.find_object(self.build_dir, "does_not_exist")
+        self.assertIn("does not exist", str(ctx.exception))
 
-    def test_ambiguous_object_raises(self) -> None:
-        # Two DIFFERENT subdirectories each containing an object matching the
-        # same stem - find_object must refuse rather than silently pick one.
-        (self.build_dir / "a").mkdir()
-        (self.build_dir / "b").mkdir()
-        (self.build_dir / "a" / "src_dup_stem.cpp.o").write_bytes(b"")
-        (self.build_dir / "b" / "src_dup_stem.cpp.o").write_bytes(b"")
-        with self.assertRaises(SystemExit):
-            self.mod.find_object(self.build_dir, "dup_stem")
+    def test_missing_object_raises(self) -> None:
+        (self.build_dir / self.mod.CORE_TARGET_OBJ_DIR).mkdir(parents=True)
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.find_object(self.build_dir, "does_not_exist")
+        self.assertIn("no compiled object", str(ctx.exception))
+
+    def test_duplicate_stem_outside_target_dir_is_ignored(self) -> None:
+        # UP-10's whole point: restricting the lookup to ONE directory means
+        # a same-named object compiled into some OTHER target's `.p`
+        # directory (a future test binary that also compiles this source
+        # file, say) can never be mistaken for the real one - a scenario
+        # the OLD whole-tree `rglob` genuinely could not disambiguate.
+        core_dir = self.build_dir / self.mod.CORE_TARGET_OBJ_DIR
+        core_dir.mkdir(parents=True)
+        (core_dir / "src_found_stem.cpp.o").write_bytes(b"real")
+        other_dir = self.build_dir / "tests" / "some_other_target.p"
+        other_dir.mkdir(parents=True)
+        (other_dir / "src_found_stem.cpp.o").write_bytes(b"decoy")
+        found = self.mod.find_object(self.build_dir, "found_stem")
+        self.assertEqual(core_dir / "src_found_stem.cpp.o", found)
+        self.assertEqual(b"real", found.read_bytes())
 
     def test_exact_match_found(self) -> None:
-        (self.build_dir / "src_found_stem.cpp.o").write_bytes(b"")
+        core_dir = self.build_dir / self.mod.CORE_TARGET_OBJ_DIR
+        core_dir.mkdir(parents=True)
+        (core_dir / "src_found_stem.cpp.o").write_bytes(b"")
         found = self.mod.find_object(self.build_dir, "found_stem")
-        self.assertEqual(self.build_dir / "src_found_stem.cpp.o", found)
+        self.assertEqual(core_dir / "src_found_stem.cpp.o", found)
 
 
 if __name__ == "__main__":

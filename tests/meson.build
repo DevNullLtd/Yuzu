@@ -2152,14 +2152,21 @@ if build_server
   # suffix" recipe (ADR-0065 note above) — L measured ~148s in that same CI
   # run, comfortably lighter than F. `~[golden]~[catalogue]` excludes them
   # from F's dex/mcp clauses; the two new L clauses below admit them.
-  # Verified via --list-tests on the built binary: old F 517 - 28 = new F 489
-  # (exact); old L 284 + 28 = new L 312 (exact); the two new L clauses
-  # (`[pg][golden]`/`[pg][catalogue]`, each reusing L's shared suffix MINUS
-  # `~[dex]`, since every one of these cases carries the [dex] tag) match
-  # exactly 15 + 13 = 28 cases with zero overlap between them and zero
-  # overlap against L's pre-existing six clauses. Total [pg] population
-  # (4286) is unchanged — this moves cases between shards, it does not add
-  # or remove any.
+  # Verified via --list-tests on the built binary: old F 517 - 28 = 489 at
+  # the time of that split (exact); old L 284 + 28 = 312 (exact); the two
+  # new L clauses (`[pg][golden]`/`[pg][catalogue]`, each reusing L's shared
+  # suffix MINUS `~[dex]`, since every one of these cases carries the [dex]
+  # tag) matched exactly 15 + 13 = 28 cases with zero overlap between them
+  # and zero overlap against L's pre-existing six clauses. Re-measured
+  # 2026-09-28 (Gate 7 fix round, third revision) after the same round's
+  # confinement-test rewrite removed 13 now-inapplicable [dex]/[mcp] cases
+  # (the retired fleet_read_fn-gate/real-RBAC-rig coverage for GET
+  # /api/v1/dex/{signals/{obs_type},app,overview} + their MCP twins, whose
+  # gate reverted to base's bare permission check): current F = 476, L
+  # still 312 (unaffected — golden/catalogue cases are untouched by that
+  # rewrite). Total [pg] population is 4273 (was 4286 before this round's
+  # net -13) — a shard-count change here moves/removes cases, it is not a
+  # partition defect.
   test('server pg unit tests shard F', server_test_exe,
        args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 85)
