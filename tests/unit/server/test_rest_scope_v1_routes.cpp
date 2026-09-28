@@ -76,6 +76,14 @@ struct ScopeV1Harness {
     // here cannot model an actually-empty std::function.
     authz::FleetReadGate fleet_gate{.admitted = true};
 
+    // #4981 adversarial-review finding 1: empty ⇒ an ordinary session; a
+    // test sets this to prove a service-scoped token is denied outright on
+    // POST /api/v1/scope/preview (same idiom as AsyncHarness's
+    // mock_token_scope_service in test_rest_result_sets_async.cpp — read
+    // LIVE by auth_fn below, so a test may set it either before or after
+    // construction).
+    std::string mock_token_scope_service;
+
     // Kept for source-stability of the register_routes call (still consumed
     // by other agents_fn-driven routes in this harness's registration list,
     // e.g. GET /api/v1/devices if a future test exercises it) — #4981 PR-2:
@@ -145,6 +153,7 @@ struct ScopeV1Harness {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::user;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
@@ -270,6 +279,68 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview denies when fleet_read_fn does n
     auto r = h.sink.Post("/api/v1/scope/preview", R"({"expression":"arch == \"x64\""})");
     REQUIRE(r);
     CHECK(r->status == 403);
+}
+
+// #4981 adversarial-review finding 1: a service-scoped token must be denied
+// OUTRIGHT — never admitted-and-narrowed via fleet_read_fn — because a
+// `from_result_set:`/`props.` atom resolves against session->username (the
+// MINTING OPERATOR's identity for a service-scoped token, per
+// auth_routes.cpp's `synth.username = api_token.principal_id`), not the
+// token's own restricted scope. Mirrors #4980's identical fix on the sibling
+// POST /api/v1/result-sets/from-inventory-query (see that route's own test,
+// "owner-scoped result-set routes: a service-scoped token is denied on all
+// 9" in test_rest_result_sets_async.cpp) — same
+// deny_fleet_wide_service_scoped chokepoint, called BEFORE fleet_read_fn.
+TEST_CASE("scope v1: POST /api/v1/scope/preview denies a service-scoped token outright, "
+          "unconditionally on the token class — never dependent on the ladder's own "
+          "owner-check outcome",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    // A REAL, owned, materialized result set — owner "tester" matches the
+    // harness's fixed auth_fn username, so an ordinary session's ladder call
+    // would resolve this reference successfully. The service-scoped deny
+    // below must still fire BEFORE that ladder ever runs.
+    CreateRequest cr;
+    cr.owner_principal = "tester";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    h.mock_token_scope_service = "printers";
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
+    REQUIRE(r);
+    CHECK(r->status == 403);
+
+    // The deny fired BEFORE the ladder/owner-check ever ran: no
+    // "result_set.access" row (the 404/owner-check-failed audit path) was
+    // ever written, only the service-scope deny itself.
+    bool saw_scope_preview_denied = false;
+    bool saw_ladder_audit = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "scope.preview.access_denied" && c.result == "denied")
+            saw_scope_preview_denied = true;
+        if (c.action == "result_set.access")
+            saw_ladder_audit = true;
+    }
+    CHECK(saw_scope_preview_denied);
+    CHECK_FALSE(saw_ladder_audit);
+
+    // Clause (5), routed-concerns-access-control.md "Service-scoped API
+    // token confinement": no `.permission` label — a service-scoped caller
+    // holding Infrastructure:Read is STILL denied outright, so naming it
+    // would be a false self-remediation claim (same idiom as
+    // test_rest_result_sets_async.cpp's identical from-inventory-query
+    // assertion).
+    auto body = nlohmann::json::parse(r->body);
+    CHECK_FALSE(body["error"].contains("permission"));
 }
 
 TEST_CASE("scope v1: POST /api/v1/scope/preview requires a non-empty expression",

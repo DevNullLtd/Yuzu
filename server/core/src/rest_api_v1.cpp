@@ -12445,8 +12445,32 @@ void RestApiV1::register_routes(
     // `from_result_set:`/`props.<key>` — see scope_preview.hpp's file header
     // for the fleet-wide over-disclosure bug this closes (#4981).
     sink.Post("/api/v1/scope/preview", [fleet_read_fn, auth_fn, audit_fn, scope_evaluate_fn,
-                                        result_set_store](const httplib::Request& req,
-                                                          httplib::Response& res) {
+                                        result_set_store, deny_fleet_wide_service_scoped](
+                                           const httplib::Request& req, httplib::Response& res) {
+        // #4981 adversarial-review finding 1: a `from_result_set:`/`props.`
+        // atom in the expression resolves against session->username — for a
+        // service-scoped token this is the MINTING OPERATOR's identity
+        // (auth_routes.cpp's `synth.username = api_token.principal_id`
+        // assignment), not the token's own restricted identity. fleet_read_fn
+        // below ADMITS a service-scoped caller (narrows only the output-agent
+        // axis) rather than denying it outright, so a service-scoped token
+        // could otherwise probe/own-check a result set it never minted
+        // (owned by the minting principal, reachable by any OTHER
+        // token/session that principal holds) — the identical cross-
+        // service-reach class #4980 already closed on
+        // POST /api/v1/result-sets/from-inventory-query, and the MCP twin
+        // already denies this tool structurally (mcp_server.cpp's
+        // kToolSecurity 2-element form -> default ServiceScopeClass::denied).
+        // No `.permission` label (explicit "" — matches every ResultSet-
+        // adjacent sibling call site above): a service-scoped caller holding
+        // Infrastructure:Read is STILL denied outright after this fix, so
+        // naming Infrastructure:Read as "the permission that would help"
+        // would be a false self-remediation claim.
+        if (deny_fleet_wide_service_scoped(
+                req, res, "scope.preview.access_denied", "ResultSet",
+                "scope preview denied to a service-scoped token",
+                "service-scoped tokens may not preview scope targets", "", ""))
+            return;
         if (!fleet_read_fn) {
             spdlog::error("scope.preview: fleet_read_fn unwired — misconfigured call site; "
                           "failing closed");
