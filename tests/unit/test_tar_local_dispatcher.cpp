@@ -165,6 +165,13 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
                 if (n.rfind("tar.db.corrupt-", 0) == 0)
                     names.push_back(n);
             }
+            // directory_iterator order is unspecified, not creation order. The
+            // `.corrupt-<epoch>[-n]` basenames are fixed-width-epoch and sort
+            // lexicographically == chronologically (quarantine_corrupt_db's own
+            // disambiguator picks '-1', '-2', ... which also sort after the
+            // bare epoch), so a plain sort recovers a deterministic oldest-first
+            // order for names[0]/names[1] below.
+            std::sort(names.begin(), names.end());
             return names;
         };
         const auto corrupt_db = [&] {
@@ -248,6 +255,13 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
                 if (n.rfind("tar.db.corrupt-", 0) == 0)
                     names.push_back(n);
             }
+            // directory_iterator order is unspecified, not creation order. The
+            // `.corrupt-<epoch>[-n]` basenames are fixed-width-epoch and sort
+            // lexicographically == chronologically (quarantine_corrupt_db's own
+            // disambiguator picks '-1', '-2', ... which also sort after the
+            // bare epoch), so a plain sort recovers a deterministic oldest-first
+            // order for names[0]/names[1] below.
+            std::sort(names.begin(), names.end());
             return names;
         };
         const auto corrupt_db = [&] {
