@@ -704,18 +704,25 @@ inline std::optional<unsigned> pwpolicy_min_length(std::string_view content) {
 /// item defect (PwPolicyItem::defects) is a `source_state|unreadable:<defect>` row and a
 /// `pwpolicy:<defect>` token (CONSTRAINED) in the action(s) its category routes to. No
 /// matching policy and no defect is the modal row `policies|none`, not an error.
+/// A policy identifier/category is normally a short, human-readable name (real captures: a few
+/// dozen bytes -- see docs/samples/macos.txt). It becomes `src`, which is re-embedded in EVERY
+/// row an item produces (one per parameter/defect), so bounding row COUNT alone (kMaxRows) is
+/// not sufficient to bound total row BYTES: an item with a near-1MB identifier and thousands of
+/// short parameters stays under kMaxRows while re-embedding that near-1MB string thousands of
+/// times (governance SRE finding: the row-count cap alone permits hundreds of MB, not just the
+/// adversarial-review probe's 100MB). Truncating the identifier before it becomes `src` bounds
+/// the per-row amplification factor directly, independent of the row-count cap.
+inline constexpr std::size_t kMaxSourceIdentifierBytes = 256;
+
 inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPolicyItem>& items) {
     const auto prefix = action_row_prefix(action);
     std::vector<std::string> rows;
     yuzu::shared::ConstraintAccumulator acc;
     bool capped = false;
     // Bounds row growth the same way Tally::row() does for file-backed sources (parsers.hpp
-    // above) -- this path had no cap of its own. An item's identifier is copied into `src` and
-    // then re-embedded in every one of that item's parameter/defect rows, so one policy element
-    // with a long identifier and many parameters multiplies into far more row bytes than its own
-    // capture size (adversarial-review finding: a 100KB identifier x 1000 params reproduced
-    // 100MB+ of row text from a single sub-1MB capture). Last slot reserved for the truncation
-    // marker, same reservation logic as Tally::row.
+    // above) -- this path had no cap of its own. Last slot reserved for the truncation marker,
+    // same reservation logic as Tally::row. Row COUNT alone is not a row BYTES bound -- see
+    // kMaxSourceIdentifierBytes above for the complementary per-row cap.
     const auto push_row = [&](std::string r) {
         if (rows.size() + 1 >= kMaxRows) {
             if (!capped) {
@@ -731,8 +738,10 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
         if (capped) break;
         const bool lock = it.category.find("Authentication") != std::string::npos;
         const bool pw = it.category.rfind("policyCategoryPassword", 0) == 0;
-        const std::string& named = it.identifier.empty() ? it.category : it.identifier;
-        const std::string src = named.empty() ? std::string{"pwpolicy"} : "pwpolicy:" + named;
+        const std::string& named_raw = it.identifier.empty() ? it.category : it.identifier;
+        const std::string_view named =
+            std::string_view{named_raw}.substr(0, kMaxSourceIdentifierBytes);
+        const std::string src = named.empty() ? std::string{"pwpolicy"} : "pwpolicy:" + std::string{named};
         const auto defect_rows = [&] {
             for (const auto& d : it.defects) {
                 push_row(format_kv_row(prefix, "source_state", "unreadable:" + d, src));

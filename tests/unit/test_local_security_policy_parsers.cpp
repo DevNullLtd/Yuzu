@@ -22,6 +22,10 @@
 
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_parsers.hpp"
 
+#if defined(__APPLE__)
+#include "../../agents/plugins/local_security_policy/src/local_security_policy_legs.hpp"
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -77,11 +81,25 @@ TEST_CASE("local_security_policy decode_utf16le_bom: BOM required, exact round-t
     REQUIRE(ab.has_value());
     CHECK(*ab == "AB");
 
-    // A non-ASCII BMP codepoint (U+00E9 'é', UTF-8 0xC3 0xA9).
+    // A non-ASCII BMP codepoint (U+00E9 'é', UTF-8 0xC3 0xA9) -- 2-byte UTF-8 output.
     const std::vector<std::uint8_t> e_acute{0xFF, 0xFE, 0xE9, 0x00};
     const auto e = decode_utf16le_bom(e_acute);
     REQUIRE(e.has_value());
     CHECK(*e == "\xC3\xA9");
+
+    // A 3-byte-UTF-8 BMP codepoint (U+20AC '€', UTF-8 0xE2 0x82 0xAC) -- the middle encoding
+    // width (< 0x800 is 2-byte, this is 3-byte, >= 0x10000 is 4-byte) had no test before.
+    const std::vector<std::uint8_t> euro{0xFF, 0xFE, 0xAC, 0x20};
+    const auto eu = decode_utf16le_bom(euro);
+    REQUIRE(eu.has_value());
+    CHECK(*eu == "\xE2\x82\xAC");
+
+    // A complete, valid surrogate pair (U+10000, the first supplementary-plane codepoint) --
+    // 4-byte UTF-8 output. High surrogate 0xD800 then low surrogate 0xDC00, both LE.
+    const std::vector<std::uint8_t> supplementary{0xFF, 0xFE, 0x00, 0xD8, 0x00, 0xDC};
+    const auto supp = decode_utf16le_bom(supplementary);
+    REQUIRE(supp.has_value());
+    CHECK(*supp == "\xF0\x90\x80\x80");
 
     // No BOM at all.
     const std::vector<std::uint8_t> no_bom{0x41, 0x00, 0x42, 0x00};
@@ -91,9 +109,16 @@ TEST_CASE("local_security_policy decode_utf16le_bom: BOM required, exact round-t
     const std::vector<std::uint8_t> odd{0xFF, 0xFE, 0x41, 0x00, 0x42};
     CHECK_FALSE(decode_utf16le_bom(odd).has_value());
 
-    // Unpaired high surrogate (no low surrogate follows).
+    // Unpaired high surrogate: buffer ends right after it, so there's no room left at all for
+    // a low surrogate. Hits the truncation check (i+3 >= size), not the value-range check.
     const std::vector<std::uint8_t> unpaired_high{0xFF, 0xFE, 0x00, 0xD8};
     CHECK_FALSE(decode_utf16le_bom(unpaired_high).has_value());
+
+    // High surrogate followed by a PRESENT but INVALID low surrogate (another high surrogate,
+    // not a low one) -- exercises the distinct `lo < 0xDC00 || lo > 0xDFFF` value-range check,
+    // never reached by unpaired_high above since that case is too short to get there at all.
+    const std::vector<std::uint8_t> invalid_low_pair{0xFF, 0xFE, 0x00, 0xD8, 0x00, 0xD8};
+    CHECK_FALSE(decode_utf16le_bom(invalid_low_pair).has_value());
 
     // Low surrogate with no preceding high surrogate.
     const std::vector<std::uint8_t> bare_low{0xFF, 0xFE, 0x00, 0xDC};
@@ -155,6 +180,35 @@ TEST_CASE("local_security_policy parse_inf_sections: sections, comments, case-in
 
     CHECK(parse_inf_sections("").empty());
     CHECK(parse_inf_sections("; only comments\n; nothing else\n").empty());
+}
+
+TEST_CASE("local_security_policy parse_inf_sections: a section header missing its closing ']' "
+          "is never treated as a real section -- either silently dropped, or (if it happens to "
+          "contain '=' while a section is already open) attributed as an ordinary key into that "
+          "section, never as a new section of its own",
+          "[local_security_policy][parsers][secedit]") {
+    // No '=' on the malformed header line, and no section open yet: dropped outright, same as
+    // any other line before the first real section.
+    const auto no_section_yet = parse_inf_sections("[Unterminated\nReal = 1\n");
+    CHECK(no_section_yet.empty()); // "Real = 1" is also dropped -- still no section open
+
+    // A malformed header line that happens to contain '=', while a real section IS already
+    // open: front()=='[' but back()!=']' fails the section-header check, so it falls through
+    // to the key=value branch and is recorded as an ordinary key (literal leading '[' and all)
+    // in the currently-open section -- never creates a new section. This is the plugin's actual
+    // parsing behavior today (locked in by this test), not a defect this PR introduces or fixes.
+    const auto misattributed = parse_inf_sections(
+        "[System Access]\n"
+        "RealKey = 1\n"
+        "[Unterminated = oops\n"
+        "AnotherKey = 2\n");
+    REQUIRE(misattributed.size() == 1); // never created a second section
+    const auto& sys = misattributed.at("System Access");
+    CHECK(sys.at("RealKey") == "1");
+    CHECK(sys.at("AnotherKey") == "2");
+    // The malformed line's whole "[Unterminated" prefix became the key, verbatim.
+    REQUIRE(sys.find("[Unterminated") != sys.end());
+    CHECK(sys.at("[Unterminated") == "oops");
 }
 
 // ── kv / PAM / auditd (Linux/macOS file sources) ──────────────────────────────────
@@ -526,4 +580,190 @@ TEST_CASE("local_security_policy pwpolicy_rows: row growth is capped, mirroring 
     CHECK(capped.reason.find("row_cap") != std::string::npos);
     CHECK(capped.rows.back() == "password_policy|source_state|unreadable:row_cap|pwpolicy");
 }
+
+TEST_CASE("local_security_policy pwpolicy_rows: the row cap's boundary is exact, mirroring "
+          "Tally::row's own exact-boundary test (quality-engineer finding -- the overshoot-by-500 "
+          "case above proves a cap exists but not that push_row's own `>=` comparison is correct "
+          "to the row, the way Tally's sibling test does)",
+          "[local_security_policy][parsers][pwpolicy]") {
+    // Exactly kMaxRows-1 params -> exactly kMaxRows-1 rows, never triggering the cap at all.
+    KvList just_under;
+    for (std::size_t i = 0; i < kMaxRows - 1; ++i)
+        just_under.emplace_back("policyAttribute" + std::to_string(i), "x");
+    const PwPolicyItem under{.category = "policyCategoryPasswordContent",
+                             .identifier = "under",
+                             .has_content = false,
+                             .params = just_under};
+    const auto under_result = pwpolicy_rows(LocalPolicyAction::Password, {under});
+    CHECK(under_result.rows.size() == kMaxRows - 1); // no marker: never hit the boundary
+    CHECK(under_result.status == PolicyStatus::Ok);
+
+    // Exactly kMaxRows params -> the cap triggers on the very last one: kMaxRows-1 real rows
+    // plus the marker, exactly kMaxRows total, never kMaxRows+1.
+    KvList exactly_at;
+    for (std::size_t i = 0; i < kMaxRows; ++i)
+        exactly_at.emplace_back("policyAttribute" + std::to_string(i), "x");
+    const PwPolicyItem at{.category = "policyCategoryPasswordContent",
+                          .identifier = "at",
+                          .has_content = false,
+                          .params = exactly_at};
+    const auto at_result = pwpolicy_rows(LocalPolicyAction::Password, {at});
+    CHECK(at_result.rows.size() == kMaxRows);
+    CHECK(at_result.status == PolicyStatus::Constrained);
+    CHECK(at_result.rows.back() == "password_policy|source_state|unreadable:row_cap|pwpolicy");
+}
+
+TEST_CASE("local_security_policy pwpolicy_rows: a huge identifier is truncated before it "
+          "becomes `src`, bounding row BYTES independent of the row-count cap "
+          "(governance SRE regression -- kMaxRows alone bounds how many times an oversized "
+          "identifier repeats, not how large each repetition is)",
+          "[local_security_policy][parsers][pwpolicy]") {
+    const std::string huge_identifier(kMaxSourceIdentifierBytes * 10, 'x');
+    const PwPolicyItem huge_id{.category = "policyCategoryPasswordContent",
+                               .identifier = huge_identifier,
+                               .content = "no length clause here",
+                               .has_content = true};
+    const auto result = pwpolicy_rows(LocalPolicyAction::Password, {huge_id});
+    REQUIRE(result.rows.size() == 1); // just the policy_content row -- no minimum_length match
+    // The row's `src` field carries at most kMaxSourceIdentifierBytes of the identifier plus
+    // the "pwpolicy:" prefix -- never the full 2560-byte identifier.
+    CHECK(result.rows[0].size() < kMaxSourceIdentifierBytes + 64);
+    CHECK(result.rows[0].find(std::string(kMaxSourceIdentifierBytes + 1, 'x')) == std::string::npos);
+}
+
+#if defined(__APPLE__)
+// ── pwpolicy_plist_to_items (the real CF-XML bridge, macOS only) ───────────────────────────
+// Governance quality-engineer finding: every test above drives pwpolicy_rows() with hand-built
+// PwPolicyItem structs -- proving the CONSUMER side, never the CF-parsing PRODUCER that actually
+// assigns identifier/content/params/defects from real plist bytes. These tests drive real XML
+// through CFPropertyListCreateWithData via the actual function, on this real Mac.
+
+TEST_CASE("local_security_policy pwpolicy_plist_to_items: a well-formed plist yields exact "
+          "identifier/content/params, no defects",
+          "[local_security_policy][parsers][pwpolicy][macos]") {
+    using namespace yuzu::local_security_policy;
+    static constexpr std::string_view kXml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>policyCategoryPasswordContent</key>
+    <array>
+        <dict>
+            <key>policyIdentifier</key>
+            <string>com.example.minlen</string>
+            <key>policyContent</key>
+            <string>policyAttributePassword matches '.{8,}+'</string>
+            <key>policyParameters</key>
+            <dict>
+                <key>policyAttributePassword</key>
+                <string>x</string>
+                <key>autoEnableInSeconds</key>
+                <integer>300</integer>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>)";
+    const auto items = pwpolicy_plist_to_items(kXml);
+    REQUIRE(items.has_value());
+    REQUIRE(items->size() == 1);
+    const auto& it = (*items)[0];
+    CHECK(it.category == "policyCategoryPasswordContent");
+    CHECK(it.identifier == "com.example.minlen");
+    CHECK(it.has_content);
+    CHECK(it.content == "policyAttributePassword matches '.{8,}+'");
+    CHECK(it.defects.empty());
+    REQUIRE(it.params.size() == 2);
+    std::map<std::string, std::string> params(it.params.begin(), it.params.end());
+    CHECK(params.at("policyAttributePassword") == "x");
+    CHECK(params.at("autoEnableInSeconds") == "300"); // CFNumber -> text, via cf_scalar_text
+}
+
+TEST_CASE("local_security_policy pwpolicy_plist_to_items: every documented defect shape is "
+          "recorded on an item, never dropped and never guessed",
+          "[local_security_policy][parsers][pwpolicy][macos]") {
+    using namespace yuzu::local_security_policy;
+    static constexpr std::string_view kXml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>policyCategoryMalformed</key>
+    <string>a category value that is not an array is itself the defect</string>
+    <key>policyCategoryPasswordContent</key>
+    <array>
+        <string>an array element that is not a dictionary</string>
+        <dict>
+            <key>policyIdentifier</key>
+            <dict><key>nested</key><string>not a scalar</string></dict>
+            <key>policyContent</key>
+            <array><string>also not a scalar</string></array>
+            <key>policyParameters</key>
+            <string>not a dictionary either</string>
+        </dict>
+        <dict>
+            <key>policyParameters</key>
+            <dict>
+                <key>badParam</key>
+                <array><string>a param value that is not a scalar</string></array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>)";
+    const auto items = pwpolicy_plist_to_items(kXml);
+    REQUIRE(items.has_value());
+    REQUIRE(items->size() == 4); // 1 malformed_category + 3 array elements
+
+    // Category-level defect: the whole category's value was not an array.
+    const auto cat_defect =
+        std::find_if(items->begin(), items->end(),
+                    [](const auto& it) { return it.category == "policyCategoryMalformed"; });
+    REQUIRE(cat_defect != items->end());
+    CHECK(cat_defect->defects == std::vector<std::string>{"malformed_category"});
+
+    // Array-element-level defect: a non-dictionary element in an otherwise-valid array.
+    const auto policy_defect = std::find_if(
+        items->begin(), items->end(), [](const auto& it) {
+            return it.category == "policyCategoryPasswordContent" && !it.defects.empty() &&
+                   it.defects.front() == "malformed_policy";
+        });
+    REQUIRE(policy_defect != items->end());
+
+    // Field-shape defects: identifier/content/parameters each present but the wrong CF type.
+    const auto shape_defect =
+        std::find_if(items->begin(), items->end(), [](const auto& it) {
+            return std::find(it.defects.begin(), it.defects.end(), "malformed_identifier") !=
+                   it.defects.end();
+        });
+    REQUIRE(shape_defect != items->end());
+    CHECK(std::find(shape_defect->defects.begin(), shape_defect->defects.end(),
+                    "malformed_content") != shape_defect->defects.end());
+    CHECK(std::find(shape_defect->defects.begin(), shape_defect->defects.end(),
+                    "malformed_parameters") != shape_defect->defects.end());
+    CHECK_FALSE(shape_defect->has_content); // malformed_content never sets has_content
+
+    // A parameter value that is present but not a scalar.
+    const auto param_defect =
+        std::find_if(items->begin(), items->end(), [](const auto& it) {
+            return std::find(it.defects.begin(), it.defects.end(), "malformed_parameter_value") !=
+                   it.defects.end();
+        });
+    REQUIRE(param_defect != items->end());
+    CHECK(param_defect->params.empty()); // the one param present was the malformed one
+}
+
+TEST_CASE("local_security_policy pwpolicy_plist_to_items: a non-dictionary root and unparseable "
+          "bytes are both nullopt, never an empty-but-successful result",
+          "[local_security_policy][parsers][pwpolicy][macos]") {
+    using namespace yuzu::local_security_policy;
+    CHECK_FALSE(pwpolicy_plist_to_items("not xml at all").has_value());
+    CHECK_FALSE(pwpolicy_plist_to_items("").has_value());
+    static constexpr std::string_view kArrayRoot = R"(<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array><string>the root is an array, not the documented dictionary shape</string></array>
+</plist>)";
+    CHECK_FALSE(pwpolicy_plist_to_items(kArrayRoot).has_value());
+}
+#endif // defined(__APPLE__)
 
