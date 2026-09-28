@@ -1588,7 +1588,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Validate a scope expression's syntax", "tags": ["Scope"], "description": "Versioned twin of the legacy POST /api/scope/validate and MCP validate_scope — all three call the SAME yuzu::scope::validate(). Auth-only, no RBAC gate (a syntax-only check with no data disclosure).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{valid: true, expression} or {valid: false, error}"}, "400": {"description": "expression missing or empty"}}}
     },
     "/scope/preview": {
-      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
+      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). #4981: this route runs the SAME evaluation ladder a real dispatch uses (owner-check gate included) — tag:<key>, props.<key>, and from_result_set:<id> atoms all resolve identically to a real dispatch, not just tag:/ostype/arch/hostname/agent_version as before. Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet; the ladder itself evaluates fleet-wide, then this confinement is intersected in afterward.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "404": {"description": "a from_result_set:<id> atom references a result set that is absent, expired, or not owned by the caller (RESULT_SET_NOT_FOUND)"}, "503": {"description": "scope evaluation degraded — a store preload failed, the cross-replica presence read failed, or the evaluator is unwired (Retry-After: 5)"}}}
     },
     "/software-packages": {
       "get": {"summary": "List registered software packages", "tags": ["Software Deployment"], "description": "Only available when SoftwareDeploymentStore is wired — the server does not construct it today (capability 7.6 deliberately shelved, ADR-0051); documented for when a future change re-wires it. Requires SoftwareDeployment:Read.", "responses": {"200": {"description": "{data: [{id, name, version, platform, installer_type, content_hash, size_bytes, created_at, created_by}]}"}, "503": {"description": "A genuine database read failure"}}},
@@ -1961,6 +1961,8 @@ void RestApiV1::register_routes(
     // route lambdas below capture plain values, not `this`.
     EnginePrincipalStore* eps = engine_principal_store_;
     UserExistsFn user_exists_fn = user_exists_fn_;
+    // #4981 PR-2 — see set_scope_evaluate_fn's doc comment in the .hpp.
+    ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
 
     // #1788: resolve the caller's confinement set on a route whose PRIMARY
     // authorization is the per-target `scoped_perm_fn` gate — the TAR retention
@@ -12435,8 +12437,16 @@ void RestApiV1::register_routes(
     // `fleet_read_fn` REPLACES the permission check (it already performs the
     // RBAC check internally) rather than being paired with it — same pattern
     // as GET /api/v1/devices above.
-    sink.Post("/api/v1/scope/preview", [fleet_read_fn, tag_store, agents_fn](
-                                            const httplib::Request& req, httplib::Response& res) {
+    //
+    // #4981 PR-2: this route now routes through the SAME `resolve_scope_targets`
+    // ladder a real dispatch uses (via `scope_evaluate_fn`, a closure over
+    // `AgentRegistry::evaluate_scope` bound in server.cpp) instead of a
+    // bespoke local attribute resolver that never populated
+    // `from_result_set:`/`props.<key>` — see scope_preview.hpp's file header
+    // for the fleet-wide over-disclosure bug this closes (#4981).
+    sink.Post("/api/v1/scope/preview", [fleet_read_fn, auth_fn, audit_fn, scope_evaluate_fn,
+                                        result_set_store](const httplib::Request& req,
+                                                          httplib::Response& res) {
         if (!fleet_read_fn) {
             spdlog::error("scope.preview: fleet_read_fn unwired — misconfigured call site; "
                           "failing closed");
@@ -12447,6 +12457,14 @@ void RestApiV1::register_routes(
         auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
         if (!gate.admitted)
             return; // gate already wrote the A4 error body + status
+        // The fleet-read gate already authenticated the request. Re-read the
+        // resolved session only for ownership — a `from_result_set:<id>` atom
+        // in the expression owner-resolves against this principal, exactly
+        // like a real dispatch (mirrors GET /api/v1/events' identical
+        // re-read-for-ownership pattern above).
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         std::string expression = (!body.is_discarded() && body.is_object())
                                      ? body.value("expression", std::string())
@@ -12456,23 +12474,47 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "expression is required"), "application/json");
             return;
         }
-        // Narrow to the caller's admitted scope BEFORE the preview builder
-        // runs — mirrors GET /api/v1/devices' own in_scope-filter-then-render.
-        nlohmann::json visible_agents = nlohmann::json::array();
-        if (agents_fn) {
-            for (const auto& a : agents_fn())
-                if (authz::in_scope(gate.scope, a.value("agent_id", "")))
-                    visible_agents.push_back(a);
+        // Checked AFTER the cheap input-shape validation above (mirrors
+        // GET /api/v1/events' own ordering: 400 on a malformed request body
+        // before any 503 for an unavailable backend) — never before it.
+        if (!scope_evaluate_fn) {
+            spdlog::error("scope.preview: scope_evaluate_fn unwired — misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
         }
-        auto outcome = preview_scope_targets(expression, visible_agents, tag_store);
+        auto outcome = preview_scope_targets(expression, session->username, gate.scope,
+                                             result_set_store, scope_evaluate_fn);
         switch (outcome.kind) {
         case ScopePreviewOutcome::Kind::kInvalidExpression:
             res.status = 400;
             res.set_content(detail::a4_error(res, outcome.detail), "application/json");
             return;
-        case ScopePreviewOutcome::Kind::kTagStoreDegraded:
+        case ScopePreviewOutcome::Kind::kEvaluationAborted:
+            if (outcome.detail == "owner_check_failed") {
+                // Existence-oracle-safe, mirrors load_owned's own 404 body
+                // (rest_api_v1.cpp's result-set routes): a non-owner is
+                // indistinguishable from an absent set. The audit row is
+                // server-side only, so probing the existence oracle via this
+                // preview route still leaves a forensic trail. One row PER
+                // failing ref — a compound expression can name more than one
+                // (mirrors command_routes.cpp's ladder callback, which fires
+                // once per ref too).
+                for (const auto& ref : outcome.failing_refs)
+                    audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
+                             "not found or not owned");
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "RESULT_SET_NOT_FOUND: result set not found"),
+                                "application/json");
+                return;
+            }
+            // db_degraded / principal_unresolved / presence_degraded /
+            // unresolvable — a degraded read the caller can retry, never
+            // silently rendered as "0 matches" (that would under-report the
+            // scope's real blast radius).
             res.status = 503;
-            res.set_content(detail::a4_error(res, "tag store unavailable",
+            res.set_content(detail::a4_error(res, "scope evaluation unavailable: " + outcome.detail,
                                              {.retry_after_ms = 5000,
                                               .remediation = "retry once the server reports "
                                                              "ready"}),
