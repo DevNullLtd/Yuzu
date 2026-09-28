@@ -123,12 +123,15 @@ TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[
 
 // WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2,
 // "aggregates GLOBAL-ONLY"): signal_detail's `visible` post-limit filter
-// (ADR-0031 WS-A4 PR-1 decision 3) was REMOVED — the REST/MCP handlers now
-// refuse ANY engaged confinement scope outright before calling this method
-// at all, since subjects/by_os/by_day stay fleet-wide aggregates a per-row
-// devices[] filter can never confine (ADR-0017 INV-3). The former
-// "confines devices[] to the visible set, post-limit" test asserted exactly
-// the removed parameter and is gone with it — see dex_api.hpp's own doc
+// (ADR-0031 WS-A4 PR-1 decision 3) was REMOVED, permanently — there is no
+// confinement-scope concept left on this method to engage or refuse.
+// REST/MCP gate this resource on the bare `GuaranteedState:Read`
+// permission (global-grant-or-legacy-admin/RBAC-off only; round-3 revert,
+// never `fleet_read_fn`) plus their own service-scoped-token denial, since
+// subjects/by_os/by_day stay fleet-wide aggregates a per-row devices[]
+// filter can never confine (ADR-0017 INV-3). The former "confines
+// devices[] to the visible set, post-limit" test asserted exactly the
+// removed parameter and is gone with it — see dex_api.hpp's own doc
 // comment on `signal_detail` for the full rationale.
 
 TEST_CASE("DexApi: device_score matches the shared builder (seam is a pure forward)",

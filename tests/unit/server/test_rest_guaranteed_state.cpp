@@ -242,6 +242,21 @@ struct RestGsHarness {
     // this file is unaffected.
     bool wire_real_gs_scoped_perm_{false};
 
+    // sec8r3-2: when true, a bare `perm_fn(req, res, "GuaranteedState", "Read")`
+    // call from GET /api/v1/dex/app or GET /api/v1/dex/overview (the ONLY two
+    // routes this checks by `req.path` — every other one of this file's ~35
+    // other GuaranteedState-securable call sites is unaffected, so the
+    // hundreds of pre-existing `grant_perms`-stub tests elsewhere keep their
+    // meaning) delegates to the REAL `AuthRoutes::require_permission` instead
+    // of the plain `grant_perms` stand-in below. Mirrors
+    // `wire_real_gs_scoped_perm_`'s pattern: the stub's `grant_perms` bool
+    // cannot distinguish "admitted via elevation" from "admitted via a stub
+    // that always says yes", which is exactly what let the three "elevated
+    // session is admitted unfiltered" tests below pass for the wrong reason
+    // (the stub, not elevation) — see those tests' own comments. Default
+    // false: every pre-existing test in this file is unaffected.
+    bool wire_real_dex_perm_{false};
+
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
@@ -438,8 +453,17 @@ struct RestGsHarness {
 
         // perm_fn grants unless grant_perms is flipped off (then 403, mirroring
         // the production perm_fn) — RBAC proper is exercised in test_rbac_store.cpp.
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
+        // sec8r3-2: EXCEPT for GET /api/v1/dex/app / GET /api/v1/dex/overview when
+        // wire_real_dex_perm_ is set (see that field's own comment) — those two
+        // delegate to the REAL AuthRoutes::require_permission so a test can
+        // actually observe elevation/RBAC composition, not just this stub.
+        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                              const std::string& securable_type,
+                              const std::string& operation) -> bool {
+            if (wire_real_dex_perm_ && securable_type == "GuaranteedState" &&
+                operation == "Read" &&
+                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview"))
+                return auth_routes_->require_permission(req, res, securable_type, operation);
             if (grant_perms)
                 return true;
             res.status = 403;
@@ -1317,9 +1341,13 @@ TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route
 // of this route's callers — see the struct's own comment). The closest
 // available proof of the denial path is `grant_perms = false`, the SAME
 // stand-in the sibling GET /api/v1/dex/catalogue "permission denied" test
-// uses; every OTHER test in this file already proves an ADMITTED caller
-// (RBAC-off, global grant, or elevated — see the "elevated session" test
-// below) sees the FULL unfiltered device list, closing sec-2.
+// uses. (sec8r3-2: unlike GET /api/v1/dex/app / GET /api/v1/dex/overview,
+// this route's `perm_fn` call sits behind a REGEX path registration —
+// `/api/v1/dex/signals/([^/]+)` — so wiring it through the real
+// `AuthRoutes::require_permission` the way `wire_real_dex_perm_` does for
+// the other two needs a prefix match on `req.path` instead of an exact one;
+// left as a follow-up rather than folded into this round, so the test right
+// below states plainly what it does and does NOT prove.)
 TEST_CASE("REST dex/signals/{obs_type}: permission denied -> 403 before any audit",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h;
@@ -1330,13 +1358,21 @@ TEST_CASE("REST dex/signals/{obs_type}: permission denied -> 403 before any audi
     CHECK(h.audit_log.empty());
 }
 
-// qa-3 (Gate 7 fix round): an elevated session with ZERO underlying RBAC
-// grants is admitted unfiltered (TOP), exercised through the DEX handler
-// itself rather than only via GET /guaranteed-state/status's own elevated
-// regression test — this pins the SAME SEC-7-class regression at the
-// surface this fix round actually touches.
-TEST_CASE("REST dex/signals/{obs_type}: an elevated session is admitted unfiltered without "
-          "any RBAC grant",
+// sec8r3-2: this test's name previously claimed to prove elevation admits a
+// zero-RBAC-grant caller. It does not — `perm_fn` here is still the plain
+// `grant_perms` stand-in (default true), which admits this request
+// regardless of whether the session is elevated, so the 200 below is
+// unconditional on `grant_perms`, not on the `elevated_status_route_headers()`
+// cookie. What this DOES prove: an admitted caller gets the SAME unfiltered
+// device list every other admitted caller on this route gets — a structural
+// fact (DexApi::signal_detail has no `visible` parameter to filter on at
+// all, per the WS-A4 PR-1 Gate 7 fix round), not an elevation-specific one.
+// GET /api/v1/dex/app and GET /api/v1/dex/overview have the real,
+// elevation-observing version of this coverage (`wire_real_dex_perm_`,
+// see their own tests) — this route's equivalent is the follow-up noted on
+// the sibling "permission denied" test just above.
+TEST_CASE("REST dex/signals/{obs_type}: an admitted caller sees the unfiltered device list "
+          "(no per-caller visible filter to observe; NOT an elevation-specific proof)",
           "[pg][rest][dex][signals][scope]") {
     RestGsHarness h;
     h.rbac_.set_rbac_enabled(true);
@@ -2440,15 +2476,24 @@ TEST_CASE("REST dex/app: permission denied -> 403 before any audit",
     CHECK(h.audit_log.empty());
 }
 
-// qa-3 (Gate 7 fix round): the same elevated coverage GET
-// /api/v1/dex/signals/{obs_type} has, exercised through get_dex_app's own
-// handler. (sec8-3's service-scoped-token-under-RBAC-ON case is NOT
-// re-tested here for the same `tag_store=nullptr` harness-limitation
-// reason documented on the sibling test above /dex/signals/{obs_type}'s
-// equivalent case.)
+// sec8r3-2: `wire_real_dex_perm_` routes this route's `perm_fn` through the
+// REAL `AuthRoutes::require_permission` so this actually OBSERVES elevation
+// — the previous version of this test passed with `perm_fn` still the plain
+// `grant_perms` stub (default true), which admits every request regardless
+// of the session's elevation state; it proved "an admitted caller gets the
+// unfiltered device list" (DexApi::app has no `visible` param to filter on,
+// so that much was never in doubt — that closure is structural, not this
+// test) but NOT that elevation is what admitted a caller holding zero RBAC
+// grants. With the real gate wired, RBAC enabled and zero grants anywhere,
+// elevation is the ONLY thing that can admit this session — see the sibling
+// negative tests directly below for the same session with RBAC on but not
+// elevated (403) and with an RBAC grant but only management-group-scoped
+// (still 403, since `require_permission` never consults
+// `ManagementGroupStore` — N-3).
 TEST_CASE("REST dex/app: an elevated session is admitted unfiltered without any RBAC grant",
-          "[pg][rest][dex][app][scope]") {
+          "[pg][rest][dex][app][scope][adr0017]") {
     RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
     h.rbac_.set_rbac_enabled(true);
     h.session_user = "elevated_user";
     h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
@@ -2458,7 +2503,53 @@ TEST_CASE("REST dex/app: an elevated session is admitted unfiltered without any 
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
+    // Elevation is unfiltered fleet-wide, despite zero RBAC grants — ALL
+    // seeded devices are present, none dropped by any confinement.
     CHECK(j["data"]["devices"].size() == 2);
+}
+
+// sec8r3-2: the same session as above (real `require_permission`, RBAC
+// enabled, zero grants anywhere) but WITHOUT elevation -> denied. Proves
+// the previous test's 200 genuinely depends on elevation, not on a stub
+// that always grants.
+TEST_CASE("REST dex/app: RBAC on, no grant, not elevated -> 403 (real require_permission)",
+          "[pg][rest][dex][app][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "plain_user";
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// sec8r3-2 / N-3: a management-group-SCOPED grant (never a global
+// RbacStore::assign_role) is not elevation and does not admit here — this
+// route's `perm_fn` is a bare `AuthRoutes::require_permission` call, which
+// (unlike `require_list_read`/`require_fleet_read`) never consults
+// `ManagementGroupStore`; a group-only grantee is denied exactly like a
+// grant-less caller. Pins the regression `dispatch_confined_arms`/
+// `authz_topology_floor`'s own "never assume a narrower-looking gate
+// composes with confinement" lesson applies to THIS gate too.
+TEST_CASE("REST dex/app: a management-group-scoped grant (not global, not elevated) -> 403",
+          "[pg][rest][dex][app][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"DexReader", "", false, 0}).has_value());
+    REQUIRE(
+        h.rbac_.set_permission({"DexReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "DexReader"}).has_value());
+    h.session_user = "carol";
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
@@ -2670,15 +2761,18 @@ TEST_CASE("REST dex/overview: permission denied -> 403 before any audit",
     CHECK(h.audit_log.empty());
 }
 
-// qa-3 (Gate 7 fix round): the same elevated coverage GET
-// /api/v1/dex/signals/{obs_type} and GET /api/v1/dex/app have, exercised
-// through get_dex_overview's own handler. (sec8-3's service-scoped-token-
-// under-RBAC-ON case is NOT re-tested here for the same `tag_store=nullptr`
-// harness-limitation reason documented on the /dex/signals/{obs_type}
-// sibling test.)
+// sec8r3-2: `wire_real_dex_perm_` routes this route's `perm_fn` through the
+// REAL `AuthRoutes::require_permission` so this actually OBSERVES elevation
+// — see GET /api/v1/dex/app's identical-shape test above for the full
+// rationale (DexApi::overview also has no `visible` param, so the
+// unfiltered-list closure is structural; this test's job is proving
+// elevation is what admitted a zero-grant caller). Sibling negative tests
+// directly below cover RBAC-on-not-elevated (403) and management-group-
+// scoped-only (403, N-3).
 TEST_CASE("REST dex/overview: an elevated session is admitted unfiltered without any RBAC grant",
-          "[pg][rest][dex][overview][scope]") {
+          "[pg][rest][dex][overview][scope][adr0017]") {
     RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
     h.rbac_.set_rbac_enabled(true);
     h.session_user = "elevated_user";
     h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
@@ -2687,7 +2781,46 @@ TEST_CASE("REST dex/overview: an elevated session is admitted unfiltered without
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
+    // Elevation is unfiltered fleet-wide, despite zero RBAC grants — ALL
+    // seeded devices are present, none dropped by any confinement.
     CHECK(j["data"]["top_devices"].size() == 2);
+}
+
+// sec8r3-2: the same session as above (real `require_permission`, RBAC
+// enabled, zero grants anywhere) but WITHOUT elevation -> denied.
+TEST_CASE("REST dex/overview: RBAC on, no grant, not elevated -> 403 (real require_permission)",
+          "[pg][rest][dex][overview][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_user = "plain_user";
+    auto res = h.sink.Get("/api/v1/dex/overview", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// sec8r3-2 / N-3: a management-group-SCOPED grant (never a global
+// RbacStore::assign_role) is not elevation and does not admit here — see
+// GET /api/v1/dex/app's identical-shape test above for the full rationale.
+TEST_CASE("REST dex/overview: a management-group-scoped grant (not global, not elevated) -> 403",
+          "[pg][rest][dex][overview][scope][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"DexReader", "", false, 0}).has_value());
+    REQUIRE(
+        h.rbac_.set_permission({"DexReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "DexReader"}).has_value());
+    h.session_user = "carol";
+    auto res = h.sink.Get("/api/v1/dex/overview", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "
