@@ -661,8 +661,96 @@ TEST_CASE("ResultSetStore: member_set_owned is owner-scoped", "[pg][result_set][
     auto owned = member_set_owned_ok(store, rs->id, "alice");
     CHECK(owned.size() == 3);
     CHECK(owned.contains("b"));
-    // A non-owner sees an empty membership — the authorization gate for B1.
-    CHECK(member_set_owned_ok(store, rs->id, "bob").empty());
+    // #4981 PR-1 (Finding A/A1): a non-owner now gets a typed NotOwner error —
+    // NOT a successful empty membership (the pre-#4981 authorization gate for
+    // B1 collapsed "not owned" into "empty", which is exactly the shape the
+    // Finding A TOCTOU bug exploited).
+    auto bob_result = store.member_set_owned(rs->id, "bob");
+    REQUIRE_FALSE(bob_result.has_value());
+    CHECK(bob_result.error() == ResultSetError::NotOwner);
+}
+
+TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewrite)",
+          "[pg][result_set][owner]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    SECTION("absent id -> NotFound") {
+        auto r = store.member_set_owned("rs_does_not_exist", "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotFound);
+    }
+    SECTION("owned, EMPTY membership -> a REAL SUCCESS (the case the pre-#4981 "
+            "contract could not express)") {
+        auto rs = store.create_materialized(req("alice", "empty-set"), {});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->empty());
+    }
+    SECTION("owned, non-empty membership -> the correct set") {
+        auto rs = store.create_materialized(req("alice", "full-set"), {"x", "y"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 2);
+        CHECK(r->contains("x"));
+        CHECK(r->contains("y"));
+    }
+    SECTION("exists but not owned -> NotOwner, indistinguishable from NotFound by design "
+            "(the caller-facing collapse is at ScopeEvalError::Kind::OwnerCheckFailed, not "
+            "here — but this method itself must still be the correct SOURCE distinction)") {
+        auto rs = store.create_materialized(req("alice", "foreign"), {"z"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotOwner);
+    }
+}
+
+TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store failure, "
+          "not a silent empty set (#4981 PR-1 A1 rewrite)",
+          "[pg][result_set][dberror]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto rs = store.create_materialized(req("alice", "will-degrade"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    // Same lock-timeout fault-injection idiom as the lineage_checked DbError
+    // test above: lock result_sets (the rewritten member_set_owned query
+    // reads it in the FROM clause on every call) so the statement fails
+    // deterministically with 55P03.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.member_set_owned(rs->id, "alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.member_set_owned(rs->id, "alice");
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->size() == 1);
 }
 
 TEST_CASE("ResultSetStore: lineage stops at a cross-owner ancestor", "[pg][result_set][lineage]") {

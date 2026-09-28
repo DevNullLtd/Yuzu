@@ -65,6 +65,7 @@
 #include <yuzu/agent/plugin_loader.hpp> // sha256_file (bounded)
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -244,7 +245,8 @@ void FileGuard::run() try {
     // the manual-cleanup version risked.
     EventHandle dir_event(CreateEventW(nullptr, FALSE, FALSE, nullptr)); // auto-reset OVERLAPPED hEvent
     if (!dir_event) {
-        spdlog::error("Guardian FileGuard[{}]: CreateEventW failed — watch not started", cfg_.rule_id);
+        spdlog::error("Guardian FileGuard[{}]: CreateEventW failed — watch not started",
+                      log_id_token(cfg_.rule_id));
         return;
     }
     // Waitable timer for the disabled-parent-watch unhealthy refresh (lost-edge backstop).
@@ -326,7 +328,8 @@ void FileGuard::run() try {
                                 "permanently disabled after {} drain failures - directory "
                                 "rename detection unavailable for this rule until it is next "
                                 "re-armed (a policy re-push or an agent restart)",
-                                *rule_id, *path, kParentIoAbandonLimit);
+                                log_id_token(*rule_id), log_key_token(*path),
+                                kParentIoAbandonLimit);
                         } catch (...) {
                         }
                     } else {
@@ -334,8 +337,8 @@ void FileGuard::run() try {
                             spdlog::warn(
                                 "Guardian FileGuard[{}]: parent-directory watch cancel for {} "
                                 "did not drain within {}ms - block abandoned ({}/{})",
-                                *rule_id, *path, kCancelDrainMs * 2, *abandon_count,
-                                kParentIoAbandonLimit);
+                                log_id_token(*rule_id), log_key_token(*path), kCancelDrainMs * 2,
+                                *abandon_count, kParentIoAbandonLimit);
                         } catch (...) {
                         }
                     }
@@ -431,10 +434,10 @@ void FileGuard::run() try {
                 sink_(d);
         } catch (const std::exception& e) {
             spdlog::warn("Guardian FileGuard[{}]: health-report sink threw: {} — continuing",
-                         cfg_.rule_id, e.what());
+                         log_id_token(cfg_.rule_id), e.what());
         } catch (...) {
             spdlog::warn("Guardian FileGuard[{}]: health-report sink threw (unknown) — continuing",
-                         cfg_.rule_id);
+                         log_id_token(cfg_.rule_id));
         }
     };
 
@@ -455,13 +458,13 @@ void FileGuard::run() try {
                                       nullptr, FALSE)) {
                     spdlog::warn("Guardian FileGuard[{}]: SetWaitableTimer failed (err={}) — "
                                  "unhealthy refresh disabled, edge report only",
-                                 cfg_.rule_id, GetLastError());
+                                 log_id_token(cfg_.rule_id), GetLastError());
                     p_refresh_timer.reset();
                 }
             } else {
                 spdlog::warn("Guardian FileGuard[{}]: CreateWaitableTimerW failed (err={}) — "
                              "unhealthy refresh disabled, edge report only",
-                             cfg_.rule_id, GetLastError());
+                             log_id_token(cfg_.rule_id), GetLastError());
             }
         }
         report_parent_unhealthy();
@@ -529,7 +532,7 @@ void FileGuard::run() try {
             if (!p_logged) {
                 p_logged = true;
                 spdlog::debug("Guardian FileGuard[{}]: no parent directory to watch above {}",
-                              cfg_.rule_id, cfg_.path);
+                              log_id_token(cfg_.rule_id), log_key_token(cfg_.path));
             }
             return false;
         }
@@ -547,7 +550,7 @@ void FileGuard::run() try {
                 p_logged = true;
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
                              "(event creation failed)",
-                             cfg_.rule_id, cfg_.path);
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.path));
             }
             return false; // fresh destructs here: pending==false, freed directly; P stays
                           // unbound, no arm_retry (finding 4) — retried on the next bind()
@@ -565,7 +568,7 @@ void FileGuard::run() try {
                 p_logged = true;
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} not armed "
                              "(err={})",
-                             cfg_.rule_id, cfg_.path, err);
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.path), err);
             }
             return false; // fresh destructs here: pending==false, freed directly; P stays
                           // unbound, no arm_retry (finding 4) — retried on the next bind()
@@ -628,9 +631,9 @@ void FileGuard::run() try {
         std::error_code ec;
         const bool present = fs::exists(target, ec);
         if (present != cfg_.expect_present) {
-            spdlog::info("Guardian FileGuard[{}]: {} (expected {}) for {}", cfg_.rule_id,
-                         present ? "present" : "absent", cfg_.expect_present ? "present" : "absent",
-                         cfg_.path);
+            spdlog::info("Guardian FileGuard[{}]: {} (expected {}) for {}",
+                         log_id_token(cfg_.rule_id), present ? "present" : "absent",
+                         cfg_.expect_present ? "present" : "absent", log_key_token(cfg_.path));
             report(present ? "<present>" : "<absent>",
                    cfg_.expect_present ? "<present>" : "<absent>");
         } else {
@@ -677,7 +680,8 @@ void FileGuard::run() try {
         if (cfg_.expected_hash.empty() && !baseline_set) {
             baseline = cur; // baseline-on-arm: first present read establishes the good state
             baseline_set = true;
-            spdlog::info("Guardian FileGuard[{}]: baselined {} = {}", cfg_.rule_id, cfg_.path, cur);
+            spdlog::info("Guardian FileGuard[{}]: baselined {} = {}", log_id_token(cfg_.rule_id),
+                         log_key_token(cfg_.path), cur);
             if (cfg_.on_baseline) // #4021: persist so a later full_sync/restart re-seeds this
                 cfg_.on_baseline(cur);
             report_compliant(); // armed at the known-good baseline → compliant edge
@@ -685,8 +689,8 @@ void FileGuard::run() try {
         }
         const std::string& effective = cfg_.expected_hash.empty() ? baseline : cfg_.expected_hash;
         if (cur != effective) {
-            spdlog::info("Guardian FileGuard[{}]: content drift on {} ({} != {})", cfg_.rule_id,
-                         cfg_.path, cur, effective);
+            spdlog::info("Guardian FileGuard[{}]: content drift on {} ({} != {})",
+                         log_id_token(cfg_.rule_id), log_key_token(cfg_.path), cur, effective);
             report(cur, effective);
         } else {
             report_compliant();
@@ -733,7 +737,7 @@ void FileGuard::run() try {
             if (!h_dir && !ancestor_event) {
                 arm_retry = true; // both arms failed → bounded degraded re-arm (no deaf-forever)
                 spdlog::warn("Guardian FileGuard[{}]: no watch armed for {} — degraded re-arm in {}ms",
-                             cfg_.rule_id, cfg_.path, kArmFailRetryMs);
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.path), kArmFailRetryMs);
             }
         }
         if (p_rebuilt && pio->p_ex) { // X's FileId, from its own handle (a transient one in
@@ -770,7 +774,7 @@ void FileGuard::run() try {
         }
         spdlog::warn("Guardian FileGuard[{}]: watched directory kept changing while arming {} - "
                      "degraded re-arm in {}ms",
-                     cfg_.rule_id, cfg_.path, kArmFailRetryMs);
+                     log_id_token(cfg_.rule_id), log_key_token(cfg_.path), kArmFailRetryMs);
         arm_retry = true;
     };
 
@@ -854,7 +858,8 @@ void FileGuard::run() try {
             if (p_failures == kParentFailureLimit + 1) // once per entry into this state
                 spdlog::warn("Guardian FileGuard[{}]: parent-directory watch for {} failing "
                              "repeatedly (err={}) - degraded re-arm in {}ms",
-                             cfg_.rule_id, cfg_.path, p_err, kArmFailRetryMs);
+                             log_id_token(cfg_.rule_id), log_key_token(cfg_.path), p_err,
+                             kArmFailRetryMs);
             pio.reset(); // pending==false: freed immediately by ParentIoRelease, no drain needed
             // A previously-working watch degrading (unlike bind()'s fresh-open failure, which
             // never sets arm_retry — see finding 4): bounded degraded re-arm, not a rebuild loop.
@@ -872,7 +877,8 @@ void FileGuard::run() try {
         }
     };
 
-    spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [resilient]", cfg_.rule_id, cfg_.path,
+    spdlog::info("Guardian FileGuard[{}]: watching {} ({}) [resilient]", log_id_token(cfg_.rule_id),
+                 log_key_token(cfg_.path),
                  hash_mode ? "hash-equals"
                            : (cfg_.expect_present ? "expect present" : "expect absent"));
     arm_watch();
@@ -1001,7 +1007,7 @@ void FileGuard::run() try {
         } else {
             spdlog::error("Guardian FileGuard[{}]: WaitForMultipleObjects failed (r={}, err={}) — "
                           "watch stopping",
-                          cfg_.rule_id, r, GetLastError());
+                          log_id_token(cfg_.rule_id), r, GetLastError());
             break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
         }
     }
@@ -1009,11 +1015,11 @@ void FileGuard::run() try {
     // invokes ParentIoRelease, which drains-or-abandons any in-flight P read (sec-1) as part of
     // that same release.
 } catch (const std::exception& e) {
-    spdlog::error("Guardian FileGuard[{}]: watch thread exception: {} — watch stopping", cfg_.rule_id,
-                  e.what());
+    spdlog::error("Guardian FileGuard[{}]: watch thread exception: {} — watch stopping",
+                  log_id_token(cfg_.rule_id), e.what());
 } catch (...) {
     spdlog::error("Guardian FileGuard[{}]: watch thread unknown exception — watch stopping",
-                  cfg_.rule_id);
+                  log_id_token(cfg_.rule_id));
 }
 
 } // namespace yuzu::agent

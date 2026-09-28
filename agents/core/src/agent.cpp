@@ -59,6 +59,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
+#include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
 #include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
@@ -2069,8 +2070,15 @@ public:
                         std::lock_guard lock(stream_write_mu_);
                         guardian_sink_stream_ = stream;
                     }
+                    // #4783: this lambda now runs on GuardianLegacySinkExecutor's own detached
+                    // worker, never on a guard's own thread — `this` stays valid across that
+                    // because the executor's orphan-exit contract (active_io_workers()'s
+                    // fourth term, guardian_engine.cpp) is what keeps main.cpp/service_win.cpp
+                    // from tearing this AgentImpl down while a send is still detached and
+                    // running, exactly like send_guardian_outbox_entry's own capture below.
                     guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
-                        const bool sent = emit_guardian_event(ev);
+                        const auto outcome = emit_guardian_event(ev);
+                        const bool sent = (outcome == LegacySendOutcome::Sent);
                         // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
                         // DEX observer's call to this same method stays uninstrumented, see
                         // emit_guardian_event's own comment).
@@ -2084,6 +2092,7 @@ public:
                             spdlog::info("{}", format_send_timing_line(r));
                         } catch (...) { // best-effort diagnostic; never propagate
                         }
+                        return outcome;
                     });
                     // Replay the durable lifecycle journal into the send window now that the
                     // sink is live on the new stream (item 7 PR-Ag). The drain worker sends the
@@ -2462,6 +2471,15 @@ public:
                                 // an acknowledgment this tick produces is visible on THIS
                                 // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                                // #4783 commit 4: legacy-sink loss visibility. Deliberately
+                                // NOT inside journal_maintenance_tick()'s prefer_spark_ gate
+                                // (nor any other prefer_spark_ conditional in this block) -
+                                // the legacy IGuard sink is the LIVE production path
+                                // regardless of the Spark flip state, so a stranded worker
+                                // or an open integrity gap must be observed and repaired on
+                                // every heartbeat, not only when Spark is preferred. See
+                                // GuardianEngine::legacy_sink_kick()'s own doc comment.
+                                guardian_->legacy_sink_kick();
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
@@ -2512,7 +2530,20 @@ public:
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
                                         .priority_demoted = guardian_->priority_demoted(),
                                         .outbox_backpressure_drops =
-                                            guardian_->outbox_backpressure_drops()});
+                                            guardian_->outbox_backpressure_drops(),
+                                        // #4783 commit 4: never gated on prefer_spark_ -
+                                        // legacy_sink_executor_ is always live, so these
+                                        // three report truthfully whichever backend is
+                                        // actually enforcing. legacy_sink_dropped_unwired
+                                        // (governance follow-up) is the third: the
+                                        // pre-network-arm drop, previously counted
+                                        // in-process only with no fleet visibility.
+                                        .legacy_sink_events_lost =
+                                            guardian_->legacy_sink_events_lost(),
+                                        .legacy_sink_gap_rules =
+                                            guardian_->legacy_sink_gap_rules(),
+                                        .legacy_sink_dropped_unwired =
+                                            guardian_->legacy_sink_dropped_unwired()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).
@@ -3267,11 +3298,14 @@ public:
 
                 // Detach the Guardian event-sink from this (now broken) stream BEFORE
                 // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
-                // in-flight sink Write to finish, then nulls the holder so a guard
-                // worker firing during teardown drops the event instead of writing to
-                // a cancelled stream. Guards keep running across the reconnect; the
-                // next iteration republishes the new stream and the heartbeat reconcile
-                // (M5) catches up any generation missed while the link was down.
+                // in-flight sink Write to finish, then nulls the holder so a send firing
+                // during teardown drops the event instead of writing to a cancelled
+                // stream. #4783: that send no longer runs on a guard's own thread - it
+                // is legacy_sink_executor_'s own detached worker (or the DEX observer's
+                // still-synchronous OS-callback thread) that can be mid-Write here, never
+                // a guard. Guards keep running across the reconnect; the next iteration
+                // republishes the new stream and the heartbeat reconcile (M5) catches up
+                // any generation missed while the link was down.
                 {
                     std::lock_guard lock(stream_write_mu_);
                     guardian_sink_stream_.reset();
@@ -3488,16 +3522,31 @@ public:
         stop_requested_.store(true, std::memory_order_release);
         yuzu::agent::request_subprocess_cancel(true);
         heartbeat_stop_.store(true, std::memory_order_release);
-        // Cancel the Subscribe stream FIRST. The Guardian drift workers and the DEX
-        // observer both emit through emit_guardian_event(), whose synchronous gRPC
-        // Write() BLOCKS on a stalled-but-not-dead stream (gateway up, not draining).
-        // guardian_->stop() / dex_observer_->stop() below DRAIN those emitters with an
-        // unbounded wait, so cancelling only after the drain lets an in-flight signal
-        // Write during shutdown wedge stop() forever (cpp-safety BLOCKING). TryCancel
-        // aborts the blocked Write; it does NOT tear the stream down — the stream holder
-        // and stream_write_mu_ are members destroyed AFTER guardian_/dex_observer_, so
-        // they stay live through both drains and emit_guardian_event's null-check under
-        // the lock remains UAF-safe.
+        // Cancel the Subscribe stream FIRST — best-effort, not a guaranteed completion
+        // time (#4783). Until #4783, the Guardian drift workers AND the DEX observer
+        // both emitted through emit_guardian_event()'s synchronous gRPC Write() on
+        // their OWN thread, so an in-flight Write during a stalled-but-not-dead
+        // stream (gateway up, not draining) could wedge guardian_->stop()'s /
+        // dex_observer_->stop()'s unbounded drain forever unless cancelled first
+        // (cpp-safety BLOCKING). #4783 routes the Guardian drift-sink path through
+        // GuardianLegacySinkExecutor's detached worker instead, so guardian_->stop()
+        // below now joins the guard threads promptly — they never enter Write()
+        // themselves, they only enqueue — and only stops the executor from admitting
+        // NEW sends; it does not join whatever send is already in flight. Cancelling
+        // the stream FIRST is still load-bearing for two reasons: (1) the DEX
+        // observer still emits SYNCHRONOUSLY on its own OS-callback thread, and
+        // dex_observer_->stop() below still drains that with an unbounded wait, so
+        // cancelling only afterward would reopen the exact same wedge for DEX signals
+        // alone; and (2) it is a best-effort means of unblocking a legacy-sink send
+        // that is already mid-stall on the executor's detached worker, giving
+        // active_io_workers() a better chance of reaching 0 before OrphanExitGuard's
+        // grace expires — NOT a guaranteed bound: if the cancelled Write does not
+        // return promptly, the worker stays counted and OrphanExitGuard hard_exit()s
+        // after kOrphanDrainGrace instead of wedging. Either way, TryCancel does NOT
+        // tear the stream down — the stream holder and stream_write_mu_ are members
+        // destroyed AFTER guardian_/dex_observer_, so they stay live through both
+        // drains and emit_guardian_event's null-check under the lock remains
+        // UAF-safe.
         // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
         // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
         cancel_ctx(subscribe_ctx_);
@@ -3563,14 +3612,17 @@ private:
     // it through the current Subscribe stream. Shared by the GuardianEngine drift
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
-    // Returns Write()'s outcome so a caller can log it (#4606 criterion-10 T_wire) —
-    // deliberately instrumented ONLY at the drift-sink call site (set_event_sink's
-    // lambda), never here and never at the DEX observer's call site: DEX signal
-    // telemetry is a different kind of traffic than the Guardian-violation latency
-    // this benchmark measures, and instrumenting it here would flood the log at DEX
-    // observation volume. A new caller of this method should make the same choice
-    // deliberately rather than copy whichever pattern it happens to see first.
-    bool emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+    // Returns the delivery outcome (LegacySendOutcome, #4783: LinkDown when the
+    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise)
+    // so a caller can distinguish those two failure shapes and log it (#4606
+    // criterion-10 T_wire) — deliberately instrumented ONLY at the drift-sink call
+    // site (set_event_sink's lambda), never here and never at the DEX observer's
+    // call site: DEX signal telemetry is a different kind of traffic than the
+    // Guardian-violation latency this benchmark measures, and instrumenting it here
+    // would flood the log at DEX observation volume. A new caller of this method
+    // should make the same choice deliberately rather than copy whichever pattern it
+    // happens to see first.
+    LegacySendOutcome emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
@@ -3578,8 +3630,9 @@ private:
         resp.set_payload(ev.SerializeAsString());
         std::lock_guard lock(stream_write_mu_);
         if (!guardian_sink_stream_)
-            return false;
-        return guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+            return LegacySendOutcome::LinkDown;
+        return guardian_sink_stream_->Write(resp, grpc::WriteOptions()) ? LegacySendOutcome::Sent
+                                                                        : LegacySendOutcome::WriteFailed;
     }
 
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
@@ -4175,12 +4228,17 @@ private:
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
     // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
-    // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
-    // and fire asynchronously, so the sink must NOT capture a specific stream: it
+    // Guarded by stream_write_mu_. The sink must NOT capture a specific stream: it
     // reads this holder under the lock and drops the event if it is null (link down
     // between reconnects). Set on stream open, reset on read-loop exit BEFORE the
-    // stream is torn down, so a guard firing mid-teardown can never write to a
-    // cancelled stream.
+    // stream is torn down, so a writer firing mid-teardown can never write to a
+    // cancelled stream. #4783: legacy guard worker threads no longer touch this at
+    // all — they only enqueue onto GuardianEngine's legacy_sink_executor_, which
+    // never captures a specific stream either. The things that CAN still write here
+    // after this AgentImpl instance has moved on to a new stream (or is tearing
+    // down) are (1) legacy_sink_executor_'s own detached worker — orphan-accounted
+    // via active_io_workers()/hard_exit.hpp, same contract as (2) the DEX observer's
+    // OS-callback threads, still synchronous and drained by dex_observer_->stop().
     std::shared_ptr<SubscribeStream> guardian_sink_stream_;
     // Fleet-wide DEX signal observer (multi-signal). Declared AFTER stream_write_mu_
     // + guardian_sink_stream_ (same reasoning as guardian_): its OS-callbacks emit

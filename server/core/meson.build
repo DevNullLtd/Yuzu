@@ -421,6 +421,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
     'src/leader_elector.cpp',
+    'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
@@ -439,6 +440,7 @@ yuzu_server_core_lib = static_library(
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
+    'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
     'src/oidc_scim_link.cpp',
     'src/saml_provider.cpp',
@@ -630,6 +632,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
@@ -642,6 +645,7 @@ yuzu_server_core_lib = static_library(
     # key_provider.cpp lives in the yuzu_key_provider leaf target above
     # (ADR-0010 arch-S3); the dep below carries it.
     'src/ca_store.cpp',
+    'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
     'src/kek_routes.cpp',

@@ -47,6 +47,14 @@ class GuaranteedStateStore;
 int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
                      const std::string& since);
 
+/// Pure scoring formula (#4855 extraction) — `dex_device_score`'s body once it
+/// has a device's signal summary in hand. Store-free; lets
+/// `build_dex_device_score_model` derive score + signals from the SAME
+/// checked read (closing the #4855 torn-read window) instead of a second,
+/// independent store call. Also DEFINED in `dex_routes.cpp` (LINK RESIDUAL
+/// above applies here too).
+int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals);
+
 DexDeviceScoreModel build_dex_device_score_model(GuaranteedStateStore* store,
                                                  const std::string& agent_id,
                                                  const std::string& window, const std::string& since);

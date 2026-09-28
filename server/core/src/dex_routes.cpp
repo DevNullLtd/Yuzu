@@ -1237,11 +1237,12 @@ double dex_family_health_deduction(const DexSignalGroup& g,
     return 0.0;
 }
 
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since) {
-    if (!store)
-        return -1;
-    const auto device_signals = store->dex_device_signal_summary(agent_id, since);
+// The pure scoring formula (#4855 extraction) — everything dex_device_score
+// below did with `device_signals` once it had them, factored out so the ONE
+// checked store read the score builder now performs (closing the #4855 torn
+// read between score + signals) can feed this directly instead of forcing a
+// second read just to get a score.
+int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {
     double total = 0.0;
     for (const auto& fw : dex_family_weights()) {
         const DexSignalGroup* g = nullptr;
@@ -1263,6 +1264,20 @@ int dex_device_score(const GuaranteedStateStore* store, const std::string& agent
         total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
     }
     return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
+}
+
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since) {
+    if (!store)
+        return -1;
+    // #4855: a degraded read must never render as a signal-free, perfectly
+    // healthy device — use the type-distinguishable checked twin and refuse
+    // to score (-1, "unscored") rather than fabricate a 100 from an empty
+    // container indistinguishable from "genuinely no signals".
+    const auto device_signals = store->dex_device_signal_summary_checked(agent_id, since);
+    if (!device_signals)
+        return -1;
+    return dex_score_from_signals(*device_signals);
 }
 
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
@@ -1675,10 +1690,13 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             seg_sum.push_back(0);
             return seg_os.size() - 1;
         };
+        int unscored = 0;
         for (const auto& [id, os] : fleet.connected_agents) {
             const int s = dex_device_score(store, id, since);
-            if (s < 0)
+            if (s < 0) {
+                ++unscored; // #4855: null store OR a degraded per-device read
                 continue;
+            }
             ds.push_back(s);
             const std::size_t i = seg_idx(os.empty() ? std::string("unknown") : os);
             ++seg_n[i];
@@ -1740,7 +1758,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         h += "<div class=\"gp-sech\">Experience</div>";
         h += "<div class=\"gp-tiles\">";
         h += stile(overall, "Overall experience",
-                   ds.empty() ? "no devices reporting"
+                   ds.empty() ? (unscored > 0 ? "scores unavailable" : "no devices reporting")
                               : "median of " + num(static_cast<int64_t>(ds.size())) + " devices");
         h += stile(dev, "Device", "stability &middot; perf &middot; hardware");
         h += stile(app, "App", "crashes &amp; hangs");
@@ -1751,6 +1769,12 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                       : "types monitored &middot; " +
                             num(static_cast<int64_t>(cscope.size())) + " platform(s)");
         h += "</div>";
+        // #4855: a degraded per-device read must never silently thin the
+        // scored population -- surface the count so "N great/fair/poor"
+        // reads as "of the devices we could read", not "of the fleet".
+        if (unscored > 0)
+            h += "<div class=\"gp-note\">" + num(unscored) +
+                 " device(s) could not be scored (DEX store read degraded).</div>";
         if (!ds.empty()) {
             auto seg = [](int n, const char* color) {
                 return n <= 0 ? std::string()
@@ -2644,15 +2668,15 @@ void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
+                                FleetReadFn fleet_read_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
                     std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(dex_perf_api), std::move(group_list_fn), std::move(fleet_read_fn),
-                    std::move(tag_values_fn));
+                    std::move(dex_perf_api), std::move(group_list_fn),
+                    std::move(fleet_read_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -2660,7 +2684,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
                                 DexPerfApiPtr dex_perf_api, GroupListFn group_list_fn,
-                                FleetReadFn fleet_read_fn, TagValuesFn tag_values_fn) {
+                                FleetReadFn fleet_read_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2673,7 +2697,6 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     dex_perf_api_ = std::move(dex_perf_api);
     fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
-    tag_values_fn_ = std::move(tag_values_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
     // out-of-scope operator can't enumerate other teams' device ids. nullopt = no
@@ -3232,14 +3255,26 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             versions = app_perf_version_summaries(*trend);
         }
-        // GAP-1 (#4857): model-selector values — a narrow, disclosed
-        // presentation-side data dependency OUTSIDE the DexPerfApi seam (see
-        // TagValuesFn's own doc comment). Best-effort: an unwired/degraded
-        // tag_values_fn_ just hides the selector (empty vector), same
-        // convention as an empty `groups` list above; it never blocks render.
-        const std::vector<std::string> model_values =
-            tag_values_fn_ ? tag_values_fn_(kDexDefaultCohortKey).value_or(std::vector<std::string>{})
-                          : std::vector<std::string>{};
+        // GAP-1 CLOSED (#4857, architect D1 ruling): model-selector values now
+        // come from THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`,
+        // via the SAME `dex_perf_cohorts()` helper the public
+        // `GET /api/v1/dex/perf/cohorts` resource uses — the dashboard picker
+        // and that resource read the identical cohort population and can
+        // never drift. The untagged residual (cohort == "") is excluded: it
+        // is not a selectable model value. `fleet_snapshot` has no degrade
+        // channel (dex_perf_api.hpp), so a genuine zero-cohort-population
+        // read is never claimed as a "degrade". `dex_perf_api_` is
+        // GUARANTEED non-null by this point — all three trend branches above
+        // return the "unavailable" placeholder and `return` early whenever
+        // `dex_perf_api_` is null (each assigns `trend = dex_perf_api_ ? ...
+        // : std::nullopt` then bails on `!trend`) — so an unguarded call here
+        // is safe and an unwired API never reaches this note at all.
+        std::vector<std::string> model_values;
+        // dex_perf_api_ is non-null here: every trend branch above returns
+        // the unavailable placeholder when it is null.
+        for (const auto& c : dex_perf_cohorts(dex_perf_api_->fleet_snapshot(kDexDefaultCohortKey)))
+            if (!c.cohort.empty())
+                model_values.push_back(c.cohort);
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version, model_values, model),
                         "text/html; charset=utf-8");

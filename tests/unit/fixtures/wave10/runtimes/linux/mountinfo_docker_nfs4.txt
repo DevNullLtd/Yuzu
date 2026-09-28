@@ -1,0 +1,12 @@
+231 159 0:61 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/desktop-containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/7127/fs:/var/lib/desktop-containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/57/fs,upperdir=/var/lib/desktop-containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/7128/fs,workdir=/var/lib/desktop-containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/7128/work,nouserxattr
+233 231 0:89 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+234 231 0:90 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755
+235 234 0:91 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666
+236 231 0:92 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw
+237 236 0:41 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw
+238 234 0:87 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw
+239 234 0:93 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k
+240 231 254:1 /docker/containers/3974d309c0375b8379e9e61deffa3a03dfa8e678d278cc6a5d37ff60b1bbc276/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/vda1 rw,discard
+241 231 254:1 /docker/containers/3974d309c0375b8379e9e61deffa3a03dfa8e678d278cc6a5d37ff60b1bbc276/hostname /etc/hostname rw,relatime - ext4 /dev/vda1 rw,discard
+242 231 254:1 /docker/containers/3974d309c0375b8379e9e61deffa3a03dfa8e678d278cc6a5d37ff60b1bbc276/hosts /etc/hosts rw,relatime - ext4 /dev/vda1 rw,discard
+157 231 0:70 / /mnt/nfs rw,relatime - nfs4 nfs-srv-4794:/ rw,vers=4.0,rsize=1048576,wsize=1048576,namlen=255,hard,fatal_neterrors=ENETDOWN:ENETUNREACH,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.18.0.3,local_lock=none,addr=172.18.0.2

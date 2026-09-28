@@ -77,7 +77,9 @@ a single global `shared_mutex` serializing every writer.
   `tests/unit/server/test_scope_walking_authz.cpp`'s `[failclosed]` test drops the underlying
   Postgres table mid-test and asserts `evaluate_scope` returns `nullopt` rather than silently
   matching every registered agent under a `NOT` scope — the regression test for exactly this bug
-  class.
+  class. (`evaluate_scope`'s return type changed from `std::optional<...>`/`nullopt` to
+  `std::expected<..., ScopeEvalError>` in the 2026-09-26 Update below — this paragraph describes
+  the contract as it stood at this ADR's original writing, superseded but not wrong for its time.)
 - `list_by_owner`, `members`, `lineage`, `count_for_owner`, `counts`, and `list_pending` remain
   plain-optional/container reads — their failure modes are deny-or-benign (an empty sidebar page,
   a short lineage breadcrumb, an under-counted gauge; none grants/targets/enforces/skips/inverts).
@@ -214,7 +216,9 @@ library instead of leaning on a Postgres-side cast this store has no other reaso
   this ADR.
 - **The public C++ API's method NAMES and parameter shapes are unchanged; four return types
   widened (`get`, `contains`, `resolve_alias`, `member_set_owned` → `std::expected<...,
-  ResultSetError>`; `AgentRegistry::evaluate_scope` → `std::optional<std::vector<std::string>>`).**
+  ResultSetError>`; `AgentRegistry::evaluate_scope` → `std::optional<std::vector<std::string>>`
+  at the time this ADR was written — further widened to `std::expected<..., ScopeEvalError>` by
+  the 2026-09-26 Update below).**
   Every caller in `rest_api_v1.cpp` (`load_owned`/`resolve_owned_parent`), `scope_yaml.{hpp,cpp}`
   (`resolve_scope_aliases`/`scope_refs_failing_owner_check`, now themselves
   `std::expected`-returning and propagating), `agent_registry.{hpp,cpp}`, `server.cpp`'s
@@ -310,3 +314,71 @@ still-plain caller (today, only the dashboard fragments).
 `count_pinned_for_owner`, `counts`, and `list_pending` remain unwidened — no caller of
 these three routes a degraded read into an authorization/targeting/dispatch decision today;
 widening them stays a legitimate mechanical follow-up, not a security gap.
+
+## Update (2026-09-26) — `member_set_owned` rewritten to a single snapshot-consistent statement, closing a dispatch-time TOCTOU fail-open (#4981 PR-1, Finding A)
+
+The B4 fix above (2026-07-26 hardening round) made `member_set_owned` return
+`std::unexpected(DbError)` on a genuine Postgres error, but its SUCCESS path was still a plain
+owner-filtered `JOIN` — `SELECT device_id FROM result_set_members m JOIN result_sets r ON
+r.id = m.result_set_id WHERE m.result_set_id = $1 AND r.owner_principal = $2`. That query
+cannot distinguish "the id never existed", "the id existed but is owned by someone else", and
+"the id exists, is owned by `$2`, and legitimately has zero members" — all three read back as
+zero rows, a SUCCESSFUL empty `std::unordered_set`, never an error.
+
+The dispatch-time gate (`gate_scope_dispatch`/`scope_refs_failing_owner_check`, scope_yaml.cpp)
+runs a SEPARATE, EARLIER existence+ownership check (`ResultSetStore::get`) before parsing. Two
+independent writers — `delete_set` (an explicit REST/MCP delete) and `gc_sweep` (the TTL
+reaper), both FK-cascading — can remove a result set in the window BETWEEN that early gate
+check returning `Proceed` and `AgentRegistry::evaluate_scope`'s own later `member_set_owned`
+preload actually running. Pre-#4981, that TOCTOU race made `member_set_owned` return the
+SUCCESSFUL-empty case above for a set that had just been deleted — under `NOT
+from_result_set:<that id>`, an empty (but present, non-error) membership set inverts to
+"matches every agent", a concrete fleet-wide fail-open reachable with a perfectly healthy
+database and no operator action beyond ordinary TTL expiry or a concurrent delete.
+
+**The fix**: `member_set_owned` is now ONE statement, one Postgres snapshot:
+
+```sql
+SELECT (r.owner_principal = $2) AS owned, m.device_id
+FROM result_set_store.result_sets r
+LEFT JOIN result_set_store.result_set_members m
+  ON m.result_set_id = r.id AND r.owner_principal = $2
+WHERE r.id = $1
+```
+
+The `LEFT JOIN`'s `ON`-clause (not a `WHERE`-clause) carries the owner predicate, so a row for
+`id` is returned whenever `id` exists at all, regardless of who owns it — `owned` tells the
+caller which case it is, and `m.device_id` is `NULL` on every row exactly when the owner
+predicate didn't match OR when the set has zero members. Outcomes: zero rows →
+`std::unexpected(ResultSetError::NotFound)`; a row with `owned = false` →
+`std::unexpected(ResultSetError::NotOwner)`; `owned = true` with every `device_id` NULL → a
+REAL SUCCESS, an empty (but present) set — the case the pre-#4981 contract could not express
+at all; otherwise the collected `device_id` set. Because existence, ownership, and membership
+are now read together under one round trip against one snapshot, the TOCTOU window above is
+closed: a set deleted before this statement runs is simply absent from it (`NotFound`), never
+observed as "owned, zero members" by accident.
+
+`AgentRegistry::evaluate_scope` collapses BOTH `NotFound` and `NotOwner` into one outward
+`ScopeEvalError::Kind::OwnerCheckFailed` (never exposing the distinction to a caller — the
+same "not-owned is indistinguishable from not-found" oracle-safety contract `rest_api_v1.cpp`'s
+`load_owned` already holds for the metadata read path) and now touches (extends the TTL of)
+ANY owned result, empty or not — previously only a non-empty owned result was touched, because
+an owned-but-empty result was indistinguishable from not-owned; that limitation is gone.
+
+`gate_scope_dispatch`/`scope_refs_failing_owner_check` are UNCHANGED and remain a legitimate,
+separate early forensic pass (they still produce the per-ref `instruction.scope_resolution_failed`
+audit row before parsing) — they are explicitly re-documented (`scope_yaml.hpp`) as NOT the
+binding check anymore: `evaluate_scope`'s own preload is. The redundancy between the two
+(a ref that passes the gate can still fail moments later at `evaluate_scope`) is a deliberate,
+harmless two-layer check, not a bug.
+
+This PR also closed the equivalent presence-store gap (Finding B, not a `ResultSetStore`
+concern): `OfflineEndpointStore::query_live_ids` now returns `std::expected<...,
+PresenceReadError>` instead of a bare vector, so a presence-store outage during
+`AgentRegistry::evaluate_scope`'s cross-replica merge is likewise type-distinguishable from
+"confirmed zero presence-only agents" — see `docs/observability-conventions.md`'s
+`OfflineEndpointStore` metrics paragraph for the full detail. `evaluate_scope`'s return type
+changed from `std::optional<std::vector<std::string>>` to
+`std::expected<std::vector<std::string>, ScopeEvalError>` (`scope_eval_error.hpp`) to carry
+both this new `OwnerCheckFailed` case and the new `PresenceDegraded` case without further
+overloading a bare `nullopt`.

@@ -38,6 +38,29 @@
 /// invert(NOT)/report success? If yes, fail closed (abort/503) on `DbError`
 /// — never treat it as empty-container."
 ///
+/// **`member_set_owned` (#4981 PR-1, Finding A) is a single, snapshot-consistent
+/// SELECT — existence, ownership, and membership are read together under one
+/// Postgres statement/snapshot, closing a TOCTOU window the pre-#4981 two-fact
+/// query (existence via a separate `get()` gate, membership via a plain owner-
+/// filtered JOIN) left open.** Pre-#4981, a result set deleted (`delete_set` or
+/// `gc_sweep`, both FK-cascading) BETWEEN a caller's own pre-dispatch ownership
+/// gate (`gate_scope_dispatch`/`scope_refs_failing_owner_check`, which calls
+/// `get()`) and this method's later membership load made `member_set_owned`
+/// return a SUCCESSFUL EMPTY set — indistinguishable from "owned, zero members"
+/// — because the owner-filtered JOIN simply produced no rows once the row was
+/// gone. Under `NOT from_result_set:<that id>`, that empty-but-successful
+/// membership inverted to "matches every agent" — a concrete fleet-wide
+/// fail-open, not a theoretical one. The rewritten query instead returns
+/// `std::unexpected(ResultSetError::NotFound)` (no row at all) or
+/// `std::unexpected(ResultSetError::NotOwner)` (row exists, owned by someone
+/// else) — both of which `AgentRegistry::evaluate_scope` now collapses to ONE
+/// `ScopeEvalError::Kind::OwnerCheckFailed` outward (never distinguishable by a
+/// caller — the same "not-owned is indistinguishable from not-found"
+/// oracle-safety contract this store has always held for `get()`'s consumers).
+/// An owned set with ZERO members is now a REAL, DISTINGUISHABLE success case
+/// (an empty-but-present `std::unordered_set`) — the case the pre-#4981
+/// contract could not express at all.
+///
 /// `list_by_owner`, `members`, `lineage`, and `count_for_owner` are thin
 /// `.value_or(...)` wrappers over their `_checked` twins above, kept for API
 /// continuity. `list_by_owner` and `lineage` still have real production
@@ -270,17 +293,32 @@ public:
     /// `result.value()`) for the actual boolean membership answer.
     std::expected<bool, ResultSetError> contains(const std::string& id,
                                                  const std::string& device_id);
-    /// All members of `id` iff owned by `owner`; empty set otherwise (absent id
-    /// and "not owned" are intentionally indistinguishable — design's
+    /// #4981 PR-1 (Finding A/A1) rewrite: a SINGLE snapshot-consistent SELECT
+    /// (existence + ownership + membership together, see the file-header note
+    /// above) rather than the pre-#4981 owner-filtered JOIN alone. Outcomes:
+    /// `id` absent entirely -> `std::unexpected(ResultSetError::NotFound)`;
+    /// `id` exists but `owner` does not own it ->
+    /// `std::unexpected(ResultSetError::NotOwner)`; `id` exists, owned, ZERO
+    /// members -> a REAL SUCCESS, an empty (but present) set — the case the
+    /// pre-#4981 contract could not express (an owned-but-empty set was
+    /// indistinguishable from not-owned); `id` exists, owned, N members ->
+    /// success, the member set. `std::unexpected(ResultSetError::DbError)` on
+    /// a genuine backend failure is DISTINCT from all three — see the
+    /// type-distinguishable-reads note above.
+    ///
+    /// `NotFound`/`NotOwner` are BOTH collapsed by `AgentRegistry::evaluate_scope`
+    /// into ONE outward `ScopeEvalError::Kind::OwnerCheckFailed` — a caller can
+    /// never distinguish "doesn't exist" from "exists but isn't yours" (design's
     /// documented "stale/not-yours members drop silently" contract, review
-    /// findings B1 + F). `std::unexpected(DbError)` on a runtime error is
-    /// DISTINCT from both — see the type-distinguishable-reads note above.
-    /// THE authorization gate for `AgentRegistry::evaluate_scope`'s
-    /// `from_result_set:` scope kind: a caller that lets `DbError` fall
-    /// through as an empty set converts a transient DB blip into "no
-    /// members", which under a `NOT from_result_set:<id>` scope inverts to
-    /// "every device matches" — the fleet-wide fail-open this contract exists
-    /// to prevent. Callers MUST abort (not dispatch) on `DbError`.
+    /// findings B1 + F, preserved by the collapse rather than by this method's
+    /// own return value). THE authorization gate for
+    /// `AgentRegistry::evaluate_scope`'s `from_result_set:` scope kind: a
+    /// caller that lets ANY of NotFound/NotOwner/DbError fall through as an
+    /// empty set converts either a TOCTOU deletion race or a transient DB blip
+    /// into "no members", which under a `NOT from_result_set:<id>` scope
+    /// inverts to "every device matches" — the fleet-wide fail-open this
+    /// contract exists to prevent. Callers MUST abort (not dispatch) on ANY
+    /// `std::unexpected` from this method.
     std::expected<std::unordered_set<std::string>, ResultSetError>
     member_set_owned(const std::string& id, const std::string& owner);
     /// Resolve an owner-scoped alias to a canonical id; `nullopt` if not

@@ -859,3 +859,70 @@ TEST_CASE("ManagementGroupStore: confinement reads degrade-distinguishable when 
     CHECK(empty->empty());
 }
 
+// #1762: a member-read degrade must be distinguishable from a genuinely
+// empty group. get_members_checked() reports the degrade (nullopt); the
+// LEGACY get_members() stays fail-soft (empty vector) for its render-only
+// callers, but MUST NOT be mistaken for "the group has zero members" by any
+// caller that needs to fail closed instead (dex_perf_api's group_trend,
+// verify_api's compare — both now use get_members_checked).
+TEST_CASE("ManagementGroupStore: get_members_checked degrades on a closed store, "
+         "get_members stays fail-soft (#1762)",
+         "[management_group][degrade]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    CHECK(!store.get_members_checked("group-x").has_value());
+    // The legacy wrapper renders the SAME degrade as an empty vector — that is
+    // the documented fail-soft behaviour, not a regression.
+    CHECK(store.get_members("group-x").empty());
+}
+
+// #1762 (governance round-2): a group-row read degrade must be distinguishable
+// from a genuine not-found. get_group_checked() reports the degrade
+// (unexpected); the LEGACY get_group() stays fail-soft (nullopt, collapsing
+// the two) for callers that keep the old semantics (parent-id validation in
+// create_group/update_group), but MUST NOT be mistaken for "no such group" by
+// a caller that needs to fail closed instead (the REST GET route and its MCP
+// twin, both now on get_group_checked).
+TEST_CASE("ManagementGroupStore: get_group_checked degrades on a closed store, "
+         "get_group stays fail-soft (#1762)",
+         "[management_group][degrade]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    CHECK(!store.get_group_checked("group-x").has_value());
+    // The legacy wrapper renders the SAME degrade as nullopt — that is the
+    // documented fail-soft behaviour, not a regression.
+    CHECK(!store.get_group("group-x").has_value());
+}
+
+TEST_CASE("ManagementGroupStore: get_group_checked distinguishes a genuine "
+         "not-found from a degrade on an open store (#1762)",
+         "[pg][management_group][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    // A genuine not-found on a healthy store is a value (present, nullopt
+    // inside) — never `unexpected`.
+    auto missing = store.get_group_checked("deadbeef0000");
+    REQUIRE(missing.has_value());
+    CHECK(!missing->has_value());
+
+    ManagementGroup g;
+    g.name = "get-group-checked-found";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    auto found = store.get_group_checked(*created);
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->name == "get-group-checked-found");
+}
+

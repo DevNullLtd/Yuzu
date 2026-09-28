@@ -57,7 +57,7 @@ See [`docs/Instruction-Engine.md`](docs/Instruction-Engine.md) for the full arch
                         │  ┌────────────┐  ┌─────────────┐  └──────────────────┘  │
                         │  │  HTMX      │  │  Response    │  ┌──────────────────┐  │
                         │  │  Dashboard │  │  Store       │  │  RBAC / Auth     │  │
-                        │  └────────────┘  │  (SQLite)    │  │  OIDC · API Keys │  │
+                        │  └────────────┘  │  (Postgres)  │  │  OIDC · API Keys │  │
                         │  ┌────────────┐  └─────────────┘  └──────────────────┘  │
                         │  │  Metrics   │  ┌─────────────┐  ┌──────────────────┐  │
   Prometheus ◄───────── │  │  /metrics  │  │  Audit Log  │  │  Scheduler       │  │
@@ -115,7 +115,7 @@ Response data is typed (bool, int32, int64, string, datetime, CLOB) and schemati
 | Transport | gRPC + Protobuf | Bidirectional streaming, strongly typed, TLS built-in, language-neutral. |
 | Plugin ABI | Stable C ABI | Binary-stable across compiler versions. Language-agnostic. `dlopen`/`LoadLibrary` safe. |
 | Web UI | HTMX + server-rendered HTML | No JavaScript framework. Server renders fragments. Minimal client complexity. |
-| Storage | SQLite (embedded) | Zero-config, single-file, fast. Agent uses it for KV storage and identity. Server uses it for responses, audit, and config. |
+| Storage | PostgreSQL (server) + SQLite (agent) | Server stores (responses, audit, auth, config, and the rest) share one PostgreSQL substrate (ADR-0006); the NVD cache is the one remaining server SQLite store, a recorded deferral. Agent uses embedded SQLite for KV storage and identity — zero-config, single-file, fast. |
 | Auth | PBKDF2 + RBAC + OIDC | Session cookies for browsers, API tokens for automation, OIDC for enterprise SSO. |
 | Platforms | Windows, Linux, macOS (ARM64), ARM | Enterprise + edge coverage. Cross-compiled from CI. macOS Intel (x64) is not currently built or tested — only Apple Silicon (ARM64) is supported. |
 
@@ -163,7 +163,7 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 
 ### Prerequisites
 
-- Meson 1.9.2, Ninja
+- Meson 1.12.0 (the CI pin in `requirements-ci.txt`), Ninja
 - CMake (required by Meson's cmake dependency method)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set

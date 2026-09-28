@@ -79,6 +79,11 @@ struct BoundedQueryResult {
     //   wmi_query_failed_<hr> | wmi_next_timeout | wmi_deadline_exceeded |
     //   wmi_next_failed_<hr>
     std::optional<std::string> error;
+    // Rows read successfully BEFORE the failure that set `error` (the rows themselves are cleared
+    // on failure); 0 for a failure before the first row and for a result with no error. The
+    // wmi_next_failed_<hr> token carries no iteration index, so this is how a caller tells a
+    // failure at the FIRST Next() (where a missing class surfaces) from one after data came back.
+    size_t rows_before_error = 0;
 };
 
 // Named error-token constants — the single source of truth both production
@@ -262,6 +267,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
         const ULONGLONG elapsed = GetTickCount64() - start_ticks;
         if (elapsed >= opts.enumeration_deadline_ms) {
             result.error = error_tokens::kWmiDeadlineExceeded;
+            result.rows_before_error = result.rows.size();
             result.rows.clear();
             return result;
         }
@@ -287,6 +293,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
         }
         if (FAILED(hr) || count == 0 || !raw_obj) {
             result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
+            result.rows_before_error = result.rows.size();
             result.rows.clear();
             return result;
         }

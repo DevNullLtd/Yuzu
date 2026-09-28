@@ -1,0 +1,12 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash e3b945e9e6db
+== action=firmware
+firmware|vendor|American Megatrends Inc.|wmi
+firmware|version|3801|wmi
+firmware|release_date|2021-07-30|wmi
+firmware|vendor|American Megatrends Inc.|smbios
+firmware|version|3801|smbios
+firmware|release_date|2021-07-30|smbios
+firmware|rom_size_bytes|16777216|smbios
+firmware|bios_release|5.17|smbios
+[result_status] OK / FULL / 
+

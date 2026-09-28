@@ -39,14 +39,39 @@ inline constexpr char kGuardianPriorityDemotedTag[] = "yuzu.guardian_priority_de
 inline constexpr char kGuardianOutboxBackpressureDropsTag[] =
     "yuzu.guardian_outbox_backpressure_drops";
 
+/// #4783 commit 4: cumulative count of legacy-sink events GuardianEngine could not
+/// deliver (see GuardianLegacySinkExecutor's own loss-table doc comment). Sparse:
+/// 0 omits the tag - a healthy fleet (or one running entirely via Spark once that
+/// flip lands) reports nothing here.
+inline constexpr char kGuardianLegacySinkEventsLostTag[] =
+    "yuzu.guardian_legacy_sink_events_lost";
+
+/// #4783 commit 4: CURRENT count of rules with an open sticky legacy-sink
+/// integrity gap (GuardianEngine::legacy_sink_kick() repairs these on the
+/// heartbeat). Sparse: 0 omits the tag.
+inline constexpr char kGuardianLegacySinkGapRulesTag[] = "yuzu.guardian_legacy_sink_gap_rules";
+
+/// #4783 governance follow-up: cumulative count of emit_guard_event() calls that
+/// bailed because no sink was wired yet (GuardianEngine::legacy_sink_dropped_unwired()
+/// - the pre-network-arm drop, a routine window on every agent boot). Previously
+/// counted in-process (legacy_sink_dropped_unwired_) with no accessor, no heartbeat
+/// tag, and no fleet visibility - unlike its two siblings above. Sparse: 0 omits the
+/// tag.
+inline constexpr char kGuardianLegacySinkDroppedUnwiredTag[] =
+    "yuzu.guardian_legacy_sink_dropped_unwired";
+
 /// M1 health-stream telemetry (F5: widened from a single scalar to a stats struct, mirroring
 /// GuardianJournalStats in guardian_journal_heartbeat.hpp, now that there are three sibling
-/// counters instead of one).
+/// counters instead of one; #4783 commit 4 added the legacy-sink loss-visibility pair; a
+/// governance follow-up added the third legacy-sink counter below).
 struct GuardianHealthStats {
     std::uint64_t unhealthy_suppressed{0};
     std::uint64_t unhealthy_refreshed{0};
     std::uint64_t priority_demoted{0};
-    std::uint64_t outbox_backpressure_drops{0}; ///< #2993
+    std::uint64_t outbox_backpressure_drops{0};   ///< #2993
+    std::uint64_t legacy_sink_events_lost{0};     ///< #4783
+    std::uint64_t legacy_sink_gap_rules{0};       ///< #4783
+    std::uint64_t legacy_sink_dropped_unwired{0}; ///< #4783 governance follow-up
 };
 
 /// Populate `tags` with the (sparse) Guardian health telemetry. `TagMap` is any map with a
@@ -61,6 +86,13 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
         tags[kGuardianPriorityDemotedTag] = std::to_string(s.priority_demoted);
     if (s.outbox_backpressure_drops != 0)
         tags[kGuardianOutboxBackpressureDropsTag] = std::to_string(s.outbox_backpressure_drops);
+    if (s.legacy_sink_events_lost != 0)
+        tags[kGuardianLegacySinkEventsLostTag] = std::to_string(s.legacy_sink_events_lost);
+    if (s.legacy_sink_gap_rules != 0)
+        tags[kGuardianLegacySinkGapRulesTag] = std::to_string(s.legacy_sink_gap_rules);
+    if (s.legacy_sink_dropped_unwired != 0)
+        tags[kGuardianLegacySinkDroppedUnwiredTag] =
+            std::to_string(s.legacy_sink_dropped_unwired);
 }
 
 } // namespace yuzu::agent

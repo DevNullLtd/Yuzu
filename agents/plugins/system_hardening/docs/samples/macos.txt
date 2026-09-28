@@ -1,0 +1,8 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-23 · euid 501 · leg-hash e678758a486f
+== action=posture
+posture|macos|kern.securelevel|0|disabled
+posture|macos|kern.coredump|1|disabled
+posture|macos|kern.sugid_coredump|0|enabled
+posture|macos|kern.bootargs||enabled
+[result_status] OK / FULL / 
+

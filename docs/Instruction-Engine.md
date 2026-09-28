@@ -11,8 +11,8 @@
 ### Verified from implementation
 
 - **Phase 0** complete — HTTPS, OTA updates (`agents/core/src/updater.cpp`), secure temp files (`sdk/include/yuzu/plugin.h`), SDK utilities (`yuzu_table_to_json`, `yuzu_json_to_table`, `yuzu_split_lines`, `yuzu_generate_sequence`).
-- **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
-- **Phase 2** implemented — `InstructionStore` (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), `ExecutionTracker` (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), `ApprovalManager` (submit/approve/reject with ownership validation — reviewer != submitter, pending count), `ScheduleEngine` (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by SQLite with WAL mode.
+- **Phase 1** data infrastructure complete — `ResponseStore` (PostgreSQL, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
+- **Phase 2** implemented — `InstructionStore` (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), `ExecutionTracker` (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), `ApprovalManager` (submit/approve/reject with ownership validation — reviewer != submitter, pending count), `ScheduleEngine` (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by PostgreSQL (`InstructionStore`: ADR-0058; `ScheduleEngine`/`ApprovalManager`/`ExecutionTracker`: ADR-0065).
 - **30 plugins** across `agents/plugins/`: 24 cross-platform, 4 Windows-only (`bitlocker`, `msi_packages`, `sccm`, `windows_updates`), 2 test/debug (`chargen`, `example`).
 - **Plugin ABI** at v4 (`YUZU_PLUGIN_ABI_VERSION`), minimum supported v1 (`YUZU_PLUGIN_ABI_VERSION_MIN`): `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`, plus the ABI4 per-OS `YuzuActionDescriptor` capability-matrix fields (append-only; see `sdk/README.md`'s ABI compatibility table and §14.3 below).
 - **Wire protocol**: gRPC/Protobuf — `CommandRequest` (plugin + action + parameters + expires_at), `CommandResponse` (status enum: RUNNING/SUCCESS/FAILURE/TIMEOUT/REJECTED, streaming output).
@@ -54,8 +54,8 @@ This document is the architectural blueprint for that work.
 | **ApprovalManager** | `approval_manager.hpp` | Stub | `Approval` struct (id, definition_id, status, submitted_by, reviewed_by, review_comment, scope_expression). Query, approve, reject, pending_count signatures. |
 | **ScheduleEngine** | `schedule_engine.hpp` | Stub | `InstructionSchedule` struct (id, name, definition_id, frequency_type, interval_minutes, time_of_day, day_of_week, day_of_month, scope_expression, requires_approval, enabled, next/last execution, execution_count). CRUD + enable/disable signatures. |
 | **ScopeEngine** | `scope_engine.cpp` (494 LOC) | **Real** | Full recursive-descent parser. 9 comparison operators. AND/OR/NOT combinators. Wildcard LIKE matching. Numeric comparison with fallback. `AttributeResolver` callback for evaluation. |
-| **ResponseStore** | `response_store.hpp` | **Real** | SQLite-backed. `StoredResponse` with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread. |
-| **AuditStore** | `audit_store.hpp` | **Real** | SQLite-backed. `AuditEvent` with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup. |
+| **ResponseStore** | `response_store.hpp` | **Real** | PostgreSQL-backed (ADR-0039). `StoredResponse` with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread. |
+| **AuditStore** | `audit_store.hpp` | **Real** | PostgreSQL-backed (ADR-0040). `AuditEvent` with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup. |
 | **TagStore** | `tag_store.hpp` | **Real** | PostgreSQL-backed (ADR-0050, schema `tag_store`). `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"/"mcp"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
@@ -1253,16 +1253,16 @@ Acceptable for interactive use. For very large fleets, scope results can be cach
 
 ### 17.3 Response Storage at Scale
 
-**SQLite WAL mode:** Concurrent reads don't block writes. Batch inserts (100 rows per transaction) sustain ~50K inserts/sec on commodity hardware.
+**PostgreSQL:** `ResponseStore` persists responses in the `response_store` schema on the shared PostgreSQL pool (ADR-0006/0008); MVCC means concurrent reads don't block writes.
 
 **Retention:** TTL-based cleanup runs on a background thread (configurable interval, default 60 min). Expired rows are deleted in batches to avoid long transactions.
 
-**Optional ClickHouse export:** For analytics workloads beyond what SQLite supports, responses can be forwarded to ClickHouse via:
+**Optional ClickHouse export:** For analytics workloads beyond what the PostgreSQL store is meant to serve, responses can be forwarded to ClickHouse via:
 - Direct INSERT over HTTP (server-side batch job)
 - Prometheus remote_write (for metrics)
 - Kafka intermediate topic (for high-volume environments)
 
-SQLite remains the primary store; ClickHouse is an optional analytics sink.
+PostgreSQL remains the primary store; ClickHouse is an optional analytics sink.
 
 ### 17.4 Definition and Policy Caching
 

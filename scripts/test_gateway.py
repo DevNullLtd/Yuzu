@@ -52,7 +52,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -60,7 +59,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from erlang_toolchain import base_env, rebar3_prefix  # noqa: E402
+from erlang_toolchain import base_env, kill_tree, rebar3_prefix, windows_stdio_isolation  # noqa: E402
 
 # Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
 # system PATH which may still point at the distro's older OTP 25 packages).
@@ -170,21 +169,15 @@ def _dump_process_tree():
 
 
 def _kill_process_tree(proc):
-    """Kill the whole child tree, not just the immediate rebar3 process."""
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)], check=False
-            )
-        else:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception as exc:  # noqa: BLE001 - best-effort; proc.kill() below backstops
-        print(f"[test_gateway.py] process-tree kill failed: {exc}", file=sys.stderr)
-    finally:
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+    """Kill the whole child tree, not just the immediate rebar3 process.
+
+    The shared erlang_toolchain.kill_tree (the same one build_gateway.py
+    uses): root killed last, taskkill in its own process group and bounded,
+    retried across a second Ctrl-C.
+    """
+    if not kill_tree(proc):
+        print("[test_gateway.py] process-tree kill reported failure; some "
+              "processes may survive", file=sys.stderr)
 
 
 def _run_streamed(args, deadline_secs):
@@ -209,12 +202,31 @@ def _run_streamed(args, deadline_secs):
         text=True,
         bufsize=1,
     )
+    # Null stdin + a private console on Windows (erlang_toolchain hazard 3);
+    # the stdout pipe above is the other half. Never -noinput: it breaks the
+    # standard_io `peer` nodes the multinode eunit suite starts.
+    popen_kwargs.update(windows_stdio_isolation())
     if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_kwargs["creationflags"] = (
+            popen_kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
     else:
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(args, **popen_kwargs)
+    try:
+        return _stream_until_exit(proc, deadline_secs)
+    except BaseException:
+        # Ctrl-C, or a closed console: the child sits on its own console and
+        # process group, so neither reaches it. Kill the tree before
+        # unwinding, or it survives holding the _build locks.
+        _kill_process_tree(proc)
+        raise
+
+
+def _stream_until_exit(proc, deadline_secs):
+    """The body of `_run_streamed`, split out so every exit path of it is
+    covered by the caller's kill-on-exception guard."""
     lines = []
     line_queue: "queue.Queue[str | None]" = queue.Queue()
 

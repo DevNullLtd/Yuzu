@@ -1552,11 +1552,66 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Compensating control: the server-authored `Guardian T_server` line (neutralised on the server) is
   the authoritative half of the join; no shipped consumer reads agent-log lines; the operator manual
   (`docs/user-manual/server-admin.md`, Upgrade Notes) states which lines print ids as authored.
-- Owner: the author of the PR-5 (F14 flip) change.
-- Milestone: #4665 itself; it blocks criterion-10 sign-off and the F14 flip, whichever comes first.
-- Revisit trigger: the earlier of #4606 closing or the F14 flip PR opening, with a backstop review
-  date of 2026-10-31. **Not risk-accepted** - #4665 is a real, filed, open decision and remains a gating
-  item for the flip; this entry records the exposure and the compensating control only.
+- **CONFIRMED and FIXED, branch `feat/4665-log-injection-neutralisation` (starting `2ef5b8d3c`;
+  not yet merged to `dev` as of this entry).** The fix went through three further rounds after
+  its initial 10 commits (`2ef5b8d3c`..`ebb6600db`) landed: doc corrections (`a3388bf1a`), an
+  `/adversarial-review` (Kimi + Codex) fix round (`1ecfa6899`) that found and closed a real,
+  previously-unwrapped forgery sink in `guard_registry.cpp`'s registry assertion values
+  (`cfg_.expected`/`detected`, CDX-01/K5), and a full `/governance` 8-gate run afterward that
+  found and closed two more sibling-field misses (`guard_registry.cpp`'s `cfg_.value_type`,
+  `guaranteed_state_store.cpp`'s `agent_id`) plus a server-side push-builder gap: a legacy
+  non-conforming `rule_id` was excluded from `apply_rules()`'s validation reach but NOT from
+  `guardian_push_builder.cpp::build_agent_push`, so a single such row could wedge whole-push
+  delivery to every agent in its scope with no server-side signal — now filtered out at the
+  builder (`yuzu_guardian_push_rule_excluded_total{reason="invalid_rule_id"}`), matching the
+  existing depth-guard exclusion pattern. `common/include/yuzu/log_token.hpp`
+  gained `log_key_token()` (a path/service-name/
+  registry-key/free-text neutraliser for a `'...'`-quoted log fragment - preserves spaces and
+  non-ASCII bytes, unlike the pre-existing `log_id_token()`) and `is_valid_rule_id()` (the shared
+  REST/MCP/agent-ingest validation predicate: non-empty, `[A-Za-z0-9._-]+`, <= 256 bytes). Every raw
+  rule_id/key/path/hive/service-name/unit-name print site across the Guardian/Spark subsystem is now
+  wrapped - the legacy file, registry and service guards; `SparkEngine`; the Guardian engine's arm,
+  baseline and rule-parsing messages; the Spark runtime's own watched-key lines; the server's
+  Guardian push enforce-downgrade warning; and the event store's own error lines - closing every
+  category the operator manual referenced by the Compensating control field above used to list as
+  still printing raw (`docs/user-manual/server-admin.md`'s Upgrade Notes, updated in the same
+  series). `GuardianEngine::apply_rules()` now pre-validates every `rule_id` in a push and rejects the WHOLE push on the first
+  invalid id, rather than silently dropping just that one rule while still advancing the generation.
+  REST `POST /api/v1/guaranteed-state/rules` and MCP `create_guardian_rule` now enforce
+  `is_valid_rule_id()` at create (400/error + an audit row on reject, previously empty-only and
+  REST didn't audit the reject at all), with real JSON-Schema `pattern`/`maxLength` constraints, not
+  prose alone. A separate, more subtle vulnerability the same review surfaced was closed alongside
+  it: the R5.7 driver's (`fullsync_blackout_diag.py`) six evidence regexes used unanchored
+  `.search()`, so a forged benchmark line embedded inside an unrelated log statement's free-text
+  field (no newline needed) could be extracted as real evidence - all anchored to `.match()` now. A
+  new regression-net tripwire (`tests/test_guardian_spark_log_injection_tripwire.py`) fails the
+  build on any future unwrapped `spdlog::` call in this subsystem; it found 7 real sites the manual
+  sweep missed on its first run, now also fixed. Windows-only code verified on real MSVC 19.44. No
+  stored-data migration needed (fresh-build-only fleet; confirmed no production fleet exists yet).
+  **A fourth round followed PR #4979's collaborator adversarial review (fjarvis, Codex+Kimi-K3
+  panel, 2026-09-25):** a real BLOCKING finding — the push-builder exclusion fix from the third
+  round, combined with `full_sync`'s unconditional teardown-and-rebuild-from-the-push semantics,
+  meant a previously-armed legacy non-conforming rule was silently and permanently DISARMED on the
+  next `full_sync`, not "frozen at its last-applied state" as that round's own doc text claimed
+  (Codex empirically observed `full_sync cleared N prior rule(s)` on this exact path). Operator
+  decision (Dave, mid-review): accept this as a deliberate **hard cutover**, not a migration — no
+  preserve-and-re-arm mechanism was built. `docs/user-manual/upgrading.md` and
+  `docs/user-manual/guaranteed-state.md` rewritten to state the true disarm behaviour and its
+  pre-upgrade detection query honestly, and `apply_rules()`'s full_sync sweep now logs the
+  disarm-in-progress explicitly (`Guardian: full_sync is disarming N rule(s)...`) rather than
+  silently. Two further non-blocking findings from the same review also fixed: `guardian_routes.cpp`'s
+  `note_platform_matrix_stale` used the weaker `log_safe()` helper (control-bytes-only) on a
+  `k=v`-shaped line, missing the same same-line field-forgery threat this whole issue exists to
+  close — switched to `audit_token()` (folds space/`=`/`,` too); and `guardian_engine.cpp`'s "failed
+  spark validation" diagnostic printed `rule.spark().type()` (and, via `assertion.error()`, three
+  more operator-authored fields from `guardian_spark_bridge.hpp`'s own error strings) raw — now
+  wrapped at the sink with one `log_key_token()` call covering all four producers.
+- Owner: fixed ahead of PR-5 by the author of the #4665 fix series, not deferred to the PR-5 (F14
+  flip) author as this entry originally assumed.
+- Milestone: #4665 itself - fix landed on `feat/4665-log-injection-neutralisation`; merge to `dev`
+  still pending as of this entry.
+- Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer blocked
+  by this entry once the branch above merges.
 
 **#4685** (Guardian: Unsupported rules not re-reconciled after a File/Registry episode, #4658)
 - Detection signal: none dedicated. The fleet query and the agent log below are hints, not proof,
@@ -1630,17 +1685,89 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (g)(1) of `docs/spark-stage2-guardian-consumer-design.md` and in the operator manual. `inert`
   is reached about 150 ms of backoff after the first failure at the default cadence (R5.7 (g)(4)),
   so once Spark is live an episode does not need to be long to open the window.
-- Owner: unassigned; until #4685 is picked up, the author of the PR-5 (F14 flip) change, as for
-  #4665.
-- Milestone: #4685 itself; no PR slot assigned yet.
-- Revisit trigger: before the F14 flip. **Not risk-accepted** - #4685 is a real, filed, open
-  defect and remains a gating item for the flip until it is fixed or closed; this entry records
-  the disclosure and the compensating control only. Severity as the #4658 governance ledger
-  records it (`gap-a-guardian-no-rereconcile`): LOW for the #4658 merge, because while
-  `prefer_spark_` is false the wrong outcome (rules enforced by neither backend) cannot occur in
-  a shipped build; HIGH and blocking at the F14 flip, when that protection lapses. The ledger's
-  impact, exposure and severity codes are defined under "Severity - DERIVE it, do not choose it"
-  in `.claude/skills/governance/SKILL.md`.
+- **CONFIRMED and FIXED, branch `fix/4685-guardian-boot-inert-split` (not yet merged to `dev` as
+  of this entry).** `SparkMechanismStats` gained an additive `boot_inert` field (declared after
+  `inert` for designated-initializer order): TRUE only for the BOOT-TIME case (`start()` could not
+  bind the mechanism's OS facility, every `watch()` refused), FALSE for a TRANSIENT
+  runtime-degraded episode (Registry's sweeper / File's worker, three consecutive failed passes).
+  `spark_file.cpp`/`spark_registry.cpp` split their single `inert_` atomic into `boot_inert_`
+  (written only by `start()`) and `degraded_` (written only by the runtime worker/sweeper),
+  deriving both `SparkMechanismStats` fields from one pair of local reads in `stats()`;
+  `spark_service.cpp` (no runtime-inert concept) reports `.boot_inert` as the same atomic as
+  `.inert`. `guardian_engine.cpp`'s `reconcile_rule_locked` now builds its capability set from
+  `!ms.boot_inert` instead of `!ms.inert`, so a rule reconciled during a runtime-degraded episode
+  Arms (the runtime reports it Committed, `subscription_establishment()` reports `coverage ==
+  None` until the mechanism's next successful pass) instead of landing `Unsupported` - closing
+  exactly the "nothing re-reconciles when `inert` clears" gap this entry's Detection
+  signal/Operator action/Compensating control bullets above describe. The Unsupported branch's own
+  log line now distinguishes the two remaining causes: `warn` for "registered but initialisation
+  refused at start() (boot-inert)", the existing `info` for "no mechanism on this host at all" -
+  `guardian_spark_bridge.hpp`'s `classify()` doc comment and `RulePlacement::Unsupported`'s own
+  comment are rewritten to match (the pre-fix wording claimed the capability filter "mirrors the
+  heartbeat's own inert-filtering exactly", which is now the defect this fix closes, not an
+  accurate description). `boot_inert` stays agent-local only - it is never serialised onto the
+  wire or into the heartbeat, so the fleet-level query and the promtool fixtures in this entry's
+  Detection signal bullet remain accurate as a description of the REMAINING (boot-inert-only)
+  case, and the per-mechanism alert this entry's Detection signal bullet says is missing (tracked
+  in #2084) is still missing - this fix adds no new telemetry. Registry parity for every test.
+- Owner: fixed ahead of PR-5 by the author of the #4685 fix series, not deferred to the PR-5 (F14
+  flip) author as this entry originally assumed.
+- Milestone: #4685 itself - fix landed on `fix/4685-guardian-boot-inert-split`; merge to `dev`
+  still pending as of this entry.
+- Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer
+  blocked by this entry once the branch above merges. What changed: the pre-fix "capability set
+  keys off the UNION `inert`" defect (Detection signal/Operator action/Compensating control above)
+  is fixed by the additive `boot_inert` split described in the paragraph above - a runtime-degraded
+  episode no longer strands a rule `Unsupported` with nothing to re-reconcile it on recovery. The
+  severity the #4658 governance ledger recorded (`gap-a-guardian-no-rereconcile`, LOW while
+  `prefer_spark_` is false, HIGH and blocking at the F14 flip) no longer applies once this fix
+  lands, since the wrong outcome it described can no longer occur regardless of `prefer_spark_`.
+
+**#4704** (File worker / Registry sweeper: a blocked log sink stalls the mechanism thread - on
+Registry while holding `mu_`; found by #4658's governance run)
+- Detection signal: none dedicated, before or after the fix. Before: a stalled sink on the
+  Registry sweeper showed only as `arm()`/`disarm()` latency on the registry type (the
+  `SparkEngine` per-type lock queued behind the mechanism's `mu_`), with `stats()` still live, so
+  `yuzu.spark_mechs` and every counter read healthy. After: the stall is confined to the sweeper's
+  own loop; a re-arm or establishment report it owes waits for the sink, `stop()`'s join waits for
+  it, and nothing else does. No alert ships and the fleet series cannot see a sink stall on either
+  mechanism; the agent log itself is what is stalled.
+- Operator action: none specific to Yuzu. Find and clear the sink stall (a reader-less stderr
+  pipe under journald/Docker, a full or hung log volume, a stuck rotation); a restart is bounded
+  by the 20 s `ShutdownDeadlineGuard` ending in `hard_exit(4)` if the sink is still blocked.
+- Compensating control: `prefer_spark_` is false in production, so no rule is armed through
+  Spark and the Registry sweeper serves no watches; its failure branch needs a pass to throw
+  (allocation failure) with something due, which an observe-only engine with no watches never
+  has. The pre-fix window in a shipped build was therefore effectively zero; at the F14 flip it
+  would have opened at every runtime-inert episode, which is why this gated the flip.
+- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, merged
+  `063885c9e`, 2026-09-27).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
+  File's shipped #4658 shape, not the shared-async-primitive option. `sweeper_main()` now
+  captures a value `PassOutcome` (failure count, backoff ms, flipped-inert, recovered) under
+  `mu_`, releases the lock on the branch's existing unlock, and writes the line through a
+  static noexcept `log_pass_outcome()` - content, level and the 1/2/4/8 gate byte-identical to
+  the lines it replaces. Verified red-then-green on DGRHP (MSVC 19.44): three new cases park the
+  sweeper inside the sink on each of the three lines (`PfStallLogger`'s `on_hit` blocking on a
+  test gate) and require `set_registry_test_controls_for_test()` - a bare `lock_guard(mu_)`
+  taker - to complete while the sweeper is still parked (`hits() == 0` at that point, since the
+  sink counts only after the parked call returns); moving `log_pass_outcome(po)` above
+  either `lk.unlock()` makes the matching case(s) fail at the 2 s wait (red run recorded in the
+  PR). The pre-existing sre6-1 case (`#2012 PR-B1`) still pins the counters, backoff and inert
+  flip/clear. One deliberate consequence of the mirrored shape: a throwing log write on the
+  sweeper now loses that line instead of terminating the agent (the lines sat outside the pass's
+  catch before). Residual, not fixed here: Registry's per-key `warn` lines in
+  `fail_backend_locked()`, `resolve_probe_locked()` and `park_lost_locked()` are still written
+  under `mu_` (a different shape, outside the ruling) - #4999. R5.7 (g)(4), the operator manual's
+  "Diagnosing an inert File worker or Registry sweeper" and section 7 above corrected from "the
+  two mechanisms are not the same shape" to the shared shape.
+- Owner: fixed ahead of PR-5 by the author of the #4704 fix, not deferred to the PR-5 (F14 flip)
+  author.
+- Milestone: #4704 itself; PR #5004.
+- Revisit trigger: fired, and resolved for the three sweeper pass-outcome lines. **Not
+  risk-accepted** - nothing here is accepted; the shared worker-loop stall stays a disclosed
+  limit under R5.7 (g)(4), and the residual sites are #4999's to close. Severity as the #4658
+  ledger recorded the runtime half (`UP-2b-blocked-sink-runtime-stall`): SHOULD for the #4658
+  merge; HIGH and blocking at the F14 flip had it stayed open, per section 7's precondition.
 
 **Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
@@ -1798,39 +1925,101 @@ adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING. This precondition is tracked in #4666.
 
-**NEW precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
-governance review of the rule-id neutralisation): agent-side `Guardian T_detect` and `T_wire` lines may
-be used as latency evidence only if either every operator-authored identifier the agent logs is
-neutralised or rejected at one ingest chokepoint, or the correlator takes its join set from the
-server-authored `T_server` line and drops any agent line whose id is outside a benchmark-authored,
-charset-checked rule set.** Rule ids and Spark keys (which embed an operator-authored path) are
-unvalidated, and many agent log lines still print them as authored (the legacy file, registry and
-service guards, which are the live detection path today; SparkEngine; the Guardian engine; nine Spark
-key sites in the runtime), so a newline in an id lets one forged physical line pose as a benchmark
-record; the R5.7 driver already reads agent-log lines. Until one of the two holds, an agent-only latency
-figure must not be presented as criterion-10 evidence. The Spark runtime's own rule-id lines are already
-neutralised (PR #4657). The adjudication of this exposure was made by subagents of the authoring session
-(independence asserted, not verified) and awaits the PR reviewer's confirmation; it derives HIGH at the
-consumer that treats agent-log lines as evidence, not for the #4606 diff. Tracked in #4665, which also
-covers the documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for
-the driver.
+**Status update (2026-09-25): #4666 PR-1 and PR-2 have landed; the precondition above is
+substantially addressed, with one residual gap flagged, not fully closed.** PR-1
+(`agents/core/src/log_handoff.hpp/.cpp`, merged as #4970) built the bounded async log
+hand-off primitive standalone, wired into nothing yet. PR-2 (`main.cpp`/`service_win.cpp`,
+this doc's own #4666 references above) installs that primitive as the process's spdlog
+default logger, so every bare `spdlog::` call anywhere in the process, including the
+Spark runtime's own arm-committed/late-arm/sweep-residue lines and the `T_wire` line on
+the legacy guard worker, now enqueues onto the bounded async queue and returns rather
+than blocking on sink I/O, on Linux confirmed and Windows inferred (single spdlog
+registry per process, measured directly on Linux via `tests/unit/test_log_handoff_multi_image.cpp`
+and `tests/shell/test_spdlog_registry_identity.sh`). The two fixtures differ on Windows,
+not agree: the shell probe has an explicit Windows leg that SKIPs outright, but the C++
+fixture carries no platform gate and does run there — CI's `windows` job exercises the
+same `--suite agent` binary — so its MI-1b topology verdict is written (Catch2 `WARN` +
+a report file) on every Windows run; that output has simply not yet been pulled from a
+CI log and reviewed to turn it into a confirmed finding, which is different from "no
+Windows evidence exists." Absent that review, Windows single-registry status is still
+only inferred from dynamic spdlog linkage, not confirmed. See `docs/darwin-compat.md`'s
+"spdlog registry identity across images" row for the macOS result, now measured: TWO
+separate registries there, with
+the exe-image swap load-bearing on the teardown side only (install-side logging already
+reaches the async hand-off correctly regardless, since `LogHandoff::install()` is compiled
+into the core library). This is the mechanism the precondition asked for: it comes from installing
+one process-wide default logger, not from touching each call site individually. What PR-2
+does NOT do, despite an earlier PR-1-era header comment predicting it would: it adds no
+`drain_log_bounded()` pre-abort breadcrumb calls inside `guardian_engine.cpp` or
+`guardian_spark_runtime.hpp` (grep-confirmed absent as of this update). On inspection
+neither file has its own `hard_exit()` call site that would need one; the only production
+`hard_exit()`s near Guardian/Spark teardown are `main.cpp`'s and `service_win.cpp`'s own
+F3 orphan-exit checks, and those ARE wired with a breadcrumb. The still-future `T_server`
+piece (server-side, PR-4 in the #4666 ladder) is untouched by either PR-1 or PR-2 and
+remains separately tracked.
+
+**Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
+governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on
+`feat/4665-log-injection-neutralisation`, merge to `dev` still pending as of this entry): agent-side
+`Guardian T_detect` and `T_wire` lines may be used as latency evidence only if either every
+operator-authored identifier the agent logs is neutralised or rejected at one ingest chokepoint, or
+the correlator takes its join set from the server-authored `T_server` line and drops any agent line
+whose id is outside a benchmark-authored, charset-checked rule set.** Rule ids and Spark keys (which
+embed an operator-authored path) were unvalidated, and many agent log lines still printed them as
+authored, so a newline in an id let one forged physical line pose as a benchmark record; the R5.7
+driver already reads agent-log lines. **#4665's own final scope turned out broader than this
+paragraph originally named** - not just "the legacy file, registry and service guards ... SparkEngine;
+the Guardian engine; nine Spark key sites in the runtime" (the Spark runtime's own rule-id lines
+were already neutralised ahead of this, PR #4657), but every rule_id/key/path/hive/service-name/
+unit-name print site across `guardian_engine.cpp`, `guardian_arm_ack.cpp`, `guardian_spark_bridge.hpp`,
+`spark_engine.cpp`, `guardian_spark_runtime.cpp`, `spark_registry.cpp`, `spark_file.cpp`,
+`spark_service.cpp`, `guard_file.cpp`, `guard_service.cpp`, `guard_systemd.cpp`, `guard_registry.cpp`
+and `guardian_outbox_send_executor.hpp` on the agent, plus `guardian_push_builder.cpp` and
+`guaranteed_state_store.cpp` on the server - closing the first branch of this precondition directly
+(every operator-authored identifier is now neutralised at print time, and `rule_id` is additionally
+rejected at REST/MCP create via `is_valid_rule_id()`). A separate, later-discovered vulnerability in
+the SAME family was closed in the same series and was never part of this precondition's original
+acceptance criteria: the R5.7 driver's own evidence regexes (`fullsync_blackout_diag.py`) were
+unanchored (`.search()` not `.match()`), letting a forged benchmark line hide inside an unrelated log
+statement's free-text field with no newline at all - now anchored. An agent-only latency figure may
+now be presented as criterion-10 evidence; a regression-net tripwire
+(`tests/test_guardian_spark_log_injection_tripwire.py`) guards against a future unwrapped call site
+reopening the first branch. Tracked in #4665, which also covered the
+documented-but-unenforced `rule_id` charset and pinning the arm-committed line's format for the
+driver.
 
 **NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
 #4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
-not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry. The
+not re-reconciled on recovery) is now SATISFIED - fixed on `fix/4685-guardian-boot-inert-split`
+(the additive `boot_inert` field, `guardian_engine.cpp`'s capability filter narrowed to
+`!boot_inert`); see its section 5 entry, now closed. The
 per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
 detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
 the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
-on the section 5 query. #4704 (a blocked log sink stalls the File worker or, worse, the Registry
-sweeper's `mu_`) must be fixed or accepted as a limit before the flip as well, since the flip is
-what makes these mechanism workers live.**
+on the section 5 query. #4704 (a blocked log sink stalled the Registry sweeper WHILE IT HELD
+`mu_`, so `arm()`/`disarm()` on that mechanism stalled with it; File's equivalent lines were
+already off-lock) is FIXED (PR #5004, merged `063885c9e`): both mechanisms now write their pass-outcome
+lines off-lock, see the section 5 entry. What remains is the shared, disclosed limit that a
+stalled sink stalls the worker's own loop, bounded only on shutdown (R5.7 (g)(4)) - plus the
+residual per-key warn sites named in #4999 (Registry) and #5002 (File, untracked mirror,
+filed post-#4704), both currently gated by the same `prefer_spark_=false` compensating
+control and likely superseded once #4666's async log hand-off is wired in as the process's
+default logger (its own PR-2 is already a blocking F14 precondition here for unrelated
+reasons).**
 
-Two fault-injection scenarios designed at that governance run are also unowned and not yet run: a
-slow or blocked log sink (on the live legacy path today, and with Spark live once `prefer_spark`
-gives the Spark drain worker a live caller), and orphan attribution under outbox rejection or an
-agent crash between enqueue and send. The related findings are ledgered in
-`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (`4606-up1` through `4606-up6`,
-`4606-sre-no-removal-plan` and the Gate 8 findings `4606-g8-*`).
+Two fault-injection scenarios designed at that governance run are not yet run. Their tracking,
+stated precisely: the slow or blocked log sink with Spark live (the drain worker once
+`prefer_spark` gives it a live caller) is #4666's own acceptance criterion (its rig scenario:
+stderr on a reader-less FIFO plus a rotation stall under a 500-rule `full_sync`); the same stall
+on the live legacy path is recorded here (per `4606-g8-s19`) but is not yet an acceptance
+criterion of any open issue; orphan attribution under outbox rejection or an agent crash between
+enqueue and send is `4606-up6-compound-orphan-attribution`, linked to #4606 at pass 15 of
+`governance.d/4606-criterion10-instrumentation.uvwyxL.jsonl` (the benchmark-side classifier
+belongs to that campaign). The mechanism-worker case those two do not cover, the Registry sweeper
+parked inside the sink on one of its own pass-outcome lines, is pinned by #4704's unit tests
+(`[spark][mechanism][windows][logofflock]`, `tests/unit/test_spark_mechanism.cpp`), which prove a
+`mu_` taker completes while the sweeper is parked. The related findings stay ledgered under
+`4606-up1` through `4606-up6`, `4606-sre-no-removal-plan` and the Gate 8 findings `4606-g8-*`.
 
 1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruled 2026-09-02 per
    §3 row 8). Runs

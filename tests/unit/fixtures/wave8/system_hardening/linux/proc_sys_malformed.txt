@@ -1,0 +1,4 @@
+kernel.randomize_va_space	ok	banana
+kernel.kptr_restrict	ok	7
+kernel.sysrq	ok	
+fs.protected_fifos	ok	99999999999999999999999

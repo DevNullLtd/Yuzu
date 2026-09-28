@@ -1,0 +1,16 @@
+host: the-rig (Windows 11 Pro 10.0.26200, x64)
+identity: nt authority\system (scheduled task, RunLevel Highest)
+command: reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" /v MitigationOptions
+date: 2026-09-21T15:36:05.6591953+01:00
+status: REAL CAPTURE (rig session A). MitigationOptions and MitigationAuditOptions were ABSENT on this fresh install (before: 'ERROR: The system was unable to find the specified registry key or value.'; Get-ProcessMitigation -System all NOTSET).
+          System-wide mitigations were then enabled with: Set-ProcessMitigation -System -Enable DEP,SEHOP,BottomUp,HighEntropy,CFG and the value read; the state was restored and verified IDENTICAL to before (kernel + Memory Management keys, both mitigation values, bcdedit, Get-ProcessMitigation -System) - the cmdlet also added MitigationAuditOptions and EAFModules, which were removed.
+layout evidence: 24-byte REG_BINARY = 3 QWORDs; the 5 options enabled (DEP, SEHOP, BottomUp, HighEntropy, CFG) appear as set nibbles 0,1,4,5,10 of QWORD 0.
+post-state summary (Get-ProcessMitigation -System): DEP.Enable ON, SEHOP.Enable ON, ASLR.BottomUp ON, ASLR.HighEntropy ON, CFG.Enable ON;
+the sub-options DEP.EmulateAtlThunks, ASLR.RequireInfo, CFG.SuppressExports, SEHOP.TelemetryOnly, BinarySignature.AllowStoreSignedBinaries, BinarySignature.AuditStoreSigned and UserShadowStack.UserShadowStackStrictMode read OFF; every other policy NOTSET.
+the full Get-ProcessMitigation -System transcript is in the PR body, not committed.
+----- ground truth for the fixture test (Get-ProcessMitigation -System: ON -> on, OFF -> off, NOTSET -> default) -----
+expect.dep=on
+expect.sehop=on
+expect.aslr_bottom_up=on
+expect.aslr_high_entropy=on
+expect.cfg=on

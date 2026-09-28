@@ -691,10 +691,18 @@ TEST_CASE("ca_routes: POST /ca/import-chain validates body + maps outcomes + aud
     REQUIRE(j["crl_republished"] == true); // CRL refreshed under the new issuer
     REQUIRE(h.crl_calls == 1);
     bool saw_import = false;
-    for (const auto& a : h.audits)
+    bool saw_crl_published = false;
+    for (const auto& a : h.audits) {
         if (a.action == "ca.subordinate.imported" && a.result == "success")
             saw_import = true;
+        // #4829: the import-chain path previously wrote NO ca.crl.published row at all —
+        // symmetric with revoke's own pair, and carries reason=import_chain to distinguish it.
+        if (a.action == "ca.crl.published" && a.result == "success" &&
+            a.detail.find("reason=import_chain") != std::string::npos)
+            saw_crl_published = true;
+    }
     REQUIRE(saw_import);
+    REQUIRE(saw_crl_published);
 
     // Body validation: invalid JSON → 400; missing fields → 400.
     auto badjson = h.sink.Post("/api/v1/ca/import-chain", "{not json");
@@ -778,9 +786,20 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
     REQUIRE(ok->get_header_value("Content-Type").find("text/html") != std::string::npos);
     REQUIRE(h.last_import_intermediate == "INT");
     REQUIRE(h.last_import_chain == "PAR");
+    // #4829: the dashboard import-chain path previously wrote NO ca.crl.published row.
+    {
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.crl.published" && a.result == "success" &&
+                a.detail.find("reason=import_chain") != std::string::npos &&
+                a.detail.find("via=dashboard") != std::string::npos)
+                saw = true;
+        REQUIRE(saw);
+    }
 
     // Hermes 6c LOW: a CRL-republish failure on a successful dashboard import is
     // SURFACED (the import stands, but the panel warns the CRL is stale).
+    h.audits.clear();
     h.crl_succeeds = false;
     auto crlfail = h.sink.dispatch("POST",
                                    "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
@@ -788,6 +807,14 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
     REQUIRE(crlfail);
     REQUIRE(crlfail->status == 200);                            // import still succeeded
     REQUIRE(crlfail->body.find("CRL could not be republished") != std::string::npos);
+    {
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.crl.published" && a.result == "failure" &&
+                a.detail.find("reason=import_chain") != std::string::npos)
+                saw = true;
+        REQUIRE(saw);
+    }
     h.crl_succeeds = true;
 
     // Cross-origin → 403 + csrf.denied, and import_chain_fn must NOT be called.

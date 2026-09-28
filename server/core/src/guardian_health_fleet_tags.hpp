@@ -2,7 +2,12 @@
 
 /// @file guardian_health_fleet_tags.hpp
 /// Reader side of the Guardian M1 health-stream fleet telemetry (#2298 gate 3, item
-/// 6d; #2993 added the 4th row below). Single source of truth for the
+/// 6d; #2993 added the 4th row below; #4783 commit 4 added the 5th/6th rows -
+/// legacy-sink loss visibility, unrelated to M1's flood-guard/outbox signals but
+/// sharing this family's exact shape: a plain sparse cumulative counter rolled up
+/// as an unlabelled fleet sum; a #4783 governance follow-up added the 7th row -
+/// the pre-network-arm legacy-sink drop, previously counted in-process only with
+/// no accessor, no heartbeat tag, and no fleet visibility). Single source of truth for the
 /// `yuzu.guardian_*` heartbeat tag keys this rollup consumes, the
 /// `yuzu_fleet_guardian_*` gauge names they roll up into, their HELP text, and the
 /// forged-value-safe parse of the agent-supplied values.
@@ -24,7 +29,7 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled, 4 counters, no age/MAX family (unlike the journal
+/// SHAPE: flat and unlabelled, 7 counters, no age/MAX family (unlike the journal
 /// sibling - these are all plain sparse cumulative counters, none of them a
 /// staleness clock). Name rule, asserted by the pin test: `gauge` == "yuzu_fleet_" +
 /// `tag` with its "yuzu." heartbeat-namespace prefix stripped.
@@ -62,7 +67,7 @@ struct GuardianHealthMetric {
 
 /// The full published set. Order matches GuardianHealthStats / the emit order in
 /// agents/core/src/guardian_health_heartbeat.hpp for reviewability; nothing depends on
-/// it. All 4 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
+/// it. All 7 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
 /// rebuilt, never monotonic.
 ///
 /// ALERTING: THESE ARE MONITOR-ONLY, same posture and same reasons as the guardian
@@ -98,6 +103,64 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "separately via guardian_journal_fleet_tags.hpp. A chronic per-agent jam here means "
      "compliance/health drift is being lost, not just delayed. MONITOR-ONLY, same posture "
      "as the rest of this family"},
+    {"yuzu.guardian_legacy_sink_events_lost", "yuzu_fleet_guardian_legacy_sink_events_lost",
+     "Fleet sum of legacy Guardian sink events an agent could not deliver (#4783) - refused "
+     "at the detached sender's queue capacity, an admission failure, a failed Write(), or a "
+     "throwing send. Three OTHER legacy-sink drop modes are excluded from this counter: "
+     "the pre-network-arm drop (no sink wired yet, before "
+     "agent.cpp's post-Subscribe set_event_sink call) is now its OWN fleet gauge, "
+     "yuzu_fleet_guardian_legacy_sink_dropped_unwired below (a governance follow-up) - it "
+     "can BE loss of already-committed guard state, since a legacy guard only re-reports "
+     "on its next real transition, so a drift lost in that pre-network window can go "
+     "unreported until the rule's compliance state changes again or the agent restarts; "
+     "the stop()-time backlog discard and the link-down drop (LinkDown / the executor's "
+     "dropped_link_down counter, D4b) remain genuinely un-signaled outside the agent "
+     "process - the pre-existing, un-built \"durable buffering is A3\" residual "
+     "(docs/spark-legacy-delta-registry.md), out of scope for this fix. Always live "
+     "regardless of the Spark flip (prefer_spark) - the legacy IGuard sink is the current "
+     "production path. MONOTONIC PER AGENT AND RESTART-DURABLE (#4783 Gate 4 UP-3): each "
+     "agent persists its own counter (and the open-gap ledger below) to its own KvStore "
+     "and restores it at boot, so a mid-outage agent restart does not reset that agent's "
+     "own value back to 0 - only the raw lost EVENT content is not durable "
+     "(docs/spark-legacy-delta-registry.md D13). "
+     "The EXPORTED FLEET SUM above is still cleared and rebuilt every sweep like the rest of "
+     "this family (not itself monotonic) - it drops when a reporting agent leaves the "
+     "retained set, same as every other gauge here; per-agent durability is what survives a "
+     "RESTART, not what the fleet aggregate does across a sweep. MONITOR-ONLY, same posture "
+     "as the rest of this family"},
+    {"yuzu.guardian_legacy_sink_gap_rules", "yuzu_fleet_guardian_legacy_sink_gap_rules",
+     "Fleet sum of rules whose SERVER-SIDE CENSUS may be stale because the agent's last "
+     "drift/compliance report for that rule was lost and has not yet been confirmed repaired "
+     "(#4783) - a count of AFFECTED RULES, not a count of lost events (see "
+     "yuzu_fleet_guardian_legacy_sink_events_lost for that). The agent self-heals this every "
+     "heartbeat (GuardianEngine::legacy_sink_kick()) by synthesizing a guard.unhealthy report "
+     "for each open gap; a persistently non-zero sum means repairs are also failing to "
+     "deliver, not just the original reports. RESTART-DURABLE PER AGENT (#4783 "
+     "Gate 4 UP-3): each agent persists its own open-gap ledger to its own KvStore and "
+     "restores it at boot, so a mid-outage agent restart no longer reads as a false "
+     "\"resolved\" the way a genuine repair would (docs/spark-legacy-delta-registry.md D13) - "
+     "an interior loss can still self-clear on a later successful event with no repair ever "
+     "firing (D13's Gate 4 UP-4, an accepted trade-off, not a bug in this gauge). The "
+     "EXPORTED FLEET SUM above is still cleared and rebuilt every sweep like the rest of this "
+     "family (not itself monotonic) - per-agent durability is what survives a RESTART, not "
+     "what the fleet aggregate does across a sweep. MONITOR-ONLY, same posture as "
+     "the rest of this family"},
+    {"yuzu.guardian_legacy_sink_dropped_unwired",
+     "yuzu_fleet_guardian_legacy_sink_dropped_unwired",
+     "Fleet sum of Guardian legacy-sink events dropped because emit_guard_event() ran "
+     "before the event sink was wired (governance follow-up to #4783) - the pre-network-"
+     "arm drop, a routine window on every agent boot, before agent.cpp's post-Subscribe "
+     "set_event_sink call. Distinct from yuzu_fleet_guardian_legacy_sink_events_lost "
+     "above: this drop has NO gap-repair mechanism (GuardianEngine::legacy_sink_kick() "
+     "never re-sends it), so a nonzero sum can mean genuine loss of already-committed "
+     "guard state, not just a delayed report - a lost drift here is only corrected by "
+     "the rule's OWN next real transition or the agent's next restart (see "
+     "docs/spark-legacy-delta-registry.md D9/D13). Always live regardless of the Spark "
+     "flip (prefer_spark) - the legacy IGuard sink is the current production path. "
+     "NOT RESTART-DURABLE, unlike events_lost/gap_rules above: legacy_sink_dropped_"
+     "unwired_ is a plain in-process atomic, never persisted to KvStore, so it resets "
+     "to 0 on every agent restart - and the pre-network-arm window it counts recurs on "
+     "every boot regardless. MONITOR-ONLY, same posture as the rest of this family"},
 };
 
 /// Derived with std::size, never a literal - see the sibling table's comment in
@@ -116,13 +179,16 @@ inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealth
 // fleet with nothing currently errored/refreshed/demoted reads 0 legitimately.
 
 /// Agents whose latest heartbeat carried at least one parseable
-/// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops
-/// tag.
+/// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops/
+/// guardian_legacy_sink_events_lost/guardian_legacy_sink_gap_rules/
+/// guardian_legacy_sink_dropped_unwired tag.
 inline constexpr const char* kGuardianHealthReportingGauge = "yuzu_fleet_guardian_health_reporting";
 inline constexpr const char* kGuardianHealthReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
-    "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, or "
-    "yuzu.guardian_outbox_backpressure_drops tag - the coverage denominator for this "
+    "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, "
+    "yuzu.guardian_outbox_backpressure_drops, yuzu.guardian_legacy_sink_events_lost, "
+    "yuzu.guardian_legacy_sink_gap_rules, or yuzu.guardian_legacy_sink_dropped_unwired "
+    "tag (#4783) - the coverage denominator for this "
     "family. Published every sweep INCLUDING 0, unlike the counters above. READ 0 "
     "CAREFULLY: because the writer is SPARSE (a 0 counter emits no tag), this counts "
     "agents with at least one NON-ZERO counter, not agents whose Guardian health "

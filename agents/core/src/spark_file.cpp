@@ -112,6 +112,7 @@
 
 #include "guard_win_handle.hpp" // detail::DirHandle, detail::EventHandle
 #include "spark_detached_call.hpp"
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -686,10 +687,14 @@ public:
         if (!iocp_) {
             spdlog::error("spark_file: CreateIoCompletionPort failed (err={}) — file sparks inert",
                           ::GetLastError());
-            inert_.store(true, std::memory_order_release);
+            boot_inert_.store(true, std::memory_order_release);
             return;
         }
-        inert_.store(false, std::memory_order_release);
+        // Clear BOTH flags on a successful bind (#4685): a restart after a runtime-degraded
+        // episode must boot clean, and a start() success is definitionally not a boot-time
+        // refusal either way.
+        boot_inert_.store(false, std::memory_order_release);
+        degraded_.store(false, std::memory_order_release);
         stop_.store(false, std::memory_order_release);
         try {
             worker_ = std::thread([this] { run(); });
@@ -700,7 +705,7 @@ public:
             // return` no-op the pre-PR-B2 code would have hit here (mirrors
             // spark_registry.cpp start()'s identical fix).
             iocp_.reset();
-            inert_.store(true, std::memory_order_release);
+            boot_inert_.store(true, std::memory_order_release);
             throw;
         }
     }
@@ -1148,15 +1153,22 @@ public:
         established_ = nullptr; // after the worker is joined, like emit_/fault_ above
     }
 
-    /// Lock-free — callable from any thread without coordinating with mu_.
+    /// Lock-free — callable from any thread without coordinating with mu_. Each atomic is
+    /// read exactly ONCE into a local here (#4685 / governance Gate-8 risk-7): `.inert` and
+    /// `.boot_inert` are then both derived from those SAME two reads, so the
+    /// `boot_inert => inert` implication holds within this one returned snapshot without a
+    /// lock or a cross-field runtime assert across independently-sampled atomics.
     [[nodiscard]] SparkMechanismStats stats() const override {
+        const bool boot = boot_inert_.load(std::memory_order_acquire);
+        const bool degraded = degraded_.load(std::memory_order_acquire);
         return {
             .retiring = retiring_gauge_.load(std::memory_order_relaxed),
             .retiring_cap = kRetiringCap,
             .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
             .quarantined_total = quarantined_.load(std::memory_order_relaxed),
             .slow_op_total = slow_op_.load(std::memory_order_relaxed),
-            .inert = inert_.load(std::memory_order_acquire),
+            .inert = boot || degraded,
+            .boot_inert = boot,
         };
     }
 
@@ -1492,7 +1504,7 @@ private:
         mark_coverage_locked(w, SparkCoverage::None);
         spdlog::warn("spark_file: establishing '{}' failed ({}, err={}) - watch is deaf until the "
                      "retry",
-                     fs::path(w.dir).string(), reason, err);
+                     ::yuzu::log_key_token(fs::path(w.dir).string()), reason, err);
     }
 
     /// Genuine backend failure with a dispatch pass behind it: the
@@ -1976,7 +1988,7 @@ private:
                 resolve_log_fail_hook_(w.dir); // test seam: may throw to model the log
                                                // call's own allocation failing
             spdlog::warn("spark_file: probe for '{}' failed at {} (err={})",
-                         fs::path(w.dir).string(), stage_for_log, err);
+                         ::yuzu::log_key_token(fs::path(w.dir).string()), stage_for_log, err);
         }
     }
 
@@ -2624,7 +2636,7 @@ private:
                         try {
                             spdlog::warn("spark_file: an establishment report for '{}' was "
                                          "dropped (sink threw); further drops are not logged",
-                                         e.key);
+                                         ::yuzu::log_key_token(e.key));
                         } catch (...) {
                         }
                     }
@@ -2787,7 +2799,7 @@ private:
                 try {
                     spdlog::warn("spark_file: synthetic fire for '{}' threw on submit (attempt "
                                  "{}) - retrying",
-                                 fs::path(w.dir).string(), w.resync_attempts);
+                                 ::yuzu::log_key_token(fs::path(w.dir).string()), w.resync_attempts);
                 } catch (...) {
                     // Diagnostic only — every state write above already
                     // landed; losing this log line must never abort the
@@ -2880,10 +2892,14 @@ private:
     ///    log line, FilePassWork destruction), where Registry stamps after its
     ///    tail; wait_timeout_locked() therefore treats a deadline that has
     ///    already passed as "retry due now";
-    ///  - logging happens off-lock, after this returns;
+    ///  - logging happens off-lock, after this returns - Registry's sweeper_main()
+    ///    does the same since #4704, but keeps its failure count as a sweeper-local
+    ///    and captures its PassOutcome inline rather than through a helper;
     ///  - a real completion's pass counts toward the three like any other pass;
-    ///  - clearing inert_ has no `if (core_)` guard: run() is the only writer
-    ///    while it executes (see the pass-failure member comment).
+    ///  - clearing degraded_ has no `if (core_)` guard: run() is the only writer
+    ///    while it executes (see the pass-failure member comment). This is the
+    ///    RUNTIME half of the boot/runtime split (#4685) - only degraded_ is
+    ///    written here, never boot_inert_.
     [[nodiscard]] PassOutcome note_pass_outcome_locked(bool ok) noexcept {
         PassOutcome out;
         if (ok) {
@@ -2895,7 +2911,7 @@ private:
                 // absorb the next nudge.
                 pass_backoff_until_ = {};
                 pass_backoff_ = {};
-                inert_.store(false, std::memory_order_release);
+                degraded_.store(false, std::memory_order_release);
             }
             return out;
         }
@@ -2907,17 +2923,21 @@ private:
         out.failures = pass_failures_;
         out.delay_ms = pass_backoff_.count();
         if (pass_failures_ >= kFileWorkerInertAfterFailures &&
-            !inert_.load(std::memory_order_acquire)) {
-            inert_.store(true, std::memory_order_release);
+            !degraded_.load(std::memory_order_acquire)) {
+            degraded_.store(true, std::memory_order_release);
             out.flipped_inert = true;
         }
         return out;
     }
 
-    /// Off-lock, noexcept: run() has NO outer catch, so a throw from a log call
-    /// here would be worker death, the very thing the pass catch exists to
-    /// prevent. Same wrapping rule as every other diagnostic in a recovery path
-    /// in this file.
+    /// Off-lock, noexcept with an internal catch: an ordinary formatting/
+    /// allocation failure is already handled inside spdlog's own logging
+    /// pipeline and does not reach here (verified against spdlog's
+    /// SPDLOG_TRY/CATCH machinery, #4704 review). This catch(...) is a
+    /// last-resort backstop for a genuinely exceptional failure surviving
+    /// that pipeline, so the worker cannot be brought down by a diagnostic
+    /// log call - run() has NO outer catch of its own. Same wrapping rule as
+    /// every other diagnostic in a recovery path in this file.
     static void log_pass_outcome(const PassOutcome& o) noexcept {
         try {
             if (o.recovered) {
@@ -3396,20 +3416,29 @@ private:
     /// pass_backoff_until_ is the retry deadline of the open episode
     /// (pass_failures_ != 0; epoch = no episode): while it is in the future no
     /// timer-driven pass runs, and wait_timeout_locked() returns it as the wake
-    /// (or "now" once it has passed). Not atomic: every reader holds mu_. inert_
-    /// (below) gains a runtime writer from this state: while run() executes it is
-    /// the ONLY writer (start()'s two `true` stores sit on paths where the worker
-    /// never runs, its `false` store precedes the spawn), so no start-time/runtime
-    /// distinction is needed and a recovery can never clear a start-time inert. A
-    /// runtime-flipped inert_ survives stop() until the next start() clears it;
-    /// SparkEngine is single-shot, so nothing reads it.
+    /// (or "now" once it has passed). Not atomic: every reader holds mu_.
+    /// degraded_ (below) is the RUNTIME half of the boot/runtime split (#4685):
+    /// while run() executes it is the ONLY writer of degraded_ (boot_inert_'s two
+    /// `true` stores sit on paths in start() where the worker never runs, its
+    /// `false` store precedes the spawn), so a runtime recovery can never clear a
+    /// boot-time refusal and vice versa. A runtime-flipped degraded_ survives
+    /// stop() until the next start() clears it (alongside boot_inert_);
+    /// SparkEngine is single-shot, so nothing reads it in between.
     unsigned pass_failures_{0};                 ///< consecutive failed passes; 0 = last pass ok
     Clock::time_point pass_backoff_until_{};    ///< epoch = no active backoff
     std::chrono::milliseconds pass_backoff_{0}; ///< last computed delay; 0 outside an episode
     std::atomic<std::uint64_t> pass_failed_{0}; ///< all-time failed passes (mirrors Registry's
                                                 ///< sweep_pass_failed_)
 
-    std::atomic<bool> inert_{false};
+    /// BOOT-TIME refusal (#4685): start() could not bind the IOCP or spawn the
+    /// worker - every watch() is refused. Written only from start() (see above).
+    std::atomic<bool> boot_inert_{false};
+    /// RUNTIME degradation (#4685): the worker's pass-failure episode above has
+    /// crossed kFileWorkerInertAfterFailures. watch() is still accepted while
+    /// this is true - the obligation is served once a pass next succeeds.
+    /// Written from both start() (cleared on a successful bind) and run() (see
+    /// note_pass_outcome_locked above).
+    std::atomic<bool> degraded_{false};
     std::atomic<std::uint64_t> retiring_gauge_{0};
     std::atomic<std::uint64_t> watch_rejected_{0};
     std::atomic<std::uint64_t> quarantined_{0};

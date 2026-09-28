@@ -310,9 +310,10 @@ public:
     /// Cheap, lock-only (mu_), no I/O.
     ///
     /// `coverage` is overlaid to None while the type's mechanism reports itself
-    /// inert (whatever it last reported); `established_at` is never touched. The
-    /// result is a conservative snapshot, not a coherent one: inert is an atomic
-    /// read beside the mu_-guarded cache, so it can disagree with a newer report.
+    /// inert - either reason, boot-inert OR runtime-degraded (whatever it last
+    /// reported); `established_at` is never touched. The result is a conservative
+    /// snapshot, not a coherent one: inert is an atomic read beside the mu_-guarded
+    /// cache, so it can disagree with a newer report.
     ///
     /// R4: after stop(), this returns the LAST-KNOWN values (stop() never
     /// erases armed_ — the same precedent subscription_health() already sets,

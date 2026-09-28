@@ -25,7 +25,7 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 | cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` (needed by Meson's cmake dep method) |
 | ninja.exe | Installed with CMake or VS BuildTools |
 | python | `C:\Python314\python.exe` (system-wide, installed via Chocolatey) |
-| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.11.1`) |
+| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.11.1` — the Windows runner contract pin in `deploy/windows/toolchain-contract.json`; Linux CI uses 1.12.0) |
 | vcpkg | `C:\vcpkg` (`VCPKG_ROOT`) |
 | protoc | `C:\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
 | grpc_cpp_plugin | `C:\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |

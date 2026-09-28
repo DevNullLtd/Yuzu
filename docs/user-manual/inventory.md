@@ -66,7 +66,9 @@ cadences.
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
   packages (they are installed). `homebrew` is a reserved `ecosystem` value —
-  not collected yet (brew is per-user; the sync is machine-scope).
+  not collected yet (per-user Homebrew stores are out of scope; the sync is machine-scope). The
+  `pkg_inventory` plugin reads the machine-scope Homebrew prefix on demand
+  (an instruction result, not a daily-sync source).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,

@@ -240,7 +240,7 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
 | Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
 | Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
-| Yuzu fleet renderer | `server/core/src/yuzu_viz_js_bundle.cpp` (hand-written) | `kYuzuVizJs` | first-party | n/a |
+| Yuzu fleet renderer | `yuzu_viz_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-viz.js`) | `kYuzuVizJs` | first-party | n/a |
 
 ### Refresh procedure (vendored vendor JS only)
 

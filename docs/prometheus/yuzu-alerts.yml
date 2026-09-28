@@ -532,6 +532,93 @@ groups:
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
 
+      - alert: YuzuBreakGlassLogin
+        # The armed break-glass account passed the password gate under
+        # --auth-mode=sso-only. Rare by design, so ANY increment pages
+        # (docs/observability-conventions.md). yuzu_auth_break_glass_login_total
+        # is boot-seeded to 0 in server.cpp, so increase() sees the first use
+        # after a restart; same idiom as YuzuOnBehalfAssertionRejected above.
+        expr: |
+          increase(yuzu_auth_break_glass_login_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Break-glass account used on {{ $labels.instance }}"
+          description: >-
+            yuzu_auth_break_glass_login_total increased: the armed break-glass
+            account's password was accepted under --auth-mode=sso-only (the
+            mandatory TOTP challenge still follows). Confirm this was a
+            sanctioned recovery. The audit rows carry the evidence:
+            auth.breakglass.armed (who armed it; the principal is the OS account
+            that ran --break-glass-arm, so correlate with the host's sudo /
+            docker exec log for the person) then auth.breakglass.login. If it
+            was not sanctioned, revoke the account's sessions and rotate its
+            password and TOTP. A break-glass attempt refused because the
+            account has no MFA (auth.breakglass.denied) does NOT move this
+            counter; alert on that audit row via your SIEM. See
+            docs/ops-runbooks/auth-db-recovery.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
+
+      - alert: YuzuRbacEnforcementChanged
+        # A1 (RBAC enforcement enable/disable toggle). Threshold-free by
+        # design — this fires on ANY observed change to this replica's
+        # cached view of the durable rbac_enabled flag, not on a rate or a
+        # duration, so there is no fleet-behaviour claim to tune (unlike the
+        # OTA bounds alerts, which ship separately for exactly that reason).
+        # A replica RESTART with an unchanged flag does not fire: the gauge
+        # is re-published with the SAME value at construction
+        # (RbacStore::set_metrics), so changes() over the window sees no
+        # transition. info severity: this is an audit/notification signal
+        # for a deliberate operator action, not an incident.
+        expr: |
+          changes(yuzu_server_rbac_enforcement_enabled[15m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "RBAC enforcement state changed on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_enforcement_enabled changed value on this
+            replica within the last 15 minutes. This reflects a durable
+            RBAC enforcement toggle (PUT /api/v1/rbac/enforcement or the
+            set_rbac_enforcement MCP tool) converging to this replica, not a
+            local-only event — every replica observes the same durable
+            flag within the ~1s generation refresh. Check the
+            rbac.enforcement_changed audit rows (target_id="rbac_enabled")
+            for WHO made the change and WHEN. See
+            docs/user-manual/rbac.md "Enabling RBAC".
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
+
+      - alert: YuzuRbacEnforcementDisabled
+        # Gate 7 Fix 14 (sre): the rule above fires identically for enable
+        # AND disable, but RBAC ships OFF by default — DISABLE is the
+        # security-REGRESSION direction (a fleet reverting from enforced to
+        # legacy-open access), which arguably deserves louder treatment than
+        # a bare "something changed" info. Keep BOTH rules: the one above
+        # still tells you SOMETHING changed at a glance; this one flags
+        # specifically when it went to disabled. Direction-aware, not a
+        # replacement — same threshold-free reasoning as the rule above (no
+        # fleet-behaviour claim to tune).
+        expr: |
+          (yuzu_server_rbac_enforcement_enabled == 0)
+          and (changes(yuzu_server_rbac_enforcement_enabled[15m]) > 0)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RBAC enforcement was DISABLED on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_enforcement_enabled transitioned to 0 (disabled)
+            on this replica within the last 15 minutes — RBAC ships OFF by
+            default, so this is the security-regression direction: the
+            fleet just reverted from enforced access to the legacy-open
+            fallback. This reflects a durable toggle converging to this
+            replica, not a local-only event. Check the
+            rbac.enforcement_changed audit rows (target_id="rbac_enabled")
+            for WHO made the change and WHEN, and confirm it was expected.
+            See docs/user-manual/rbac.md "Enabling RBAC".
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-enforcement-changed"
+
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
   # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never
@@ -1145,7 +1232,7 @@ groups:
             when nobody asked the store would under-enforce against a healthy
             one. The quarantine plugin's own control actions stay
             reachable throughout - releasing a device does not depend on this
-            read - as do the three system-reserved internal pushes
+            read - as do the four system-reserved internal pushes
             (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
@@ -1411,7 +1498,11 @@ groups:
             yuzu_server_ca_crl_publish_failures_total moved: a CRL (re)publish
             attempt failed (e.g. CA key load, build/sign, a database read or
             write, or a wait of more than 5s for the ca_store.ca_crl_versions lock
-            held by another publisher; see docs/user-manual/metrics.md).
+            held by another publisher; see docs/user-manual/metrics.md). For
+            which cause, check the reason-labelled sibling
+            yuzu_server_ca_crl_publish_failure_reason_total{reason} (#4830) —
+            a bounded breakdown (key_load, lock_timeout, no_connection, etc.)
+            alongside this unlabelled alert source.
             Consumers keep serving the last still-valid CRL, so this is not yet
             an outage, but a revocation made since the last successful publish
             is NOT yet in the public CRL — server-side enforcement (is_revoked())
@@ -2038,18 +2129,51 @@ groups:
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
-  # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on
-  # breaker-open (off yuzu_pg_connect_failed_total), so the load balancer
-  # drains the instance right away. These alerts carry `for:` windows and are
-  # for paging/escalation — they fire AFTER the LB has already reacted, not
-  # before. Metrics come from the pool's Observer feed.
+  # service-affecting. NOTE ON TIMING: /readyz goes 503 within seconds of this
+  # replica losing Postgres, off its dedicated reachability probe (HA WS-8,
+  # the `pg_reachable` row: 2 failed probes, a probe stuck >15s, or a server
+  # that refuses writes), so the load balancer drains the instance well before
+  # any alert here fires.
+  # These alerts carry `for:` windows and are for paging/escalation — they fire
+  # AFTER the LB has already reacted, not before. The pool metrics come from
+  # the pool's Observer feed; the reachability metrics from the probe.
   - name: yuzu-postgres
     rules:
+      - alert: YuzuServerPostgresUnreachable
+        # HA WS-8 (ADR-2002 §12): this replica's dedicated reachability probe
+        # has reported Postgres unreachable, stale, or read-only (a standby)
+        # for 2m. /readyz has been 503 for that whole window, so the LB has
+        # already taken this replica out of rotation. `for: 2m` rides out an
+        # ordinary Patroni failover (10-30s), during which EVERY replica is
+        # briefly red by design. Fired on several replicas at once, it is the
+        # database or the network path to it, not the replicas.
+        expr: |
+          yuzu_server_pg_reachable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }} cannot reach a writable PostgreSQL primary (/readyz 503)"
+          description: >-
+            The dedicated Postgres reachability probe on {{ $labels.instance }}
+            has failed for over 2 minutes; /readyz reports not ready with a
+            `pg` reason (unreachable, stale, or read_only). Check the server log
+            for the "[readyz] Postgres not reachable" line (it carries the libpq
+            detail), the database, and the network or proxy path to it.
+            read_only means the probe reached a server that refuses writes: a
+            standby (check that the proxy routes to the current primary) or a
+            primary with default_transaction_read_only on (often a full disk on
+            managed Postgres). With a multi-host DSN (target_session_attrs=read-write)
+            libpq refuses read-only hosts itself, so a cluster with no writable
+            host shows as unreachable, with the reason in the log line.
+
       - alert: YuzuPgConnectFailing
-        # The connect-failure circuit breaker has armed — the database is
-        # unreachable. /readyz already reports not-ready off the same signal
-        # (LB eviction is immediate); this alert fires after for:2m of
-        # sustained failure to page/escalate, NOT to drive LB eviction.
+        # The pool's connect-failure breaker has armed — NEW pool connections
+        # are failing. This arms only when a pool connect is attempted, so it
+        # can lag (idle pooled connections are reused first) or stay quiet
+        # with no traffic; YuzuServerPostgresUnreachable above is the steady
+        # reachability signal. This alert fires after for:2m of sustained
+        # failure to page/escalate, NOT to drive LB eviction.
         expr: |
           rate(yuzu_pg_connect_failed_total[5m]) > 0
         for: 2m
@@ -2159,6 +2283,57 @@ groups:
             that the clock moved. Nothing has been deleted by these passes - the guard
             declines rather than deletes on this trigger.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-reap-anchor-not-surviving"
+      # #4856: yuzu_server_guardian_read_degrade_total{reason,source} shipped
+      # with no alert referencing it, so a sustained read degrade silently
+      # turned device compliance scores "healthy" (the DEX-score fail-open
+      # this counter's guardian_state source also covers) and paged nobody.
+      # Two sources on the SAME counter, both keyed by reason
+      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # is the DEX/observation family (dex_read<>/dex_observation) - these
+      # fail SOFT, serving an empty/degraded result rather than an error, so
+      # this is the ONLY external signal that anything went wrong; "guardian_rules"
+      # is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
+      # agent_rule_statuses*/rule_names*/errored_rule_count) - these fail HARD
+      # (a typed error the caller must act on), but a sustained rate here still
+      # means the Guardian push/reconcile/status surface is failing, not
+      # merely serving stale data. `by (reason, source)` keeps both dimensions
+      # on the fired alert so an operator can tell which family and which
+      # substrate condition without cross-referencing /metrics by hand.
+      - alert: YuzuGuardianReadDegraded
+        expr: |
+          sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason, source) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian reads degrading ({{ $labels.source }}/{{ $labels.reason }})"
+          description: >-
+            yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
+            source="{{ $labels.source }}"} is non-zero. source="guardian_state"
+            means a DEX/observation read (crash summary, top apps, device
+            score inputs, ...) is degrading and fails SOFT - callers keep
+            serving an empty/partial result, so this counter and the sampled
+            warn log are the only external tell; do not read a "healthy"
+            device compliance score as authoritative while this fires (#4855).
+            source="guardian_rules" means an AUTHORITATIVE rule/status read
+            (get_rule/list_rules/agent_rule_statuses/rule_names/
+            errored_rule_count) is degrading: the read itself returns a typed
+            error, not a silent empty/stale result — but "returns a typed
+            error" does not mean every caller aborts. Most callers DO fail
+            closed (abort push/reconcile/status on the typed error), but this
+            is not universal: several guardian_routes.cpp dashboard renders
+            call list_rules().value_or({}) and fall back to an empty rule
+            list on a degrade, and guardian_ingest.cpp's event-severity
+            enrichment folds a degraded get_rule into the same "unknown"
+            severity default it already uses for a genuinely-deleted rule.
+            Treat those specific views/fields as unknown, not "confirmed
+            absent", while this alert fires. Either way,
+            pool_acquire_timeout/query_error correlate with yuzu_pg_*
+            saturation or outage; store_not_open means the store failed to
+            open at boot (should not be reachable post-boot given fail-closed
+            construction - investigate as a possible regression if seen).
+            See #2659 for the deferred-widening posture behind this metric.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
@@ -2992,13 +3167,29 @@ groups:
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
-        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
-        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
-        # closed to DenyAll. This is the confinement substrate itself faulting,
-        # not the fleet shrinking: a fired alert means SCOPED operators see
-        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
-        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
-        # pure pool saturation, so only the store-specific counter moves.
+        # A CONFINEMENT-feeding management-group read (ancestors / descendants /
+        # agent-groups / row/member resolution, ADR-0042 + #1762) degraded.
+        # Three shapes share this one counter, by caller: (1) the confinement
+        # hierarchy reads fail closed to DenyAll; (2) a checked row/member read
+        # (get_group_checked and/or get_members_checked — the DEX app-perf
+        # group trend, /auto VERIFY compare, and GET
+        # /api/v1/management-groups/{id} + its MCP twin get_management_group,
+        # the latter two on BOTH checked twins since governance round-2)
+        # surfaces the degrade as a 503/retryable result to its own caller;
+        # (3) the LEGACY get_group()/get_members() wrappers still render the
+        # SAME degrade as a flat not-found / empty member list to their
+        # remaining callers — a genuinely render-only dashboard fragment, but
+        # ALSO several dispatch-targeting reads (group dispatch resolution,
+        # dispatch-scope-ladder's group-members closure, Guardian rule-push
+        # group resolution, policy-check target resolution, and the `/auto`
+        # Pre-flight group-cohort resolver) whose empty result fails safe by
+        # under-reaching rather than being a benign display gap — tracked as
+        # KNOWN, DISCLOSED residuals at #4907. This is deliberate fail-soft
+        # behaviour there, not a bug, but it is why a fired alert must not be
+        # read as "groups were deleted" or "the fleet shrank". Same
+        # dashboard-invisibility as YuzuInventoryReadDegraded — /readyz stays
+        # green under pure pool saturation, so only the store-specific counter
+        # moves.
         # reason = store_not_open | pool_acquire_timeout | query_error.
         expr: |
           sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
@@ -3009,14 +3200,32 @@ groups:
           summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
           description: >-
             yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
-            is non-zero: a confinement-feeding hierarchy read degraded and the
-            caller failed closed to DenyAll. This is a confinement-substrate
-            degrade — scoped operators now see REDUCED or EMPTY lists, it does
-            NOT mean management groups shrank or devices left the fleet.
-            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
-            or outage; store_not_open means the store failed to open at boot. Do
-            not read a scoped operator's short/empty list as authoritative while
-            this fires.
+            is non-zero: a confinement-feeding management-group read degraded.
+            Depending on the caller this means the caller failed closed to
+            DenyAll, returned a degraded/503-or-retryable result to its own
+            caller (e.g. the DEX app-perf group trend, /auto VERIFY compare,
+            or GET /api/v1/management-groups/{id} and its MCP twin — both now
+            on get_group_checked for the group row as well as
+            get_members_checked for the member list), or — for the legacy
+            get_group()/get_members() wrappers' remaining callers (#4907) —
+            received a flat not-found / an empty member list rather than the
+            real row/membership, which for the dashboard scope picker is a
+            benign display gap but for a dispatch-targeting caller (group
+            dispatch, dispatch-scope ladder, Guardian rule push, policy-check
+            target resolution) means the current dispatch under-reaches
+            rather than the group being genuinely empty. A `/auto` Pre-flight
+            run STARTED during the degrade resolves its group cohort through
+            the same legacy path: it answers "No visible devices in that
+            scope." and creates no run at all, rather than a run with a
+            frozen-empty cohort — re-run Pre-flight after the degrade clears,
+            it will not self-heal an existing run. This is a
+            confinement-substrate degrade, it does NOT mean management groups
+            shrank or devices left the fleet. pool_acquire_timeout/query_error
+            correlate with yuzu_pg_* saturation or outage; store_not_open
+            means the store failed to open at boot. Do not read a scoped
+            operator's short/empty list, an empty app-perf/VERIFY cohort, a
+            zero-reach dispatch, or a Pre-flight "no visible devices" refusal,
+            as authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuAnalyticsStoreNotOpen
         # AnalyticsEventStore (ADR-0049) failed to open at boot and is
@@ -3505,9 +3714,10 @@ groups:
   #     # macOS registers none of file/registry/service) is expected, not a regression. A
   #     # bare `> 0` would page on every legitimate cross-platform deploy. It is NOT
   #     # universally safe to ignore, though: classify() keys off the registered-AND-
-  #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
-  #     # registered-but-inert mechanism can also land a rule here on a platform where it
-  #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
+  #     # armable (not boot-inert) capability set (guardian_engine.cpp) - #4685 keeps a
+  #     # merely runtime-degraded mechanism armable, so only a registration failure or a
+  #     # boot-inert mechanism lands a rule here on a platform where it should have
+  #     # worked - see docs/user-manual/guaranteed-state.md's on-call note for
   #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
   #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
   #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to

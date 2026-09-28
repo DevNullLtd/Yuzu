@@ -98,9 +98,37 @@ public:
     /// Optional; a null registry makes the counters no-ops.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    // ── Group CRUD (deny-or-benign display class — may stay plain) ───────────
+    // ── Group CRUD (deny-or-benign display class — may stay plain, EXCEPT
+    // get_group: see get_group_checked below) ────────────────────────────
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);
+    /// LEGACY fail-soft: `get_group_checked(id).value_or(std::nullopt)` — a
+    /// store-not-open / pool-acquire-timeout / query-error degrade is
+    /// INDISTINGUISHABLE from "no such group" (both render as `nullopt`).
+    /// The `GET /api/v1/management-groups/{id}` REST route and its MCP twin
+    /// `get_management_group` have both moved to `get_group_checked` (fail
+    /// closed with a retryable 503/error on a degrade, a flat 404 only on a
+    /// genuine not-found). Remaining fail-soft callers: the parent-id check
+    /// in `create_group`/`update_group`, the REST `PUT
+    /// /api/v1/management-groups/{id}` route, MCP `update_management_group`,
+    /// and the root-group bootstrap in ServerImpl. On a degrade each of them
+    /// refuses rather than writes (the mutation paths answer 404/400
+    /// "group not found" / "parent group not found" — the SAME `nullopt`, so
+    /// the operator sees the wrong cause, not an unsafe write; tracked with
+    /// the other fail-soft residuals in #4907). Because this wrapper now goes
+    /// through `get_group_checked`, every such degrade IS counted on
+    /// `yuzu_server_mgmt_group_read_degrade_total` (previously silent).
+    /// Prefer `get_group_checked` for any NEW code that needs to tell the two
+    /// apart (#1762 shape).
     std::optional<ManagementGroup> get_group(const std::string& id) const;
+    /// Degrade-distinguishable twin of `get_group()` (#1762): `nullopt` on a
+    /// genuine not-found, `unexpected` on store-not-open / pool-acquire-
+    /// timeout / query-error (each bumps
+    /// `yuzu_server_mgmt_group_read_degrade_total{reason=...}`, matching
+    /// `get_members_checked`/`get_agent_groups` above) so a caller that needs
+    /// to tell "the read failed" apart from "the group does not exist" can
+    /// fail closed (503/retryable) instead of a flat 404.
+    [[nodiscard]] std::expected<std::optional<ManagementGroup>, std::string>
+    get_group_checked(const std::string& id) const;
     std::optional<ManagementGroup> find_group_by_name(const std::string& name) const;
     std::vector<ManagementGroup> list_groups() const;
     std::vector<ManagementGroup> get_children(const std::string& parent_id) const;
@@ -112,7 +140,58 @@ public:
                                                 const std::string& agent_id);
     std::expected<void, std::string> remove_member(const std::string& group_id,
                                                    const std::string& agent_id);
+    /// LEGACY fail-soft: `get_members_checked(group_id).value_or({})` — a
+    /// store-not-open / pool-acquire-timeout / query-error degrade renders as
+    /// an empty vector, INDISTINGUISHABLE from a genuinely empty group (#1762).
+    /// The `GET /api/v1/management-groups/{id}` REST route and its MCP twin
+    /// `get_management_group` have both moved to `get_members_checked` (fail
+    /// closed with a retryable error on a degrade); the remaining callers on
+    /// this legacy wrapper are NOT uniformly render-only — grep before
+    /// assuming otherwise:
+    ///   - `dashboard_routes.cpp` (the scope-picker fragment) is genuinely
+    ///     render-only display.
+    ///   - `PolicyEvaluator::resolve_targets` is dispatch-TARGETING: a degrade
+    ///     renders as zero members, which under-reaches (fails safe — zero
+    ///     compliance-check targets dispatched this tick, never a false
+    ///     target set) rather than mis-authorizing anyone.
+    /// Four further dispatch-TARGETING call sites remain on this fail-soft
+    /// form as KNOWN, DISCLOSED residuals — tracked at #4907 (this comment
+    /// does not itself change their behaviour):
+    ///   - `dispatch_scope_ladder.hpp`'s `group_members_fn` closure — the
+    ///     shared group-dispatch resolver several confined-dispatch call
+    ///     sites wire through — under-reaches to zero on a degrade.
+    ///   - `command_routes.cpp`'s `/api/command` group-dispatch resolution —
+    ///     a degrade reaches nobody, surfacing via the same catch-all
+    ///     zero-reach cause every other unreachable-scope case there does
+    ///     (routed-concerns.md's "Dispatch zero-reach cause discrimination"
+    ///     row), not a distinguishable "store degraded" report.
+    ///   - The PreflightRoutes cohort resolver lambda (wired in
+    ///     `ServerImpl`'s `PreflightRoutes::register_routes` call, `server.cpp`)
+    ///     — a degrade does NOT freeze an empty cohort; `resolve_targets`
+    ///     resolves to zero targets, so `preflight_routes.cpp`'s run-start
+    ///     handler takes its existing empty-scope branch: it audits
+    ///     `preflight.run`/`no_devices`, answers "No visible devices in that
+    ///     scope.", and creates NO RUN AT ALL — a genuine store degrade is
+    ///     indistinguishable from a genuinely empty/unauthorized scope, and
+    ///     the operator must retry (there is no run to self-heal once the
+    ///     degrade clears).
+    ///   - The Guardian `group:`-scope push resolution in `ServerImpl`
+    ///     (`server.cpp`) — a degrade targets NO device for that push; the
+    ///     periodic heartbeat reconcile pass repairs the gap on a later tick,
+    ///     so this one is bounded-staleness rather than a permanent miss.
+    /// Prefer `get_members_checked` for NEW code, especially anything that
+    /// would otherwise render a degrade as "0 members" (the #1762 shape) in a
+    /// context where under-reach is not the safe default.
     std::vector<ManagementGroupMember> get_members(const std::string& group_id) const;
+
+    /// Degrade-distinguishable twin of `get_members()` (#1762): `nullopt` on
+    /// store-not-open / pool-acquire-timeout / query-error (each bumps
+    /// `yuzu_server_mgmt_group_read_degrade_total{reason=...}`, matching
+    /// `get_agent_groups`/`get_ancestor_ids` below) so a caller that needs to
+    /// tell "the read failed" apart from "the group has zero members" can fail
+    /// closed instead of rendering the degrade as an empty cohort.
+    [[nodiscard]] std::optional<std::vector<ManagementGroupMember>>
+    get_members_checked(const std::string& group_id) const;
 
     /// CONFINEMENT read (ADR-0042): the management groups an agent belongs to.
     /// Feeds `RbacStore::check_scoped_permission`'s reachable-set build. Returns

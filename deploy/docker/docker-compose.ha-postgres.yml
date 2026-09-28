@@ -68,6 +68,10 @@ x-pg-env: &pg-env
   YUZU_DB_NAME: ${YUZU_DB_NAME:-yuzu}
   YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (must differ from the superuser password)}
   YUZU_PG_DURABILITY: ${YUZU_PG_DURABILITY:-quorum3}
+  # Connection slots reserved for the app role ahead of every other client, so a
+  # backup job or ad-hoc psql can never take the slot a server's /readyz probe
+  # needs to reconnect (HA WS-8, #4943). Size: N_servers × (pool size + 2).
+  YUZU_PG_RESERVED_CONNECTIONS: ${YUZU_PG_RESERVED_CONNECTIONS:-40}
   # Host (TCP) connections are scoped to this CIDR (the cluster subnet); see the entrypoint.
   YUZU_PG_TRUST_CIDR: ${YUZU_PG_TRUST_CIDR:-10.89.0.0/24}
 

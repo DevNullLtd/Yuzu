@@ -97,8 +97,8 @@ services:
   # work here: YUZU_VERSION is the OLD release on the first leg and a
   # never-published -test tag on the second). The postgres service stays
   # identical across both legs while the server image swaps around it —
-  # exactly the topology the ADR-0009 first-boot backfill upgrade
-  # assertions will exercise. The OLD release's server ignores
+  # exactly the topology the fixtures-write -> image-swap -> fixtures-verify
+  # data-preservation assertions exercise. The OLD release's server ignores
   # YUZU_POSTGRES_DSN entirely; the env var below is inert until #1320.
   postgres:
     build:

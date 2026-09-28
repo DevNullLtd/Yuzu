@@ -43,9 +43,10 @@ maintainer at nathan.dornbrook@gmail.com.
 > directly. **CMake is not an alternative build system** here — it is pulled in
 > only as a Meson dependency-resolution method, never invoked to build. Without
 > Meson + Ninja you cannot build, test, or run any of the tooling, so install
-> them first (Meson 1.11.1; a recent Ninja) before following the steps below.
+> them first (Meson 1.12.0, the pin in `requirements-ci.txt`; a recent Ninja)
+> before following the steps below.
 
-1. **Prerequisites**: Meson 1.11.1, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
+1. **Prerequisites**: Meson 1.12.0 (`requirements-ci.txt`), Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
    git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu

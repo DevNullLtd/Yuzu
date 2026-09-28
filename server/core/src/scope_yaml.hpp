@@ -91,10 +91,26 @@ std::expected<std::string, ResultSetError> resolve_scope_aliases(std::string_vie
 /// or `store` is null (no owner context to check against). Drives the
 /// invocation-time INSTRUCTION_SCOPE_RESOLUTION_FAILED audit row (design §7).
 ///
+/// **#4981 PR-1 (Finding A/A2): this is an EARLY, per-ref FORENSIC pass —
+/// NOT the binding authorization check.** It runs once, before parsing, using
+/// `store->get()` (a plain existence+ownership read). The BINDING check is
+/// `AgentRegistry::evaluate_scope`'s own `member_set_owned` preload, which
+/// runs later (after parsing, at actual registry evaluation) against the
+/// SAME store in a single snapshot-consistent statement (A1) — so a set that
+/// passes THIS check can still be deleted/expired in the window between here
+/// and that later read (a real TOCTOU race: `delete_set`/`gc_sweep` both
+/// cascade via an FK), and `evaluate_scope` aborts fail-closed
+/// (`ScopeEvalError::Kind::OwnerCheckFailed`) when that happens — this
+/// function's job is only to produce the early per-ref forensic audit row
+/// BEFORE that later abort, not to be the sole gate against it. The
+/// redundancy between the two checks (an owner-valid ref here can still fail
+/// at evaluate_scope moments later) is a harmless, deliberate two-layer
+/// check, not a bug — do not "simplify" it away.
+///
 /// Returns `std::unexpected(DbError)` when `store->get` hits a Postgres error
 /// mid-scan (ADR-0036 fail-closed contract) — the caller MUST abort dispatch
 /// rather than proceed with a partial/no audit-row view (this function is a
-/// forensic side-channel today, but a degraded scan could also mask a
+/// forensic side-channel, but a degraded scan could also mask a
 /// genuinely-failing owner check, which the audit row exists to surface).
 std::expected<std::vector<std::string>, ResultSetError>
 scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
@@ -108,12 +124,18 @@ scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
 ///                        not owned by `principal` (`failing_out` carries them
 ///                        for per-ref forensic audit rows);
 ///   - Proceed          — every from_result_set: reference is owner-valid (or
-///                        the expression has none).
+///                        the expression has none) AT THIS EARLY CHECK — see
+///                        `scope_refs_failing_owner_check`'s doc comment
+///                        above: `evaluate_scope`'s own later preload is the
+///                        binding check and can still abort after this
+///                        returns Proceed (#4981 PR-1 Finding A TOCTOU case).
 /// Extracted from the three dispatch sites (REST raw / tracked closure / MCP)
 /// so the abort-vs-proceed rule is ONE testable function: the pre-M1 bug was
 /// exactly a caller auditing the failing refs and then dispatching anyway,
 /// which a NOT combinator inverts into a fleet-wide match. Callers MUST NOT
-/// parse/evaluate/dispatch unless this returns Proceed.
+/// parse/evaluate/dispatch unless this returns Proceed — but a Proceed here
+/// is a necessary, not sufficient, condition for the dispatch to actually go
+/// through; the later evaluate_scope call can still abort.
 enum class ScopeDispatchGate { Proceed, AbortDbDegraded, AbortOwnerCheck };
 ScopeDispatchGate gate_scope_dispatch(std::string_view resolved_scope,
                                       const std::string& principal, ResultSetStore* store,

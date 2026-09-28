@@ -630,31 +630,50 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         spdlog::error("ResultSetStore::member_set_owned: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    // The owner join is the authorization gate: a set not owned by `owner`
-    // yields zero rows, so the caller sees an empty (non-matching) membership
-    // and never learns it exists — the documented "stale members drop
-    // silently" contract extends cleanly to "not-yours members drop silently".
-    // A DB ERROR is DISTINCT from both of those (std::unexpected, never an
-    // empty set) — see the header's type-distinguishable-reads note; the
-    // caller (AgentRegistry::evaluate_scope) MUST abort on DbError rather
-    // than proceed with a partial preload (the fleet-wide fail-open under a
-    // NOT combinator this contract exists to prevent).
+    // #4981 PR-1 (Finding A/A1): a SINGLE statement, one Postgres snapshot,
+    // existence + ownership + membership together — closes the TOCTOU window
+    // the pre-#4981 plain owner-filtered JOIN left open (a set deleted
+    // between a caller's own pre-dispatch ownership gate and this read used
+    // to surface here as a SUCCESSFUL EMPTY set, not an error — see the
+    // header's file-level note). The LEFT JOIN's ON-clause carries the owner
+    // predicate (not a WHERE clause) so a row for `id` is ALWAYS returned
+    // when `id` exists regardless of who owns it — the `owned` column tells
+    // the caller which case it is — while `m.device_id` is NULL on every row
+    // when the owner predicate didn't match (or when `id` has zero members).
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT m.device_id FROM result_set_store.result_set_members m "
-        "JOIN result_set_store.result_sets r ON r.id = m.result_set_id "
-        "WHERE m.result_set_id = $1 AND r.owner_principal = $2",
+        "SELECT (r.owner_principal = $2) AS owned, m.device_id "
+        "FROM result_set_store.result_sets r "
+        "LEFT JOIN result_set_store.result_set_members m "
+        "ON m.result_set_id = r.id AND r.owner_principal = $2 "
+        "WHERE r.id = $1",
         std::vector<std::string>{id, owner});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::member_set_owned: query failed: {}",
                       PQerrorMessage(lease.get()));
         return std::unexpected(ResultSetError::DbError);
     }
-    std::unordered_set<std::string> out;
     const int rows = PQntuples(res.get());
+    if (rows == 0)
+        return std::unexpected(ResultSetError::NotFound);
+    // `owned` is identical on every returned row (it depends only on `id`'s
+    // single owner_principal, not on which member row it's paired with) — the
+    // first row's value is authoritative for the whole result. `owner_principal`
+    // is `NOT NULL` (see the `result_sets` migration), so this column can
+    // never be NULL either — `to_bool` (this file's established boolean-
+    // column idiom, reused rather than re-inlined) treats a NULL/unexpected
+    // value as false (not-owned), the fail-closed direction, as a defensive
+    // fallback that should never actually trigger here.
+    const bool owned = to_bool(PQgetvalue(res.get(), 0, 0));
+    if (!owned)
+        return std::unexpected(ResultSetError::NotOwner);
+    std::unordered_set<std::string> out;
     out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        out.insert(PQgetvalue(res.get(), i, 0));
+    for (int i = 0; i < rows; ++i) {
+        if (PQgetisnull(res.get(), i, 1))
+            continue; // owned, zero members: every row's device_id is NULL
+        out.insert(PQgetvalue(res.get(), i, 1));
+    }
     return out;
 }
 

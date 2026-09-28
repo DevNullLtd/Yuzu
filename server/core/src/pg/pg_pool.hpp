@@ -257,6 +257,11 @@ public:
     /// failure reason is in `last_error()`).
     [[nodiscard]] Lease acquire();
 
+    /// The `connect_timeout` (seconds) this pool adds to a new connection when
+    /// the conninfo and PGCONNECT_TIMEOUT set none. The /readyz probe applies the
+    /// same default so it gives up on a host exactly when the pool does (HA WS-8).
+    [[nodiscard]] int connect_timeout_s() const noexcept { return connect_timeout_s_; }
+
     /// As `acquire()`, but gives up after `timeout` when the pool is
     /// exhausted and nothing is released in time. Bound caveat: a fresh
     /// connection attempt is only STARTED before the deadline, but once

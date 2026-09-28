@@ -36,6 +36,35 @@ The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Window
 
 ## Standing Erlang pitfalls
 
+**Windows IDE builds: invalid handle / no Erlang output.** An IDE-launched
+Ninja (CLion) can hand its children stdio handles the Erlang VM cannot use. The
+VM then dies on its first write (`Writer crashed ('The handle is invalid.')`,
+exit 127; console-mode errors such as `SetConsoleModeInitIn` have also been
+reported) before printing anything, so the IDE shows a failed step with no
+Erlang output. On Windows both gateway wrappers therefore never give the child
+an inherited stdio handle: its stdout+stderr go to a pipe the wrapper owns (the
+part that actually fixes this), and its stdin is null on a private hidden
+console (`CREATE_NO_WINDOW`) — those two shared through
+`scripts/erlang_toolchain.py`'s `windows_stdio_isolation()`.
+`build_gateway.py` relays the pipe to its own stdout and tees it to
+`<build dir>/meson-logs/yuzu_gateway_build.log`, which `ci.yml`'s Windows leg
+uploads with the rest of `meson-logs/` on failure. (If that file is held open
+by something that blocks deleting it, the run logs to a fresh
+`yuzu_gateway_build.<random>.log` beside it instead; the failure message
+always names the file actually written.) On a nonzero exit or a timeout
+(`YUZU_GATEWAY_BUILD_TIMEOUT`, default 900 s) it names the command, the exit
+code and that log. **If a CLion gateway build fails with no Erlang output, read
+that log first.**
+
+Two consequences to know. Because the child's console is invisible, git
+credential prompts are disabled (`GIT_TERMINAL_PROMPT=0`,
+`GCM_INTERACTIVE=never`): a cold `_build` fetching a git dependency behind an
+authenticating proxy or with missing credentials fails fast with git's error
+instead of prompting — set up credentials or proxy config beforehand. And do
+**not** add `-noinput` to `ERL_FLAGS` for these wrappers: `ERL_FLAGS` reaches
+every VM rebar3 starts, and `-noinput` breaks the `standard_io` `peer` nodes
+the multinode eunit suite uses.
+
 | Area | Issue |
 |---|---|
 | `ctx` dependency | `ctx:background/0` is used for grpcbox RPC calls. `ctx` is a transitive dep of `grpcbox` but must be listed in `yuzu_gw.app.src` `applications` since we call it directly — otherwise dialyzer can't find it in the PLT. **Rule: if you call a function from a transitive dependency, add it to the applications list.** |

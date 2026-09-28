@@ -94,10 +94,23 @@
 /// #4576 completed `DexApi`'s own dashboard deferral. `AppPerfProviders` (the
 /// pre-seam provider bundle) is RETIRED — this seam's `dex_perf_api` instance
 /// is now the SOLE consumer for every surface (REST, MCP, dashboard).
-/// GAP-1: the model-picker's device-tag distinct-values read has NO home in
-/// `DexPerfApi` (no public fleet-wide "distinct tag values" resource exists
-/// yet) — `DexRoutes` carries it as its own standalone, disclosed
-/// `TagValuesFn` outside this seam (see that type's own doc comment).
+/// GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's device-model
+/// scope-selector values are no longer a standalone `DexRoutes::TagValuesFn`
+/// reading `TagStore` outside this seam — `DexRoutes` now derives them from
+/// THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`, via the SAME
+/// `dex_perf_cohorts()` helper the `GET /api/v1/dex/perf/cohorts` resource
+/// uses, so the dashboard picker and the public REST resource can never list
+/// different values. `fleet_snapshot` has no degrade channel (see its own doc
+/// comment), so a genuine empty cohort list is never rendered as a claimed
+/// "degraded" state — it is disclosed as "Model: no device-model values in
+/// the current fleet snapshot." instead, deliberately neutral wording since
+/// the empty case covers BOTH devices reporting with no `model` tag AND zero
+/// devices reporting anything at all this cycle (governance round-2, G8-2 —
+/// the earlier "no reporting device carries a model tag" wording falsely
+/// presupposed reporting devices existed). An unwired `dex_perf_api_` does NOT reach this
+/// code path at all: `DexRoutes`'s route handler returns an "unavailable"
+/// placeholder from its trend fetch before ever calling `fleet_snapshot`
+/// (see `dex_routes.cpp`'s F2a fragment handler).
 /// See `dex_app_perf_builders.hpp`'s banner for why VerifyApi's `.cohort`
 /// input shape specifically is not folded into this seam (a Fable review of
 /// the plan found it dead in production and would drag VerifyApi's types
@@ -175,16 +188,14 @@ public:
     /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (a named group is a
     /// set of specific devices, so a small-N aggregate is de-facto individual
     /// behaviour — works-council). `nullopt` = the aggregate read failed OR the
-    /// B1 `group_reader_` is unwired OR the group/tag store is unwired. A
-    /// DEGRADED member-resolution read is a known pre-existing gap, NOT
-    /// covered by `nullopt` today:
-    /// `ManagementGroupStore::get_members` returns an empty vector rather than
-    /// a distinguishable error on a store degrade, so `LocalDexPerfApi` cannot
-    /// tell "genuinely zero members" from "the read failed" and renders the
-    /// former (an empty trend, "no member reported…") in both cases — tracked as
-    /// #1762. `tag_trend` below does NOT share this gap: `TagStore`
-    /// returns `std::optional` and a degraded tag read fails closed to
-    /// `nullopt`.
+    /// B1 `group_reader_` is unwired OR the group/tag store is unwired OR the
+    /// member-resolution read degraded (`ManagementGroupStore::get_members_checked`
+    /// returned `nullopt` — store-not-open / pool-acquire-timeout / query-error,
+    /// #1762, fixed). `LocalDexPerfApi` resolves members via the checked twin,
+    /// not the fail-soft `get_members()`, so a degraded member read now fails
+    /// closed to `nullopt` instead of rendering as an empty trend — the SAME
+    /// contract `tag_trend` below already has via `TagStore`, which returns
+    /// `std::optional` and fails closed on a degraded tag read.
     [[nodiscard]] virtual std::optional<std::vector<AppPerfTrendPoint>>
     group_trend(const std::string& group_id, const std::string& app,
                const std::string& version) const = 0;

@@ -443,7 +443,7 @@ for fast, download-free builds:
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
-- **meson** 1.11.1 + the rest of `requirements-ci.txt` persist in the runner
+- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in the runner
   user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
   no-op (no re-download).
 - **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a

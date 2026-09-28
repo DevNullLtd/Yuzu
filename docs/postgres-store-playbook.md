@@ -290,23 +290,30 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise
   has changed. (Historical note: the original mandatory-backfill mechanism this bullet used to
   describe — a one-time, idempotent `migrate_from_sqlite()` running at startup, before serving,
-  failing closed on any error — is still what every already-migrated store built, and stays in
-  place for those stores. See ADR-0009's amendment for the full rationale.)
+  failing closed on any error — is what every store that built one built UNTIL ADR-0009's
+  hard-cutover Update (2026-09-04, #3623) withdrew it fleet-wide, including AuditStore's
+  previously-permanent exception. No store on this ladder has a `migrate_from_sqlite()` today —
+  see the ADR-0040-round-3 discussion further below for the retirement history. See ADR-0009's
+  2026-09-04 hard-cutover Update, not the earlier 2026-08-25 amendment, for the rationale.)
 - **Secret columns transform, never copy** (ADR-0010): applies only if you DO build a backfill
   under the documented-exception case above — a backfill that touches secret material
   encrypts/hashes on the way in, a plain column copy of a secret is forbidden. For the
   skip-by-default case, this bullet doesn't apply (there's no column copy to transform); see the
   detect-and-warn requirement above instead for that case's own obligation on secret-bearing
   legacy files.
-- **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.
-  Backfill opens it read-only; a wired subject/device erasure path must delete that identity
-  from the rollback copy so rollback cannot resurrect erased data. The upgrade-test
-  (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
-  config/reference/audit data survives previous-release-SQLite → new-release-Postgres —
-  **for a store that DID build a backfill** (the documented-exception case, or an
-  already-migrated store). **Superseded for the skip-by-default case** (ADR-0009's 2026-08-25
-  amendment): there is no transition to assert when nothing is copied across, so this
-  requirement does not apply to the common case above.
+- **Rollback window** — applies only if you DO build a backfill under the documented-exception
+  case above; **historical, no live target today** (see below): retain the legacy `<name>.db`
+  for exactly one release, then remove it. Backfill opens it read-only; a wired subject/device
+  erasure path must delete that identity from the rollback copy so rollback cannot resurrect
+  erased data. The upgrade-test (`scripts/test/test-upgrade-stack.sh` — the assertions live in the
+  script, not in `docker-compose.upgrade-test.yml`) used to assert config/reference/audit data
+  survives previous-release-SQLite → new-release-Postgres. ADR-0009's hard-cutover Update
+  (2026-09-04, #3623) retired every remaining backfill on this ladder, AuditStore's included, so
+  there is currently no store this requirement applies to — the last stale assertion of this
+  shape was removed from the harness in #3997. This was already superseded for the skip-by-default
+  case (ADR-0009's earlier 2026-08-25 amendment) for the same reason: there is no transition to
+  assert when nothing is copied across. If a future store's own per-store ADR reintroduces a
+  documented-exception backfill, its upgrade-test assertion belongs here again.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
 - **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
@@ -524,6 +531,21 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   `yuzu_pg_acquire_wait_seconds` histogram. Pool live-probe + every store's `is_open()` join
   the `/readyz` conjunction. Chaos coverage: CH-9/10/11 (pool exhaustion, PG down at boot,
   PG lost at runtime).
+- **`is_open()` is BOOT STATE — recorded decision (#3061, HA WS-8)**: a store latches `open_`
+  at the end of its constructor and never clears it, and construction failure is already
+  fail-closed (`startup_failed_`). So a store's `/readyz` row reports whether it opened and
+  migrated at boot, nothing more — do not describe it as catching a "runtime `is_open()`
+  flip", and do not add a per-store runtime probe. RUNTIME reachability is ONE shared
+  signal: `/readyz`'s `pg_reachable` row, fed by `PgReachabilityProbe`
+  (`server/core/src/pg_reachability_probe.hpp`) on its own dedicated connection. Per-store
+  runtime degradation (a revoked grant, a dropped table) is deliberately out of scope for
+  `/readyz`: every replica shares the database, so evicting one fixes nothing — it surfaces
+  as the store's own request-path 503s (or, for a store that fails open, its degraded answers)
+  and, where the store emits one, its `*_read_degrade_total` counter; several existing stores
+  (e.g. `deployment_store`, `result_set_store`, `notification_store`) have no
+  such counter, so only the HTTP 5xx rate shows it. A NEW store adds its `/readyz` (and
+  `/health`) row for boot-state parity AND a `*_read_degrade_total{reason}` counter, so this
+  decision holds for it.
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match

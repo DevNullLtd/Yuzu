@@ -135,6 +135,13 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
+    // after /readyz starts answering 503 `draining`, so a load balancer stops
+    // routing here before the socket closes. 0 = no minimum (the single-node
+    // default). Range [0, 60] — see shutdown_drain_rules.hpp for why 60. Wired
+    // via --shutdown-drain-seconds / YUZU_SHUTDOWN_DRAIN_SECONDS.
+    int shutdown_drain_seconds{0};
+
     // Set by main.cpp iff `AuthDB::seed_admin_if_empty` actually seeded the
     // sole admin user this boot (a genuinely-empty `auth.users` — fresh
     // start / Postgres cutover). Threaded through Config rather than set

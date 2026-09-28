@@ -74,6 +74,27 @@ jobs:
       - name: No conn-less libpq escape references (#1611)
         run: python3 tests/test_no_connless_pq_escape.py
 
+      # PR #4985 / ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL
+      # lives only in RbacAdminAuthorityOwner (never rbac_store.cpp), and its shared SQL
+      # fragment kAuthenticatableAdminGrantsFrom has exactly one definition. Also
+      # registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
+        run: python3 tests/test_rbac_query_owner_seam.py
+
+      # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
+      # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
+      # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered
+      # in tests/meson.build for local `meson test --suite docs` parity.
+      - name: Spark evidence format lockstep (#4665)
+        run: python3 tests/test_spark_evidence_format_lockstep.py
+
+      # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+      # subsystem that fails the moment a NEW spdlog:: call prints a rule-id/Spark-key-
+      # shaped argument unwrapped. Also registered in tests/meson.build for local
+      # `meson test --suite docs` parity.
+      - name: Guardian/Spark log-injection tripwire (#4665)
+        run: python3 tests/test_guardian_spark_log_injection_tripwire.py
+
       # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's
@@ -103,6 +124,17 @@ jobs:
       # synthetic input, touches no real ledger. Stdlib only.
       - name: Governance-ledger linter self-test
         run: python3 tests/test_governance_ledger_check_selftest.py
+
+      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
+      # (system roles, securable types, operations, the authorization-topology
+      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
+      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
+      # by the time PR #4776 audited them the doc was 15 securable types, one
+      # role and five floor entries behind — each drift arriving through a
+      # reviewed PR. Set-equality, so a failure names the entry rather than the
+      # count. Stdlib only, parses source text, needs no build.
+      - name: RBAC doc/seed parity
+        run: python3 tests/test_rbac_doc_counts.py
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
