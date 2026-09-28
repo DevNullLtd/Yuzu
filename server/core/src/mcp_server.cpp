@@ -14644,6 +14644,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
                 // every OS). by_os stays cross-OS — it IS the split.
                 const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
+                // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: resolve
+                // the caller's visible-agent set BEFORE the success audit —
+                // this derivation is the tool's ONLY per-device authz
+                // (perm_fn above is a bare global gate), so an UNSET
+                // `dex_visible_fn_` must REFUSE, audited, rather than
+                // silently serve fleet-wide (a SET resolver answering
+                // nullopt — RBAC off / global read — is the legitimate
+                // unfiltered case and is NOT this branch; see DexVisibleFn's
+                // doc comment, mcp_server.hpp).
+                if (!dex_visible_fn_) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.signal.view", "failure", "ObsType", obs_type,
+                        "DEX visibility resolver unwired (MCP get_dex_signal_detail)");
+                    res.set_content(
+                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
+                        "application/json");
+                    return;
+                }
+                const std::optional<std::set<std::string>> vis =
+                    dex_visible_fn_(session->username);
                 // Behavioral-PII access audit — the devices[] list below names the
                 // agent_ids exhibiting this signal. Same verb/target as the REST
                 // and dashboard per-signal views (cross-surface SIEM parity).
@@ -14663,7 +14683,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // reads the REST twin also bundles, same obs_type/window/os/limit.
                 const auto detail =
                     dex_api_->signal_detail(obs_type, param_str(args, "window", "7d"),
-                                            param_str(args, "os", ""), limit);
+                                            param_str(args, "os", ""), limit,
+                                            vis ? &*vis : nullptr);
                 JArr subjects;
                 for (const auto& s : detail.subjects) {
                     subjects.add(JObj()
@@ -14896,14 +14917,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the affected-devices
+                // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
+                // decision 3 / ADR-0033 clause 2: confine the affected-devices
                 // list to the caller's management-group scope (ADR-0017 World
                 // A) -- deny_fleet_wide_service_scoped above closes the
                 // service-scoped-token axis only; this is the independent
                 // confined-OPERATOR axis the REST twin now also applies (see
-                // rest_api_v1.cpp's GET /dex/app handler).
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
+                // rest_api_v1.cpp's GET /dex/app handler). This derivation is
+                // the tool's ONLY per-device authz, so an UNSET
+                // `dex_visible_fn_` must REFUSE, audited, before any success
+                // row is emitted -- never substitute nullopt/unfiltered.
+                if (!dex_visible_fn_) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.app.view", "failure", "GuaranteedState", "",
+                        "DEX visibility resolver unwired (MCP get_dex_app)");
+                    res.set_content(
+                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
+                        "application/json");
+                    return;
+                }
+                const std::optional<std::set<std::string>> vis = dex_visible_fn_(session->username);
                 const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/app).
@@ -15237,11 +15270,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the top-devices list
+                // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
+                // decision 3 / ADR-0033 clause 2: confine the top-devices list
                 // to the caller's management-group scope (ADR-0017 World A) --
-                // same independent second belt as get_dex_app above.
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
+                // same independent second belt as get_dex_app above, same
+                // refuse-if-unwired posture (this derivation is the tool's
+                // ONLY per-device authz).
+                if (!dex_visible_fn_) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.overview.view", "failure", "GuaranteedState", "",
+                        "DEX visibility resolver unwired (MCP get_dex_overview)");
+                    res.set_content(
+                        error_response(id, kInternalError, "DEX visibility resolver not configured"),
+                        "application/json");
+                    return;
+                }
+                const std::optional<std::set<std::string>> vis = dex_visible_fn_(session->username);
                 const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
                 // Fail-closed success audit (matches REST twin's posture --
                 // see rest_api_v1.cpp's route comment above GET /dex/overview).

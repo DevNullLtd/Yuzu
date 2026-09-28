@@ -79,7 +79,7 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
 
     CHECK(api->signals("7d", "").empty());
     CHECK(api->scope("7d").empty());
-    const auto detail = api->signal_detail("process.crashed", "7d", "", 50);
+    const auto detail = api->signal_detail("process.crashed", "7d", "", 50, nullptr);
     CHECK(detail.subjects.empty());
     CHECK(detail.by_os.empty());
     CHECK(detail.devices.empty());
@@ -113,12 +113,56 @@ TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[
     CHECK(api->scope("7d").size() == store.dex_os_signal_scope(since).size());
 
     // signal_detail bundles the four raw reads unchanged
-    const auto detail = api->signal_detail("process.crashed", "7d", "", 50);
+    const auto detail = api->signal_detail("process.crashed", "7d", "", 50, nullptr);
     CHECK(detail.subjects.size() == store.dex_signal_subjects("process.crashed", since, 50, "").size());
     CHECK(detail.devices.size() == store.dex_signal_devices("process.crashed", since, 50, "").size());
     CHECK(detail.by_day.size() == store.dex_signal_by_day("process.crashed", since, "").size());
     // notepad.exe crashed on two devices -> the most-affected list names both
     CHECK(detail.devices.size() == 2);
+}
+
+// ADR-0031 WS-A4 PR-1 decision 3: signal_detail's `visible` param confines
+// devices[] POST-limit (the store read is not itself re-filtered) — the
+// same admit-then-filter shape as build_dex_app_model/build_dex_overview_model.
+TEST_CASE("DexApi: signal_detail confines devices[] to the visible set, post-limit",
+          "[pg][dex_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    // a1 gets two events (wins a limit=1 cut over a2's one event, per
+    // dex_signal_devices' "COUNT(*) DESC, agent_id ASC" ordering).
+    seed_crash(store, "e1", "a1", "notepad.exe", "windows", kTs);
+    seed_crash(store, "e2", "a1", "notepad.exe", "windows", kTs);
+    seed_crash(store, "e3", "a2", "notepad.exe", "windows", kTs);
+
+    auto api = make_local_dex_api(&store, {});
+
+    // Unconfined (visible=nullptr): both devices, limit=50 keeps both.
+    const auto unconfined = api->signal_detail("process.crashed", "7d", "", 50, nullptr);
+    CHECK(unconfined.devices.size() == 2);
+
+    // Confined to exactly {a1}: a2 never appears.
+    const std::set<std::string> vis_a1{"a1"};
+    const auto confined = api->signal_detail("process.crashed", "7d", "", 50, &vis_a1);
+    REQUIRE(confined.devices.size() == 1);
+    CHECK(confined.devices[0].agent_id == "a1");
+
+    // Present-EMPTY visible set -> deny-all rows (never a substitute for
+    // unconfined).
+    const std::set<std::string> vis_empty{};
+    const auto denied = api->signal_detail("process.crashed", "7d", "", 50, &vis_empty);
+    CHECK(denied.devices.empty());
+    // subjects/by_os/by_day stay fleet-wide aggregates, unfiltered by visible.
+    CHECK_FALSE(denied.subjects.empty());
+
+    // POST-limit, not pre-limit: limit=1 keeps only a1 (the top event
+    // count) BEFORE the visible filter runs, so a2 -- who legitimately
+    // has events and would otherwise be visible -- is never fetched at
+    // all and cannot be re-admitted by widening `visible`.
+    const std::set<std::string> vis_a2{"a2"};
+    const auto post_limit = api->signal_detail("process.crashed", "7d", "", 1, &vis_a2);
+    CHECK(post_limit.devices.empty());
 }
 
 TEST_CASE("DexApi: device_score matches the shared builder (seam is a pure forward)",

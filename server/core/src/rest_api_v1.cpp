@@ -2065,25 +2065,42 @@ void RestApiV1::register_routes(
         return true;
     };
 
-    // #4035 hardening (governance): resolves the caller's management-group
-    // -visible agent set for confining a fleet-wide DEX device list (ADR-0017
-    // World A) — mirrors DexRoutes::resolve_visible (dex_routes.cpp) exactly,
-    // so GET /api/v1/dex/app and GET /api/v1/dex/overview confine their
-    // devices[]/top_devices[] lists the SAME way the equivalent dashboard
-    // fragments already do. This is a SECOND, independent belt alongside
-    // deny_fleet_wide_service_scoped above — that closes the service-scoped
-    // -API-token axis, this closes the management-group-confined-OPERATOR
-    // axis; neither substitutes for the other (see the SCOPING NOTE on
-    // server.cpp's dex_visible_fn provider). nullopt = unfiltered (global read
-    // / RBAC off, unresolved session, or dex_visible_fn unwired).
-    auto resolve_dex_visible =
-        [auth_fn, dex_visible_fn](const httplib::Request& req) -> std::optional<std::set<std::string>> {
+    // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
+    // resolves the caller's management-group-visible agent set for confining
+    // a fleet-wide DEX device list (ADR-0017 World A) — mirrors
+    // DexRoutes::resolve_visible (dex_routes.cpp) exactly, so GET
+    // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+    // /api/v1/dex/signals/{obs_type} confine their devices[]/top_devices[]
+    // lists the SAME way the equivalent dashboard fragments already do. This
+    // is a SECOND, independent belt alongside deny_fleet_wide_service_scoped
+    // above — that closes the service-scoped-API-token axis, this closes the
+    // management-group-confined-OPERATOR axis; neither substitutes for the
+    // other (see the SCOPING NOTE on server.cpp's dex_visible_fn provider).
+    //
+    // Return shape is a NESTED optional (ADR-0033 clause 2 — "unwired" and
+    // "wired, answered unfiltered" are NOT the same outcome for a route where
+    // this derivation is the ONLY per-device authz):
+    //   - outer `nullopt`  -> `dex_visible_fn` is UNWIRED (misconfiguration).
+    //     The caller MUST refuse (audited 500), never substitute nullopt or
+    //     present-empty.
+    //   - outer engaged, inner `nullopt` -> wired and answered "unfiltered"
+    //     (RBAC off, or the caller holds the global permission). Legitimate;
+    //     serve unconfined.
+    //   - outer engaged, inner engaged (incl. empty) -> filter to exactly
+    //     these agents.
+    // The no-session branch (`auth_fn` can't resolve a session on a request
+    // that already cleared `perm_fn`) is treated as the wired-unfiltered
+    // case, not as unwired — same posture as before this fix, and out of
+    // this fix's scope (it is not the "unwired resolver" class the ADR-0033
+    // clause is about).
+    auto resolve_dex_visible = [auth_fn, dex_visible_fn](const httplib::Request& req)
+        -> std::optional<std::optional<std::set<std::string>>> {
         if (!dex_visible_fn)
-            return std::nullopt;
+            return std::nullopt; // UNWIRED — caller must refuse
         httplib::Response throwaway;
         auto sess = auth_fn(req, throwaway);
         if (!sess)
-            return std::nullopt;
+            return std::optional<std::set<std::string>>{std::nullopt}; // no session to filter by
         return dex_visible_fn(sess->username);
     };
 
@@ -14601,7 +14618,7 @@ void RestApiV1::register_routes(
     // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
     // read-model has no such observations — it is not an entity-not-found).
     sink.Get(R"(/api/v1/dex/signals/([^/]+))",
-             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api](
+             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api, resolve_dex_visible](
                  const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): the devices[] array
@@ -14664,6 +14681,24 @@ void RestApiV1::register_routes(
                  // catalogue drilldown. by_os stays cross-OS (it IS the split).
                  const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
                  const std::string os_scope = dex_normalize_os_filter(os_raw);
+                 // ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: resolve
+                 // the caller's visible-agent set BEFORE the success audit —
+                 // this derivation is the route's ONLY per-device authz
+                 // (perm_fn above is a bare global gate, inert against
+                 // management-group confinement), so an UNWIRED resolver must
+                 // REFUSE, audited, rather than silently serve fleet-wide (a
+                 // wired resolver answering nullopt — RBAC off / global read —
+                 // is the legitimate unfiltered case and is NOT this branch).
+                 const auto vis_result = resolve_dex_visible(req);
+                 if (!vis_result) {
+                     res.status = 500;
+                     res.set_content(
+                         detail::a4_error(res, "DEX visibility resolver not configured"),
+                         "application/json");
+                     audit_fn(req, "dex.signal.view", "failure", "ObsType", obs_type,
+                              "DEX visibility resolver unwired");
+                     return;
+                 }
                  // Behavioral-PII access audit: the devices[] list below names the
                  // agent_ids exhibiting this signal. Emit the same verb the
                  // dashboard per-signal view does so a SIEM filter catches both.
@@ -14694,8 +14729,12 @@ void RestApiV1::register_routes(
                  // ADR-0031 WS-A4: the four raw signal-detail reads, bundled by
                  // the DexApi seam (the impl derives since + normalizes os the
                  // same way; os_scope below still feeds the response "os" field).
+                 // `vis_result` is guaranteed engaged past the refuse-if-unwired
+                 // check above; its inner optional is nullopt for the
+                 // legitimate unfiltered case.
+                 const auto& vis = *vis_result;
                  const DexSignalDetailModel detail =
-                     dex_api->signal_detail(obs_type, window, os_raw, limit);
+                     dex_api->signal_detail(obs_type, window, os_raw, limit, vis ? &*vis : nullptr);
                  JArr subjects;
                  for (const auto& s : detail.subjects) {
                      subjects.add(JObj()
@@ -15856,6 +15895,24 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         }
+        // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
+        // confine the affected-devices list to the caller's management-group
+        // scope (ADR-0017 World A) — the service-scoped-token axis is already
+        // closed above by deny_fleet_wide_service_scoped; this closes the
+        // independent confined-OPERATOR axis the equivalent /fragments/dex/app
+        // fragment already applies via resolve_visible (dex_routes.cpp).
+        // Resolved BEFORE the success audit (ADR-0033 clause 2): this
+        // derivation is the route's ONLY per-device authz, so an UNWIRED
+        // resolver must refuse, audited, before any success row is emitted.
+        const auto vis_result = resolve_dex_visible(req);
+        if (!vis_result) {
+            res.status = 500;
+            res.set_content(detail::error_json_a4(500, "DEX visibility resolver not configured", cid),
+                            "application/json");
+            audit_fn(req, "dex.app.view", "failure", "GuaranteedState", "",
+                     "DEX visibility resolver unwired");
+            return;
+        }
         if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.app.view", "success",
                                            "GuaranteedState", "",
                                            "REST DEX app affected-devices read cid=" + cid)) {
@@ -15869,13 +15926,7 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
             return;
         }
-        // #4035 hardening (governance): confine the affected-devices list to
-        // the caller's management-group scope (ADR-0017 World A) — the
-        // service-scoped-token axis is already closed above by
-        // deny_fleet_wide_service_scoped; this closes the independent
-        // confined-OPERATOR axis the equivalent /fragments/dex/app fragment
-        // already applies via resolve_visible (dex_routes.cpp).
-        const auto vis = resolve_dex_visible(req);
+        const auto& vis = *vis_result;
         const auto model = dex_api->app(name, window, vis ? &*vis : nullptr);
         res.set_content(ok_json(dex_app_json(model)), "application/json");
     });
@@ -16079,6 +16130,22 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
+                 // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1
+                 // decision 3: confine the top-devices list to the caller's
+                 // management-group scope (ADR-0017 World A) — same
+                 // independent second belt as GET /api/v1/dex/app above.
+                 // Resolved BEFORE the success audit (ADR-0033 clause 2), same
+                 // reasoning as the /dex/app route above.
+                 const auto vis_result = resolve_dex_visible(req);
+                 if (!vis_result) {
+                     res.status = 500;
+                     res.set_content(
+                         detail::error_json_a4(500, "DEX visibility resolver not configured", cid),
+                         "application/json");
+                     audit_fn(req, "dex.overview.view", "failure", "GuaranteedState", "",
+                              "DEX visibility resolver unwired");
+                     return;
+                 }
                  if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.overview.view",
                                                     "success", "GuaranteedState", "",
                                                     "REST DEX overview top-devices read cid=" +
@@ -16093,10 +16160,7 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 // #4035 hardening (governance): confine the top-devices list
-                 // to the caller's management-group scope (ADR-0017 World A) —
-                 // same independent second belt as GET /api/v1/dex/app above.
-                 const auto vis = resolve_dex_visible(req);
+                 const auto& vis = *vis_result;
                  const auto model = dex_api->overview(window, vis ? &*vis : nullptr);
                  res.set_content(ok_json(dex_overview_json(model)), "application/json");
              });

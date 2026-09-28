@@ -148,10 +148,34 @@ public:
     /// GET /api/v1/dex/scope — per-OS signal coverage.
     [[nodiscard]] virtual std::vector<DexOsScope> scope(const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/signals/{obs_type}?os=&limit= — one signal type's drill-down.
+    /// GET /api/v1/dex/signals/{obs_type}?os=&limit= — one signal type's
+    /// drill-down. `visible` confines the `devices[]` list (nullptr =
+    /// unconfined / global Read; present-EMPTY = deny-all rows), the SAME
+    /// admit-then-filter shape as `app`/`overview` above (ADR-0031 WS-A4
+    /// PR-1 decision 3 — closes the fleet-wide `devices[]` disclosure on
+    /// REST `GET /api/v1/dex/signals/{obs_type}` + MCP `get_dex_signal_detail`,
+    /// the two routes that previously called this method with no confinement
+    /// at all while the dashboard's own `/fragments/dex/catalogue/signal`
+    /// fragment already post-filtered its `devices[]` by the caller's
+    /// visible set).
+    ///
+    /// `limit` is applied to the store read FIRST (top-N most-affected
+    /// devices by event count), and `visible` filters THAT already-limited
+    /// set — never the reverse. This matches the pre-existing dashboard
+    /// fragment's own filter order (`dex_read_model.cpp`'s `app`/`overview`
+    /// builders filter post-limit the same way) so a byte-identical rendered
+    /// device list survives the rewire. The consequence: a confined caller
+    /// may see FEWER than `limit` devices even when more of their own
+    /// visible devices exhibit the signal — a device ranked outside the
+    /// store's top-`limit` is never fetched at all, so it cannot be
+    /// re-admitted by widening the visible set. Only `devices[]` is
+    /// filtered; `subjects`/`by_os`/`by_day` stay fleet-wide aggregates with
+    /// no per-agent identity (unchanged; whether THOSE aggregates should
+    /// also floor/confine is a separate, undecided follow-up).
     [[nodiscard]] virtual DexSignalDetailModel
     signal_detail(const std::string& obs_type, const std::string& window,
-                  const std::string& os_filter, int limit) const = 0;
+                  const std::string& os_filter, int limit,
+                  const std::set<std::string>* visible) const = 0;
 };
 
 } // namespace yuzu::server

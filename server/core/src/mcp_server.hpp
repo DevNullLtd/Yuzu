@@ -684,18 +684,30 @@ public:
     /// dashboard fragments now route through this same seam too.
     void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
-    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
-    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
-    /// devices/top_devices lists to the caller's management-group scope
-    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
-    /// `/fragments/dex/overview` already do. This is a SECOND, independent
-    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
-    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
-    /// Unset (default-constructed) degrades to "no confinement" (matching the
-    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
+    /// #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision 3:
+    /// the SAME username-keyed visible-agent-set resolver
+    /// `RestApiV1::DexVisibleFn` receives (see its doc comment,
+    /// rest_api_v1.hpp — the authoritative contract) — server.cpp wires the
+    /// IDENTICAL lambda (`dex_visible_fn`) into the dashboard fragment, the
+    /// REST twin, and this MCP twin, so `get_dex_app`/`get_dex_overview`/
+    /// `get_dex_signal_detail` confine their devices/top_devices lists to the
+    /// caller's management-group scope (ADR-0017 World A) exactly like
+    /// `/fragments/dex/app` and `/fragments/dex/overview` already do. This is
+    /// a SECOND, independent belt alongside `deny_fleet_wide_service_scoped`
+    /// — that closes the service-scoped-token axis, this closes the
+    /// confined-OPERATOR axis.
+    ///
+    /// **ADR-0033 clause (2) — UNWIRED is NOT "unfiltered".** For these three
+    /// tools this derivation is the tool's ONLY per-device authz (`perm_fn`
+    /// above is a bare global gate) — an unset (default-constructed)
+    /// `dex_visible_fn_` is the tool's OWN misconfiguration and each of the
+    /// three call sites REFUSES with an audited internal error rather than
+    /// substituting `nullopt`/unfiltered. This inverts this field's own
+    /// PRE-existing "unset == no confinement" contract (dating to #4035) —
+    /// that was the exact defect this fix closes; do not revert to it. A SET
+    /// `dex_visible_fn_` answering `nullopt` (RBAC off, or the caller holds
+    /// the global permission) is the legitimate unfiltered case and is
+    /// unaffected.
     using DexVisibleFn =
         std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }

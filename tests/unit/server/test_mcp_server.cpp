@@ -1189,13 +1189,35 @@ struct McpTestServer {
     DexFleet dex_fleet_for_test;
 
     /// #4035 hardening (governance) — the visible-agent-set resolver for
-    /// get_dex_app/get_dex_overview (ADR-0017 World A confinement,
-    /// independent of the service-scoped-token deny belt). nullopt (default)
-    /// = unfiltered, matching every EXISTING test in this file. Ignores
-    /// `username` — this stub doesn't model per-username resolution, only
-    /// whether the caller's set is engaged (read LIVE at request time via the
-    /// wiring lambda below).
+    /// get_dex_app/get_dex_overview/get_dex_signal_detail (ADR-0017 World A
+    /// confinement, independent of the service-scoped-token deny belt).
+    /// nullopt (default) = unfiltered, matching every EXISTING test in this
+    /// file — the WIRED-and-answered-nullopt case (ADR-0031 WS-A4 PR-1
+    /// decision 3 / ADR-0033 clause 2). Ignores `username` — this stub
+    /// doesn't model per-username resolution, only whether the caller's set
+    /// is engaged (read LIVE at request time via the wiring lambda below).
+    /// See `dex_visible_fn_for_test` below for a per-username resolver (the
+    /// engine-principal coverage) and `wire_dex_visible_fn_for_test` for the
+    /// genuinely-UNWIRED case.
     std::optional<std::set<std::string>> dex_visible_for_test;
+
+    /// ADR-0031 WS-A4 PR-1 decision 3: when set, REPLACES the
+    /// username-blind `dex_visible_for_test` stub above with a real
+    /// per-username resolver — lets a test replicate server.cpp's own
+    /// production `dex_visible_fn` lambda (RBAC-off/global-read -> nullopt,
+    /// else `RbacStore::visible_agents_for_permission`) against a REAL
+    /// `rbac_store_for_test`/`mgmt_store_for_test`, keyed by the session's
+    /// `username` (an engine-principal session carries `"engine:<slug>"` —
+    /// see auth_routes.cpp's `synth.username = api_token.principal_id`).
+    std::function<std::optional<std::set<std::string>>(const std::string& username)>
+        dex_visible_fn_for_test;
+
+    /// ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause 2: false → wire a
+    /// genuinely EMPTY `DexVisibleFn` (mirrors the REST harness's
+    /// `wire_dex_visible_fn_`), exercising get_dex_app/get_dex_overview/
+    /// get_dex_signal_detail's "unwired resolver -> audited internal error"
+    /// fail-closed path. Default true preserves every existing test.
+    bool wire_dex_visible_fn_for_test{true};
 
     /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
     /// hoisted to a member (was a start()-local) so a test can read its #3564
@@ -1534,12 +1556,21 @@ private:
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
 
-        // #4035 hardening (governance): same setter idiom, reads
-        // dex_visible_for_test LIVE at request time (see that field's doc
-        // comment) — unconditional, no-op-shaped default for every
-        // pre-existing test.
-        mcp.set_dex_visible_fn(
-            [this](const std::string&) { return dex_visible_for_test; });
+        // #4035 hardening (governance), amended ADR-0031 WS-A4 PR-1 decision
+        // 3: same setter idiom, reads dex_visible_for_test/dex_visible_fn_for_test
+        // LIVE at request time (see those fields' doc comments).
+        // wire_dex_visible_fn_for_test=false models the genuinely-unwired
+        // resolver instead (an empty DexVisibleFn) — never called by
+        // McpServer's set_dex_visible_fn at all, mirroring the REST harness's
+        // wire_dex_visible_fn_ toggle.
+        if (wire_dex_visible_fn_for_test) {
+            mcp.set_dex_visible_fn(dex_visible_fn_for_test
+                                       ? dex_visible_fn_for_test
+                                       : yuzu::server::mcp::McpServer::DexVisibleFn{
+                                             [this](const std::string&) {
+                                                 return dex_visible_for_test;
+                                             }});
+        }
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -7594,6 +7625,312 @@ TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
         CHECK(a != "mcp.get_dex_signal_detail|success");
     }
     CHECK(saw_denied);
+}
+
+// ADR-0031 WS-A4 PR-1 decision 3: get_dex_signal_detail's devices[] list
+// previously ALWAYS passed visible=nullptr to the DexApi seam regardless of
+// the caller's management-group scope, unlike its own
+// /fragments/dex/catalogue/signal dashboard fragment (which post-filters by
+// the caller's visible set). Same defect class + same fix as MCP
+// get_dex_app's own regression test above.
+TEST_CASE("MCP DEX: get_dex_signal_detail devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto unconfined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9731,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(unconfined);
+    auto ubody = nlohmann::json::parse(unconfined->body);
+    auto upayload =
+        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(upayload["devices"].size() == 2);
+
+    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
+    auto confined = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9732,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(confined);
+    auto cbody = nlohmann::json::parse(confined->body);
+    auto cpayload =
+        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(cpayload["devices"].is_array());
+    CHECK(cpayload["devices"].size() == 1);
+    CHECK(cpayload["devices"][0]["agent_id"] == "WS-1");
+    for (const auto& d : cpayload["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+
+    // Present-EMPTY visible set -> deny-all rows, never a substitute for
+    // unconfined.
+    ts.dex_visible_for_test = std::set<std::string>{};
+    auto denied_scope = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9733,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(denied_scope);
+    auto dbody = nlohmann::json::parse(denied_scope->body);
+    auto dpayload =
+        nlohmann::json::parse(dbody["result"]["content"][0]["text"].get<std::string>());
+    CHECK(dpayload["devices"].empty());
+    CHECK_FALSE(dpayload["subjects"].empty()); // fleet-wide aggregate, unfiltered
+}
+
+// POST-limit, not pre-limit (same coverage as the REST sibling test) — the
+// store read applies `limit` FIRST, so a device outside the resulting top-N
+// is never re-admitted by widening `visible`.
+TEST_CASE("MCP DEX: get_dex_signal_detail visible filters POST-limit, not pre-limit",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "pl1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "pl2", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:05:00Z");
+    mcp_seed_obs(store, "pl3", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.dex_visible_for_test = std::set<std::string>{"WS-2"};
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9734,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all","limit":1}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // WS-2 is in the visible set but never made the store's top-1 cut
+    // (WS-1 has two events, WS-2 has one) -- devices[] is empty.
+    CHECK(payload["devices"].empty());
+}
+
+// ADR-0031 WS-A4 PR-1 decision 3 / ADR-0033 clause (2): a genuinely UNSET
+// `dex_visible_fn_` (never wired via set_dex_visible_fn) is the tool's OWN
+// misconfiguration, distinct from a set resolver answering nullopt -- it
+// must REFUSE (audited internal error), never silently serve fleet-wide.
+TEST_CASE("MCP DEX: get_dex_signal_detail unwired visibility resolver refuses, "
+          "audited failure",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "u1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.wire_dex_visible_fn_for_test = false;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9735,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.signal.view|failure")
+            saw_failure = true;
+        CHECK(a != "dex.signal.view|success");
+    }
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP DEX: get_dex_app unwired visibility resolver refuses, audited failure",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "u1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.wire_dex_visible_fn_for_test = false;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9736,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.app.view|failure")
+            saw_failure = true;
+        CHECK(a != "dex.app.view|success");
+    }
+    CHECK(saw_failure);
+}
+
+TEST_CASE("MCP DEX: get_dex_overview unwired visibility resolver refuses, audited failure",
+          "[pg][mcp][integration][dex][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.wire_dex_visible_fn_for_test = false;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9737,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.overview.view|failure")
+            saw_failure = true;
+        CHECK(a != "dex.overview.view|success");
+    }
+    CHECK(saw_failure);
+}
+
+// ADR-0031 WS-A4 PR-1 decision 3 — engine-principal coverage. An
+// engine-principal session (auth_routes.cpp: `synth.username =
+// api_token.principal_id`, i.e. the literal string "engine:<slug>") flows
+// through the SAME `RbacStore::visible_agents_for_permission(username, ...)`
+// call the production `dex_visible_fn` lambda in server.cpp makes — RBAC
+// resolves grants by username string, independent of principal type.
+//
+// FINDING (this test was originally written to prove a management-group
+// -SCOPED engine grant narrows devices[] the same way a human operator's
+// would; it cannot be — recorded here rather than silently dropped):
+// `ManagementGroupStore::assign_role` REJECTS `principal_type == "engine"`
+// outright ("engine principals cannot hold scoped role assignments in this
+// release" — PR 4.2 only ships FLEET-WIDE engine grants; scoped engine role
+// assignment is a Phase-5 deliverable). Even setting that check aside,
+// `get_assignments_for_principal`'s SQL hardcodes
+// `principal_type='user' AND principal_id=$1` for the direct-principal
+// branch, so a stray `principal_type='engine'` row would never be read back
+// by the resolver anyway. THIRD clause found while building the fleet-wide
+// fallback below: even `RbacStore::assign_role` (the "ONE supported grant
+// shape") further restricts an engine principal to a CUSTOM (non-`is_system`)
+// role — its own F1 guard rejects ANY built-in role, e.g. "Operator" (not
+// just the admin-class roles `validate_assignment`'s narrower "no admin,
+// ever" bar names) — so this test grants a test-only custom role rather than
+// a seeded built-in one. **The conclusion:** an engine principal's
+// `dex_visible_fn` resolution can ONLY ever answer `nullopt` (a
+// global/fleet-wide grant of a CUSTOM role via `RbacStore::assign_role`, the
+// one grant shape PR 4.2 supports) or an empty set (no grant) — NEVER a
+// genuinely narrowed non-empty subset, today. This test instead proves the mechanism
+// that DOES apply end-to-end: an engine-principal SESSION correctly resolves
+// through a REAL RbacStore's global grant, AND that the scoped-assignment
+// attempt is rejected exactly where the confinement gap would otherwise be
+// invisible. If/when Phase-5 lands scoped engine grants, flip this test's
+// final assertion to the narrowed-set shape the two REMOVED CHECK_FALSE
+// candidates below describe.
+static yuzu::test::PgTestTemplate mcp_dex_engine_principal_tpl{
+    "mcpdexengineprincipal", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GuaranteedStateStore store{pool};
+        yuzu::server::RbacStore rbac{pool};
+        yuzu::server::ManagementGroupStore mgmt{pool};
+        if (!store.is_open() || !rbac.is_open() || !mgmt.is_open())
+            throw std::runtime_error("mcpdexengineprincipal template: a store failed to migrate");
+    }};
+
+TEST_CASE("MCP DEX: get_dex_app — engine-principal session resolves via a REAL "
+          "RbacStore global grant; a scoped (management-group) engine grant is "
+          "rejected outright (PR 4.2 boundary, not this fix's scope)",
+          "[pg][mcp][integration][dex][scope][engine_principal]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_dex_engine_principal_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    yuzu::server::RbacStore rbac(pool);
+    yuzu::server::ManagementGroupStore mgmt(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(rbac.is_open());
+    REQUIRE(mgmt.is_open());
+    rbac.set_rbac_enabled(true); // RBAC-off would answer nullopt for every caller
+
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "e2", "WS-2", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+
+    // The confinement gap this test set out to probe: a management-group
+    // -scoped grant for an engine principal is refused at the WRITE side.
+    yuzu::server::ManagementGroup group;
+    group.name = "Engine scope group";
+    group.membership_type = "static";
+    group.created_by = "admin";
+    auto group_id = mgmt.create_group(group);
+    REQUIRE(group_id.has_value());
+    REQUIRE(mgmt.add_member(*group_id, "WS-1").has_value());
+    yuzu::server::GroupRoleAssignment scoped_grant;
+    scoped_grant.group_id = *group_id;
+    scoped_grant.principal_type = "engine";
+    scoped_grant.principal_id = "engine:dex-reader";
+    scoped_grant.role_name = "Operator";
+    auto scoped_result = mgmt.assign_role(scoped_grant);
+    REQUIRE_FALSE(scoped_result.has_value());
+    CHECK(scoped_result.error().find("scoped role assignments") != std::string::npos);
+
+    // PR 4.2's ONE supported grant shape: a global (fleet-wide, non-group)
+    // RbacStore role assignment -- and even THAT is further restricted to a
+    // CUSTOM (non-`is_system`) role (`RbacStore::assign_role`'s own F1 guard
+    // rejects ANY built-in role, e.g. "Operator", for principal_type=="engine"
+    // -- "no built-in role, ever" generalizes validate_assignment's narrower
+    // "no admin, ever" bar). A custom role is the mechanism engine principals
+    // actually use for a fleet-wide grant.
+    yuzu::server::RbacRole custom_role;
+    custom_role.name = "EngineDexReader";
+    custom_role.description = "test-only custom role for engine-principal DEX read coverage";
+    custom_role.is_system = false;
+    REQUIRE(rbac.create_role(custom_role).has_value());
+    yuzu::server::Permission perm;
+    perm.role_name = "EngineDexReader";
+    perm.securable_type = "GuaranteedState";
+    perm.operation = "Read";
+    perm.effect = "allow";
+    REQUIRE(rbac.set_permission(perm).has_value());
+    yuzu::server::PrincipalRole global_grant;
+    global_grant.principal_type = "engine";
+    global_grant.principal_id = "engine:dex-reader";
+    global_grant.role_name = "EngineDexReader";
+    REQUIRE(rbac.assign_role(global_grant).has_value());
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.mock_username = "engine:dex-reader"; // engine-principal session keying
+    ts.rbac_store_for_test = &rbac;
+    ts.mgmt_store_for_test = &mgmt;
+    // Replicate server.cpp's production dex_visible_fn lambda verbatim
+    // against the REAL stores above, keyed by the session's username.
+    ts.dex_visible_fn_for_test =
+        [&rbac, &mgmt](const std::string& username) -> std::optional<std::set<std::string>> {
+        if (!yuzu::server::rbac_enforcement_in_effect(&rbac))
+            return std::nullopt;
+        if (rbac.is_open() && rbac.check_permission(username, "GuaranteedState", "Read"))
+            return std::nullopt; // global read via the fleet-wide grant above
+        auto v = rbac.visible_agents_for_permission(username, "GuaranteedState", "Read", &mgmt);
+        if (!v)
+            return std::set<std::string>{}; // fail-closed
+        return std::set<std::string>(v->begin(), v->end());
+    };
+    ts.start("readonly");
+
+    // The global grant resolves nullopt (unfiltered) -- the SAME
+    // "wired-and-unfiltered" case a human operator with a global grant gets;
+    // both WS-1 and WS-2 appear, because there is no group-scoped grant to
+    // narrow against (the rejected assignment above never landed).
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9738,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload["devices"].is_array());
+    CHECK(payload["devices"].size() == 2);
 }
 
 // ── #4035 (api-parity #2146 Batch A): get_dex_device_score — the MCP-only gap ──
