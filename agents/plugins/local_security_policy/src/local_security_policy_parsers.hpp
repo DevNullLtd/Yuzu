@@ -102,14 +102,16 @@ inline std::optional<std::string> decode_utf16le_bom(std::span<const std::uint8_
 }
 
 /// Case-insensitive `std::map` ordering/lookup for INI section and key names (the INF
-/// rule): `secedit_export_complete` already compares section/key names case-insensitively,
-/// but a plain `std::map<std::string,...>` orders and looks up by exact bytes, so a
-/// differently-cased section or key that passed the completeness check was invisible to
-/// `secedit_policy_rows`'s row lookups -- a present setting silently read as the legitimate
-/// modal value `absent` (#4997). `is_transparent` lets `.find()` take a `std::string_view`
-/// literal directly, same call sites as before. Values keep whatever casing the export
-/// file used -- only lookup/ordering are case-insensitive, so the audit row loop below
-/// (which prints the stored key verbatim) is unaffected.
+/// rule), restored from the pre-split secedit implementation this PR does not ship:
+/// `secedit_export_complete` and `secedit_policy_rows` (PLANNED, follow with the Windows
+/// leg in their own PR -- see this file's "WHEN THE SUDOERS ACTION LANDS" banner) will
+/// compare section/key names case-insensitively; a plain `std::map<std::string,...>`
+/// orders and looks up by exact bytes, so a differently-cased section or key that passed
+/// the completeness check would be invisible to the row lookups -- a present setting
+/// silently reading as the legitimate modal value `absent` (#4997, the defect this type
+/// exists to prevent once its callers land). `is_transparent` lets `.find()` take a
+/// `std::string_view` literal directly. Values keep whatever casing the export file used
+/// -- only lookup/ordering are case-insensitive.
 struct CaseInsensitiveLess {
     using is_transparent = void;
     bool operator()(std::string_view a, std::string_view b) const {
@@ -127,8 +129,9 @@ struct CaseInsensitiveLess {
 /// before the first section are ignored; a repeated key keeps the last value
 /// (case-insensitively -- see CaseInsensitiveLess -- so `MinimumPasswordLength` and a
 /// later `minimumpasswordlength` in the same section are the same key). std::map, not
-/// unordered: secedit_policy_rows iterates `[Event Audit]` directly, so the key order IS
-/// the audit_policy row order on the wire.
+/// unordered: the PLANNED `secedit_policy_rows` (see CaseInsensitiveLess's comment) will
+/// iterate `[Event Audit]` directly once it lands, so the key order IS meant to become the
+/// audit_policy row order on the wire.
 using InfSections =
     std::map<std::string, std::map<std::string, std::string, CaseInsensitiveLess>, CaseInsensitiveLess>;
 
@@ -432,9 +435,10 @@ struct Tally {
     /// reservation the cap silently drops the row announcing the cap, so the
     /// output ended on an ordinary row indistinguishable from a complete dump --
     /// the one place a non-OK status was not paired with a row saying why.
-    /// `marker_prefix` is the action's row prefix; `marker_fields` makes the
-    /// marker match the action's own field count (4 for the kv actions, 7 for
-    /// sudoers), so the truncation notice never breaks the wire shape.
+    /// `marker_prefix` is the action's row prefix; the marker is always the 4-field
+    /// kv shape in this PR (the Sudoers action, whose row is 7 fields, is PLANNED and
+    /// follows as its own PR -- see local_security_policy_legs.hpp's "when the sudoers
+    /// action lands" note, which must restore a 7-field marker branch here alongside it).
     void row(std::string r) {
         if (rows.size() + 1 >= kMaxRows) {
             if (!capped) {
@@ -448,10 +452,6 @@ struct Tally {
     }
 
     std::string marker_prefix{"local_security_policy"};
-    std::size_t marker_fields{4};
-    // marker_fields is always 4 in this PR: the Sudoers action (whose row is 7 fields) is
-    // PLANNED, follows as its own PR -- see local_security_policy_legs.hpp's "when the sudoers
-    // action lands" note, which restores the 7-field branch here.
     [[nodiscard]] std::string truncation_marker() const {
         return format_kv_row(marker_prefix, "source_state", "unreadable:row_cap", marker_prefix);
     }
@@ -625,6 +625,13 @@ struct PwPolicyItem {
     std::string category;   // policyCategoryAuthentication | policyCategoryPasswordContent | ...
     std::string identifier; // policyIdentifier
     std::string content;    // policyContent (Apple policy expression)
+    /// True iff the plist actually carried a scalar `policyContent` key (even an empty one).
+    /// `content` alone can't distinguish "key absent" from "key present, empty string" -- both
+    /// leave `content.empty()` true -- and pwpolicy_rows() needs that distinction: a genuinely
+    /// present-but-empty value renders `policy_content|present` (format_kv_row's own contract for
+    /// any present-empty value), never the `missing_content` shape-defect reserved for a truly
+    /// absent key.
+    bool has_content = false;
     std::vector<std::pair<std::string, std::string>> params; // policyParameters scalars, key-sorted
     /// What the plist bridge could NOT read in the documented shape, each named once:
     /// `malformed_category` (the category's value is not an array), `malformed_policy`
@@ -721,15 +728,17 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             continue;
         }
         if (lock != (action == LocalPolicyAction::Lockout)) continue;
-        if (it.content.empty() && it.params.empty() && it.defects.empty()) {
+        if (!it.has_content && it.params.empty() && it.defects.empty()) {
             // A policy element carrying nothing this action can report is a shape defect,
             // not "no policy": without this row it would vanish, and could leave the clean
-            // `policies|none` answer below.
+            // `policies|none` answer below. Gated on has_content, not content.empty() -- a
+            // genuinely present-but-empty policyContent must fall through to the row below,
+            // never collapse into this shape-defect case.
             rows.push_back(format_kv_row(prefix, "source_state", "unreadable:missing_content", src));
             acc.add_failure("pwpolicy:missing_content");
             continue;
         }
-        if (!it.content.empty()) rows.push_back(format_kv_row(prefix, "policy_content", it.content, src));
+        if (it.has_content) rows.push_back(format_kv_row(prefix, "policy_content", it.content, src));
         if (const auto n = pwpolicy_min_length(it.content))
             rows.push_back(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
         for (const auto& [k, v] : it.params) {

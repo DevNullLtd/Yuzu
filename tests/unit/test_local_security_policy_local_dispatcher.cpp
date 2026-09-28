@@ -106,5 +106,12 @@ TEST_CASE("local_security_policy: each real action returns at least one well-sha
             CHECK((row.rfind(std::string{action} + "|", 0) == 0 ||
                    row.rfind("constrained|", 0) == 0));
         }
+        // apply_collected() calls CommandContext::set_result_status() on every path (Ok,
+        // PermissionDenied, Constrained) -- prove that ABI4 CC-07 seam actually fired, not
+        // just that a row was written. A plugin that stopped calling set_result_status would
+        // leave result_status at its UNDECLARED default with every row-shape check above
+        // still green.
+        CHECK(result.result_status != YUZU_RESULT_STATUS_UNDECLARED);
+        CHECK(result.result_completeness != YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
 }

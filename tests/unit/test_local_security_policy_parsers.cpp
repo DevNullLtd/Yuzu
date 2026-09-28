@@ -19,6 +19,7 @@
 
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_parsers.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <map>
@@ -223,6 +224,65 @@ TEST_CASE("local_security_policy collect_file_policy: macOS never reads Linux pa
     CHECK_FALSE(called);
 }
 
+TEST_CASE("local_security_policy collect_file_policy: Linux audit_policy over injected audit.rules",
+          "[local_security_policy][parsers]") {
+    // Same fixture shape as the "auditd: rule vs control-directive counting" pure-parser
+    // case above, driven this time through the actual collect_file_policy(Audit) wiring --
+    // nothing previously exercised this switch arm (only the underlying parser helper).
+    auto rd = reader_from({{"/etc/audit/audit.rules", "# audit rules\n"
+                                                       "-D\n"
+                                                       "-b 8192\n"
+                                                       "-w /etc/shadow -p wa -k identity\n"
+                                                       "-a always,exit -F arch=b64 -S execve\n"
+                                                       "-e 1\n"
+                                                       "some_unknown_directive foo\n"}});
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Audit, rd, empty_dir());
+    CHECK(c.status == PolicyStatus::Ok);
+    const std::vector<std::string> expect = {
+        "audit_policy|rules|3|/etc/audit/audit.rules",
+        "audit_policy|watch_rules|1|/etc/audit/audit.rules",
+        "audit_policy|syscall_rules|1|/etc/audit/audit.rules",
+        "audit_policy|unmodelled_lines|1|/etc/audit/audit.rules",
+        "audit_policy|control_lines|3|/etc/audit/audit.rules",
+        "audit_policy|enabled|enabled|/etc/audit/audit.rules",
+    };
+    for (const auto& row : expect) CHECK(c.rows.end() != std::find(c.rows.begin(), c.rows.end(), row));
+    CHECK(c.rows.size() == expect.size()); // arithmetic closes: exactly these six, nothing else
+}
+
+TEST_CASE("local_security_policy collect_file_policy: macOS audit_policy over injected audit_control",
+          "[local_security_policy][parsers]") {
+    // The macOS Audit arm takes a distinct code path from Linux (":" kv lines, not the
+    // rule-counting parser) -- previously unexercised at the collector level.
+    auto rd = reader_from({{"/etc/security/audit_control", "dir:/var/audit\nflags:lo,aa\n"}});
+    const auto c = collect_file_policy(FileFlavor::Macos, LocalPolicyAction::Audit, rd, empty_dir());
+    CHECK(c.status == PolicyStatus::Ok);
+    bool saw_dir = false, saw_flags = false;
+    for (const auto& r : c.rows) {
+        if (r == "audit_policy|dir|/var/audit|/etc/security/audit_control") saw_dir = true;
+        if (r == "audit_policy|flags|lo,aa|/etc/security/audit_control") saw_flags = true;
+    }
+    CHECK(saw_dir);
+    CHECK(saw_flags);
+}
+
+TEST_CASE("local_security_policy collect_file_policy: an embedded NUL is embedded_nul, never a "
+          "truncated value",
+          "[local_security_policy][parsers]") {
+    // checked_read() (read_source's one call site) auto-detects a NUL in an otherwise
+    // successful read and converts it to kReadEmbeddedNul -- exercised here through the
+    // real injected-reader path, not just the classify_read_errno token-mapping test.
+    using namespace std::string_literals;
+    auto rd = reader_from({{"/etc/login.defs", "PASS_MAX_DAYS 99999\0trailing"s}});
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Password, rd, empty_dir());
+    CHECK(c.status == PolicyStatus::Constrained);
+    bool saw_embedded_nul = false;
+    for (const auto& r : c.rows)
+        if (r == "password_policy|source_state|unreadable:embedded_nul|/etc/login.defs")
+            saw_embedded_nul = true;
+    CHECK(saw_embedded_nul);
+}
+
 TEST_CASE("local_security_policy Tally: the row cap reserves its own slot for the truncation marker",
           "[local_security_policy][parsers]") {
     detail::Tally t;
@@ -272,13 +332,19 @@ TEST_CASE("local_security_policy pwpolicy: minimum-length extraction is exact, n
 
 TEST_CASE("local_security_policy pwpolicy_rows: category routing, defects, and the clean-none row",
           "[local_security_policy][parsers][pwpolicy]") {
-    const PwPolicyItem lock{"policyCategoryAuthentication", "loginRateLimit",
-                            "policyAttributeFailedAuthentications < 5", {}, {}};
-    const PwPolicyItem pw{"policyCategoryPasswordContent", "requireAlpha",
-                          "policyAttributePassword matches '.{14,}'",
-                          {{"policyAttributePassword", "x"}, {"autoEnableInSeconds", "300"}}, {}};
-    const PwPolicyItem unmodelled_cat{"policyCategorySomethingElse", "", "", {}, {}};
-    const PwPolicyItem defective{"policyCategoryPasswordContent", "broken", "", {}, {"malformed_content"}};
+    const PwPolicyItem lock{.category = "policyCategoryAuthentication",
+                            .identifier = "loginRateLimit",
+                            .content = "policyAttributeFailedAuthentications < 5",
+                            .has_content = true};
+    const PwPolicyItem pw{.category = "policyCategoryPasswordContent",
+                          .identifier = "requireAlpha",
+                          .content = "policyAttributePassword matches '.{14,}'",
+                          .has_content = true,
+                          .params = {{"policyAttributePassword", "x"}, {"autoEnableInSeconds", "300"}}};
+    const PwPolicyItem unmodelled_cat{.category = "policyCategorySomethingElse"};
+    const PwPolicyItem defective{.category = "policyCategoryPasswordContent",
+                                 .identifier = "broken",
+                                 .defects = {"malformed_content"}};
 
     const auto lockout = pwpolicy_rows(LocalPolicyAction::Lockout, {lock, pw, unmodelled_cat});
     bool saw_content = false, saw_unmodelled = false;
@@ -313,14 +379,30 @@ TEST_CASE("local_security_policy pwpolicy_rows: category routing, defects, and t
         if (r.find("unreadable:malformed_content") != std::string::npos) saw_defect_row = true;
     CHECK(saw_defect_row);
 
-    // An item carrying nothing this action can report is its own shape defect.
-    const PwPolicyItem empty_item{"policyCategoryPasswordContent", "id", "", {}, {}};
+    // An item carrying nothing this action can report is its own shape defect: content genuinely
+    // absent (has_content still default-false), no params, no defects.
+    const PwPolicyItem empty_item{.category = "policyCategoryPasswordContent", .identifier = "id"};
     const auto empty_result = pwpolicy_rows(LocalPolicyAction::Password, {empty_item});
     CHECK(empty_result.status == PolicyStatus::Constrained);
     bool saw_missing_content = false;
     for (const auto& r : empty_result.rows)
         if (r.find("unreadable:missing_content") != std::string::npos) saw_missing_content = true;
     CHECK(saw_missing_content);
+
+    // A policyContent key that IS present but holds an empty string is a real, present value --
+    // never the missing_content shape defect (regression for the has_content/content.empty()
+    // conflation this PR's own /code-review functional pass caught, FV-codex-5).
+    const PwPolicyItem present_empty_content{
+        .category = "policyCategoryPasswordContent", .identifier = "id", .content = "", .has_content = true};
+    const auto present_empty_result = pwpolicy_rows(LocalPolicyAction::Password, {present_empty_content});
+    CHECK(present_empty_result.status == PolicyStatus::Ok);
+    bool saw_present_content = false, saw_false_missing_content = false;
+    for (const auto& r : present_empty_result.rows) {
+        if (r.find("policy_content|present|") != std::string::npos) saw_present_content = true;
+        if (r.find("unreadable:missing_content") != std::string::npos) saw_false_missing_content = true;
+    }
+    CHECK(saw_present_content);
+    CHECK_FALSE(saw_false_missing_content);
 
     // No matching item and no defect: the clean modal "none" row, never an empty vector.
     const auto none = pwpolicy_rows(LocalPolicyAction::Lockout, {});

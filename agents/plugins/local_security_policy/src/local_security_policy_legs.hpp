@@ -14,7 +14,11 @@
  * files() list and the advapi32 dependency branch, add collect_windows_policy's declaration
  * back here, restore plugin.cpp's #if defined(_WIN32) dispatch to call it, flip the three
  * actions' windows_leg descriptors off YUZU_SUPPORT_PLANNED, then grep the tree for
- * "planned" and "follows as its own PR" and update every hit.
+ * "planned" and "follows as its own PR" and update every hit. Also add a
+ * `local_security_policy.dll` Source line to deploy/packaging/windows/yuzu-agent.iss (the
+ * portable TU already builds a .dll on Windows even in THIS PR, but the installer's per-DLL
+ * Sources list has no entry for it yet -- an installed Windows agent would report
+ * plugin-not-installed until this line lands, not the planned row execute() reports today).
  *
  * WHEN THE SUDOERS ACTION LANDS: restore local_security_policy_parsers.hpp's sudoers block
  * (lines 310-845 of the pre-split file: detail::SudoersLexer, parse_sudoers,
@@ -23,7 +27,9 @@
  * the 4th kActionDescriptors entry and the `execute()` guard that currently treats Sudoers
  * as unregistered; add the 4th plugin_action_catalogue_local_security_policy.hpp row; restore
  * the sudoers-specific test cases in test_local_security_policy_parsers.cpp; re-derive
- * EXPECTED_TOTAL_ROWS.
+ * EXPECTED_TOTAL_ROWS; restore a 7-field branch to Tally::truncation_marker() in
+ * local_security_policy_parsers.hpp (removed in this PR since only the 4-field kv shape is
+ * reachable here -- see that function's own doc comment).
  */
 #pragma once
 
@@ -308,7 +314,7 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
     }
     for (const auto& [category, value] : root.entries) {
         if (CFGetTypeID(value) != CFArrayGetTypeID()) {
-            PwPolicyItem it{category, "", "", {}, {}};
+            PwPolicyItem it{.category = category};
             detail::add_defect(it, "malformed_category");
             items.push_back(std::move(it));
             continue;
@@ -316,7 +322,7 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
         const auto arr = static_cast<CFArrayRef>(value);
         for (CFIndex i = 0; i < CFArrayGetCount(arr); ++i) {
             const auto el = static_cast<CFTypeRef>(CFArrayGetValueAtIndex(arr, i));
-            PwPolicyItem it{category, "", "", {}, {}};
+            PwPolicyItem it{.category = category};
             if (CFGetTypeID(el) != CFDictionaryGetTypeID()) {
                 detail::add_defect(it, "malformed_policy");
                 items.push_back(std::move(it));
@@ -333,8 +339,10 @@ inline std::optional<std::vector<PwPolicyItem>> pwpolicy_plist_to_items(std::str
                     if (auto t = detail::cf_scalar_text(v)) it.identifier = std::move(*t);
                     else detail::add_defect(it, "malformed_identifier");
                 } else if (k == "policyContent") {
-                    if (auto t = detail::cf_scalar_text(v)) it.content = std::move(*t);
-                    else detail::add_defect(it, "malformed_content");
+                    if (auto t = detail::cf_scalar_text(v)) {
+                        it.content = std::move(*t);
+                        it.has_content = true;
+                    } else detail::add_defect(it, "malformed_content");
                 } else if (k == "policyParameters") {
                     if (CFGetTypeID(v) != CFDictionaryGetTypeID()) {
                         detail::add_defect(it, "malformed_parameters");
