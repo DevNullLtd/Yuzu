@@ -300,12 +300,10 @@ their own workflow, from either the interface or the API.
   installed for a single user account, rather than for the machine as a whole, is not collected by
   this decision; it depends on user-level access work this platform has not yet built, and is
   explicitly left for later.
-- **Risk and compliance interpretation.** This decision produces facts — what is installed, where,
-  and how it was found. It does not score those facts for vulnerability, license compliance, or
-  policy violation. Those are separate, existing or future capabilities that can consume the
-  identity this inventory now provides, but this decision does not build or extend them.
-  Correspondingly, nothing in this decision touches this platform's existing vulnerability-related
-  capabilities.
+- **Compliance interpretation.** This decision produces facts — what is installed, where, and how
+  it was found. It does not score those facts for license compliance or policy violation. Other
+  capabilities, existing or future, can consume the identity this inventory now provides, but this
+  decision does not build or extend them.
 - **Outward-pushing integrations.** This platform is read from; it does not write to another
   system on its own initiative. A connector that actively pushes this inventory into a third-party
   system is not part of this decision and would be a separate, later one if ever pursued.
@@ -346,12 +344,11 @@ beyond what already applies to machine-level inventory data applies to it.
   sub-daily latency. The daily-plus-on-demand model meets the need at a fraction of the cost, and
   the on-demand check exists precisely for the cases where "as of this morning" genuinely isn't
   good enough.
-- **Building per-user visibility, or risk/compliance interpretation, into this same decision.**
+- **Building per-user visibility, or compliance interpretation, into this same decision.**
   Deferred, not rejected: both are real future needs, but bundling them here would make this
-  decision depend on work — user-level machine access, a risk-scoring capability — that either
-  does not exist yet or belongs to a different, already-established part of this platform. Keeping
-  this decision to machine-level facts lets it ship on its own and lets those other capabilities
-  consume it later without having shaped it prematurely.
+  decision depend on work, such as user-level machine access, that does not exist yet. Keeping
+  this decision to machine-level facts lets it ship on its own and lets other capabilities consume
+  it later without having shaped it prematurely.
 
 ## Where the detail lives
 
