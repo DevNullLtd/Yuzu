@@ -56,6 +56,7 @@
 
 #include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
 #include "mfa_step_up.hpp"          // StepUpFn, the step-up seam the REST routes call
+#include "pg/pg_raii.hpp"           // PgConn/PgResult — the list-route query-failure test
 #include "rbac_admin_predicate.hpp" // kRbacAdminGateUnavailableAuditReason
 #include "rbac_assignable_roles.hpp"
 #include "web_utils.hpp" // audit_token — C5's expected-neutralization oracle
@@ -63,6 +64,7 @@
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacStoreOnAuthPool, RbacRoleHarness (A1 Step 6.1 extraction)
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1727,4 +1729,49 @@ TEST_CASE("MCP: list_rbac_role_assignments is advertised in tools/list",
     auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     CHECK(res->body.find("\"list_rbac_role_assignments\"") != std::string::npos);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: 503 on a genuine store query "
+          "failure, never a silent 200",
+          "[pg][rest][rbac][list][503]") {
+    // Same technique as RbacStore::provision_first_admin's own failure test
+    // (test_rbac_store.cpp): DROP the table the route's query reads, on a
+    // second connection, so list_all_principal_roles_checked() fails at the
+    // query level rather than never being exercised.
+    RbacRoleHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // A4 envelope, not a bare empty success shape.
+    CHECK(res->body.find("correlation_id") != std::string::npos);
+    CHECK(res->body.find("\"data\":[]") == std::string::npos);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: internal error on a genuine store "
+          "query failure, never a silent empty success",
+          "[pg][mcp][rbac][list][503]") {
+    RbacRoleHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("\"count\":0") == std::string::npos);
 }

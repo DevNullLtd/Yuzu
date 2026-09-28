@@ -2511,9 +2511,13 @@ access-review export uses, deliberately **not** `UserManagement:Read` like
 the plain role catalog above: a confinement-filtered view would be
 incomplete evidence, so this route needs the same bar as the export. Also
 subject to the RBAC-off authorization-topology floor
-(`docs/auth-architecture.md` "The authorization topology floor (#2376)") —
-an Administrator-equivalent grant is required regardless of whether RBAC
-enforcement is currently on.
+(`docs/auth-architecture.md` "The authorization topology floor (#2376)"),
+which applies **only** in the legacy RBAC-off fallback: with RBAC
+**disabled**, the floor additionally requires an effective local admin
+role; with RBAC **enabled**, any principal actually granted
+`AccessReview:Read` — including the seeded, non-admin `Reviewer` role — is
+admitted, exactly as intended (#2324 seeded `Reviewer` specifically to
+reach this class of surface without full Administrator authority).
 
 No pagination: `list_all_principal_roles_checked()` is a single bulk read
 with no limit/offset — `pagination.total`/`start`/`page_size` in the
