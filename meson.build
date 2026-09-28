@@ -557,6 +557,7 @@ if build_agent
   subdir('agents/plugins/browser_policy')  # Wave 10 PR10.2-b
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
+  subdir('agents/plugins/privacy_permissions')  # Wave 8 PR8.5
   subdir('agents/plugins/pkg_inventory')  # Wave 10 PR10.1-c
 endif
 

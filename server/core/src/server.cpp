@@ -191,6 +191,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
@@ -4828,6 +4829,23 @@ public:
                     "/api/v1/plugin-config/browser_inventory/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: browser_inventory default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // Wave 8: privacy_permissions (per-app sensitive-permission grants —
+        // camera/microphone/location/full-disk-access equivalents) ships
+        // default-off, same Forensics-class posture as execution_artifacts. An
+        // operator must explicitly enable it via PUT
+        // /api/v1/plugin-config/privacy_permissions/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "privacy_permissions",
+                    "default-off: forensics class (Wave 8); enable per PUT "
+                    "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: privacy_permissions default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
@@ -19946,6 +19964,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
     };
