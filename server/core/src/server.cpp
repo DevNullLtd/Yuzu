@@ -191,6 +191,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
@@ -19946,6 +19947,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
     };
