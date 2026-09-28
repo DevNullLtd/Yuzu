@@ -143,7 +143,10 @@ inline constexpr std::uint64_t kPortalTotalBudgetUs = 5'000'000;
 }
 
 /// A failed Lookup, by its D-Bus error name, or by its positive errno: ETIMEDOUT (the call ran out
-/// of the remaining budget) is `timeout` whatever name sd-bus attached.
+/// of the remaining budget) is `timeout` whatever name sd-bus attached; a raw EACCES/EPERM (no
+/// named AccessDenied error attached) is `access_denied` too, matching classify_session_bus_open's
+/// treatment of the same two errnos -- PR review finding, uncommon since a named AccessDenied is
+/// already handled above, but the two functions should classify the same errnos the same way.
 [[nodiscard]] constexpr LookupError classify_lookup_error(std::string_view dbus_error_name,
                                                           int err = 0) noexcept {
     if (err == ETIMEDOUT || dbus_error_name == "org.freedesktop.DBus.Error.Timeout")
@@ -153,6 +156,7 @@ inline constexpr std::uint64_t kPortalTotalBudgetUs = 5'000'000;
     if (dbus_error_name == "org.freedesktop.portal.Error.NotFound") return LookupError::not_found;
     if (dbus_error_name == "org.freedesktop.DBus.Error.AccessDenied")
         return LookupError::access_denied;
+    if (err == EACCES || err == EPERM) return LookupError::access_denied;
     return LookupError::failed;
 }
 
@@ -216,8 +220,14 @@ inline void append_lookup_reply_rows(const PortalTable& t, const PortalReply& re
     for (const auto* e : ordered) {
         const auto d = decode_portal_permissions(t.kind, e->permissions);
         if (!d.cause.empty()) {
-            rows.push_back(failure_row("linux", e->app_id, t.category, false,
-                                       e->app_id + ":" + cat + ":" + std::string{d.cause}, acc));
+            // The failure token reaches ConstraintAccumulator (no cap or sanitization of its
+            // own) and from there agent-side logging, not the wire -- the row path below is
+            // already sanitized via safe_output_field, but this token wasn't (PR review
+            // finding). app_id is portal-controlled; safe_output_field folds any control
+            // character/pipe before it lands in a log line.
+            rows.push_back(failure_row(
+                "linux", e->app_id, t.category, false,
+                yuzu::util::safe_output_field(e->app_id) + ":" + cat + ":" + std::string{d.cause}, acc));
             continue;
         }
         rows.push_back({"linux", e->app_id, t.category, d.state, join_permissions(e->permissions),

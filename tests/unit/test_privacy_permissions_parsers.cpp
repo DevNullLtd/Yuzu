@@ -348,6 +348,21 @@ TEST_CASE("portal::append_lookup_reply_rows: the real location shape reads allow
         CHECK(rows[0].raw == "org.example.CamApp:camera:empty_permissions");
         CHECK(acc.reason() == rows[0].raw);
     }
+    SECTION("a portal-controlled app_id carrying a literal pipe is escaped in the failure token "
+            "-- PR review finding: ConstraintAccumulator's token has no sanitization of its own, "
+            "and this token reaches agent-side logging, not just the row. safe_output_field is "
+            "this codebase's one sanitizer for output fields (folds backslash/CR/LF, escapes "
+            "pipes); it does not strip general control characters, so the assertion below checks "
+            "exactly what it actually does, not a broader guarantee it doesn't make.") {
+        yuzu::shared::ConstraintAccumulator acc;
+        std::vector<PermissionRow> rows;
+        const std::string hostile_app_id = "org.example.Evil|App";
+        portal::PortalReply r{true, {{hostile_app_id, {}}}, false, false};
+        portal::append_lookup_reply_rows(table_for("camera"), r, rows, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].raw == "org.example.Evil\\|App:camera:empty_permissions");
+        CHECK(acc.reason() == rows[0].raw);
+    }
     SECTION("a cleanly empty table is absent") {
         yuzu::shared::ConstraintAccumulator acc;
         std::vector<PermissionRow> rows;
@@ -389,6 +404,10 @@ TEST_CASE("portal::classify_lookup_error + append_lookup_error_rows: NotFound ab
     CHECK(portal::classify_lookup_error("") == LookupError::failed);
     CHECK(portal::classify_lookup_error("", ETIMEDOUT) == LookupError::timeout);
     CHECK(portal::classify_lookup_error("org.freedesktop.DBus.Error.Timeout") == LookupError::timeout);
+    // PR review finding: a raw EACCES/EPERM (no named AccessDenied error attached) must
+    // classify the same as classify_session_bus_open treats the same two errnos.
+    CHECK(portal::classify_lookup_error("", EACCES) == LookupError::access_denied);
+    CHECK(portal::classify_lookup_error("", EPERM) == LookupError::access_denied);
 
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
