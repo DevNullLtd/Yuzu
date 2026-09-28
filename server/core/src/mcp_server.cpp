@@ -1416,7 +1416,9 @@ static const ToolDef kTools[] = {
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
      "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
      "audit-logged (dex.signal.view). A well-formed obs_type with no observations returns empty "
-     "arrays. Mirrors GET /api/v1/dex/signals/{obs_type}. Requires GuaranteedState:Read.",
+     "arrays. Every field, including the devices list, is a fleet-wide aggregate with no "
+     "per-caller confinement; denied outright to a service-scoped API token. Mirrors GET "
+     "/api/v1/dex/signals/{obs_type}. Requires a global GuaranteedState:Read grant.",
      R"j({"type":"object","properties":{)j"
      R"j("obs_type":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","maxLength":64,"description":"Catalogue key, e.g. process.crashed, os.boot"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"

@@ -2085,7 +2085,7 @@ void RestApiV1::register_routes(
     // so they stay global-only, and `DexApi::app`/`DexApi::overview` take no
     // `visible` parameter (dex_api.hpp).
     // Net effect: every caller who reaches the handler body (RBAC-off — any
-    // authenticated non-service session, since `perm_fn`'s legacy fallback
+    // authenticated non-service, non-engine session, since `perm_fn`'s legacy fallback
     // admits unconditionally there — a global grant, or an elevated
     // administrator) now sees the SAME unfiltered device list — nothing is
     // narrowed for anyone admission ever lets through.

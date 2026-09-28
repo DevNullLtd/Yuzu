@@ -51,10 +51,9 @@
 /// `DexFleet` denominator from an injected `FleetFn` — exactly as today's
 /// handlers do — so neither `since` nor `DexFleet` appears in this abstract
 /// interface. NONE of `app`/`overview`/`signal_detail` takes a `visible`
-/// (ADR-0017 admit-then-filter set) parameter — WS-A4 PR-1's Gate 7 fix
-/// round tried threading one through `app`/`overview` (resolved from a
-/// per-caller resolver, `resolve_dex_visible`/`dex_visible_fn_`) and reverted
-/// it: the resolver was dormant for a management-group-confined-only caller
+/// parameter. `app`/`overview` carried one since #4035 (resolved from a
+/// per-caller resolver, `resolve_dex_visible`/`dex_visible_fn_`); WS-A4 PR-1
+/// removed it: the resolver was dormant for a management-group-confined-only caller
 /// (REST/MCP's `perm_fn` gate on all three routes is GLOBAL-only, so a
 /// confined-only operator never reached it) and wrongly narrowed a
 /// JIT-elevated administrator to their BASE identity's grant instead of the
@@ -64,8 +63,8 @@
 /// every AGGREGATE field (crash/hang counts, health/score distribution,
 /// …) fleet-wide regardless — a caller could reasonably (and wrongly) read
 /// the aggregate as scoped to their own visible devices. `signal_detail`
-/// never had this parameter at all for the same reason — see its own doc
-/// comment.
+/// briefly gained one during WS-A4 PR-1 review and lost it for the same
+/// reason — see its own doc comment.
 
 #include <optional>
 #include <string>
@@ -172,7 +171,7 @@ public:
     /// of confinement, and top-N-then-filter meant a confined caller could
     /// see FEWER than `limit` devices while never being told the aggregate
     /// above included excluded ones. Both REST and MCP gate this resource
-    /// on `GuaranteedState:Read` (global-grant-or-legacy-admin/RBAC-off
+    /// on `GuaranteedState:Read` (a global grant; with RBAC off, any authenticated non-service/non-engine session
     /// only) plus their own service-scoped-token denial — nothing left for
     /// a `visible` parameter to do here.
     [[nodiscard]] virtual DexSignalDetailModel

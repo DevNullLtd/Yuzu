@@ -279,9 +279,9 @@ public:
     // `devices[]`/`top_devices[]` INCLUDED, since those lists are built by a
     // query that runs a fleet-wide LIMIT before any per-caller filter — is a
     // FLEET-WIDE AGGREGATE (ADR-0017 INV-3 violation if narrowed per caller
-    // without confining the aggregate math itself), so per Fraser's round-3
+    // without confining the aggregate math itself), so per the WS-A4 PR-1
     // decision all three REVERTED to base gating: a bare `perm_fn`
-    // (`GuaranteedState:Read`, global-grant-or-legacy-admin/RBAC-off only —
+    // (`GuaranteedState:Read`, a global grant; with RBAC off, any authenticated non-service/non-engine session only —
     // NEVER management-group-confined) plus each route's own
     // `deny_fleet_wide_service_scoped` call. `DexApi::app`/`overview`/
     // `signal_detail` no longer take a `visible` parameter at all — there is

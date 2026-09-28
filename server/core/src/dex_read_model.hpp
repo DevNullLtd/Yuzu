@@ -96,9 +96,9 @@ struct DexAppModel {
     DexEntitySummary summary; ///< crashes/hangs/signals/distinct_devices/first_seen/last_seen
     std::vector<DexModuleCrashCount> modules;
     std::vector<DexExceptionCount> exceptions;
-    /// Affected devices, ALREADY confined to `visible` when non-null (an
-    /// out-of-scope device's id is never present — not merely filtered client
-    /// side) — same admit-then-filter posture as the fragment's own loop.
+    /// Affected devices (top 20). When the builder's `visible` is non-null the
+    /// rows are filtered AFTER the LIMIT — a post-LIMIT row filter, NOT
+    /// ADR-0017 INV-3 confinement: every other field stays fleet-wide.
     std::vector<DexDeviceCrashCount> devices;
 };
 
@@ -272,10 +272,9 @@ struct DexOverviewDayCrash {
 };
 
 /// The fleet-overview read model — the `/dex` landing page's fleet summary.
-/// `top_devices` is ALREADY confined to `visible` when non-null (an
-/// out-of-scope device's id is never present), same admit-then-filter
-/// posture as the fragment's own loop; every other field is a fleet
-/// aggregate carrying no per-agent identity.
+/// `top_devices` is filtered by the builder's `visible` (when non-null)
+/// AFTER the top-N cut — a post-LIMIT row filter, NOT ADR-0017 INV-3
+/// confinement; every other field is a fleet aggregate over ALL agents.
 struct DexOverviewModel {
     std::string window;
     // Experience (per-device score distribution + Device/App/Network composite).

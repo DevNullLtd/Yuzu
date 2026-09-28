@@ -126,7 +126,7 @@ TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[
 // (ADR-0031 WS-A4 PR-1 decision 3) was REMOVED, permanently — there is no
 // confinement-scope concept left on this method to engage or refuse.
 // REST/MCP gate this resource on the bare `GuaranteedState:Read`
-// permission (global-grant-or-legacy-admin/RBAC-off only; round-3 revert,
+// permission (a global grant; with RBAC off, any authenticated non-service/non-engine session only; round-3 revert,
 // never `fleet_read_fn`) plus their own service-scoped-token denial, since
 // subjects/by_os/by_day stay fleet-wide aggregates a per-row devices[]
 // filter can never confine (ADR-0017 INV-3). The former "confines

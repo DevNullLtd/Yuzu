@@ -86,9 +86,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # One entry per enrolled family. `core`/`presentation` are OBJECT-FILE STEMS
 # (the source file's name under server/core/src, without the `.cpp`
-# extension) - the script locates each stem's compiled object under the
-# build directory itself (find_object below), so it does not hard-code a
-# build-system path shape.
+# extension) - find_object resolves each stem inside CORE_TARGET_OBJ_DIR (the
+# yuzu_server_core static library's `.p` directory, hard-coded below). A family
+# whose TUs live in another meson target needs its own per-family directory.
 FAMILIES: dict[str, dict[str, list[str]]] = {
     "dex": {
         "core": [

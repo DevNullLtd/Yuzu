@@ -41,7 +41,9 @@ class GuaranteedStateStore;
 
 // ── Store-reaching builders (each reads `store` into a pure model struct) ──
 // `store` may be null in every builder (degrades to an empty/`-1` model, never
-// a throw); `visible` (where present) is the ADR-0017 admit-then-filter set.
+// a throw); `visible` (where present) is a post-LIMIT row filter only — NOT
+// ADR-0017 INV-3 confinement (every aggregate stays fleet-wide); never use it
+// to serve a confined caller.
 
 /// Per-device DEX experience score (0–100) — the canonical severity-weighted
 /// composite; -1 when `store` is null. A store-reaching read helper the

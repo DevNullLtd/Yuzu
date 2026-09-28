@@ -14632,9 +14632,9 @@ private:
         // /api/v1/dex/signals/{obs_type} (REST + MCP) onto `fleet_read_fn`
         // below instead — but every value these three return is a
         // fleet-wide aggregate, not a per-caller-confinable list, so per
-        // Fraser's round-3 decision all three REVERTED to base gating: a
-        // bare `perm_fn`/`tier_allows` (`GuaranteedState:Read`, global-
-        // grant-or-legacy-admin/RBAC-off only) plus each surface's own
+        // WS-A4 PR-1 all three stay on base gating: a bare
+        // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or
+        // with RBAC off any authenticated non-service/non-engine session) plus each surface's own
         // service-scoped-token deny. `fleet_read_fn` is NOT one of these
         // three routes' gates (it still exists below for the OTHER routes
         // that are genuinely per-caller-confinable, e.g. GET

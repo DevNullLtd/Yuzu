@@ -690,13 +690,13 @@ public:
     // `RestApiV1::DexVisibleFn`'s retirement comment (rest_api_v1.hpp) for
     // the full rationale — the bare `perm_fn`/`tier_allows` gate in front of
     // it resolved GLOBAL roles only, so this resolver's confinement was
-    // dormant on every admitted call. Per Fraser's round-3 decision (see the
+    // dormant on every admitted call. Per the WS-A4 PR-1 decision (see the
     // same rest_api_v1.hpp comment) all three tools REVERTED to base
     // gating instead of moving onto `fleet_read_fn_`: every value they
     // return is a fleet-wide aggregate (an ADR-0017 INV-3 concern, not a
     // per-caller-confinement one), so they gate on the bare
-    // `perm_fn`/`tier_allows` (`GuaranteedState:Read`, global-grant-or-
-    // legacy-admin/RBAC-off only) plus the base MCP `ServiceScopeClass`
+    // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or with
+    // RBAC off any authenticated non-service/non-engine session) plus the base MCP `ServiceScopeClass`
     // service-token deny — no per-caller confinement resolver, dormant or
     // otherwise, on any of the three.
 
