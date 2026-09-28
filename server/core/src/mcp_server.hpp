@@ -603,6 +603,24 @@ public:
                                                   const std::string& operation)>;
     void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
 
+    /// #4981 PR-2 — `preview_scope_targets`'s SOLE scope-evaluation callback:
+    /// a thin closure over `AgentRegistry::evaluate_scope` with the caller's
+    /// tag/custom-properties/result-set stores already bound (the SAME
+    /// binding shape `command_routes.cpp`'s Scope arm and
+    /// `wire_and_dispatch_confined`, dispatch_scope_ladder.hpp, already use —
+    /// see `scope_preview.hpp`'s identically-shaped `yuzu::server::ScopeEvaluateFn`
+    /// for the full contract this mirrors, independently declared per this
+    /// class's own `Fn`-alias convention rather than a shared type import).
+    /// Injected rather than threading `AgentRegistry*`/`CustomPropertiesStore*`
+    /// raw pointers into this class (matches `set_result_set_store`'s "one
+    /// setter per borrowed dependency" idiom). MUST be called BEFORE
+    /// `build_handler()`. Unset (`{}`, the default) makes
+    /// `preview_scope_targets` answer `kInternalError` (misconfigured call
+    /// site), same posture as `fleet_read_fn_` unwired.
+    using ScopeEvaluateFn = std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&, const std::string& principal)>;
+    void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
+
     /// #2146 Batch B1 — the injected-callback twin of `RestApiV1::GuardianPushFn`
     /// (rest_api_v1.hpp), backing `push_guardian_rules`. Same shape (scope +
     /// full_sync in, agents-reached count out, with -1 = unparseable scope and
@@ -1185,6 +1203,8 @@ private:
     PreflightRunStore* preflight_run_store_{nullptr};
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
+    // #4981 PR-2 — see set_scope_evaluate_fn above.
+    ScopeEvaluateFn scope_evaluate_fn_;
     // #2146 Batch B1 — see set_baseline_store above.
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.

@@ -19440,6 +19440,10 @@ private:
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #4981 PR-2 — see scope_evaluate_fn's own comment above (defined
+            // once, shared with rest_api_v1_->set_scope_evaluate_fn above).
+            // MUST run BEFORE register_routes()/build_handler() below.
+            mcp_server_->set_scope_evaluate_fn(scope_evaluate_fn);
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so

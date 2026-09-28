@@ -968,19 +968,21 @@ static const ToolDef kTools[] = {
      R"j(]})j"},
 
     {"preview_scope_targets",
-     "Show which agents match a scope expression. Confined by management group (ADR-0017): a "
-     "caller admitted through a management-group grant sees matched_agents/matched_count "
-     "narrowed to only their own visible devices, never the whole fleet. NOTE: tag:<key> atoms "
-     "resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls "
-     "back to a connected agent's own live self-reported value when the store has no row for "
-     "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
-     "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". NOTE: "
-     "from_result_set:<id> and props.* atoms are NOT resolved by this preview (only "
-     "os/arch/hostname/agent_version/tag:* are) - an expression using from_result_set: always "
-     "previews as matched_count:0 here even though a real dispatch resolves it correctly; do "
-     "not rely on this tool for such an expression (tracked #4307). REST v1 twin: POST "
-     "/api/v1/scope/preview.",
+     "Show which agents match a scope expression. Runs the SAME evaluation ladder a real "
+     "dispatch uses (owner-check gate included, #4981) - tag:<key>, props.<key>, and "
+     "from_result_set:<id> atoms all resolve identically to a real dispatch, not just "
+     "os/arch/hostname/agent_version/tag:* as before. Confined by management group (ADR-0017): "
+     "a caller admitted through a management-group grant sees matched_agents/matched_count "
+     "narrowed to only their own visible devices, never the whole fleet - the ladder itself "
+     "evaluates fleet-wide, then this confinement is intersected in afterward. NOTE: tag:<key> "
+     "atoms resolve from the persistent tag store ONLY (unlike an actual dispatch, which also "
+     "falls back to a connected agent's own live self-reported value when the store has no row "
+     "for that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is "
+     "its own live report may be previewed as excluded here but still be targeted by the real "
+     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
+     "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
+     "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
+     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -11413,34 +11415,58 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Narrow the candidate set to the caller's admitted scope
-                // BEFORE the preview builder runs — the unfiltered snapshot
-                // (get_agents()) is the SAME source list_agents' own agents_fn
-                // and GET /api/v1/devices use; gate.scope is the sole filter,
-                // mirroring GET /api/v1/devices' own in_scope-filter-then-render.
-                const auto& all_agents = get_agents();
-                nlohmann::json visible_agents = nlohmann::json::array();
-                for (const auto& a : all_agents) {
-                    if (authz::in_scope(gate.scope, a.value("agent_id", "")))
-                        visible_agents.push_back(a);
+                // Checked AFTER the cheap input-shape validation above
+                // (mirrors GET /api/v1/events' own ordering — a malformed
+                // request is rejected before any backend-unavailable check).
+                if (!scope_evaluate_fn_) {
+                    spdlog::error("preview_scope_targets: scope_evaluate_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
                 }
-                // #2146 Batch B2: delegates to the shared preview_scope_targets()
-                // builder (scope_preview.hpp) so this tool and its new REST v1
+                // #4981 PR-2: delegates to the shared preview_scope_targets()
+                // builder (scope_preview.hpp) so this tool and its REST v1
                 // twin (POST /api/v1/scope/preview) cannot silently diverge in
-                // which agents match (api-twin-recipe.md Rule 1).
-                auto outcome =
-                    yuzu::server::preview_scope_targets(expression, visible_agents, tag_store);
+                // which agents match (api-twin-recipe.md Rule 1). Runs the
+                // SAME evaluation ladder a real dispatch uses (owner-check
+                // gate included) — gate.scope is applied AFTER the ladder's
+                // unfiltered fleet-wide evaluation, mirroring
+                // GET /api/v1/devices' own in_scope-filter-then-render.
+                auto outcome = yuzu::server::preview_scope_targets(
+                    expression, session->username, gate.scope, result_set_store_,
+                    scope_evaluate_fn_);
                 switch (outcome.kind) {
                 case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
                     res.set_content(error_response(id, kInvalidParams, outcome.detail),
                                     "application/json");
                     return;
-                case yuzu::server::ScopePreviewOutcome::Kind::kTagStoreDegraded:
-                    // Target = the expression being previewed — every sibling
-                    // failure audit here carries a target (governance cons-F2).
+                case yuzu::server::ScopePreviewOutcome::Kind::kEvaluationAborted:
+                    if (outcome.detail == "owner_check_failed") {
+                        // Existence-oracle-safe, mirrors rs_load_owned's own
+                        // 404 body: a non-owner is indistinguishable from an
+                        // absent set. One row PER failing ref — a compound
+                        // expression can name more than one.
+                        for (const auto& ref : outcome.failing_refs)
+                            (void)audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
+                                           "not found or not owned");
+                        mcp_audit("failure", expression);
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_NOT_FOUND: result set not found"),
+                            "application/json");
+                        return;
+                    }
+                    // db_degraded / principal_unresolved / presence_degraded /
+                    // unresolvable — a degraded read the caller can retry,
+                    // never silently rendered as "0 matches" (that would
+                    // under-report the scope's real blast radius). Target =
+                    // the expression being previewed — every sibling failure
+                    // audit here carries a target (governance cons-F2).
                     mcp_audit("failure", expression);
                     res.set_content(
-                        a4_error(kInternalError, "Tag store unavailable",
+                        a4_error(kInternalError,
+                                 "scope evaluation unavailable: " + outcome.detail,
                                  "retry once the server reports ready",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
