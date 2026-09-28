@@ -30,6 +30,7 @@
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/enrollment_cfg_import.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -3011,6 +3012,32 @@ public:
             for (auto reason : {"no_store", "pool_acquire_timeout", "query_error"})
                 metrics_.counter("yuzu_auth_enrollment_store_degrade_total",
                                  {{"op", op}, {"reason", reason}});
+        // WS-6 6.2: the one-time legacy enrollment .cfg import. `kind` = tokens |
+        // pending; `outcome` = imported | already_imported | fingerprint_mismatch |
+        // absent | error. A steady-state boot is `absent` (nothing to import) or
+        // `already_imported` (file survived a failed rename). fingerprint_mismatch means
+        // a restored old backup / edited file was REFUSED (Postgres state stands); error
+        // means the server refused to start.
+        metrics_.describe("yuzu_server_enrollment_import_total",
+                          "One-time legacy enrollment .cfg import outcomes per file kind "
+                          "(kind: tokens / pending; outcome: imported / already_imported / "
+                          "fingerprint_mismatch / absent / error)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto outcome : {"imported", "already_imported", "fingerprint_mismatch",
+                                 "absent", "error"})
+                metrics_.counter("yuzu_server_enrollment_import_total",
+                                 {{"kind", kind}, {"outcome", outcome}});
+        metrics_.describe("yuzu_server_enrollment_import_rows_total",
+                          "Rows handled by the one-time legacy enrollment .cfg import "
+                          "(result: imported / skipped_existing / skipped_garbled / "
+                          "recovered_colon / id_disambiguated / unplaceable)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto result : {"imported", "skipped_existing", "skipped_garbled",
+                                "recovered_colon", "id_disambiguated", "unplaceable"})
+                metrics_.counter("yuzu_server_enrollment_import_rows_total",
+                                 {{"kind", kind}, {"result", result}});
         metrics_.describe("yuzu_auth_session_reap_total",
                           "Expired durable operator-session rows deleted by the clock-guarded "
                           "retention sweep",
@@ -4699,6 +4726,30 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+
+                        // WS-6 6.2: one-time import of the legacy per-replica
+                        // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
+                        // Runs HERE - right after the auth store is wired and
+                        // before any listener binds, so no Register can be served
+                        // against a half-imported enrollment set - and never from a
+                        // main.cpp one-shot (--mfa-reset / --generate-tokens must
+                        // not import or rename). A missing file is a no-op; a PG
+                        // error with a file present refuses to start (like the
+                        // first-boot admin seed): a half-known enrollment set is
+                        // worse than no boot. The reports are kept so the audit
+                        // events can be emitted once audit_store_ exists.
+                        auto imported = enrollment_import::run_legacy_enrollment_import(
+                            *auth_db_,
+                            enrollment_import::Locations{cfg_.data_dir,
+                                                         cfg_.auth_config_path.parent_path()},
+                            &metrics_);
+                        enrollment_import_reports_ = std::move(imported.reports);
+                        if (imported.fatal) {
+                            spdlog::error("[PG] Refusing to start: the one-time legacy enrollment "
+                                          ".cfg import failed with a file present (see the "
+                                          "[enrollment-import] lines above)");
+                            startup_failed_ = true;
+                        }
                     }
                 }
             }
@@ -5232,6 +5283,44 @@ public:
                              .detail = detail_json,
                              .result = failure ? "failure" : "success"});
                     });
+            }
+
+            // WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg
+            // import (system principal, like the other boot-time posture rows). One row
+            // per file kind that did something noteworthy: `imported` (result=success),
+            // `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
+            // or `error` (result=failure - the server is refusing to start, so this only
+            // lands if a later boot gets that far). `absent` / `already_imported` are
+            // the steady state and deliberately write no row.
+            if (audit_store_ && audit_store_->is_open()) {
+                for (const auto& r : enrollment_import_reports_) {
+                    using enrollment_import::Outcome;
+                    if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
+                        continue;
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "system";
+                    ev.principal_role = "system";
+                    ev.action = "enrollment.import";
+                    ev.target_type = "Enrollment";
+                    ev.target_id = r.kind;
+                    ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
+                                " imported=" + std::to_string(r.counts.imported) +
+                                " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
+                                " skipped_garbled=" + std::to_string(r.parse.garbled) +
+                                " recovered_colon=" + std::to_string(r.parse.recovered) +
+                                " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
+                                " renamed=" + (r.renamed ? "true" : "false") +
+                                (r.detail.empty() ? "" : " reason=" + r.detail);
+                    ev.result = r.outcome == Outcome::imported
+                                    ? "success"
+                                    : (r.outcome == Outcome::fingerprint_mismatch ? "warning"
+                                                                                   : "failure");
+                    (void)audit_store_->log(ev);
+                }
+                enrollment_import_reports_.clear();
             }
 
             // Gate 7 compliance F-1 — durable evidence that the viz
@@ -20416,6 +20505,10 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // WS-6 6.2: outcome of the one-time legacy enrollment .cfg import (see the
+    // boot block after set_auth_db). Held until audit_store_ is constructed, then
+    // emitted as `enrollment.import` rows.
+    std::vector<enrollment_import::KindReport> enrollment_import_reports_;
     // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
     // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
     // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via

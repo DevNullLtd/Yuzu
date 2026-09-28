@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "yuzu/server/auth.hpp"  // For Role, UserEntry, PendingAgent, etc.
+#include "yuzu/server/enrollment_cfg_import.hpp" // legacy-import row/result types (pure)
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -779,6 +780,31 @@ public:
 
     /// Hard-delete a row. `true` = row existed.
     std::expected<bool, StoreError> remove_pending(const std::string& agent_id);
+
+    // ── One-time legacy .cfg import (WS-6 6.2; see enrollment_cfg_import.hpp) ──
+    //
+    // Each call is ONE transaction under a dedicated advisory lock
+    // (`pg_advisory_xact_lock(2037545589, 2)`, auth_db.cpp), so two replicas racing
+    // first boot with identical files serialise: the loser sees the winner's marker
+    // and returns `already_imported`. `marker_key` is the per-FILE-KIND key in
+    // `auth.import_meta`; `fingerprint` the sha256 of the file bytes. Marker
+    // present + same fingerprint => `already_imported`; present + DIFFERENT =>
+    // `fingerprint_mismatch` (nothing written - restored-old-backup case, "refused,
+    // not merged"); absent => rows inserted and the marker stamped in the SAME txn.
+    // Rows are INSERT .. ON CONFLICT DO NOTHING keyed on token_hash / agent_id, so
+    // Postgres state (a higher use_count, a revoke, a deny, a removal) ALWAYS wins
+    // over the file. Any PG error rolls the whole txn back (no marker) and returns
+    // `StoreError` - the caller refuses to start. Never uses the file's token_id:
+    // the id is the hash prefix, lengthened per row on a collision with a DIFFERENT
+    // token so both survive.
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_tokens(std::string_view marker_key, std::string_view fingerprint,
+                         const std::vector<enrollment_import::LegacyToken>& rows,
+                         std::string_view imported_by);
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_pending(std::string_view marker_key, std::string_view fingerprint,
+                          const std::vector<enrollment_import::LegacyPending>& rows,
+                          std::string_view imported_by);
 
 private:
     struct Impl;

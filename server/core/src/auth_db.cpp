@@ -158,6 +158,11 @@ constexpr const char* kSeedAdminLockSql =
     // `2037545589` yuzu namespace (the migration runner's global lock uses `0`).
     "SELECT pg_advisory_xact_lock(2037545589, 1)";
 
+// Legacy enrollment .cfg import (WS-6 6.2): second key `2` in the same namespace,
+// distinct from `0` (PgMigrationRunner's global lock) and `1` (first-boot admin
+// seed above). Literal for the same cross-version-stability reason as `1`.
+constexpr const char* kEnrollmentImportLockSql = "SELECT pg_advisory_xact_lock(2037545589, 2)";
+
 // ── Schema ────────────────────────────────────────────────────────────────
 
 constexpr const char* kStoreName = "auth";
@@ -2517,6 +2522,160 @@ std::expected<bool, StoreError> AuthDB::remove_pending(const std::string& agent_
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(StoreError::QueryFailed);
     return PQntuples(res.get()) > 0;
+}
+
+
+// ── One-time legacy .cfg import (WS-6 6.2) ─────────────────────────────────────
+
+namespace {
+
+/// Shared skeleton of both imports: lock, marker check, `write_rows`, marker stamp.
+/// `write_rows(conn, counts)` returns false on a PG error (=> whole txn rolls back).
+template <typename WriteRows>
+std::expected<enrollment_import::ImportDbResult, StoreError>
+run_legacy_import(pg::PgPool& pool, std::chrono::milliseconds timeout, std::string_view marker_key,
+                  std::string_view fingerprint, std::string_view imported_by, WriteRows&& write_rows) {
+    if (marker_key.empty() || fingerprint.empty() || !text_ok(marker_key, 256) ||
+        !text_ok(fingerprint, 256) || !text_ok(imported_by, 256)) {
+        return std::unexpected(StoreError::InvalidInput);
+    }
+    auto lease = pool.try_acquire_for(timeout);
+    if (!lease)
+        return std::unexpected(StoreError::Unavailable);
+
+    enrollment_import::ImportDbResult result;
+    const std::string key{marker_key}, fp{fingerprint}, by{imported_by};
+    const bool ok = pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult lock{PQexec(conn, kEnrollmentImportLockSql)};
+        if (lock.status() != PGRES_TUPLES_OK)
+            return false;
+        pg::PgResult marker = pg::exec_params(
+            conn, "SELECT fingerprint FROM auth.import_meta WHERE key = $1",
+            std::vector<std::string>{key});
+        if (marker.status() != PGRES_TUPLES_OK)
+            return false;
+        if (PQntuples(marker.get()) > 0) {
+            result.stored_fingerprint = col_str(marker.get(), 0, 0);
+            result.status = (result.stored_fingerprint == fp)
+                                ? enrollment_import::ImportStatus::already_imported
+                                : enrollment_import::ImportStatus::fingerprint_mismatch;
+            return true; // nothing written; commit the no-op txn
+        }
+        if (!write_rows(conn, result.counts))
+            return false;
+        // The marker rides in the SAME txn as the rows: rows without a marker (or a
+        // marker without rows) can never persist.
+        pg::PgResult stamp = pg::exec_params(
+            conn,
+            "INSERT INTO auth.import_meta (key, fingerprint, imported_by) VALUES ($1, $2, $3)",
+            std::vector<std::string>{key, fp, by});
+        if (stamp.status() != PGRES_COMMAND_OK)
+            return false;
+        result.status = enrollment_import::ImportStatus::imported;
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(StoreError::QueryFailed);
+    return result;
+}
+
+} // namespace
+
+std::expected<enrollment_import::ImportDbResult, StoreError>
+AuthDB::import_legacy_tokens(std::string_view marker_key, std::string_view fingerprint,
+                             const std::vector<enrollment_import::LegacyToken>& rows,
+                             std::string_view imported_by) {
+    // Longer hash prefixes tried, in order, when the 8-hex id collides with a
+    // DIFFERENT token (the pre-6.2 map keyed on the 32-bit id silently overwrote on
+    // such a collision; here both survive).
+    static constexpr std::size_t kIdLens[] = {8, 12, 16, 24, 32, 64};
+    return run_legacy_import(
+        impl_->pool, kWriteTimeout, marker_key, fingerprint, imported_by,
+        [&](PGconn* conn, enrollment_import::ImportCounts& counts) -> bool {
+            for (const auto& t : rows) {
+                const std::vector<std::string> common_tail = {
+                    t.token_hash,
+                    t.label,
+                    std::to_string(t.max_uses),
+                    std::to_string(t.use_count),
+                    t.revoked ? "true" : "false",
+                    std::to_string(t.created_epoch),
+                    std::to_string(t.expires_epoch)};
+                bool placed = false, existing = false;
+                std::size_t attempt = 0;
+                for (const std::size_t len : kIdLens) {
+                    std::vector<std::string> params;
+                    params.push_back(t.token_hash.substr(0, len));
+                    params.insert(params.end(), common_tail.begin(), common_tail.end());
+                    // Bare `ON CONFLICT DO NOTHING` covers BOTH unique constraints
+                    // (token_hash, token_id); the follow-up read below tells them apart.
+                    pg::PgResult ins = pg::exec_params(
+                        conn,
+                        "INSERT INTO auth.enrollment_tokens (token_id, token_hash, label, "
+                        "max_uses, use_count, revoked, created_by, created_at, expires_at) "
+                        "VALUES ($1, $2, $3, $4::int, $5::int, $6::boolean, 'legacy-import', "
+                        "  CASE WHEN $7::bigint = 0 THEN now() ELSE to_timestamp($7::bigint) END, "
+                        "  CASE WHEN $8::bigint = 0 THEN NULL ELSE to_timestamp($8::bigint) END) "
+                        "ON CONFLICT DO NOTHING RETURNING token_id",
+                        params);
+                    if (ins.status() != PGRES_TUPLES_OK)
+                        return false;
+                    if (PQntuples(ins.get()) > 0) {
+                        placed = true;
+                        break;
+                    }
+                    pg::PgResult present = pg::exec_params(
+                        conn, "SELECT 1 FROM auth.enrollment_tokens WHERE token_hash = $1",
+                        std::vector<std::string>{t.token_hash});
+                    if (present.status() != PGRES_TUPLES_OK)
+                        return false;
+                    if (PQntuples(present.get()) > 0) {
+                        existing = true; // PG already has this token: PG wins
+                        break;
+                    }
+                    ++attempt; // the id (not the hash) collided: try a longer prefix
+                }
+                if (placed) {
+                    ++counts.imported;
+                    if (attempt > 0)
+                        ++counts.id_disambiguated;
+                } else if (existing) {
+                    ++counts.skipped_existing;
+                } else {
+                    ++counts.failed; // id space exhausted (cannot happen for distinct hashes)
+                }
+            }
+            return true;
+        });
+}
+
+std::expected<enrollment_import::ImportDbResult, StoreError>
+AuthDB::import_legacy_pending(std::string_view marker_key, std::string_view fingerprint,
+                              const std::vector<enrollment_import::LegacyPending>& rows,
+                              std::string_view imported_by) {
+    return run_legacy_import(
+        impl_->pool, kWriteTimeout, marker_key, fingerprint, imported_by,
+        [&](PGconn* conn, enrollment_import::ImportCounts& counts) -> bool {
+            for (const auto& p : rows) {
+                pg::PgResult ins = pg::exec_params(
+                    conn,
+                    "INSERT INTO auth.pending_agents (agent_id, hostname, os, arch, "
+                    "agent_version, requested_at, status, status_changed_at, status_changed_by) "
+                    "VALUES ($1, $2, $3, $4, $5, "
+                    "  CASE WHEN $6::bigint = 0 THEN now() ELSE to_timestamp($6::bigint) END, "
+                    "  $7, now(), 'legacy-import') "
+                    "ON CONFLICT (agent_id) DO NOTHING RETURNING agent_id",
+                    std::vector<std::string>{p.agent_id, p.hostname, p.os, p.arch, p.agent_version,
+                                             std::to_string(p.requested_epoch), p.status});
+                if (ins.status() != PGRES_TUPLES_OK)
+                    return false;
+                if (PQntuples(ins.get()) > 0)
+                    ++counts.imported;
+                else
+                    ++counts.skipped_existing; // PG already has this agent: PG wins
+            }
+            return true;
+        });
 }
 
 } // namespace yuzu::server
