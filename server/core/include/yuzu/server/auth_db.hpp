@@ -129,6 +129,24 @@ enum class AuthDBError : std::uint8_t {
            e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
 }
 
+/// Typed failure of the enrollment-token / pending-agent store surface
+/// (WS-6 slice 6.2). Deliberately three-valued and distinct from "not found"/
+/// "rejected", which are successful outcomes carried in the value channel.
+enum class StoreError : std::uint8_t {
+    /// The pool lease could not be acquired (transient outage / saturation).
+    Unavailable,
+    /// A statement or transaction ran (or the connection broke) and failed.
+    QueryFailed,
+    /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
+    /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
+    InvalidInput,
+};
+
+/// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
+[[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
+    return e != StoreError::InvalidInput;
+}
+
 /// `list_users_including_inactive()` row — same fields as `auth::UserEntry`
 /// plus the `is_active` flag `list_users()` deliberately filters out. A NEW
 /// type rather than extending `auth::UserEntry` itself: that struct is a
@@ -685,6 +703,119 @@ public:
     /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
+
+    // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
+    //
+    // Authoritative, fleet-wide (every replica shares one PG), and FAIL-CLOSED:
+    // every method returns `std::expected<_, StoreError>` so a store outage is a
+    // typed error the caller maps to gRPC UNAVAILABLE / HTTP 503 — NEVER an empty
+    // list, a `0` count, "absent", or "rejected" (an unreadable pending row that
+    // read as "absent" would let a denied agent fall through to add_pending/
+    // consume, #3401). Timestamps are authored from PG `now()` in SQL and token
+    // expiry is evaluated in SQL (DB-clock authority, ADR-2002 §4) — never the
+    // replica's `system_clock`. Raw tokens are hashed on entry (SHA-256) and are
+    // never logged, never a column; only the 8-hex `token_id` appears in logs.
+    // Text inputs are length-capped (`kMaxEnrollmentTextLength`) and rejected on
+    // an embedded NUL (`StoreError::InvalidInput`), never silently truncated.
+
+    /// Result of a successful `create_token`. `raw_token` is shown once.
+    struct CreatedEnrollmentToken {
+        std::string raw_token;
+        std::string token_id; ///< 8 hex chars of the token hash — the admin handle.
+    };
+
+    /// Outcome of the atomic `consume_and_enroll`. Exactly one of three shapes:
+    ///  - `enrolled`       : token use counted AND agent row approved, one txn.
+    ///  - `token_rejected` : the token did not admit (audit/metric reason in
+    ///                       `token_error`; the WIRE message stays uniform).
+    ///                       `already_consumed_by` names the last consumer when
+    ///                       `token_error == already_consumed`.
+    ///  - `admin_denied`   : the token was valid but an administrator has denied
+    ///                       this agent_id. The whole txn ROLLED BACK — the
+    ///                       token's `use_count` is unchanged (closes the
+    ///                       consume-then-deny use-burn, #1135).
+    struct ConsumeEnrollResult {
+        enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+        Kind kind{Kind::token_rejected};
+        auth::EnrollmentClaim claim{};                                        ///< enrolled only
+        auth::EnrollmentTokenError token_error{auth::EnrollmentTokenError::not_found}; ///< token_rejected only
+        std::string already_consumed_by;                                      ///< token_rejected only
+    };
+
+    /// Maximum length of any free-text field (label, hostname, os, arch,
+    /// agent_version, principal) accepted by the enrollment/pending store.
+    /// `agent_id` uses `auth::kMaxAgentIdLength`, the raw token
+    /// `auth::kMaxEnrollmentTokenLength`.
+    static constexpr std::size_t kMaxEnrollmentTextLength = 256;
+
+    /// Upper bound on a token TTL (~100 years). `0` = never expires.
+    static constexpr std::int64_t kMaxEnrollmentTtlSeconds = 3'153'600'000;
+
+    /// Create a token. `max_uses` 0 = unlimited; `ttl` 0 = never expires.
+    /// The token_id (8 hex of the hash) is regenerated on a UNIQUE violation —
+    /// an existing token is never overwritten.
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                 const std::string& created_by);
+
+    /// Test seam for `create_token`'s regenerate-on-collision loop: `entropy`
+    /// supplies the 32 raw bytes for each attempt. Production callers use
+    /// `create_token` (CSPRNG).
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token_with_entropy(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                              const std::string& created_by,
+                              const std::function<std::vector<std::uint8_t>()>& entropy);
+
+    /// Revoke by token_id. true = a row exists (idempotent), false = unknown id.
+    std::expected<bool, StoreError> revoke_token(const std::string& token_id);
+
+    /// All tokens, newest first. `expires_at == time_point::max()` = never.
+    std::expected<std::vector<auth::EnrollmentToken>, StoreError> list_tokens();
+
+    /// THE atomic enrollment claim: ONE transaction that (1) counts a use of the
+    /// token (single guarded UPDATE — exactly-N winners across replicas), then
+    /// (2) upserts the agent row to `approved` unless an admin denied it; a
+    /// denial ROLLS BACK step 1. A miss on step 1 is classified in the same txn.
+    std::expected<ConsumeEnrollResult, StoreError>
+    consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                       const std::string& hostname, const std::string& os,
+                       const std::string& arch, const std::string& agent_version);
+
+    /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
+    /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
+    std::expected<std::optional<auth::PendingStatus>, StoreError>
+    pending_status(const std::string& agent_id);
+
+    /// Queue an unenrolled agent as `pending`. `true` = NEWLY added (gates the
+    /// analytics event + SSE publish); `false` = a row already existed (unchanged).
+    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent);
+
+    /// No-token enrollment path: upsert to `approved` unless denied. `true` =
+    /// enrolled, `false` = admin-denied (tokens/no-token paths never override a
+    /// denial). `by` is recorded as `status_changed_by`.
+    std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
+                                                    const std::string& by);
+
+    /// Rows newest-first; `only` filters to one status.
+    std::expected<std::vector<auth::PendingAgent>, StoreError>
+    list_pending(std::optional<auth::PendingStatus> only = std::nullopt);
+
+    /// Set status approved/denied for an existing row. `true` = row existed.
+    std::expected<bool, StoreError> approve_pending(const std::string& agent_id,
+                                                    const std::string& principal);
+    std::expected<bool, StoreError> deny_pending(const std::string& agent_id,
+                                                 const std::string& principal);
+
+    /// Bulk: every currently-`pending` row -> approved/denied in one statement
+    /// (`UPDATE .. WHERE status='pending' RETURNING agent_id`). Returns the
+    /// agent_ids affected (for audit + SSE).
+    std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending(const std::string& principal);
+    std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending(const std::string& principal);
+
+    /// Hard-delete a row. `true` = row existed.
+    std::expected<bool, StoreError> remove_pending(const std::string& agent_id);
 
 private:
     struct Impl;
