@@ -2,7 +2,6 @@
 
 #include "guardian_rule_spec.hpp" // dangerous_enforce_in_spec (H1 push backstop)
 #include "mcp_jsonrpc.hpp"        // json_exceeds_depth / kMcpMaxJsonDepth (depth guard)
-#include "on_behalf_guard.hpp"    // onbehalf::sanitize_for_log
 #include "yuzu/metrics.hpp"
 
 #include <algorithm>
@@ -13,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token / log_key_token
 
 namespace yuzu::server::guardian {
 
@@ -193,6 +193,40 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
         if (!row.scope_expr.empty() && in_scope && !in_scope(row.scope_expr))
             continue;
 
+        // Charset/length guard on rule_id itself (#4665 Phase-3 governance:
+        // architect + security-guardian + sre + compliance-officer + enterprise-
+        // readiness + unhappy-path all independently found this gap). Validation
+        // at REST/MCP create time (is_valid_rule_id, ded560d30/f83e95528) is
+        // create-only and NOT retroactive — a rule_id accepted before #4665
+        // shipped, when creation enforced no charset/length bound at all, can
+        // still sit in the store. GuardianEngine::apply_rules() on the AGENT
+        // now pre-validates every rule_id in an incoming push and rejects the
+        // push IN ITS ENTIRETY if any one fails — so without this filter, one
+        // such legacy row silently wedges ALL Guardian policy delivery to
+        // every agent in its scope, indefinitely, with the agent's own
+        // rejection reply dropped fire-and-forget by the server's Subscribe
+        // loop (agent_service_impl.cpp) and the heartbeat reconcile path
+        // logging the push as "success" regardless (it observes only that the
+        // push was SENT, never what the agent did with it). Same exclusion
+        // shape as the depth guard just below: skip the row entirely (no
+        // header, no spark/assertion/remediation content) rather than sending
+        // a push the agent is guaranteed to reject outright.
+        if (!is_valid_rule_id(row.rule_id)) {
+            if (metrics)
+                metrics
+                    ->counter("yuzu_guardian_push_rule_excluded_total",
+                             {{"reason", "invalid_rule_id"}})
+                    .increment();
+            if (g_exclusion_sampler.should_log(row.rule_id))
+                spdlog::error(
+                    "Guardian push: rule {} ('{}') has a rule_id that fails the "
+                    "[A-Za-z0-9._-]+/256-byte charset check (#4665) — excluding it "
+                    "from this push; delete and recreate it via MCP delete_guardian_rule "
+                    "then a conforming create_guardian_rule to restore delivery",
+                    log_id_token(row.rule_id), log_key_token(row.name));
+            continue;
+        }
+
         // Depth guard on the raw stored text, before anything below interprets it
         // (including dangerous_enforce_in_spec's own parse just below, and the
         // nlohmann::json::parse further down): spec_json is stored,
@@ -222,8 +256,7 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
                 spdlog::error(
                     "Guardian push: rule {} ('{}') has spec_json nested past the depth "
                     "guard (max {}); excluding it from this push, cannot be safely parsed",
-                    onbehalf::sanitize_for_log(row.rule_id, 128),
-                    onbehalf::sanitize_for_log(row.name, 128),
+                    log_id_token(row.rule_id), log_key_token(row.name),
                     yuzu::server::mcp::kMcpMaxJsonDepth);
             continue;
         }
@@ -247,7 +280,7 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
             if (std::string why = dangerous_enforce_in_spec(row.spec_json); !why.empty()) {
                 spdlog::warn("Guardian push: rule {} ('{}') requests enforce on {} — downgrading to "
                              "audit (enforce-safety denylist, contract §6/H1)",
-                             row.rule_id, row.name, why);
+                             log_id_token(row.rule_id), log_key_token(row.name), why);
                 mode = "audit";
             }
         }

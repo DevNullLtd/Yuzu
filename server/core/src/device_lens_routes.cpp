@@ -54,6 +54,15 @@ void DeviceLensRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_
         // Fixed 7-day window — the lens's own pre-seam posture verbatim (never
         // the ?window= selector the full /dex drill exposes).
         const DexDeviceScoreModel m = dex_api_->device_score(id, "7d");
+        // #4855: a degraded signal-summary read must render an honest "DEX
+        // store degraded." placeholder AFTER the access audit above (parity
+        // with the Guardian lens's device_guards()-degraded branch just
+        // below) — never the pre-#4855 silent score-100/no-signals result.
+        if (m.degraded) {
+            res.set_content(render_device_lens_placeholder("dex", id, "DEX store degraded.", tabs),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::vector<std::pair<std::string, std::int64_t>> sigs;
         for (const auto& s : m.signals)
             sigs.emplace_back(s.obs_type, s.count);

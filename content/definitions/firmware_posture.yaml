@@ -1,0 +1,102 @@
+## Firmware Posture Definitions
+## Reports BIOS/UEFI firmware vendor, version, release date and update-pending posture. Read-only.
+## Plugin: firmware_posture | Actions: firmware
+##
+## Sources (all rung 1, no spawn): Windows WMI Win32_BIOS (Manufacturer,
+## SMBIOSBIOSVersion, ReleaseDate) plus the raw SMBIOS type-0 table from
+## GetSystemFirmwareTable('RSMB'); Linux sysfs DMI (/sys/class/dmi/id/bios_*)
+## plus fwupd (org.freedesktop.fwupd GetDevices/GetUpgrades over the sd-bus
+## system bus); macOS IOKit IODeviceTree (/rom, /chosen, root) plus
+## sysctlbyname hw.model.
+##
+## Wire rows lead with a fixed tag: `firmware|<field>|<value>|<source>` (the
+## data rows) or, only when the action's one exception handler fires,
+## `constrained|internal_error`. A fact the OS definitively reports as not
+## present is `absent` (or `unavailable` when the system bus reports fwupd not
+## installed) and is not a failure; `unreadable` is a failed read and always
+## comes with a non-OK result status.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.firmware_posture.firmware
+  displayName: Firmware Posture
+  version: 1.0.0
+  description: >
+    Reports BIOS/UEFI firmware facts as `firmware|field|value|source` rows:
+    vendor, version and release date on every OS, plus the SMBIOS ROM size
+    and BIOS/embedded-controller release (Windows raw SMBIOS, Linux DMI
+    release), the fwupd update-pending verdict and one row per fwupd device
+    (Linux), and the device-tree version source and hardware model (macOS).
+    A fact the OS reports as not present reads `absent`; a system bus that
+    reports fwupd not installed reads `update_pending|unavailable`; a failed
+    read (including a bus that cannot be opened) reads
+    `unreadable` and downgrades the result to CONSTRAINED or
+    PERMISSION_DENIED with a `<source>:<cause>` reason.
+  tags: [firmware_posture, security, posture, firmware, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firmware_posture
+    action: firmware
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # firmware|<field>|<value>|<source>
+    # constrained|<reason>            (only the catch-all exception row: `constrained|internal_error`)
+    #
+    # The leading tag is declared as `row_kind` so every value below maps to its own column.
+    # A `constrained` row has two fields only: field carries the reason, value and source are empty.
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Fixed leading tag of the row: `firmware` for a data row; `constrained` only for the single catch-all `constrained|internal_error` row emitted when the action hit an unexpected exception (the next column then carries the reason and the last two are empty).'
+        values: [firmware, constrained]
+        example: firmware
+        platforms: [windows, linux, darwin]
+      - name: field
+        type: string
+        description: 'The firmware fact. Every OS: vendor, version, release_date. Windows raw SMBIOS: rom_size_bytes, bios_release, ec_release (each only when the table specifies it). Linux: bios_release (DMI, only when present and well formed), update_pending (the aggregate fwupd verdict), fwupd_device (one row per fwupd device). macOS: version_source (which device-tree node and key carried the version), model. For a `constrained` row: the reason (internal_error).'
+        values: [vendor, version, release_date, rom_size_bytes, bios_release, ec_release, update_pending, fwupd_device, version_source, model, internal_error]
+        example: version
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: 'The value. vendor, version, release_date: the text read, else `absent` (the OS reports nothing) or `unreadable` (the read failed). release_date is `YYYY-MM-DD` when the source used a recognised date shape, otherwise the source text unchanged. update_pending: `yes`, `no` or `unknown` (aggregate over updatable fwupd devices), `unavailable` (the system bus answered and fwupd is not on it: a state, not a failure) or `unreadable` (the fwupd read failed, or this build has no libsystemd and reports the fwupd:not_built reason). fwupd_device: `id=<id>;name=<name>;version=<version>;updatable=<yes|no>;needs_reboot=<yes|no>;update_pending=<yes|no|unknown>;unmodelled=<yes|no>`, where unmodelled=yes means a device flag bit above those the plugin names was set. Other fields: a decimal number, an `<major>.<minor>` release, a device-tree `<node>#<key>` reference or the hardware model. Empty on a `constrained` row.'
+        example: A1.2.3
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'The mechanism that produced the row: smbios (Windows raw SMBIOS type 0), wmi (Windows Win32_BIOS), dmi (Linux sysfs), fwupd (Linux D-Bus), iokit (macOS device tree), sysctl (macOS hw.model). Empty on a `constrained` row.'
+        values: [smbios, wmi, dmi, fwupd, iokit, sysctl]
+        example: dmi
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - source
+      operations:
+        - count
+
+  readablePayload: "Report BIOS/firmware vendor, version, release date and update-pending posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [firmware_posture]
+
+status:
+  phase: active

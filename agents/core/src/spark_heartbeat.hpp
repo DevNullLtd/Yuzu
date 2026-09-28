@@ -135,6 +135,12 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
     // Capability: the registered AND functional mechanism types, as a CSV.
     std::string mechs;
     for (const auto& [type, ms] : by_type) {
+        // `.inert` here is deliberately the UNION of boot-inert and runtime-degraded
+        // (both reasons this CSV should stop advertising the type as a capability) -
+        // NOT the narrower boot-inert-only signal Guardian's capability filter reads
+        // (guardian_engine.cpp's reconcile_rule_locked, #4685): a transient
+        // runtime-degraded mechanism stays armable there, but has nothing to serve
+        // right now, so it correctly drops out of THIS CSV for that same window.
         if (ms.inert)
             continue; // registered but not currently serviceable: not a capability
         if (!mechs.empty())

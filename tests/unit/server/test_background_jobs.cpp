@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 43);
+    CHECK(kBackgroundJobs.size() == 44);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -61,6 +61,11 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         auto* collect = find("policy_evaluator.collect_ready");
         REQUIRE(collect != nullptr);
         CHECK(collect->cls == BackgroundJobClass::ReplicaSafe);
+        // HA WS-8: each replica's /readyz must measure its OWN path to Postgres —
+        // leader-gating the probe would leave every follower stale/unready.
+        auto* probe = find("pg_reachability_probe.tick");
+        REQUIRE(probe != nullptr);
+        CHECK(probe->cls == BackgroundJobClass::ReplicaSafe);
     }
     SECTION("the three #2508 clock-guard prune targets are ReplicaSafe (single-writer via guard)") {
         for (std::string_view p : {"app_perf_fleet_store.run_retention_prune",

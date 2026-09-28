@@ -262,6 +262,7 @@ agent_test_exe = executable(
     'unit/test_command_dedup_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_engine_legacy_sink.cpp', # #4783 commit 1: [!mayfail] red evidence only
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
@@ -290,6 +291,10 @@ agent_test_exe = executable(
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
+    'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
+    'unit/test_service_completion.cpp', # #4666 PR-2: service shutdown completion handshake
+    'unit/test_agent_log_wiring.cpp', # #4666 PR-2: install/release wrapper (agent_log_wiring.hpp)
+    'unit/test_log_handoff_multi_image.cpp', # #4666 PR-2 W3a: macOS multi-image topology fixture (MI-1/MI-3)
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
@@ -309,6 +314,7 @@ agent_test_exe = executable(
     'unit/test_guardian_convergence_scheduler.cpp',
     'unit/test_guardian_io_executor.cpp',
     'unit/test_guardian_outbox_send_executor.cpp',
+    'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_guardian_arm_ack.cpp',
@@ -333,6 +339,7 @@ agent_test_exe = executable(
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
+    'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
@@ -527,6 +534,13 @@ agent_test_exe = executable(
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
+    'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
+    'unit/test_browser_policy_local_dispatcher.cpp',  # Wave 10 PR10.2-b: real browser_policy dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
+    'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
+    'unit/test_platform_security_win_parsers.cpp',        # Wave 8 PR8.1-a1: pure registry-state mappers + reg-export parser over the-rig REAL CAPTURE fixtures
+    'unit/test_platform_security_local_dispatcher.cpp',   # Wave 8 PR8.1-a1: real platform_security dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
@@ -534,6 +548,16 @@ agent_test_exe = executable(
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
+    'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
+    'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
+    'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
+    'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
+    'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
+    'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
+    'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
+    '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -543,10 +567,16 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
+    include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
+    include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
+    include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
@@ -602,6 +632,13 @@ agent_test_exe = executable(
              # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
              # CAPTURE fixtures via this same define. Wave 9 PR9.1a2:
              # test_peripherals_win_parsers.cpp reads the-rig REAL CAPTURE fixtures too.
+             # Wave 8 PR8.4: test_firmware_posture_parsers.cpp reads REAL CAPTURE fixtures via
+             # this same define.
+             # Wave 8 PR8.1-a1: test_platform_security_{parsers,win_parsers}.cpp read
+             # Wave 8 PR8.1-b: test_system_hardening_{parsers,win_parsers}.cpp read
+             # Docker/this-Mac/the-rig REAL CAPTURE fixtures via this same define.
+             # Wave 10 PR10.1-c: test_pkg_inventory_macos_parsers.cpp reads the this-Mac REAL
+             # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -649,6 +686,9 @@ agent_test_exe = executable(
   # plugin by path for the identical reason (PKG-NC).
   # content_dist_plugin_lib / script_exec_plugin_lib: same reasoning, for
   # test_content_dist_actions.cpp / test_script_exec_actions.cpp.
+  # agent_actions_plugin_lib (agents/plugins/agent_actions/meson.build):
+  # test_log_handoff_multi_image.cpp's MI-3 loads the real agent_actions plugin by path
+  # for the identical reason (#4666 PR-2 W3a macOS multi-image fixture).
   # echo_argv_fixture: test_content_dist_exec_seam.cpp's real B6 exec-verify
   # test stages and execs this fixture binary by path -- without it in
   # link_depends, a fresh build could leave the test executable built before
@@ -666,6 +706,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
@@ -697,11 +738,17 @@ agent_test_exe = executable(
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
                 app_control_plugin_lib,  # Wave 8 PR8.6
+                platform_security_plugin_lib,  # Wave 8 PR8.1-a1
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
+                browser_policy_plugin_lib,  # Wave 10 PR10.2-b
+                firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
+                system_hardening_plugin_lib,  # Wave 8 PR8.1-b
+                runtimes_plugin_lib,  # Wave 10 PR10.1-b
+                pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -1109,6 +1156,8 @@ if build_server
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
+      'unit/server/test_pg_reachability_probe.cpp', # HA WS-8: /readyz pg_reachable rule + probe
+      'unit/server/test_multi_host_dsn.cpp', # HA WS-8: multi-host DSN target_session_attrs guard
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
@@ -1122,6 +1171,9 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
+      'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
+      'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
@@ -1263,6 +1315,7 @@ if build_server
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
+      'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
@@ -1270,6 +1323,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
@@ -2275,6 +2329,20 @@ test('proto gen_proto version check',
   timeout: 30,
 )
 
+# ── Gateway build wrapper ──────────────────────────────────────────────────
+# scripts/build_gateway.py (+ the shared erlang_toolchain.py) driven with a
+# fake Python child — no Erlang needed, so it runs on every leg, including the
+# Windows one whose stdio/timeout/Ctrl-C behaviour it mostly pins. ~51s
+# measured (Windows and Linux); several cases deliberately wait out a
+# grandchild to prove the whole tree was killed, so the timeout leaves room
+# for a loaded shared runner box.
+test('gateway build wrapper',
+  _python3_test,
+  args: [files('test_build_gateway.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
@@ -2301,6 +2369,37 @@ test('capability catalogue completeness',
 test('capability gate consistency',
   _python3_test,
   args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# firmware_posture's definition-column contract (content/definitions/firmware_posture.yaml):
+# row_kind must be the first result column and the order must match the wire row
+# firmware_posture_parsers.hpp emits. Parses the YAML directly -- catches a reordered or
+# renamed column the C++ test's hard-coded literal cannot.
+test('firmware_posture definition columns',
+  _python3_test,
+  args: [files('test_firmware_posture_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# runtimes' definition-column contract (content/definitions/runtimes.yaml): row_kind first and the
+# column order match the wire row runtimes_parsers.hpp emits; parses the YAML directly.
+test('runtimes definition columns',
+  _python3_test,
+  args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
+# row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
+# parses the YAML directly -- catches a reordered or renamed column the C++ test's
+# hard-coded literal cannot.
+test('browser_policy definition columns',
+  _python3_test,
+  args: [files('test_browser_policy_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -2507,6 +2606,55 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
+# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
+# describe -- see the script's own header). No build required, so gated only on bash
+# being present, same as the other lexical selftests above.
+if _bash_test.found()
+  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+    _bash_test,
+    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
+# #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
+# agent_actions plugin (see the script's own header for what it does and does not prove).
+# Gated on build_agent the same way the capability matrix gate above is -- nothing to
+# inspect without a real agent build.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
+  test('spdlog registry identity symbol-binding report (#4666 PR-2 W3a MI-2)',
+    _bash_test,
+    args: [files('shell/test_spdlog_registry_identity.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 60,
+    depends: [
+      yuzu_agent_exe,
+      yuzu_agent_core_lib,
+      agent_actions_plugin_lib,
+    ],
+  )
+endif
+
+# #4666 PR-2 acceptance-evidence harness: formalizes the hand-verified manual
+# repro of the blocked-log-sink SIGTERM scenario (main.cpp's async log
+# hand-off, log_handoff.hpp) into a committed, repeatable shell test against
+# the real yuzu-agent binary. Linux-only -- the blockage-detection mechanism
+# reads /proc/<pid>/task/*/wchan, which has no equivalent on macOS/Windows.
+# `yuzu_agent_exe` (agents/core/meson.build) is named specifically so this
+# depends: entry can pin the real agent binary as a build dependency.
+if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('blocked log sink SIGTERM harness (#4666 PR-2)',
+    _bash_test,
+    args: [files('shell/test_blocked_log_sink_sigterm.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 300,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
@@ -2553,6 +2701,18 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
+# and authorization-topology-floor tables must match rbac_store.cpp's seed
+# arrays and authz_topology_floor.hpp's kTopologyFloor. Also runs in
+# .github/workflows/docs-lint.yml on every PR; registered here for local
+# `meson test --suite docs` parity with the sibling python doc-tests.
+test('rbac doc counts',
+  _python3_test,
+  args: [files('test_rbac_doc_counts.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
 # ADR-0032 split interlock merge-gate: the tripwire (no engine-path symbol may
 # merge while the gate is red) and its self-test (the ledger's load-bearing
 # constants are pinned so the gate cannot be silently neutered). Both also run in
@@ -2578,6 +2738,39 @@ test('split interlock tripwire selftest',
 test('no conn-less libpq escape references',
   _python3_test,
   args: [files('test_no_connless_pq_escape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL lives only in the
+# query owner, and its one shared SQL fragment has exactly one definition (PR #4985).
+test('rbac cross-schema query-owner seam',
+  _python3_test,
+  args: [files('test_rbac_query_owner_seam.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4665 lockstep: the #4606-pinned format_arm_committed_line shape
+# (tests/unit/fixtures/spark/arm_committed_line.json) still parses through the #3990
+# driver's own T2_RE, and the driver's evidence regexes still refuse a forged rule-id/Spark-key
+# free-text injection. Also runs in .github/workflows/docs-lint.yml on every PR.
+test('spark evidence format lockstep (#4665)',
+  _python3_test,
+  args: [files('test_spark_evidence_format_lockstep.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+# subsystem (agents/core/src + server/core/src + common/include, filtered to the
+# guardian_*/guard_*/spark_*/guaranteed_state* basename glob) that fails the moment
+# a NEW spdlog:: call prints a rule-id/Spark-key-shaped argument unwrapped -- see the
+# script's own module docstring for the full design (why position-aware, file scope,
+# known limitations). Also runs in .github/workflows/docs-lint.yml on every PR.
+test('guardian/spark log-injection tripwire (#4665)',
+  _python3_test,
+  args: [files('test_guardian_spark_log_injection_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

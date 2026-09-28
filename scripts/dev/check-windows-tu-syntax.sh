@@ -56,12 +56,20 @@ tus=(
     agents/plugins/power_health/src/power_health_plugin.cpp
     agents/plugins/autoruns/src/autoruns_win.cpp
     agents/plugins/peripherals/src/peripherals_win.cpp
+    agents/plugins/browser_policy/src/browser_policy_win.cpp
+    agents/plugins/pkg_inventory/src/pkg_inventory_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
+    agents/plugins/runtimes/src/runtimes_win.cpp
+    agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
+    agents/plugins/firmware_posture/src/firmware_posture_win.cpp
     agents/plugins/app_control/src/app_control_plugin.cpp
     agents/plugins/app_control/src/app_control_win.cpp
+    agents/plugins/platform_security/src/platform_security_win.cpp
+    agents/plugins/system_hardening/src/system_hardening_plugin.cpp
+    agents/plugins/system_hardening/src/system_hardening_win.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 

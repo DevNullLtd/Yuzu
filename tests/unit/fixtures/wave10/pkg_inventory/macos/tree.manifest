@@ -1,0 +1,13 @@
+# tree.manifest -- pkg_inventory macOS Homebrew tree. Format and provenance: see provenance.txt in this
+# directory. payload D: = directory. Lines starting with '#' are comments.
+opt/homebrew/Cellar/ccache/4.13.6_1	D:
+opt/homebrew/Cellar/cmake/4.4.2	D:
+opt/homebrew/Cellar/fmt/12.2.0	D:
+opt/homebrew/Cellar/lz4/1.10.0	D:
+opt/homebrew/Cellar/meson/1.12.0	D:
+opt/homebrew/Cellar/ninja/1.13.2	D:
+opt/homebrew/Cellar/openssl@3/3.6.3	D:
+opt/homebrew/Cellar/sqlite/3.53.4	D:
+opt/homebrew/Cellar/xz/5.8.3	D:
+opt/homebrew/Cellar/zstd/1.5.7_1	D:
+opt/homebrew/Caskroom	D:

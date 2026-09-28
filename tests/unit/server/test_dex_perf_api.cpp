@@ -311,6 +311,24 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() null-reader degrade", "[dex_perf
     CHECK_FALSE(api->tag_trend("model", "laptop-x", "chrome.exe", "124.0.0.0").has_value());
 }
 
+// #1762: a degraded ManagementGroupStore member-resolution read must fail
+// group_trend() closed to nullopt, never render as an empty trend
+// (indistinguishable from a genuinely empty/unknown group). No live database
+// needed — an invalid pool makes ManagementGroupStore::is_open() false, so
+// get_members_checked() degrades before group_trend ever reaches the B1
+// aggregate reader.
+TEST_CASE("DexPerfApi group_trend() fails closed on a degraded member-resolution "
+         "read (#1762)",
+         "[dex_perf_api]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore mgmt{pool};
+    REQUIRE(!mgmt.is_open());
+    AppPerfGroupReader reader{pool};
+
+    auto api = make_local_dex_perf_api({}, nullptr, nullptr, &reader, &mgmt, nullptr);
+    CHECK_FALSE(api->group_trend("g1", "chrome.exe", "124.0.0.0").has_value());
+}
+
 // Real-impl PG coverage for group_trend()/tag_trend() — the seam's OWN
 // ManagementGroupStore::get_members()/TagStore::agents_with_tag() member
 // resolution + AppPerfGroupReader::get_group_trend() aggregate + the SAME

@@ -1,0 +1,154 @@
+## Browser Policy Definitions
+## Reports the enterprise-managed browser policies configured on a device:
+## which Chrome, Chromium and Edge policies an administrator has set, at which
+## level (mandatory or recommended), with their typed values. Read-only,
+## facts only: a policy is a row, never a verdict, and nothing is enforced,
+## changed or fetched.
+## Plugin: browser_policy | Actions: policies
+##
+## Sources by platform:
+##   Linux:   file reads of the JSON policy files under
+##            /etc/opt/chrome/policies/{managed,recommended},
+##            /etc/chromium/policies/{managed,recommended} and
+##            /etc/opt/edge/policies/{managed,recommended} (*.json). Directories
+##            are opened without following symlinks and every file is read with
+##            a 1 MiB cap.
+##   Windows: PLANNED - follows as its own PR (HKLM\SOFTWARE\Policies\
+##            {Google\Chrome,Microsoft\Edge} and their Recommended subkeys).
+##            Until then `policies` on Windows returns one `status` row and
+##            result status UNAVAILABLE with provenance `windows:planned`.
+##   macOS:   PLANNED - follows as its own PR (/Library/Managed Preferences).
+##            Until then `policies` on macOS returns one `status` row and
+##            result status UNAVAILABLE with provenance `macos:planned`.
+##
+## Absent versus constrained: a host with no managed policy files (browser not
+## installed, nothing managed) returns ZERO rows and result status OK/FULL - a
+## genuinely absent thing. A directory or file that exists but cannot be read or
+## decoded makes the result CONSTRAINED/PARTIAL with a reason token, never an
+## empty success. A planned leg reports UNAVAILABLE/PARTIAL: that host was not
+## inspected, which is not the same as "no policy configured". Every one of those
+## non-OK outcomes is ALSO written as one in-band `status` row, because the
+## server's response queries (REST, MCP, the dashboard) do not return the typed
+## result status today: zero rows and no status row means the read completed.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.browser_policy.policies
+  displayName: Browser Policies
+  version: 1.0.0
+  description: >
+    Lists the enterprise-managed Chrome, Chromium and Edge browser policies
+    configured on the device, one row per policy: the browser, whether the
+    policy is mandatory or recommended, its scope, its name, its typed value
+    and the file it was read from. On Linux the rows come from the JSON policy
+    files under /etc/opt/chrome, /etc/chromium and /etc/opt/edge. Windows and
+    macOS legs planned - each follows as its own PR; on those hosts the action
+    returns one `status` row and result status UNAVAILABLE with provenance
+    `<os>:planned`. A host with no managed policy returns zero rows and a clean
+    result status; a read that could not be completed adds one `constrained`
+    status row. Values are reported verbatim. The plugin never enforces, fetches
+    or changes anything.
+  tags: [browser, policy, inventory, software]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: browser_policy
+    action: policies
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Two row kinds, discriminated by field 0 (row_kind), both nine fields wide:
+    #
+    #   policy|<browser>|<level>|<scope>|<name>|<value_type>|<value>|<source>|<detail>
+    #   status|-|-|-|policies|-|<constrained|unavailable>|-|<reason tokens>
+    #
+    # A `status` row is written FIRST and only when the read was not complete (a
+    # read that could not be finished, a planned leg, a leg that threw); it
+    # repeats the typed result status in band. A complete read writes none, and a
+    # host with no managed policy returns zero rows. Free text is escaped for the
+    # server's pipe grammar (safe_output_field; lossy on backslash by design).
+    columns:
+      - name: row_kind
+        type: string
+        values: [policy, status]
+        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-".'
+        example: policy
+        platforms: [windows, linux, darwin]
+      - name: browser
+        type: string
+        values: [chrome, chromium, edge]
+        description: 'Browser the policy applies to. Values: chrome (Google Chrome), chromium (Chromium), edge (Microsoft Edge); "-" on a status row.'
+        example: chrome
+        platforms: [linux]
+      - name: level
+        type: string
+        values: [mandatory, recommended]
+        description: 'Policy level. Values: mandatory (the user cannot override it), recommended (a default the user may change); "-" on a status row.'
+        example: mandatory
+        platforms: [linux]
+      - name: scope
+        type: string
+        description: 'Where the policy applies. Values: machine, or user:<name> where a leg reads per-user policy (the Linux leg reads machine policy only, so it always reports machine). The user name is untrusted text.'
+        example: machine
+        platforms: [linux]
+      - name: name
+        type: string
+        description: 'Policy name exactly as the browser documents it. On a status row: the action name, policies.'
+        example: HomepageLocation
+        platforms: [windows, linux, darwin]
+      - name: value_type
+        type: string
+        values: [bool, int, real, string, list, dict, "null", unmodelled]
+        description: 'Type of the value. Values: bool, int, real, string, list, dict, null, unmodelled (the policy is present but its value could not be represented; see detail); "-" on a status row.'
+        example: string
+        platforms: [linux]
+      - name: value
+        type: string
+        description: 'The policy value as text: true or false for a bool, decimal text for int and real, the string verbatim, compact JSON text for a list or dict (flagged json_escaped in detail, and lossy and not trustworthy as the original JSON -- an escaped quote can make it syntactically invalid -- if the escaper folded a backslash inside it), the literal null for null, and "-" for unmodelled. Reported verbatim: a value can carry a credential-bearing URL or an enrollment token an administrator put in the file. On a status row: the state, constrained or unavailable.'
+        example: https://intranet.example.com
+        platforms: [windows, linux, darwin]
+      - name: source
+        type: string
+        description: 'The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path.'
+        example: /etc/opt/chrome/policies/managed/corp.json
+        platforms: [linux]
+      - name: detail
+        type: string
+        description: 'A short qualifier, or "-" when there is none. json_type marks an unmodelled value; json_escaped marks a list/dict value whose JSON dump held a backslash, now folded to / by the wire escaper -- the result is lossy and not trustworthy as the original JSON, and an escaped quote can make it syntactically invalid -- the value is still reported, just flagged; nul_replaced and utf8_replaced (appended, comma-joined) mark a free-text field that held an embedded NUL byte or a byte that is not valid UTF-8 (possible in a Linux file name), each replaced by U+FFFD; truncated marks a field longer than 64 KiB, cut. On a status row: the comma-joined reason tokens, for example linux:permission_denied or macos:planned.'
+        example: "-"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+        - browser
+        - level
+      operations:
+        - count
+
+  readablePayload: "List managed browser policies"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [browser_policy]
+
+status:
+  phase: active

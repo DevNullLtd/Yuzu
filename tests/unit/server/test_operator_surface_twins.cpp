@@ -57,6 +57,7 @@
 #include "schedule_arming_check.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_runner.hpp"
+#include "test_auth_db_pg_helper.hpp" // AuthDbPg — the last-admin guard's auth.users JOIN (BLOCKING #1)
 
 #include "../test_helpers.hpp"
 
@@ -342,9 +343,26 @@ struct Harness {
 TEST_CASE("arming_check (auto path): a schedule whose creator lost the required permission "
           "does not fire, and re-fires once permission is restored",
           "[server][routes][mcp][schedule][pg]") {
-    TWINS_RBAC(rbac);
+    // RbacStore is co-located on a real AuthDbPg's pool (not TWINS_RBAC's own,
+    // separate database) so the last-admin guard's `auth.users` JOIN
+    // (BLOCKING #1) can see the seeded users below — same fixture-colocation
+    // fix as test_rbac_store.cpp's RBAC_STORE_WITH_AUTH macro, applied
+    // file-locally here since TWINS_RBAC's "optwinsrbac" template has no
+    // other caller to keep in sync with.
+    yuzu::test::AuthDbPg twins_auth_fx_;
+    RbacStore rbac{twins_auth_fx_.pool()};
+    REQUIRE(rbac.is_open());
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder so unassigning carol's grant below doesn't
+    // trip the A2 last-Administrator guard (delivery plan §2) — this test is
+    // about arming re-verification, not that guard. Both need a live
+    // `auth.users` row for the guard's JOIN to count them.
+    REQUIRE(twins_auth_fx_->upsert_user("twins-other-admin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(twins_auth_fx_->upsert_user("carol", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "carol", "Administrator"}).has_value());
     auto id = h.make_due("carol", /*requires_approval=*/false);
 
@@ -370,9 +388,21 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
 TEST_CASE("arming_check (approval path): a schedule whose creator lost the required "
           "permission does not submit an approval ticket and does not fire",
           "[server][routes][mcp][schedule][pg]") {
-    TWINS_RBAC(rbac);
+    // See the identical comment in the auto-path test above — RbacStore is
+    // co-located on a real AuthDbPg's pool so the last-admin guard's
+    // `auth.users` JOIN (BLOCKING #1) can see the seeded users.
+    yuzu::test::AuthDbPg twins_auth_fx_;
+    RbacStore rbac{twins_auth_fx_.pool()};
+    REQUIRE(rbac.is_open());
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder — see the identical comment in the
+    // auto-path test above (A2 last-Administrator guard).
+    REQUIRE(twins_auth_fx_->upsert_user("twins-other-admin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(twins_auth_fx_->upsert_user("dave", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "dave", "Administrator"}).has_value());
     auto id = h.make_due("dave", /*requires_approval=*/true);
 

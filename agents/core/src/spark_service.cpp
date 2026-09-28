@@ -45,6 +45,7 @@
 #include <yuzu/agent/guard_systemd.hpp> // parse_active_state, systemd_error_name_is_absence,
                                         // systemd_state_is_transitional, normalize_unit_name,
                                         // valid_unit_name — pure, all-platform, shared with the guard
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -378,9 +379,12 @@ public:
     /// slow-op are ReadDirectoryChangesW-specific — #1979/#1980/#1982); its own
     /// fault-tiering and retry counters are tracked separately (#1929/#1931). What it
     /// MUST publish is `inert`, so the fleet can tell a service mechanism that bound
-    /// the system bus from one that never did (the container case).
+    /// the system bus from one that never did (the container case). `inert_` here is
+    /// ENTIRELY boot-time (#4685) — Linux Service has no runtime-inert concept, unlike
+    /// File/Registry — so `.boot_inert` is the same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = inert_.load(std::memory_order_acquire)};
+        const bool boot = inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:
@@ -420,7 +424,7 @@ private:
         } else {
             spdlog::warn("spark_service: LoadUnit '{}' transient error (name='{}', {}) — "
                          "reopening, no false Stopped",
-                         uw.unit, err.name ? err.name : "(none)",
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)",
                          err.message ? err.message : err_str(r < 0 ? -r : 0));
             res = ResolveResult::BusError;
         }
@@ -447,7 +451,7 @@ private:
         } else {
             spdlog::warn("spark_service: ActiveState read transient error for '{}' (name='{}') — "
                          "reopening, no false drift",
-                         uw.unit, err.name ? err.name : "(none)");
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)");
         }
         if (s)
             free(s);
@@ -515,7 +519,8 @@ private:
         int r = sd_bus_match_signal(bus, &slot, kDest, uw.path.c_str(), kPropsIface,
                                     "PropertiesChanged", &on_props_changed, &uw);
         if (r < 0) {
-            spdlog::warn("spark_service: match arm failed for '{}': {}", uw.unit, err_str(-r));
+            spdlog::warn("spark_service: match arm failed for '{}': {}",
+                         ::yuzu::log_key_token(uw.unit), err_str(-r));
             if (auto st = read_state(bus, uw)) {
                 set_terminal_from_systemd(uw, *st, emits);
                 stage_coverage(uw, SparkCoverage::Poll, established);
@@ -1597,9 +1602,12 @@ public:
 
     /// See the Linux twin: this mechanism tracks none of the File-mechanism counters,
     /// but it MUST publish `inert` so an SCM-denied service mechanism is distinguishable
-    /// from a healthy idle one.
+    /// from a healthy idle one. `started_inert_` here is ENTIRELY boot-time (#4685) —
+    /// Windows Service has no runtime-inert concept either — so `.boot_inert` is the
+    /// same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = started_inert_.load(std::memory_order_acquire)};
+        const bool boot = started_inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:

@@ -40,6 +40,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -109,10 +110,131 @@ TEST_CASE("AccessReviewStore reports !is_open on an unreachable pool, and every 
     AccessReviewStore store{pool};
     CHECK_FALSE(store.is_open());
 
-    CHECK_FALSE(store.open_campaign("t", "admin", {}).has_value());
+    CHECK_FALSE(store.open_campaign("t", "admin", {}, "enabled").has_value());
     CHECK_FALSE(store.record_attestation("x", "user", "a", "R", "attested", "r", "").has_value());
     CHECK_FALSE(store.get_campaign("x").has_value());
     CHECK_FALSE(store.close_campaign("x", "admin").has_value());
+}
+
+// ── Migration v1->v2 (rbac_enforcement column, A3) ──────────────────────────
+
+// UP-7 pattern (test_api_token_store.cpp's v2->v3 case, test_quarantine_store.cpp's
+// own v1->v2 case): every other test in this file clones access_review_store_tpl,
+// already at v2 — the real v1->v2 upgrade path (PgMigrationRunner applying v2's
+// ALTER against a genuinely-populated v1 table) is otherwise untested. Hand-seeds
+// v1 DDL verbatim (copied from migrations() in access_review_store.cpp, file-local
+// and not exported), stamps schema_meta at v1, and inserts a pre-existing campaign
+// row BEFORE handing the database to a real AccessReviewStore construction — the
+// column's '' default is the honest-empty value this test proves for a row that
+// genuinely predates rbac_enforcement, never re-derived or backfilled.
+TEST_CASE("AccessReviewStore: a genuine v1->v2 upgrade (real ALTER against a populated "
+         "table) opens cleanly and rbac_enforcement defaults to '' on the pre-existing row",
+         "[access_review][store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    std::string pre_v2_id;
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA access_review_store")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL, copied from migrations() in access_review_store.cpp, but
+        // SCHEMA-QUALIFIED throughout (a raw PQexec on a plain connection
+        // does not get the transaction-scoped search_path the real runner
+        // sets — see that file's "Unqualified DDL" comment).
+        PgResult v1{PQexec(
+            conn.get(),
+            "CREATE TABLE access_review_store.access_review_campaign ("
+            "  campaign_id    TEXT PRIMARY KEY,"
+            "  title          TEXT NOT NULL,"
+            "  status         TEXT NOT NULL CHECK (status IN ('open','closed')),"
+            "  created_by     TEXT NOT NULL,"
+            "  created_at_ms  BIGINT NOT NULL,"
+            "  closed_by      TEXT NOT NULL DEFAULT '',"
+            "  closed_at_ms   BIGINT NOT NULL DEFAULT 0);"
+            "CREATE INDEX access_review_campaign_status_idx ON "
+            "access_review_store.access_review_campaign (status);"
+            "CREATE TABLE access_review_store.access_review_attestation ("
+            "  campaign_id     TEXT NOT NULL REFERENCES "
+            "access_review_store.access_review_campaign(campaign_id) ON DELETE CASCADE,"
+            "  principal_type  TEXT NOT NULL CHECK (principal_type IN ('user','group','engine')),"
+            "  principal_id    TEXT NOT NULL,"
+            "  role_name       TEXT NOT NULL,"
+            "  decision        TEXT NOT NULL CHECK (decision IN ('pending','attested',"
+            "                  'flagged_revoke')),"
+            "  reviewer        TEXT NOT NULL DEFAULT '',"
+            "  decided_at_ms   BIGINT NOT NULL DEFAULT 0,"
+            "  justification   TEXT NOT NULL DEFAULT '',"
+            "  grant_snapshot  TEXT NOT NULL DEFAULT '',"
+            "  PRIMARY KEY (campaign_id, principal_type, principal_id, role_name));")};
+        REQUIRE(v1.ok());
+        PgResult stamp{
+            PQexec(conn.get(), "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                               "VALUES ('access_review_store', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+
+        // A row genuinely present BEFORE the v2 ALTER runs — no
+        // rbac_enforcement column exists at this point at all.
+        PgResult seed{PQexec(
+            conn.get(), "INSERT INTO access_review_store.access_review_campaign "
+                       "(campaign_id, title, status, created_by, created_at_ms) VALUES "
+                       "('pre-v2-campaign', 'Pre-A3 campaign', 'open', 'admin', 1000) "
+                       "RETURNING campaign_id")};
+        REQUIRE(seed.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(seed.get()) == 1);
+        pre_v2_id = PQgetvalue(seed.get(), 0, 0);
+    }
+
+    // The real construction path: PgMigrationRunner::run reads version 1 from
+    // schema_meta and applies v2's ALTER against the table seeded above.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto view = store.get_campaign(pre_v2_id);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.title == "Pre-A3 campaign");
+    // The honest-empty default — NOT "degraded": the store never degraded,
+    // the column simply didn't exist when this row was written.
+    CHECK(view->campaign.rbac_enforcement.empty());
+
+    // A NEW campaign opened after the upgrade gets a real value, proving the
+    // ALTER's CHECK constraint (added in the same migration) doesn't reject
+    // a live open_campaign() write.
+    auto open_res = store.open_campaign("Post-A3 campaign", "admin", {}, "enabled");
+    REQUIRE(open_res.has_value());
+    auto view2 = store.get_campaign(*open_res);
+    REQUIRE(view2.has_value());
+    CHECK(view2->campaign.rbac_enforcement == "enabled");
+}
+
+// ── rbac_enforcement validation (A3, RBAC delivery plan) ───────────────────
+
+// The column's own '' default exists ONLY for a pre-A3 row (schema migration
+// 2) — a live open_campaign() caller must always supply one of the three
+// real values, mirroring record_attestation's decision validation below.
+TEST_CASE("open_campaign rejects an rbac_enforcement value outside "
+         "{enabled,disabled,degraded}",
+         "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    for (const std::string& bad : {std::string(""), std::string("on"), std::string("ENABLED"),
+                                   std::string("unknown")}) {
+        auto res = store.open_campaign("Bad enforcement", "admin", {}, bad);
+        REQUIRE_FALSE(res.has_value());
+        CHECK_FALSE(res.error().starts_with("not_found:"));
+    }
 }
 
 // ── Freeze-at-open (R3) ──────────────────────────────────────────────────────
@@ -125,7 +247,7 @@ TEST_CASE("open_campaign freezes the full population as pending rows (R3)",
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Q3 Review", "admin", three_grants());
+    auto open_res = store.open_campaign("Q3 Review", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     CHECK_FALSE(open_res->empty());
 
@@ -137,6 +259,7 @@ TEST_CASE("open_campaign freezes the full population as pending rows (R3)",
     CHECK(view_res->campaign.created_by == "admin");
     CHECK(view_res->campaign.closed_by.empty());
     CHECK(view_res->campaign.closed_at_ms == 0);
+    CHECK(view_res->campaign.rbac_enforcement == "enabled"); // A3 — frozen at open
     REQUIRE(view_res->attestations.size() == 3);
     CHECK(view_res->pending_count == 3);
     for (const auto& a : view_res->attestations) {
@@ -153,12 +276,13 @@ TEST_CASE("open_campaign with an empty population still opens a campaign (zero p
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Empty", "admin", {});
+    auto open_res = store.open_campaign("Empty", "admin", {}, "disabled");
     REQUIRE(open_res.has_value());
     auto view_res = store.get_campaign(*open_res);
     REQUIRE(view_res.has_value());
     CHECK(view_res->attestations.empty());
     CHECK(view_res->pending_count == 0);
+    CHECK(view_res->campaign.rbac_enforcement == "disabled");
 }
 
 // governance hardening round: get_campaign's two reads (campaign row +
@@ -178,7 +302,7 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Drop test", "admin", three_grants());
+    auto open_res = store.open_campaign("Drop test", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
 
     {
@@ -203,7 +327,7 @@ TEST_CASE("record_attestation transitions a pending row and upserts in place on 
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("R1", "admin", three_grants());
+    auto open_res = store.open_campaign("R1", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
@@ -253,7 +377,7 @@ TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revok
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Bad decision", "admin", three_grants());
+    auto open_res = store.open_campaign("Bad decision", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
 
     auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "pending", "carol",
@@ -273,7 +397,7 @@ TEST_CASE("record_attestation rejects a write into a closed campaign",
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Closed test", "admin", three_grants());
+    auto open_res = store.open_campaign("Closed test", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
@@ -321,7 +445,7 @@ TEST_CASE("record_attestation on a grant never in the frozen population is not_f
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Narrow", "admin", three_grants());
+    auto open_res = store.open_campaign("Narrow", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
 
     // A real, open campaign — but this (principal, role) tuple was never in
@@ -339,7 +463,7 @@ TEST_CASE("close_campaign is idempotent-rejecting: closing twice returns not_fou
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Double close", "admin", {});
+    auto open_res = store.open_campaign("Double close", "admin", {}, "enabled");
     REQUIRE(open_res.has_value());
     REQUIRE(store.close_campaign(*open_res, "admin").has_value());
 
@@ -359,7 +483,7 @@ TEST_CASE("campaign evidence persists across a fresh store/connection — there 
         PgPool pool{{.conninfo = db.dsn(), .size = 4}};
         AccessReviewStore store{pool};
         REQUIRE(store.is_open());
-        auto open_res = store.open_campaign("Durable", "admin", three_grants());
+        auto open_res = store.open_campaign("Durable", "admin", three_grants(), "degraded");
         REQUIRE(open_res.has_value());
         cid = *open_res;
         REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "")
@@ -378,6 +502,7 @@ TEST_CASE("campaign evidence persists across a fresh store/connection — there 
     auto view = store2.get_campaign(cid);
     REQUIRE(view.has_value());
     CHECK(view->campaign.title == "Durable");
+    CHECK(view->campaign.rbac_enforcement == "degraded"); // A3 — frozen value survives too
     CHECK(view->pending_count == 2);
     bool found_attested = false;
     for (const auto& a : view->attestations)
@@ -407,11 +532,11 @@ TEST_CASE("list_campaigns: returns every opened campaign's metadata, newest-firs
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_a = store.open_campaign("Campaign A", "admin", {});
+    auto open_a = store.open_campaign("Campaign A", "admin", {}, "enabled");
     REQUIRE(open_a.has_value());
-    auto open_b = store.open_campaign("Campaign B", "admin", {});
+    auto open_b = store.open_campaign("Campaign B", "admin", {}, "disabled");
     REQUIRE(open_b.has_value());
-    auto open_c = store.open_campaign("Campaign C", "admin", three_grants());
+    auto open_c = store.open_campaign("Campaign C", "admin", three_grants(), "degraded");
     REQUIRE(open_c.has_value());
 
     auto list_res = store.list_campaigns();
@@ -445,6 +570,20 @@ TEST_CASE("list_campaigns: returns every opened campaign's metadata, newest-firs
         CHECK(c.closed_by.empty());
         CHECK(c.closed_at_ms == 0);
     }
+
+    // Each campaign's own rbac_enforcement stamp survives the round trip
+    // through list_campaigns (A3) — distinct per campaign, so this also
+    // proves the column isn't shared/aliased across rows.
+    auto find = [&](const std::string& id) {
+        return std::find_if(list_res->begin(), list_res->end(),
+                            [&](const auto& c) { return c.campaign_id == id; });
+    };
+    REQUIRE(find(*open_a) != list_res->end());
+    CHECK(find(*open_a)->rbac_enforcement == "enabled");
+    REQUIRE(find(*open_b) != list_res->end());
+    CHECK(find(*open_b)->rbac_enforcement == "disabled");
+    REQUIRE(find(*open_c) != list_res->end());
+    CHECK(find(*open_c)->rbac_enforcement == "degraded");
 }
 
 TEST_CASE("list_campaigns: a closed campaign's metadata still appears (list is not filtered by "
@@ -455,7 +594,7 @@ TEST_CASE("list_campaigns: a closed campaign's metadata still appears (list is n
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto open_res = store.open_campaign("Will be closed", "admin", {});
+    auto open_res = store.open_campaign("Will be closed", "admin", {}, "enabled");
     REQUIRE(open_res.has_value());
     REQUIRE(store.close_campaign(*open_res, "admin").has_value());
 

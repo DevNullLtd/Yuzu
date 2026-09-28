@@ -68,10 +68,15 @@ public:
         // Resolve members (one bounded read, lease released), THEN aggregate B1
         // (a second bounded read) — never a lease held across the other
         // (ADR-0012 §1), matching the pre-seam AppPerfProviders.group closure.
-        const auto members = mgmt_group_store_->get_members(group_id);
+        // get_members_checked (not the plain get_members()) so a member-read
+        // degrade fails closed to nullopt instead of rendering as an empty
+        // cohort (#1762) — same contract tag_trend already has via TagStore.
+        auto members = mgmt_group_store_->get_members_checked(group_id);
+        if (!members)
+            return std::nullopt; // AUTHORITATIVE degrade — the member read failed
         std::vector<std::string> agent_ids;
-        agent_ids.reserve(members.size());
-        for (const auto& m : members)
+        agent_ids.reserve(members->size());
+        for (const auto& m : *members)
             agent_ids.push_back(m.agent_id);
         auto rows = group_reader_->get_group_trend(agent_ids, app, version);
         if (!rows)

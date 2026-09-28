@@ -16,11 +16,11 @@
 /// `AppPerfProviders` aggregate — it is this test double's OWN type, defined
 /// here, so `AppPerfProviders` could be deleted from production (#4626 Concern
 /// C) without breaking every harness that builds one of these. It keeps the
-/// SAME field names/types `AppPerfProviders` had (including `.cohort`/
-/// `.tag_values`, which `DexPerfApi` itself never reads) purely so existing
-/// callers building a `Providers` and separately reusing `.cohort` for
-/// VerifyApi's own test wiring, or `.tag_values` for a caller's own picker,
-/// need NO field-level changes — only the type name at the declaration site.
+/// SAME field names/types `AppPerfProviders` had (including `.cohort`, which
+/// `DexPerfApi` itself never reads) purely so existing callers building a
+/// `Providers` and separately reusing `.cohort` for VerifyApi's own test
+/// wiring need NO field-level changes (the former `.tag_values` field was
+/// removed with `DexRoutes::TagValuesFn`, #4857) — only the type name at the declaration site.
 ///
 /// The individual `AppPerfXxxFn` provider typedefs (that `Providers` below is
 /// built from) used to live in the production `dex_app_perf_builders.hpp`
@@ -71,9 +71,6 @@ using AppPerfTagCohortFn = std::function<std::optional<std::vector<AppPerfFleetR
     std::string_view tag_key, std::string_view tag_value, std::string_view app_name,
     std::string_view version)>;
 
-using AppPerfTagValuesFn =
-    std::function<std::optional<std::vector<std::string>>(std::string_view tag_key)>;
-
 using AppPerfVersionDevicesFn = std::function<std::optional<std::vector<AppPerfVersionDeviceRow>>(
     std::string_view app_name, std::string_view version,
     const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated)>;
@@ -85,9 +82,8 @@ namespace yuzu::server::test {
 class FnDexPerfApi final : public yuzu::server::DexPerfApi {
 public:
     /// Per-method raw-provider bundle — SAME shape as the retired
-    /// `AppPerfProviders` (see the file banner above for why `.cohort`/
-    /// `.tag_values` are kept even though `DexPerfApi` itself never reads
-    /// them).
+    /// `AppPerfProviders` (see the file banner above for why `.cohort` is
+    /// kept even though `DexPerfApi` itself never reads it).
     struct Providers {
         yuzu::server::AppPerfFleetFn fleet;
         yuzu::server::AppPerfAppListFn apps;
@@ -96,7 +92,6 @@ public:
         yuzu::server::AppPerfCohortFn cohort; ///< VERIFY before/after compare; unused by DexPerfApi
         yuzu::server::AppPerfVersionDevicesFn version_devices;
         yuzu::server::AppPerfTagCohortFn tag_cohort;
-        yuzu::server::AppPerfTagValuesFn tag_values; ///< unused by DexPerfApi (see GAP-1/TagValuesFn)
     };
 
     FnDexPerfApi(yuzu::server::DexPerfFn dex_perf_fn, Providers providers)

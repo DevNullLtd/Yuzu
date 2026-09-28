@@ -1,0 +1,1 @@
+status: RECONSTRUCTION of the kernel's securityfs lockdown format (every mode listed, the active one in brackets: `[none] integrity confidentiality`). Not a capture: the only kernel available (Docker linuxkit) has no Lockdown LSM, so the real file cannot be read anywhere accessible.

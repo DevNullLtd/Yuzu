@@ -1563,6 +1563,112 @@ Yuzu ships Postgres, so HA Postgres is a delivery artifact we own.
   buffering; health targets `/readyz`; draining; optional stickiness (locality only); TLS stance.
   Owned by `docs-writer` + `release-deploy`.
 
+**Update (2026-09-24, WS-8 readyz — monolith).** The monolith's single `/readyz` plays the core role and
+is what the operator LB targets (the tier split is a no-op until ADR-1005's split lands, §1c). Two
+gaps closed:
+- **"Red when core cannot reach `yuzu`" is now true at runtime.** Every store's `is_open()` is latched
+  at construction (#3061) and the pool's connect breaker arms only on a failed *new* connect, so
+  `/readyz` used to stay green through an outage. A dedicated-connection probe
+  (`PgReachabilityProbe`, never a pool lease) now feeds a gating `pg_reachable` row: not ready after
+  two failed probes, immediately on reaching a server that refuses writes (`pg_is_in_recovery()` or
+  `transaction_read_only` — core is the sole writer, so a replica pointed at a standby, or at a primary
+  in read-only mode, cannot serve), or after 15 s without a success. Every libpq socket wait runs under a
+  client-side deadline via the non-blocking API (a host-name lookup is bounded by the system
+  resolver instead), because a blocking query against a frozen backend was
+  measured at 101 s; libpq walks a multi-host DSN itself with the pool's exact connection parameters, and the
+  probe only gives each host its own deadline (the pool's effective `connect_timeout`, timed as the
+  linked libpq's blocking connect times it),
+  restarting the walk over the untried hosts when one goes silent — and not moving on at all when that
+  timeout is unlimited, because the pool does not either (libpq's non-blocking
+  connect never advances past a silent host); and a read-only answer drops the
+  connection so the next probe re-resolves, rather than staying on a standby that a proxy, DNS name
+  or read-any port routed a new connection to. Consequence, accepted: a Postgres failover
+  turns **every** replica red for the failover window — truthful, since nothing can serve writes.
+  Leadership is deliberately not a readiness condition.
+- **Multi-host DSNs.** libpq walks the host list for the probe exactly as for the pool (order, which
+  failures move on and which end the attempt, the pool's connection parameters), so the probe
+  measures the host the pool reaches — every re-implementation of that walk diverged (governance
+  rounds 2–5); and a multi-host DSN must carry
+  `target_session_attrs=read-write` (added when absent, a weaker value refuses boot) and may not set
+  `load_balance_hosts` (refused at boot: the pool would shuffle per connection while the probe holds one),
+  because without
+  it libpq puts pool connections on standbys that no single probe connection can observe. Residual: the
+  pool does not re-validate connections it holds, so a server that turns read-only in place (without the
+  restart a demotion implies, or behind a per-node pooler that keeps server connections open) keeps
+  failing those connections. `/readyz` goes red too when a new connection reaches that server; it stays
+  green only when a new connection reaches a different, writable host.
+- **The contract, and a freeze (governance round 9, architecture review adopted by the operator).**
+  Nine review rounds each found a new divergence between the probe and the pool, all one class: the pool
+  holds N connections opened at N moments under N resolved settings and never re-validates them, so no
+  single probe connection can represent them. The promise is therefore stated precisely:
+  `pg_reachable` is a one-session signal — red when the probe's most recent connect, made with the pool's
+  own parameters (a single host capped at 5 s), could not establish a session to a server that accepts
+  writes, or when the probe's held session stops answering or turns read-only. It keeps a healthy session
+  open, so it does not observe the pool's other held connections, nor anything that changed after the
+  probe last connected. Named residuals: held pool connections to a server demoted in place (#4942);
+  anything that changes whether a new connection would succeed — service-file/environment edits, a
+  password rotation or expiry, a pg_hba or certificate change — until the probe's next reconnect (#4956);
+  a multi-address host name with one silent address (#4954); `max_connections` exhaustion (#4943); and,
+  accepted and untracked, timing — about ±1 s against the pool's connect, a single host capped at 5 s
+  (red-only). Freeze rule: no further emulation of libpq/pool behaviour in
+  the probe; a newly found divergence is an issue against this contract unless it produces a false green
+  for a fresh connect on a single-endpoint or read-write multi-host DSN, which stays blocking. The durable
+  fix for held connections is pool-side (validate on acquire / maximum lifetime), not more probe
+  emulation.
+- **Draining.** `--shutdown-drain-seconds` (0–60, default 0) holds the listener open after `/readyz`
+  turns `503 draining`, so the fronting layer drains before the socket closes.
+The BYO-LB documentation deliverable above remains open (P2, not in the safe-to-scale gate).
+
+**Decision (2026-09-26, #4943 + #4944 — the two whole-tier-eviction shapes).** Both were recorded by the
+WS-8 governance run as decisions to take before a second replica fronts a load balancer, because each can
+red every replica at once while the database still serves. Both are decided on one principle, already
+applied to the store rows above: **a shared-substrate condition must not drive per-replica eviction** —
+moving traffic to another replica of the same database cannot help, and taking the whole tier out of a
+fail-closed LB turns a degradation into an outage.
+
+- **#4943 — the probe is the connection refused first at `max_connections`.** Decided: the probe stays
+  pool-faithful and the *substrate* is sized and protected; no probe-only privilege, no 53300 special case.
+  (a) A reserved slot for the probe alone is rejected: it would connect as a different role from the pool,
+  which is precisely the false green the contract above forbids (probe ready while fresh pool connects are
+  refused). (b) A distinct non-gating reason for 53300 is rejected: libpq exposes no SQLSTATE for a
+  connection-phase failure (only message text, whose format depends on verbosity), so it would mean
+  matching localisable server messages — the emulation the freeze rule forbids. (c) The server's footprint
+  is static and small — `pool_size + 2` per replica (the pool is hard-capped, one leader-election
+  connection, one probe; no other connect site) — so `max_connections ≥ N × (pool_size + 2) +
+  superuser_reserved_connections + every other client` makes self-exhaustion impossible; the runbook
+  states that formula. (d) Foreign clients are kept out of the server's share with a Postgres mechanism that
+  keeps probe/pool fidelity: the shipped images set `reserved_connections` (default 40, env
+  `YUZU_PG_RESERVED_CONNECTIONS`, PG 16+) and grant `pg_use_reserved_connections` to the app role, so the
+  pool **and** the probe draw from the same reserve ahead of a backup job or an ad-hoc `psql` — the app is
+  privileged over other clients, not the probe over the pool. Both scripts refuse to boot if
+  `YUZU_PG_RESERVED_CONNECTIONS` reaches `max_connections − superuser_reserved_connections` (Gate 2 finding
+  #1, added in the same PR before merge) — that value would leave zero ordinary slots any non-privileged
+  client could ever use, not merely under load, which is a self-inflicted version of the exact failure this
+  decision closes. WS-9 scenario N reproduces both halves:
+  with every unreserved slot held by foreign sessions, a killed probe backend reconnects into the reserve
+  and `/readyz` stays 200; with the grant revoked the same kill leaves the probe refused and `/readyz` reads
+  `503 unreachable` — the failure the default prevents. Accepted residual: exhaustion by other *privileged*
+  clients reds a replica on its next probe reconnect, truthfully (its fresh pool connects fail too); in
+  steady state the probe holds its slot and reconnects only after a failure, so this is uncorrelated across
+  replicas outside a failover, during which every replica is red by design anyway.
+- **#4944 — Postgres overload flaps every replica together.** Decided: **no server-side hysteresis**; the
+  rule stays 2 s query deadline / 2 consecutive failures / 15 s stale / one success recovers, and the LB's
+  `healthy_threshold` is the anti-flap lever, with recommended values in the runbook (`interval 5 s,
+  unhealthy 2, healthy 3`: eviction needs ≥ 10 s continuously red, so a single stall never evicts;
+  re-admission needs ≥ 15 s continuously green, so a marginal database does not re-enter and drop out
+  every few seconds, which is what turns slowness into a reconnect storm). The considered alternative — a
+  query *timeout* as a "slow, not unreachable" class that does not strike and is caught only by the 15 s
+  stale backstop — moves the threshold (about 6 s → 15 s) without adding hysteresis: sustained overload
+  still reds and still flaps, and frozen-primary detection slows from ~11 s to 15 s. A second knob set on
+  the server would stack on the LB's (the Q5 decision that the constants are not flags stands). Sustained
+  overload taking the tier red is accepted as **truthful**: a one-row, no-table `SELECT` that misses a 2 s
+  deadline twice in four seconds means the database cannot serve real operator requests within their
+  deadlines either (session validate plus an audit write on nearly every request), and a frozen backend is
+  indistinguishable from it client-side without more emulation. Operators are told to check their LB's
+  all-unhealthy behaviour (route-anyway vs fail-closed) in the runbook now rather than waiting for the P2
+  BYO-LB document. WS-9 scenarios L (CPU-starved primary under load: red while starved, back within one
+  probe of lifting the limit) and M (a 3 s stall never reds) demonstrate the chosen behaviour.
+
 ### 13. HA guarantees — RTO/RPO (Q12)
 Proposed targets for the team to ratify:
 - **Presentation-replica loss:** RTO ≈ 0 (operator LB removes it on `/readyz`; sessions/streams are

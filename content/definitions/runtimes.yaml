@@ -1,0 +1,195 @@
+## Runtimes Definitions
+## Reports installed .NET (Core/5+) and JVM runtimes. Read-only, zero subprocess.
+## Plugin: runtimes | Actions: dotnet, jvm
+##
+## SHIPPED LEG: Linux only, rung 1 (directory names and metadata-file reads;
+## no `java` or `dotnet` process is ever started).
+##   Linux:   /usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version>
+##            and sdk/<version> directory walk (dotnet);
+##            <home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm and
+##            /var/opt/java, plus a bin/java probe for a home with no release file (jvm).
+##            Network mounts are skipped (read from /proc/self/mountinfo).
+##
+## macOS AND WINDOWS: planned; the action answers a single unsupported status row on this OS.
+## Until then every action on those hosts answers a single
+## `status|<action>|unsupported|<macos|windows>:planned` row. The planned mechanisms
+## are declared in the plugin descriptor (runtimes_plugin.cpp):
+##   macOS:   /usr/local/share/dotnet/shared walk (dotnet);
+##            /Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict +
+##            Contents/Home/release (jvm).
+##   Windows: NDP release-key table + dotnet InstalledVersions + Program Files walk (dotnet);
+##            JavaSoft keys + Program Files\Java walk (jvm).
+##
+## Every action's output is: one `status|<action>|<level>|<reason>` row FIRST, then zero or
+## more `<action>|<flavour>|<version>|<install_path>|<vendor>` rows. A `supported` status
+## with zero data rows means none was found at the standard roots listed above (a runtime
+## installed anywhere else is not looked for); a `constrained` status means a read failed or
+## was skipped and the rows may be incomplete — failure never reads as absent.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.runtimes.dotnet
+  displayName: .NET Runtime Inventory
+  version: 1.0.0
+  description: >
+    Reports installed .NET (Core/5+) shared frameworks and SDKs on Linux: one
+    row per framework version or SDK version found under the standard install
+    roots (flavour, version, install path), from directory names only — no
+    `dotnet` process is started. A `supported` status with no rows means none
+    was found at the standard roots (a runtime installed elsewhere is not
+    looked for); a `constrained` status means a read failed or was skipped and
+    the list may be incomplete. macOS and Windows: planned; the action answers a single
+    unsupported status row on this OS
+    (`status|dotnet|unsupported|<macos|windows>:planned`).
+  tags: [runtimes, dotnet, inventory]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: runtimes
+    action: dotnet
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|dotnet|<level>|<reason>   (always first)
+    # dotnet|<flavour>|<version>|<install_path>|<vendor or ->
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found).'
+        values: [status, dotnet]
+        example: dotnet
+        platforms: [linux]
+      - name: flavour
+        type: string
+        description: 'Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). The three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name.'
+        values: [core, sdk, unmodelled]
+        example: core
+        platforms: [linux]
+      - name: version
+        type: string
+        description: 'Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).'
+        example: 8.0.31
+        platforms: [linux]
+      - name: install_path
+        type: string
+        description: 'Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -.'
+        example: /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31
+        platforms: [linux]
+      - name: vendor
+        type: string
+        description: 'Always "-" for dotnet: the install tree carries no vendor field.'
+        example: "-"
+        platforms: [linux]
+
+  readablePayload: "List installed .NET runtimes"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [runtimes]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.runtimes.jvm
+  displayName: JVM Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Java runtimes on Linux: one row per JDK/JRE home under
+    /usr/lib/jvm, /opt/java, /usr/lib64/jvm and /var/opt/java — flavour (jdk,
+    jre, unmodelled), version, install path and vendor (the build's self-reported
+    `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian; it is not verified). A
+    home with a java binary but no `release` file (some distro OpenJDK 8 packages)
+    is a row with version `-` and a `release_missing` constraint. No `java` process is
+    started. A `supported` status with no rows means none was found at those
+    roots (an Oracle-RPM /usr/java or a tarball install elsewhere is not looked
+    for); a `constrained` status means a read failed or was skipped and the list
+    may be incomplete. macOS and Windows: planned; the action answers a single
+    unsupported status row on this OS (`status|jvm|unsupported|<macos|windows>:planned`).
+  tags: [runtimes, jvm, inventory]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: runtimes
+    action: jvm
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|jvm|<level>|<reason>   (always first)
+    # jvm|<flavour>|<version>|<install_path>|<vendor or ->
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found).'
+        values: [status, jvm]
+        example: jvm
+        platforms: [linux]
+      - name: flavour
+        type: string
+        description: 'Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name.'
+        values: [jdk, jre, unmodelled]
+        example: jdk
+        platforms: [linux]
+      - name: version
+        type: string
+        description: 'JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported).'
+        example: 17.0.20
+        platforms: [linux]
+      - name: install_path
+        type: string
+        description: 'Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -.'
+        example: /opt/java/openjdk
+        platforms: [linux]
+      - name: vendor
+        type: string
+        description: 'IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or "-" when the key is absent (or the home has no release file).'
+        example: Eclipse Adoptium
+        platforms: [linux]
+
+  readablePayload: "List installed JVMs"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [runtimes]
+
+status:
+  phase: active

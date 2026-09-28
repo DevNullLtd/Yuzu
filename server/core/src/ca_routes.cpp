@@ -322,12 +322,13 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // when the new CRL was persisted, so crl_ok never falsely claims success.
         const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
         if (crl_ok)
-            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial, "") &&
+            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial,
+                                "reason=revoke") &&
                        audit_ok;
         else
             audit_ok = audit_fn(req, "ca.crl.published", "failure", "Security", serial,
-                                "CRL build/record failed after revocation; public CRL may be "
-                                "stale") &&
+                                "reason=revoke CRL build/record failed after revocation; public "
+                                "CRL may be stale") &&
                        audit_ok;
         return {crl_ok ? RevokeOutcome::RevokedCrlPublished : RevokeOutcome::RevokedCrlStale,
                 audit_ok};
@@ -897,11 +898,11 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 result = "failure";
                 break;
             }
-            const bool audit_ok =
+            bool audit_ok =
                 audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
-            if (!audit_ok)
-                res.set_header("Sec-Audit-Failed", "true");
             if (!ok) {
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;
                 res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
                 return;
@@ -909,6 +910,16 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             // Re-publish the CRL so the served CRL is signed under the new issuing
             // cert's identity (issuer_fingerprint refresh after the re-key).
             const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+            // #4829: was previously unaudited — the only publish_crl_fn caller in this file that
+            // wrote no ca.crl.published row at all, symmetric with revoke_core's own pair above.
+            audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                "Security", "root",
+                                crl_ok ? "reason=import_chain"
+                                       : "reason=import_chain CRL build/record failed after "
+                                         "import; public CRL may be stale under the new issuer") &&
+                       audit_ok;
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
             nlohmann::json out = {{"imported", true},
                                   {"mode", "subordinate"},
                                   {"crl_republished", crl_ok},
@@ -1113,7 +1124,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       emsg = "Failed to persist the imported chain.";
                       break;
                   }
-                  const bool audit_ok =
+                  bool audit_ok =
                       audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root",
                                ok ? "mode=subordinate via=dashboard" : "via=dashboard");
                   if (!ok) {
@@ -1128,6 +1139,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                   // failure — the import succeeded but external CRL consumers stay
                   // on the old issuer until the next publish. Prepend a notice.
                   const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+                  // #4829: was previously unaudited, symmetric with the REST import-chain
+                  // handler's own ca.crl.published addition above.
+                  audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                      "Security", "root",
+                                      crl_ok ? "reason=import_chain via=dashboard"
+                                             : "reason=import_chain via=dashboard CRL build/record "
+                                               "failed after import; public CRL may be stale under "
+                                               "the new issuer") &&
+                             audit_ok;
                   if (!audit_ok)
                       res.set_header("Sec-Audit-Failed", "true");
                   std::string body;

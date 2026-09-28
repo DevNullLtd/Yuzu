@@ -13,11 +13,14 @@
 #include "guaranteed_state_store.hpp"
 #include "guardian_api_local.hpp"     // make_local_guardian_api
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"             // PgConn/PgResult -- the DROP-TABLE degrade test below
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <stdexcept>
 #include <string>
@@ -274,6 +277,56 @@ TEST_CASE("device lenses: Guardian lens on a degraded read renders the degraded 
                       "degraded.</div>");
     REQUIRE(audited.size() == 1);
     CHECK(audited[0] == "guardian.device.view|a-1");
+}
+
+// #4855: a WIRED DexApi whose signal-summary read DEGRADES (a real store, a
+// genuine query-level failure — DROP TABLE on a second connection, the same
+// technique the Guardian degrade test above and test_guardian_routes.cpp
+// use) must render the "DEX store degraded." placeholder AFTER the access
+// audit — never the pre-fix silent score-100/no-signals result. Distinct
+// from the unwired (dex_api=nullptr) "DEX store unavailable." placeholder
+// tested below, and from a null-store DexApi (which is DexApi's own
+// documented "no data", degraded=false — see test_dex_api.cpp's null-store
+// case) — this is the genuinely-open-but-failing-read case.
+TEST_CASE("device lenses: DEX lens on a degraded signal-summary read renders the degraded "
+          "placeholder",
+          "[pg][device][routes][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
+                            const std::string&, const std::string& tid, const std::string&) {
+        audited.push_back(a + "|" + tid);
+        return true;
+    };
+    auto dex_api = make_local_dex_api(&store, {});
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, dex_api, /*guardian_api=*/nullptr, audit);
+
+    auto dex = sink.Get("/fragments/device/dex?id=a-1&bare=1");
+    REQUIRE(dex);
+    CHECK(dex->status == 200);
+    CHECK(dex->body == "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>DEX store "
+                       "degraded.</div>");
+    // The access audit fires BEFORE the read (fail-closed ordering), so it
+    // still records "success" -- the audit records the ACCESS, not whether
+    // the downstream read then degraded.
+    REQUIRE(audited.size() == 1);
+    CHECK(audited[0] == "dex.device.view|a-1");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

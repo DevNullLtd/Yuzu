@@ -25,11 +25,10 @@ You implement new plugins for roadmap phases 4-7, maintain the SDK ABI boundary,
 ## Key Files
 
 - `agents/plugins/` — All 29+ plugins
-  - Each plugin: `src/<name>.cpp`, `include/<name>.h`
-  - Subdirectories by category: hardware, network, security, filesystem, system, etc.
+  - Each plugin: `agents/plugins/<name>/` with `src/*.cpp` and a `meson.build`, registered in the root `meson.build`
 - `sdk/include/yuzu/plugin.h` — Stable C ABI (DO NOT BREAK)
 - `sdk/include/yuzu/plugin.hpp` — C++ CRTP wrapper
-- `sdk/src/sdk_utilities.cpp` — SDK utility functions
+- `sdk/include/yuzu/sdk_utilities.hpp` + `agents/core/src/sdk_utilities.cpp` — SDK utility functions (the header holds the implementation; the `.cpp` holds the `YUZU_EXPORT` C ABI wrappers `plugin.h` declares)
 - `agents/core/src/plugin_loader.cpp` — Plugin discovery and loading
 - `content/definitions/` — YAML InstructionDefinition files
 - `agents/plugins/example/` — Canonical example plugin

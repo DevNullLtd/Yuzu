@@ -246,7 +246,20 @@ private:
     // Resolve scope/groups -> unique agent ids. Must be called WITHOUT mu_
     // held (it does store/registry I/O that must not run under the evaluator
     // lock — see the lock-discipline note on kickoff_check).
-    std::vector<std::string> resolve_targets(const Policy& p) const;
+    //
+    // #4981 PR-1 (Finding B, B6): this call site bypasses the dispatch ladder
+    // entirely, so it is the ONE place that must both increment
+    // `yuzu_scope_eval_degraded_total{reason}` itself (never inside
+    // AgentRegistry::evaluate_scope — that would double-count for every
+    // ladder-routed caller, which already increments via
+    // audit_scope_evaluation_aborted) and expose WHY a scope-expression
+    // policy resolved to zero targets. `out_reason`, when non-null, is set to
+    // `to_string(ScopeEvalError::Kind)` on a `d_.registry->evaluate_scope`
+    // abort — used by `remediate()` to distinguish a genuine empty-scope
+    // result from a presence/store degradation in its refusal message.
+    // Untouched (left as whatever the caller initialised it to) on a
+    // management-group target or a clean/empty scope evaluation.
+    std::vector<std::string> resolve_targets(const Policy& p, std::string* out_reason = nullptr) const;
 
     // Resolve targets, dispatch the fragment's check_instruction, record a
     // Check in-flight. Returns the execution_id, or "" on failure / when a Check

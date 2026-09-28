@@ -1,0 +1,1 @@
+- Tests: the Guardian UP-1 round-2 reconcile test now waits for the real post-#4508 end state, where the released wedge is adopted (two watches, two armed rules). Before, it passed vacuously or timed out intermittently on Windows (#4863).

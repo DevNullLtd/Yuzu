@@ -43,6 +43,10 @@ public:
     void start();
     /// Signal stop and join the thread (idempotent; also called by the destructor).
     void stop();
+    /// Signal stop WITHOUT joining: no new recompute starts; one already in flight
+    /// finishes. Called when the server starts draining (HA WS-8) so a recompute
+    /// cannot begin inside the drain grace and then run after it; stop() joins later.
+    void request_stop() noexcept;
 
 private:
     void run();

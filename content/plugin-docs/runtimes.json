@@ -1,0 +1,390 @@
+{
+  "actions": [
+    {
+      "action": "dotnet",
+      "definition_ids": [
+        "crossplatform.runtimes.dotnet"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/usr/share/dotnet, /usr/lib/dotnet, /usr/lib64/dotnet shared/<framework>/<version> and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
+          "mechanism": "/usr/local/share/dotnet/shared walk",
+          "rung": "1",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
+          "mechanism": "NDP release-key table + dotnet InstalledVersions + Program Files walk",
+          "rung": "1",
+          "support": "planned"
+        }
+      }
+    },
+    {
+      "action": "jvm",
+      "definition_ids": [
+        "crossplatform.runtimes.jvm"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "<home>/release file reads under /usr/lib/jvm, /opt/java, /usr/lib64/jvm, /var/opt/java (bin/java probe when a home has no release); network mounts skipped via /proc/self/mountinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
+          "mechanism": "/Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + Contents/Home/release",
+          "rung": "1",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "planned; the action answers a single unsupported status row on this OS",
+          "mechanism": "JavaSoft keys + Program Files\\\\Java walk",
+          "rung": "1",
+          "support": "planned"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**macOS and Windows legs are planned.** Only the Linux leg ships; on macOS and Windows every action reads nothing and answers `status|<action>|unsupported|<os>:planned`. .NET Framework (the Windows registry family) arrives with the Windows leg, and the flavour vocabulary above is the Linux subset until then.",
+    "**Runtimes reachable only through an alias entry are not listed.** A framework, version or JVM home entry that is itself a symlink (Debian `default-java`, Fedora `java`) is skipped silently because its real directory is a sibling entry; a runtime reachable only through such a link is missed. A symlink at a candidate root that is not a same-action alias is a `symlink_refused` constraint, not a skip.",
+    "**Only standard locations are walked.** `dotnet`: `/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; `jvm`: `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm`, `/var/opt/java`. A runtime installed elsewhere (an Oracle-RPM `/usr/java`, a version manager under a home directory, a tarball unpacked to a custom prefix) is not found, by design: the plugin does not search user profiles. So `supported` with zero rows means none found at these roots, not that none is installed.",
+    "**Some OpenJDK 8 packages ship no `release` file.** Measured: Ubuntu 22.04 `openjdk-8-jre-headless`, Rocky 9 `java-1.8.0-openjdk-headless` and Alpine 3.20 `openjdk8-jre-base` ship none; other packages may ship one. A home with `bin/java` or `jre/bin/java` but no `release` file is reported with version `-`, flavour `unmodelled` and a `release_missing` constraint, so such a host reads `constrained` for as long as it is installed; the `install_path` names the major. A `java` that is not a regular file or a symlink is not a JVM, and a symlinked `bin` or `jre` with no binary found through the other route records `symlink_refused`. Reading the version would need the package manager or `java -version`, which this plugin never uses.",
+    "**Network mounts are skipped by filesystem type, from a dispatch-start snapshot.** A candidate root on, under or containing a mount of a listed network type (`yuzu::shared::is_network_fstype`: `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `9p`, `virtiofs`, `gpfs`, `vmhgfs`, `autofs`, network `fuse.*`, ...) is never opened and records `network_fs_skipped`, so a healthy network-mounted JDK is skipped too, and a host whose `/` is a network or virtiofs mount skips every candidate. `/proc/self/mountinfo` is read once per dispatch and streamed (an unreadable file or a table over 256 MiB records `mountinfo_unreadable` and the walk is then guarded only by the mounts read; a single line over 64 KiB may be skipped (one over 128 KiB always is), which records the same token and does not stop the scan). The guard cannot see a mount that appears after the snapshot, a stacked filesystem (an `overlay`, `ecryptfs` or loop device over a dead network mount reports its own local type), a network or FUSE type the list does not name (a bare `fuse` mount among them), or a hang on a local block device: each can pin one of the agent's shared command workers until the kernel returns, and closing that class needs a bounded-call seam in agent core (#4875)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports installed .NET (Core/5+) shared frameworks and SDKs on Linux: one row per framework version or SDK version found under the standard install roots (flavour, version, install path), from directory names only — no `dotnet` process is started. A `supported` status with no rows means none was found at the standard roots (a runtime installed elsewhere is not looked for); a `constrained` status means a read failed or was skipped and the list may be incomplete. macOS and Windows: planned; the action answers a single unsupported status row on this OS (`status|dotnet|unsupported|<macos|windows>:planned`).",
+      "display_name": ".NET Runtime Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.runtimes.dotnet",
+      "platforms": [
+        "linux"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports installed Java runtimes on Linux: one row per JDK/JRE home under /usr/lib/jvm, /opt/java, /usr/lib64/jvm and /var/opt/java — flavour (jdk, jre, unmodelled), version, install path and vendor (the build's self-reported `IMPLEMENTOR` value, e.g. Eclipse Adoptium vs Debian; it is not verified). A home with a java binary but no `release` file (some distro OpenJDK 8 packages) is a row with version `-` and a `release_missing` constraint. No `java` process is started. A `supported` status with no rows means none was found at those roots (an Oracle-RPM /usr/java or a tarball install elsewhere is not looked for); a `constrained` status means a read failed or was skipped and the list may be incomplete. macOS and Windows: planned; the action answers a single unsupported status row on this OS (`status|jvm|unsupported|<macos|windows>:planned`).",
+      "display_name": "JVM Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.runtimes.jvm",
+      "platforms": [
+        "linux"
+      ]
+    }
+  ],
+  "description": "Installed .NET and JVM runtime inventory",
+  "how_it_works": "`dotnet` and `jvm` each answer one software-inventory question: which language runtimes are installed on this host. The Linux leg walks the standard install roots with no-follow directory opens and reads metadata files only: `dotnet` lists `shared/<framework>/<version>` and `sdk/<version>` directory names under `/usr/share/dotnet`, `/usr/lib/dotnet` and `/usr/lib64/dotnet`; `jvm` reads the `release` file of every home under `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm` (openSUSE, SLES) and `/var/opt/java` (rpm-ostree hosts, where `/opt` links there), and reports a home that has a java binary but no `release` file (some distro OpenJDK 8 packages) with version `-` (its `install_path` names the major, for example `java-8-openjdk-amd64`). A candidate root on, under or containing a network mount is not opened (caveat 5). The plugin is zero-subprocess: no `java` or `dotnet` process is ever run, and every fact is a directory name or a file the runtime's installer laid down. Every action writes one `status` row first, then zero or more runtime rows, so an empty list is never inferred from silence. The plugin is read-only and complements `installed_apps`: it reads the runtime's own install tree, so under those roots it also sees runtimes no package manager owns, and it does no vulnerability matching (a row is presence and the upstream version at read time, not an assessment).\n\nTwo decision records sit next to this plugin; it closes neither. ADR-0028 (agent component inventory), Decision 1(b), targets *\"Embedded-runtime (Electron/Chromium/Node) detection... This is the single largest silent-false-negative class on a corporate fleet (Slack, Teams, Discord, VS Code) — the parent app's own version reflects none of the embedded runtime's CVE surface.\"* This plugin inventories installed .NET and JVM runtimes and does not detect embedded ones, and ADR-0028 is itself recorded as accepted but deferred. ADR-0024 (software licensing and entitlements) lists *\"Java runtimes — vendor/distribution/version, Oracle JDK vs the OpenJDK builds...\"* as a `license_scan` probe tracked by #2112, which stays open. The `vendor` field of `jvm` is the build's self-reported `IMPLEMENTOR` string: an input to a licensing audit, not proof of the licence.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "5cadaa03e74e",
+  "manifest_version": 1,
+  "name": "runtimes",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), dotnet (one per runtime found).",
+          "example": "dotnet",
+          "name": "row_kind",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "dotnet"
+          ]
+        },
+        {
+          "description": "Runtime kind. Values: core (a Microsoft.NETCore.App, Microsoft.AspNetCore.App or Microsoft.WindowsDesktop.App shared framework), sdk (an SDK install), unmodelled (any other shared-framework name — reported, never dropped). The three core frameworks all read core at the same version; the install path tells them apart. Status rows: the action name.",
+          "example": "core",
+          "name": "flavour",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "core",
+            "sdk",
+            "unmodelled"
+          ]
+        },
+        {
+          "description": "Version taken from the install directory name (e.g. 8.0.31, or a preview build such as 9.0.100-preview.1.24101.2). Status rows: the level (supported, constrained or unsupported).",
+          "example": "8.0.31",
+          "name": "version",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Absolute path of the framework or SDK version directory the version was read from. Status rows: the comma-joined failure tokens, or -.",
+          "example": "/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31",
+          "name": "install_path",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Always \"-\" for dotnet: the install tree carries no vendor field.",
+          "example": "-",
+          "name": "vendor",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.runtimes.dotnet"
+    },
+    {
+      "columns": [
+        {
+          "description": "Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), jvm (one per runtime found).",
+          "example": "jvm",
+          "name": "row_kind",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "jvm"
+          ]
+        },
+        {
+          "description": "Image kind from the IMAGE_TYPE key of the release file. Values: jdk, jre, unmodelled (the file does not say — Debian and SUSE OpenJDK release files have no IMAGE_TYPE, and a release-less home has no file at all; never guessed from the path). Status rows: the action name.",
+          "example": "jdk",
+          "name": "flavour",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "jdk",
+            "jre",
+            "unmodelled"
+          ]
+        },
+        {
+          "description": "JAVA_VERSION from the release file, falling back to JAVA_RUNTIME_VERSION. A release file with neither key yields no row and a release_unparsable constraint; a home with a java binary but no release file yields - and a release_missing constraint. Status rows: the level (supported, constrained or unsupported).",
+          "example": "17.0.20",
+          "name": "version",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Absolute path of the JVM home directory. Status rows: the comma-joined failure tokens, or -.",
+          "example": "/opt/java/openjdk",
+          "name": "install_path",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "IMPLEMENTOR from the release file (e.g. Eclipse Adoptium, Debian), self-reported by the build and not verified, or \"-\" when the key is absent (or the home has no release file).",
+          "example": "Eclipse Adoptium",
+          "name": "vendor",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.runtimes.jvm"
+    }
+  ],
+  "outputs_note": "Every row is pipe-delimited. The first row is always `status|<action>|<level>|<reason>` (`level` is `supported`, `constrained` or `unsupported`; `reason` is comma-joined tokens, or `-`). Runtime rows follow as `<action>|<flavour>|<version>|<install_path>|<vendor>`, one per runtime found; the first field is `row_kind` (`status`, or the action name) and is the first column below. `supported` with zero runtime rows means none was found at the standard roots (caveat 3 lists what is not walked); `constrained` means a read failed or was skipped and the rows may be incomplete, so failure never reads as absent. A field the host did not supply is `-`, and every flavour mapper has a named `unmodelled` value distinct from no data. Free-text fields (`version`, `install_path`, `vendor`) go through `yuzu::util::safe_output_field`, so a value containing a pipe or ending in a backslash cannot shift the field count on the server's escape-aware decoder. `runtimes` is not in the server's `kKeyValuePlugins` set (`server/core/src/result_parsing.hpp`), so its rows are not decoded as two-cell key and value rows.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "planned",
+    "windows": "planned"
+  },
+  "privileges": [
+    {
+      "grant": "n/a",
+      "if_refused": "`status|<action>|unsupported|windows:planned`, result status `UNAVAILABLE`",
+      "measured": "n/a",
+      "os": "Windows",
+      "runs_as": "n/a — the leg reads nothing (caveat 1)"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "`status|<action>|unsupported|macos:planned`, result status `UNAVAILABLE`",
+      "measured": "n/a",
+      "os": "macOS",
+      "runs_as": "n/a — the leg reads nothing (caveat 1)"
+    },
+    {
+      "grant": "None expected — stock install trees under `/usr`, `/opt` and `/var/opt/java` are world-readable (0755 directories, 0644 `release` files); not measured as `yuzu` (see Measured)",
+      "if_refused": "`status|<action>|constrained|linux:runtimes:permission_denied`; rows read before the refusal are still returned, and a later readable root never hides it",
+      "measured": "real-capture fixtures of the walked trees (`tests/unit/fixtures/wave10/runtimes/linux/provenance.txt`); the live-agent capture `docs/samples/linux.txt` ran as `euid 0` in a container. The unprivileged read rests on the stock file modes (0755 directories, 0644 `release`, observed on the stock images) and on a probe of the production walk as uid 65534 that returned the same rows as root over stock-mode trees (recorded in this PR's governance ledger, `governance.d/4794-runtimes-plugin.*.jsonl`; not a committed test)",
+      "os": "Linux",
+      "runs_as": "agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`)"
+    }
+  ],
+  "readme": "agents/plugins/runtimes/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "(empty)",
+      "status": "`OK`",
+      "when": "Linux: the read finished with no failure, populated, or none found at the standard roots (`status|<action>|supported|-` with zero rows)"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:runtimes:permission_denied` / `linux:runtimes:symlink_refused` / `linux:runtimes:not_a_directory` / `linux:runtimes:open_failed` / `linux:runtimes:stat_failed` / `linux:runtimes:read_failed` / `linux:runtimes:row_cap` / `linux:runtimes:not_regular` / `linux:runtimes:oversized` / `linux:runtimes:field_oversized` / `linux:runtimes:release_unparsable` / `linux:runtimes:release_missing` / `linux:runtimes:network_fs_skipped` / `linux:runtimes:mountinfo_unreadable` / `internal_error`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: one or more reads failed, were refused or skipped (a network mount), or hit a cap, and the rows returned may be incomplete; the tokens of every root are accumulated and comma-joined in the status row. `internal_error` is a caught exception on any leg: it never crosses the plugin boundary and the command returns 1 (a failed command)"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`macos:planned` / `windows:planned`",
+      "status": "`UNAVAILABLE`",
+      "when": "macOS and Windows: the leg is not shipped; the action answers `status|<action>|unsupported|<os>:planned` and nothing else"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "dotnet",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|dotnet|supported|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "jvm",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|jvm|supported|-"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-24",
+        "host_class": "container",
+        "leg_hash": "5cadaa03e74e",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "dotnet",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "jvm",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp"
+    ],
+    "changelog": [
+      "changelog.d/wave10-pr10.1b-runtimes.added.md"
+    ],
+    "definitions": [
+      "content/definitions/runtimes.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/runtimes/src/runtimes_legs.hpp",
+      "agents/plugins/runtimes/src/runtimes_linux.cpp",
+      "agents/plugins/runtimes/src/runtimes_linux_parsers.hpp",
+      "agents/plugins/runtimes/src/runtimes_macos.cpp",
+      "agents/plugins/runtimes/src/runtimes_parsers.hpp",
+      "agents/plugins/runtimes/src/runtimes_plugin.cpp",
+      "agents/plugins/runtimes/src/runtimes_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/test_runtimes_definition.py",
+      "tests/unit/test_runtimes_linux_parsers.cpp",
+      "tests/unit/test_runtimes_local_dispatcher.cpp",
+      "tests/unit/test_runtimes_parsers.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.",
+    "**Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin runs only on an explicit instruction dispatch and there is no agent daily-sync source for runtimes.",
+    "**Sensitivity.** Rows name installed runtimes with their exact version, install path and vendor, which is a patch-level and licensing-relevant software inventory for the device. The Linux leg reads only fixed machine-scope roots (`/usr`, `/opt`, `/var/opt/java`) and the mount table `/proc/self/mountinfo` (used only to decide what to skip, never emitted), so no user-profile root is walked; `install_path` and `vendor` echo directory and file text as found, so a name planted under those roots reaches a row after the UTF-8 and pipe scrub (`yuzu::util::sanitize_utf8` replaces invalid lead and continuation bytes but still passes overlong, surrogate and out-of-range sequences that protobuf rejects: #4864).",
+    "**Siblings:** `crossplatform.runtimes.dotnet`, `crossplatform.runtimes.jvm`."
+  ]
+}

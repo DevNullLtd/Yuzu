@@ -1,0 +1,7 @@
+host: braga (Docker Desktop 29.7.2 linuxkit VM), container image debian:12
+os: Linux 7.0.12-linuxkit (kernel is the Docker Desktop VM's, shared by every container)
+identity: root (uid 0) in container; a second run as nobody (uid 65534) printed byte-identical output, so no EACCES path is observable on this kernel
+command: for k in <11 allowlisted keys>; do p=/proc/sys/$(echo $k | tr . /); v=$(cat $p 2>&1) && printf "%s\tok\t%s\n" $k "$v" || printf "%s\terr\t%s\n" $k "$v"; done   (docker run --rm <image> sh cap.sh)
+date: 2026-09-21
+status: REAL CAPTURE. kernel.yama.ptrace_scope is genuinely absent (Yama not built into the linuxkit kernel): the real ENOENT case.
+lines: 11 (budget 20)

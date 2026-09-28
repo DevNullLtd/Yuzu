@@ -331,21 +331,6 @@ public:
     /// be empty → the scope selector is omitted (whole-fleet only).
     using GroupListFn = std::function<std::vector<DexGroupOption>()>;
 
-    /// GAP-1 (#4857): the app-perf trend page's device-MODEL scope selector
-    /// values (`GET /fragments/dex/perf/app`'s `model_values`) — resolves the
-    /// distinct values of the conventional cohort tag key (`kDexDefaultCohortKey`,
-    /// "model"), server.cpp wiring the SAME `TagStore::get_distinct_values`
-    /// lambda the pre-seam `AppPerfProviders::tag_values` field used. This is a
-    /// NARROW, DISCLOSED presentation-side data dependency OUTSIDE the
-    /// `DexPerfApi` seam: no public fleet-wide "distinct tag values" resource
-    /// exists yet (`DexPerfApi` only exposes device-scoped/floor-applied reads);
-    /// widening the seam to add one is a follow-up, not this change's scope.
-    /// `nullopt` = a read degrade (the picker best-effort hides itself, same
-    /// convention as an unwired `group_list_fn` above); empty (default) = the
-    /// selector is omitted.
-    using TagValuesFn =
-        std::function<std::optional<std::vector<std::string>>(const std::string& tag_key)>;
-
     /// The version-drill "which devices" fragment's SOLE authorization gate —
     /// the injected-callback twin of `AuthRoutes::require_fleet_read`
     /// (authz_gates.hpp), identical shape/contract to `RestApiV1::FleetReadFn` /
@@ -378,8 +363,7 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
-                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
-                         TagValuesFn tag_values_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -389,8 +373,7 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, DexPerfApiPtr dex_perf_api = {},
-                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {},
-                         TagValuesFn tag_values_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
 private:
     /// Deny a service-scoped API token on a fleet-wide fragment that names more
@@ -423,7 +406,6 @@ private:
     DexPerfApiPtr dex_perf_api_;
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
-    TagValuesFn tag_values_fn_;
 };
 
 } // namespace yuzu::server

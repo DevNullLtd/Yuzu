@@ -1,7 +1,7 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same sixteen capability-declaration spans the production site
+// composed from the same twenty-three capability-declaration spans the production site
 // composes, for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
@@ -9,7 +9,7 @@
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the sixteen-span composition is the drift a shared seam exists to
+// copy of the twenty-three-span composition is the drift a shared seam exists to
 // remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.
@@ -35,8 +35,14 @@
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
+#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "command_capability.hpp"
 
 #include <string_view>
@@ -63,8 +69,14 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
+        capdecls::plugin_action_catalogue_browser_policy(),
         capdecls::plugin_action_catalogue_app_control(),
+        capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_runtimes(),
+        capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_system_hardening(),
+        capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
     };
     return reg;

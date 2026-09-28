@@ -824,7 +824,48 @@ TEST_CASE("REST gs.rules: missing required fields → 400",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("required") != std::string::npos);
-    CHECK(h.audit_log.empty());
+    // #4665: this combined validation reject now audits (previously it was the
+    // one create-reject branch that didn't, an asymmetric-audit-coverage gap
+    // matching the UP-R1 PUT-malformed-body precedent above).
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id == "r-bad");
+}
+
+TEST_CASE("REST gs.rules: charset-invalid rule_id → 400 with the updated error message (#4665)",
+          "[pg][rest][guaranteed_state][create][validation]") {
+    RestGsHarness h;
+    for (const std::string& bad_id :
+         {std::string("has space"), std::string("has=eq"), std::string("has\nnewline"),
+          std::string("has\xC3\xA9" "byte")}) {
+        INFO("bad_id = " << bad_id);
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
+                               RestGsHarness::make_rule_body(bad_id, "n"));
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("[A-Za-z0-9._-]+") != std::string::npos);
+    }
+    REQUIRE(h.audit_log.size() == 4);
+    for (const auto& rec : h.audit_log)
+        CHECK(rec.result == "denied");
+}
+
+TEST_CASE("REST gs.rules: rule_id at the 256-byte boundary (#4665)",
+          "[pg][rest][guaranteed_state][create][validation]") {
+    RestGsHarness h;
+    const std::string id256(256, 'a');
+    auto ok = h.sink.Post("/api/v1/guaranteed-state/rules",
+                          RestGsHarness::make_rule_body(id256, "n256"));
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    CHECK(ok->body.find("\"rule_id\":\"" + id256 + "\"") != std::string::npos);
+
+    const std::string id257(257, 'a');
+    auto bad = h.sink.Post("/api/v1/guaranteed-state/rules",
+                           RestGsHarness::make_rule_body(id257, "n257"));
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
 }
 
 TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
@@ -2204,6 +2245,37 @@ TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device'
     CHECK(crashed_count == 2);
     CHECK_FALSE(saw_other); // WS-2's signal must not leak into WS-1's per-device summary
     // Per-device behavioral read → audited dex.device.view (parity with the lens).
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+}
+
+// #4855: a degraded signal-summary read must 503, never render a fabricated
+// healthy score of 100 with no signals. DROP TABLE on a second connection
+// forces a genuine query-level failure while the store stays open (same
+// technique the guard/baseline degrade tests in test_guardian_routes.cpp
+// use). The audit fires BEFORE the read (unchanged fail-closed ordering), so
+// it still records "success" here.
+TEST_CASE("REST dex/devices/{id}: a degraded signal-summary read → 503, never a fabricated "
+          "healthy score",
+          "[pg][rest][dex][device][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"score\"") == std::string::npos); // never a score at all
     bool audited = false;
     for (const auto& a : h.audit_log)
         if (a.action == "dex.device.view" && a.target_id == "WS-1")

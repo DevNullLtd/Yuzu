@@ -33,20 +33,23 @@ Substrate quick facts and the general Postgres-unreachable-at-boot recovery
 in that doc; there is nothing engine-principal-specific about this failure
 mode once you've identified which store's migration/lease failed.
 
-### 2. `GET /readyz` reports the store unhealthy at runtime
+### 2. `GET /readyz` is not ready
 
 ```json
-{"status": "not_ready", "checks": {"engine_principal_store": false, ...}}
+{"status": "not ready", "failed_stores": ["pg_reachable"], "pg": "unreachable"}
 ```
 
-`engine_principal_store` in the `/readyz` checks vector mirrors every other
-`X && X->is_open()` row — `false` means either the store never opened at
-boot (see §1 — but then the process would already have refused to start,
-so this combination should not be observable in a healthy deploy) or,
-transiently, that a background health signal has flagged the pool. Treat it
-as a Postgres-pool health question first: check `pg_pool` saturation /
-connectivity metrics before assuming the `engine_principal_store` schema
-itself is the problem.
+`engine_principal_store` in `failed_stores` means the store did not open at
+boot (§1). That cannot appear on a running server: a store's open state is
+fixed at startup, and a failed open refuses to start the process at all.
+What CAN appear at runtime is `pg_reachable`, with a `pg` reason
+(`unreachable`, `stale`, `read_only`) — this replica cannot reach a writable
+Postgres primary (HA WS-8; `docs/user-manual/server-admin.md`, "What
+`/readyz` checks"). Engine-principal requests then degrade like every other
+Postgres-backed path (§3). Treat it as a Postgres-reachability question:
+read the `[readyz] Postgres not reachable` server-log line for the libpq
+detail, and `yuzu_server_pg_reachable` / the pool metrics, before assuming
+the `engine_principal_store` schema itself is the problem.
 
 ### 3. Engine-authenticated requests failing — the 503-vs-401 split
 
