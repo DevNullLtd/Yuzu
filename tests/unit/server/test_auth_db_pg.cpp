@@ -597,62 +597,128 @@ TEST_CASE("AuthDB find_reserved_prefix_users scans active and soft-deleted rows"
     CHECK_FALSE(guarded.has_value());
 }
 
-// ── enrollment tokens ──────────────────────────────────────────────────────
+namespace {
 
-TEST_CASE("AuthDB enrollment token lifecycle", "[pg][auth_db]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-
-    auto token = h.db.create_enrollment_token("admin", std::chrono::seconds(3600));
-    REQUIRE(token.has_value());
-    CHECK_FALSE(token->empty());
-
-    CHECK(h.db.validate_enrollment_token(*token).value());
-    auto consumed = h.db.consume_enrollment_token(*token, "agent-1");
-    REQUIRE(consumed.has_value());
-    CHECK(*consumed == true);
-
-    // Reuse is rejected — already consumed.
-    CHECK_FALSE(h.db.validate_enrollment_token(*token).value());
-    auto second = h.db.consume_enrollment_token(*token, "agent-2");
-    REQUIRE(second.has_value());
-    CHECK(*second == false);
-
-    CHECK_FALSE(h.db.validate_enrollment_token("not-a-real-token").value());
+/// Runs one statement on a side connection and returns the first cell ("" for
+/// NULL / no rows).
+std::string scalar(PGconn* conn, const char* sql) {
+    PgResult res{PQexec(conn, sql)};
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    if (PQntuples(res.get()) == 0 || PQgetisnull(res.get(), 0, 0))
+        return {};
+    return PQgetvalue(res.get(), 0, 0);
 }
 
-// ── pending agents ─────────────────────────────────────────────────────────
+} // namespace
 
-TEST_CASE("AuthDB pending agent approve/reject", "[pg][auth_db]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
+// ── v1 -> v2 migration (WS-6 6.2) ───────────────────────────────────────────
 
-    yuzu::server::auth::PendingAgent agent;
-    agent.agent_id = "agent-xyz";
-    agent.hostname = "host1";
-    agent.os = "linux";
-    agent.arch = "x86_64";
-    agent.agent_version = "1.0.0";
-    REQUIRE(h.db.add_pending_agent(agent).has_value());
+// Hand-seeds the v1 `auth` schema (users + the dead v1 enrollment_tokens /
+// pending_agents shapes + mfa_recovery_codes) exactly as migrations()[0] created
+// it, stamps schema_meta at 1 with a populated v1 row in each dead table, then
+// hands the database to a real AuthDB construction. Proves the v2 step drops the
+// v1 shapes and creates the clean ones + import_meta, keeps unrelated v1 data,
+// and that the resulting store works end-to-end.
+TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_meta",
+          "[pg][auth_db][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgConn conn = connect(db.dsn());
+        PgResult meta{PQexec(conn.get(), "CREATE TABLE public.schema_meta ("
+                                         "  store TEXT PRIMARY KEY, version INTEGER NOT NULL,"
+                                         "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA auth")};
+        REQUIRE(schema.ok());
+        PgResult v1{PQexec(
+            conn.get(),
+            "CREATE TABLE auth.users ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, username TEXT NOT NULL UNIQUE,"
+            "  password_hash TEXT NOT NULL DEFAULT '', salt_hex TEXT NOT NULL DEFAULT '',"
+            "  role TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_login_at TIMESTAMPTZ,"
+            "  is_active BOOLEAN NOT NULL DEFAULT TRUE, mfa_totp_secret BYTEA,"
+            "  mfa_enrolled_at TIMESTAMPTZ, mfa_disabled_at TIMESTAMPTZ,"
+            "  mfa_last_counter BIGINT NOT NULL DEFAULT 0, failed_login_count INTEGER NOT NULL DEFAULT 0,"
+            "  last_failed_login_at TIMESTAMPTZ, locked_until TIMESTAMPTZ,"
+            "  break_glass_armed_until TIMESTAMPTZ, elevation_eligible BOOLEAN NOT NULL DEFAULT FALSE,"
+            "  identity_source TEXT NOT NULL DEFAULT 'local', external_iss TEXT, external_sub TEXT,"
+            "  display_name TEXT, last_seen_at TIMESTAMPTZ,"
+            "  provisioning_source TEXT NOT NULL DEFAULT 'local');"
+            "CREATE INDEX users_active_idx ON auth.users (is_active) WHERE is_active;"
+            "CREATE TABLE auth.enrollment_tokens ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,"
+            "  created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  expires_at TIMESTAMPTZ NOT NULL, is_used BOOLEAN NOT NULL DEFAULT FALSE,"
+            "  used_at TIMESTAMPTZ, used_by_agent_id TEXT);"
+            "CREATE INDEX enrollment_tokens_expires_idx ON auth.enrollment_tokens (expires_at);"
+            "CREATE TABLE auth.pending_agents ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE,"
+            "  hostname TEXT NOT NULL, os TEXT, arch TEXT, agent_version TEXT,"
+            "  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(), approved_at TIMESTAMPTZ,"
+            "  approved_by TEXT, status TEXT NOT NULL DEFAULT 'pending');"
+            "CREATE INDEX pending_agents_status_idx ON auth.pending_agents (status);"
+            "CREATE TABLE auth.mfa_recovery_codes ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, username TEXT NOT NULL,"
+            "  code_hash TEXT NOT NULL, code_salt TEXT NOT NULL, consumed_at TIMESTAMPTZ,"
+            "  created_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+            "CREATE INDEX mfa_recovery_username_idx ON auth.mfa_recovery_codes (username);"
+            "CREATE INDEX mfa_recovery_unconsumed_idx ON auth.mfa_recovery_codes (username) "
+            "  WHERE consumed_at IS NULL;"
+            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+            "  VALUES ('auth', 1, extract(epoch FROM now())::bigint);"
+            "INSERT INTO auth.users (username, password_hash, salt_hex, role) "
+            "  VALUES ('legacy-admin', 'h', 's', 'admin');"
+            "INSERT INTO auth.enrollment_tokens (token_hash, created_by, expires_at) "
+            "  VALUES ('v1-dead-row', 'x', now() + interval '1 day');"
+            "INSERT INTO auth.pending_agents (agent_id, hostname) VALUES ('v1-dead-agent', 'h');")};
+        REQUIRE(v1.ok());
+    }
 
-    auto pending = h.db.list_pending_agents();
-    REQUIRE(pending.has_value());
-    REQUIRE(pending->size() == 1);
-    CHECK((*pending)[0].agent_id == "agent-xyz");
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    {
+        PgConn conn = connect(db.dsn());
+        REQUIRE(codec.init(conn.get()).has_value());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AuthDB adb{pool, codec};
+    REQUIRE(adb.is_open()); // the v2 step applied
 
-    REQUIRE(h.db.approve_agent("agent-xyz", "admin").has_value());
-    auto after_approve = h.db.list_pending_agents();
-    REQUIRE(after_approve.has_value());
-    CHECK(after_approve->empty()); // no longer 'pending'
+    PgConn conn = connect(db.dsn());
+    CHECK(scalar(conn.get(), "SELECT version FROM public.schema_meta WHERE store='auth'") == "2");
 
-    yuzu::server::auth::PendingAgent agent2;
-    agent2.agent_id = "agent-abc";
-    agent2.hostname = "host2";
-    REQUIRE(h.db.add_pending_agent(agent2).has_value());
-    REQUIRE(h.db.reject_agent("agent-abc").has_value());
-    auto after_reject = h.db.list_pending_agents();
-    REQUIRE(after_reject.has_value());
-    CHECK(after_reject->empty());
+    // v1 dead shapes gone, clean shape present (no `is_used`, has `max_uses`/`token_id`).
+    CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.enrollment_tokens") == "0");
+    CHECK(scalar(conn.get(), "SELECT count(*) FROM auth.pending_agents") == "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='enrollment_tokens' AND column_name IN "
+                 "('token_id','label','max_uses','use_count','revoked','last_used_at',"
+                 " 'last_consumed_by_agent_id')") == "7");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='enrollment_tokens' AND column_name IN ('is_used','used_at')") == "0");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='pending_agents' AND column_name IN "
+                 "('status_changed_at','status_changed_by')") == "2");
+    CHECK(scalar(conn.get(),
+                 "SELECT count(*) FROM information_schema.columns WHERE table_schema='auth' "
+                 "AND table_name='import_meta' AND column_name IN "
+                 "('key','fingerprint','imported_at','imported_by')") == "4");
+    // Unrelated v1 data survives.
+    CHECK(scalar(conn.get(), "SELECT role FROM auth.users WHERE username='legacy-admin'") == "admin");
+
+    // DB-level guards on the clean shape.
+    PgResult neg{PQexec(conn.get(), "INSERT INTO auth.enrollment_tokens (token_id, token_hash, max_uses) "
+                                    "VALUES ('x','y',-1)")};
+    CHECK_FALSE(neg.ok());
+    PgResult bad_status{PQexec(conn.get(), "INSERT INTO auth.pending_agents (agent_id, status) "
+                                           "VALUES ('z','rejected')")};
+    CHECK_FALSE(bad_status.ok());
 }
 
 // ── recovery codes ─────────────────────────────────────────────────────────

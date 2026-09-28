@@ -686,45 +686,6 @@ public:
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
 
-    // ── Enrollment Token Operations ───────────────────────────────────────
-
-    /// Create a new enrollment token. Returns the raw token (show once).
-    /// The token is stored as a SHA-256 hash — plaintext never persisted.
-    std::expected<std::string, AuthDBError> create_enrollment_token(
-        const std::string& created_by,
-        std::chrono::seconds validity
-    );
-
-    /// Validate an enrollment token without consuming it.
-    /// Returns true if token exists, is unused, and hasn't expired.
-    std::expected<bool, AuthDBError> validate_enrollment_token(const std::string& plain_token);
-
-    /// Consume an enrollment token atomically.
-    /// Returns true if token was valid and consumed, false if already used/invalid.
-    /// Persists to DB BEFORE returning — survives server restart.
-    /// Defense-in-depth: Also checks expiry in same atomic operation.
-    std::expected<bool, AuthDBError> consume_enrollment_token(
-        const std::string& plain_token,
-        const std::string& agent_id
-    );
-
-    // ── Pending Agent Operations ─────────────────────────────────────────
-
-    /// Add an agent to the pending approval queue.
-    std::expected<void, AuthDBError> add_pending_agent(const auth::PendingAgent& agent);
-
-    /// List all pending agents.
-    std::expected<std::vector<auth::PendingAgent>, AuthDBError> list_pending_agents();
-
-    /// Approve a pending agent.
-    std::expected<void, AuthDBError> approve_agent(
-        const std::string& agent_id,
-        const std::string& approved_by
-    );
-
-    /// Reject a pending agent.
-    std::expected<void, AuthDBError> reject_agent(const std::string& agent_id);
-
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
