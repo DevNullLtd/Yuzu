@@ -2266,6 +2266,26 @@ if build_server
     timeout: 60,
   )
 
+  # ADR-0031 WS-A4 PR-1 F1 fix: check-seam-closure.py (docs-lint.yml, no build
+  # dependency) enforces INCLUDE closure only, and is blind to a core TU
+  # linking against a symbol only DEFINED in a presentation TU's own `.cpp`
+  # (the `dex` family's exact defect — see check_core_presentation_link.py's
+  # module docstring). This link-level twin needs compiled `.o` files, so it
+  # runs as a build-and-test-gated meson test() instead of a docs-lint.yml
+  # step — `depends:` on the static lib forces ninja to build every enrolled
+  # family's core AND presentation objects first. `--build-dir` is threaded
+  # explicitly (mirrors the pg-shard check above) rather than relying on the
+  # script's own $MESON_BUILD_ROOT fallback, so this stays correct even if a
+  # future harness stops setting that var for `meson test`-launched processes.
+  test('dex link no presentation symbols',
+    _pg_shard_python3,
+    args: [files('../scripts/ci/check_core_presentation_link.py'),
+           '--build-dir', meson.project_build_root(), '--verbose'],
+    suite: ['server', 'server-checks'],
+    depends: [yuzu_server_core_lib],
+    timeout: 60,
+  )
+
   # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
   # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went
   # from carrying zero [pg]-tagged cases to 57 ([policy_store][pg], one
