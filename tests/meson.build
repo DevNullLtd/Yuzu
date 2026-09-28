@@ -2277,14 +2277,19 @@ if build_server
   # explicitly (mirrors the pg-shard check above) rather than relying on the
   # script's own $MESON_BUILD_ROOT fallback, so this stays correct even if a
   # future harness stops setting that var for `meson test`-launched processes.
-  test('dex link no presentation symbols',
-    _pg_shard_python3,
-    args: [files('../scripts/ci/check_core_presentation_link.py'),
-           '--build-dir', meson.project_build_root(), '--verbose'],
-    suite: ['server', 'server-checks'],
-    depends: [yuzu_server_core_lib],
-    timeout: 60,
-  )
+  # GCC/Clang only: the script reads `*.cpp.o` objects with `nm`; MSVC emits
+  # `.obj` files and its runners ship no `nm`. The Linux and macOS legs gate
+  # the same source, so the Windows leg adds nothing here.
+  if cxx.get_id() != 'msvc'
+    test('dex link no presentation symbols',
+      _pg_shard_python3,
+      args: [files('../scripts/ci/check_core_presentation_link.py'),
+             '--build-dir', meson.project_build_root(), '--verbose'],
+      suite: ['server', 'server-checks'],
+      depends: [yuzu_server_core_lib],
+      timeout: 60,
+    )
+  endif
 
   # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
   # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went
