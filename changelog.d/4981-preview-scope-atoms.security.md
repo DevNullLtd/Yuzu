@@ -16,5 +16,6 @@
   intersects against the operator's execute-visible set before sending. Additionally, a
   service-scoped API token is now denied outright (403) on both surfaces (closing the same
   cross-service-reach gap #4980 closed on `create_result_set_from_inventory_query`), and a
-  preview no longer touches a referenced result set's TTL (`last_used_at`) as a side effect — it
-  is now a genuine read-only dry run.
+  preview no longer touches a referenced result set's TTL (`ttl_at`, the GC-reaper's expiry
+  field — `last_used_at` is a separate pagination sort key) as a side effect — it is now a
+  genuine read-only dry run.
