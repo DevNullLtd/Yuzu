@@ -112,6 +112,14 @@ public:
     /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity).
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
 
+    /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family
+    /// cards + fleet coverage + the "Other (uncatalogued)" list (ADR-0031
+    /// WS-A4 PR-1 / Fraser decision 1: the first public resource for the
+    /// per-family health score / online-denominator coverage the dashboard
+    /// fragment previously computed with no REST/MCP twin).
+    [[nodiscard]] virtual DexCatalogueModel
+    catalogue(const std::string& os_filter, const std::string& window) const = 0;
+
     /// GET /api/v1/dex/catalogue/group?name=&os= — one signal family's members;
     /// `nullopt` for an unknown family name (the caller's 404).
     [[nodiscard]] virtual std::optional<DexCatalogueGroupModel>

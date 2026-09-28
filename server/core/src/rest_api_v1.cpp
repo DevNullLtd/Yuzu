@@ -1320,6 +1320,9 @@ const std::string& openapi_spec() {
     "/dex/apps": {
       "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a crash/hang signal in the window, ranked by activity — the REST twin of the /fragments/dex/apps dashboard tab. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.apps[].{subject, crashes, hangs, distinct_devices, last_seen})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable"}}}
     },
+    "/dex/catalogue": {
+      "get": {"summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})"}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable"}}}
+    },
     "/dex/catalogue/group": {
       "get": {"summary": "Signal-family drill (Catalogue View 2)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One signal family's member signals: per-type monitored/not-collected state, coverage platforms, event count + blast radius, plus the family's own health-score slice — the REST twin of the /fragments/dex/catalogue/group dashboard drill (see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Exact family name, e.g. 'App reliability'."}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Family drill object (group_name, os, window, monitored_count, total_type_count, health_score|null, active_events, max_signal_devices, types[].{obs_type, monitored, coverage_platforms, count, distinct_devices, last_seen})"}, "400": {"description": "missing name, or invalid window"}, "404": {"description": "no such signal family"}, "503": {"description": "service unavailable"}}}
     },
@@ -15903,6 +15906,45 @@ void RestApiV1::register_routes(
         const auto model = dex_api->apps(window);
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
+
+    // GET /dex/catalogue?os=&window= -- the Catalogue View 1 family cards +
+    // fleet coverage + the "Other (uncatalogued)" list (ADR-0031 WS-A4 PR-1 /
+    // Fraser decision 1: first public resource for this data — previously
+    // fragment-only). No per-agent identity -- no audit, same aggregate
+    // posture as the sibling catalogue/group/health/trends twins.
+    sink.Get("/api/v1/dex/catalogue",
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto cid = detail::make_correlation_id();
+                 res.set_header("X-Correlation-Id", cid);
+                 if (!dex_api) {
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
+                     return;
+                 }
+                 const std::string window =
+                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                 if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid window (expected 24h|7d|30d|all)", cid),
+                         "application/json");
+                     return;
+                 }
+                 const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
+                 if (os != "all" && os != "windows" && os != "linux" && os != "macos") {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "invalid os (expected all|windows|linux|macos)",
+                                               cid),
+                         "application/json");
+                     return;
+                 }
+                 const auto model = dex_api->catalogue(os, window);
+                 res.set_content(ok_json(dex_catalogue_json(model)), "application/json");
+             });
 
     // GET /dex/catalogue/group?name=&os=&window= -- one signal family's
     // member signals (Catalogue View 2). No per-agent identity -- no audit,

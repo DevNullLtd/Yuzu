@@ -1490,6 +1490,22 @@ static const ToolDef kTools[] = {
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}}},)j"
      R"j("required":["window","apps"]})j"},
 
+    {"get_dex_catalogue",
+     "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
+     "monitored/total type count, its own health-score slice, window event count and busiest "
+     "member type, plus an 'other' list of obs_types seen on the wire but not yet in a curated "
+     "family. No per-agent identity — not audited. Mirrors GET /api/v1/dex/catalogue. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string"},"window":{"type":"string"},"monitored_types":{"type":"integer"},"total_types":{"type":"integer"},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"monitored":{"type":"integer"},"total":{"type":"integer"},"health_score":{"type":["number","null"]},"events":{"type":"integer"},"top_obs_type":{"type":["string","null"]}},"required":["name","monitored","total","health_score","events","top_obs_type"]}},)j"
+     R"j("uncatalogued":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}})j"
+     R"j(},"required":["os","window","monitored_types","total_types","families","uncatalogued"]})j"},
+
     {"get_dex_catalogue_group",
      "One signal family's member signals (Catalogue View 2): per-type monitored/not-collected "
      "state, coverage platforms, event count + blast radius, plus the family's own health-score "
@@ -1503,7 +1519,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("group_name":{"type":"string"},"os":{"type":"string"},"window":{"type":"string"},)j"
      R"j("monitored_count":{"type":"integer"},"total_type_count":{"type":"integer"},)j"
-     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},)j"
+     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},"benign":{"type":"boolean"},)j"
      R"j("types":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"monitored":{"type":"boolean"},"coverage_platforms":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","monitored","coverage_platforms","count","distinct_devices","last_seen"]}})j"
      R"j(},"required":["group_name","os","window","monitored_count","total_type_count","active_events","max_signal_devices","types"]})j"},
 
@@ -1577,6 +1593,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
      R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("connected_platforms":{"type":"integer"},"busiest_family":{"type":["string","null"]},"busiest_family_events":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -3793,6 +3810,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // per-tool about "is this data really safe", so these follow suit).
     {"get_dex_app", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_catalogue", {"GuaranteedState", "Read"}},
     {"get_dex_catalogue_group", {"GuaranteedState", "Read"}},
     {"get_dex_device_history", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_observation", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
@@ -4491,6 +4509,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
     {"get_dex_app", {ToolEffect::ReadOnly, true, "Get DEX app blast radius"}},
     {"list_dex_apps", {ToolEffect::ReadOnly, true, "List DEX app stability"}},
+    {"get_dex_catalogue", {ToolEffect::ReadOnly, true, "Get DEX signal catalogue"}},
     {"get_dex_catalogue_group", {ToolEffect::ReadOnly, true, "Get DEX catalogue signal family"}},
     {"get_dex_device_history", {ToolEffect::ReadOnly, true, "Get per-device DEX signal history"}},
     {"get_dex_observation", {ToolEffect::ReadOnly, true, "Get DEX single-observation detail"}},
@@ -14926,6 +14945,45 @@ McpServer::HandlerFn McpServer::build_handler(
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_apps_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_catalogue") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!dex_api_) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string os = param_str(args, "os", "all");
+                if (os != "all" && os != "windows" && os != "linux" && os != "macos") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid os (expected all|windows|linux|macos)"),
+                        "application/json");
+                    return;
+                }
+                const auto model = dex_api_->catalogue(os, window);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_catalogue_json(model), kObjectOutputSchema)),
                     "application/json");
                 return;
             }

@@ -143,6 +143,11 @@ struct DexCatalogueGroupModel {
     double health_score{-1.0}; ///< -1 = suppressed (nothing monitored, or the scoped denominator is 0)
     int64_t active_events{0};
     int64_t max_signal_devices{0}; ///< largest single signal's distinct-device count (#1374, not the union)
+    /// True for the one family (`dex_family_is_benign`) whose window activity is
+    /// routine reports, not incidents — the fragment shows "Reports (window)"
+    /// instead of "Events (window)" on this flag alone (ADR-0031 WS-A4 PR-1: added
+    /// so a future renderer can reproduce that label from the model alone).
+    bool benign{false};
     std::vector<DexCatalogueGroupTypeRow> types;
 };
 
@@ -285,6 +290,16 @@ struct DexOverviewModel {
     /// healthier fleet than is actually known.
     int unscored{0};
     int64_t coverage_monitored{0}, coverage_total{0};
+    /// ADR-0031 WS-A4 PR-1: distinct connected-OS tokens in scope for the
+    /// coverage tile's "N platform(s)" caption (`cscope.size()` in the
+    /// fragment) — additive so the REST/MCP twin can reproduce that exact text.
+    int64_t connected_platforms{0};
+    /// ADR-0031 WS-A4 PR-1: the Explore card's busiest-family teaser
+    /// (`render_dex_overview_fragment`'s "busiest <b>NAME</b>" text) — empty
+    /// when no family has fired in-window (mirrors the fragment's own
+    /// `busiest_ev > 0` guard), additive.
+    std::string busiest_family;
+    int64_t busiest_family_events{0};
     std::vector<DexOverviewSegment> segments; ///< by normalised OS
     // Reliability -- measured.
     double crash_free_pct{-1.0}; ///< -1 when windows_reporting == 0
@@ -306,5 +321,44 @@ struct DexOverviewModel {
 
 /// (`build_dex_overview_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
 std::string dex_overview_json(const DexOverviewModel& model, bool audit_persisted = true);
+
+// ── New twin #9: catalogue / family cards (/fragments/dex/catalogue, GET /api/v1/dex/catalogue) ──
+
+/// One family's card in the Catalogue grid (View 1) — mirrors
+/// `render_dex_catalogue_fragment`'s per-card computation exactly (Rule 1
+/// refactor target, ADR-0031 WS-A4 PR-1 / Fraser decision 1). `monitored == 0`
+/// is the fragment's "dark" state (not collected on any in-scope platform);
+/// `monitored > 0 && health_score < 0` is its "no_data" state (monitored, but
+/// the scoped online denominator is 0) — both are DERIVABLE from these two
+/// fields, so no separate flag is carried.
+struct DexCatalogueFamilyRow {
+    std::string name;
+    int monitored{0};
+    int total{0};
+    double health_score{-1.0}; ///< -1 = not scored (dark, or no online denominator)
+    int64_t events{0};
+    /// The busiest member signal's obs_type, empty when nothing fired
+    /// (mirrors the fragment's `r.events > 0 && r.top` guard) — never a raw
+    /// pointer/reference into the builder's transient signal-summary vector.
+    std::string top_obs_type;
+};
+
+/// The signal-catalogue read model — the `/dex` Catalogue landing grid (View
+/// 1). No per-agent identity — a fleet aggregate, same posture as the sibling
+/// `catalogue_group`/`health`/`trends` twins (no confinement, no audit).
+/// `uncatalogued` mirrors the fragment's "Other (uncatalogued)" section: any
+/// obs_type seen on the wire that isn't in any curated family yet, so a newer
+/// agent's signal is never silently hidden from this resource either.
+struct DexCatalogueModel {
+    std::string os;     ///< resolved scope token: "all"|"windows"|"linux"|"macos"
+    std::string window;
+    int monitored_types{0};
+    int total_types{0};
+    std::vector<DexCatalogueFamilyRow> families; ///< dex_signal_groups() order
+    std::vector<DexSignalCount> uncatalogued;
+};
+
+/// (`build_dex_catalogue_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
+std::string dex_catalogue_json(const DexCatalogueModel& model);
 
 } // namespace yuzu::server

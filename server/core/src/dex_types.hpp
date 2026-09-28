@@ -209,6 +209,14 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 //    httplib-coupled header. dex_routes.hpp re-includes this header, so its
 //    own callers are unaffected; definitions are unchanged in their .cpp.
 
+/// True for the ONE hand-picked family (name-matched, not data-driven) whose
+/// members are routine reports (boot/uptime), never deducted from health and
+/// displayed as "Reports" rather than "Events" in the Catalogue drill-down.
+/// Factored out of `dex_family_rollup` (ADR-0031 WS-A4 PR-1) so a second
+/// caller — the catalogue-group read-model builder — can carry the SAME
+/// classification without re-deriving it from `DexFamilyRollup::benign`.
+bool dex_family_is_benign(const std::string& family_name);
+
 /// One family's rolled-up signal counts — the shared basis both the Catalogue
 /// grid and the health-score deduction read.
 struct DexFamilyRollup {

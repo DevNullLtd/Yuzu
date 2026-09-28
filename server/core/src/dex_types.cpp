@@ -141,6 +141,14 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
     return out;
 }
 
+// ADR-0031 WS-A4 PR-1: factored out of dex_family_rollup below so the
+// catalogue-group builder (dex_read_model.cpp) can carry the same
+// classification onto DexCatalogueGroupModel::benign without re-deriving it
+// from a DexFamilyRollup it may not otherwise need.
+bool dex_family_is_benign(const std::string& family_name) {
+    return family_name == "Boot, start-up & shutdown";
+}
+
 // One family's rollup over the window (events, active count, blast radius, leader).
 // #4035: DexFamilyRollup itself moved to dex_types.hpp (external linkage, no longer
 // tied to any one TU's anonymous namespace) so dex_read_model.cpp can build the
@@ -150,7 +158,7 @@ DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
                                   const std::vector<DexSignalCount>& signals) {
     DexFamilyRollup r;
     r.total = static_cast<int>(g.types.size());
-    r.benign = std::string(g.name) == "Boot, start-up & shutdown";
+    r.benign = dex_family_is_benign(g.name);
     for (const char* t : g.types) {
         const DexSignalCount* c = nullptr;
         for (const auto& s : signals)

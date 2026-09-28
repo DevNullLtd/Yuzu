@@ -519,6 +519,9 @@ constexpr TwinRow kExpectedTwins[] = {
     // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
     {"get_dex_app", "GuaranteedState", "Read", true},
     {"list_dex_apps", "GuaranteedState", "Read", true},
+    // ADR-0031 WS-A4 PR-1 / Fraser decision 1: the Catalogue View 1 REST+MCP
+    // twin, pinned against GET /api/v1/dex/catalogue (rest_api_v1.cpp).
+    {"get_dex_catalogue", "GuaranteedState", "Read", true},
     {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
     {"get_dex_device_history", "GuaranteedState", "Read", true},
     {"get_dex_observation", "GuaranteedState", "Read", true},

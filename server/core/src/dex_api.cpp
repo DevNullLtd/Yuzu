@@ -54,6 +54,11 @@ public:
         return build_dex_apps_model(store_, window, since_of(window));
     }
 
+    [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,
+                                              const std::string& window) const override {
+        return build_dex_catalogue_model(store_, fleet(), os_filter, window);
+    }
+
     [[nodiscard]] std::optional<DexCatalogueGroupModel>
     catalogue_group(const std::string& group_name, const std::string& os_filter,
                     const std::string& window) const override {

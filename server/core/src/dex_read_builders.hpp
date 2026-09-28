@@ -100,4 +100,15 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
                                           const std::string& since,
                                           const std::set<std::string>* visible);
 
+/// ADR-0031 WS-A4 PR-1 (Fraser decision 1) — the Catalogue View 1 read model
+/// (per-family cards + fleet coverage + the "Other (uncatalogued)" list), the
+/// first public resource the /dex Catalogue grid's own fragment computation
+/// has ever had (previously fragment-only: no REST/MCP twin served the
+/// per-family health score / online-denominator coverage this builds).
+/// `since` is derived from `window` internally (`dex_iso_since(
+/// dex_window_to_days(window))`), matching every other builder here.
+DexCatalogueModel build_dex_catalogue_model(GuaranteedStateStore* store, const DexFleet& fleet,
+                                            const std::string& os_filter,
+                                            const std::string& window);
+
 } // namespace yuzu::server
