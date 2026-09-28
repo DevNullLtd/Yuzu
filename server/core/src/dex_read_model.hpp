@@ -326,7 +326,7 @@ std::string dex_overview_json(const DexOverviewModel& model, bool audit_persiste
 
 /// One family's card in the Catalogue grid (View 1) — mirrors
 /// `render_dex_catalogue_fragment`'s per-card computation exactly (Rule 1
-/// refactor target, ADR-0031 WS-A4 PR-1 / Fraser decision 1). `monitored == 0`
+/// refactor target, ADR-0031 WS-A4 PR-1). `monitored == 0`
 /// is the fragment's "dark" state (not collected on any in-scope platform);
 /// `monitored > 0 && health_score < 0` is its "no_data" state (monitored, but
 /// the scoped online denominator is 0) — both are DERIVABLE from these two

@@ -302,13 +302,10 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
-  - **Update (2026-09-28, WS-A4 PR-1 Gate 7 fix round, third revision — Fraser decision: revert to
-    base gating):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
+  - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
     /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
     check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
-    Two intermediate designs were tried and reverted in review: pinning the three routes onto
-    `require_fleet_read` (round 1), then adding a 403 refusal for an admitted-but-scoped caller
-    (round 2). Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
+    Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
     `top_devices[]`/`top_apps[]`, etc.) is a query-time `GROUP BY` over agent-attributed rows —
     **not** a precomputed rollup like `software_catalog`/`version_rollup` above, so the rationale
     for pinning it global-only is different: it is simply **not yet confined per-caller** — an

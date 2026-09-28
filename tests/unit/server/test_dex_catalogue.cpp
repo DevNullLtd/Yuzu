@@ -1,7 +1,7 @@
 /**
  * test_dex_catalogue.cpp — the Catalogue View 1 (family cards) read model,
  * `build_dex_catalogue_model` + `DexApi::catalogue` (ADR-0031 WS-A4 PR-1 /
- * Fraser decision 1): the first public REST/MCP resource for the per-family
+ * catalogue decision): the first public REST/MCP resource for the per-family
  * health score / online-denominator coverage `render_dex_catalogue_fragment`
  * has always computed with no twin. Mirrors test_dex_api.cpp's template/seed
  * conventions (a separate PgTestTemplate instance per this file's own

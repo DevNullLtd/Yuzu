@@ -121,7 +121,7 @@ TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[
     CHECK(detail.devices.size() == 2);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
+// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2,
 // "aggregates GLOBAL-ONLY"): signal_detail's `visible` post-limit filter
 // (ADR-0031 WS-A4 PR-1 decision 3) was REMOVED — the REST/MCP handlers now
 // refuse ANY engaged confinement scope outright before calling this method

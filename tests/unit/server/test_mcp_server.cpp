@@ -1528,8 +1528,8 @@ private:
         // #4035 hardening (governance)'s bespoke `set_dex_visible_fn` wiring,
         // and the WS-A4 PR-1 first/second fix rounds' migration of
         // get_dex_app/get_dex_overview/get_dex_signal_detail onto
-        // `fleet_read_fn_` as their sole gate, are ALL RETIRED (third
-        // revision, Fraser decision: revert to base gating). Those three
+        // `fleet_read_fn_` as their sole gate, are ALL RETIRED (reverted to
+        // base gating). Those three
         // tools gate on `perm_fn` + `deny_fleet_wide_service_scoped` again —
         // see each tool's own test for the current coverage shape.
 
@@ -7552,8 +7552,7 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating): this tool reverted off `fleet_read_fn_`/real RBAC composition
+// WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
 // back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
 // worth of fleet-read-gate coverage this test replaced (a fixture-faked
 // FleetReadGate denial, then a real AuthRoutes/RbacStore/ManagementGroupStore
@@ -7596,7 +7595,7 @@ TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
     CHECK(saw_denied);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision): the `fleet_read_fn_`-scope
+// WS-A4 PR-1 Gate 7 fix round: the `fleet_read_fn_`-scope
 // boundary/unwired coverage this test, the sibling get_dex_app/
 // get_dex_overview "unwired fleet_read_fn_" tests, and the get_dex_app
 // engine-principal test provided is retired — `fleet_read_fn_` is no
@@ -7953,8 +7952,7 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating): restored to base's own coverage — a service-scoped token
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — a service-scoped token
 // is denied via the tool's own `deny_fleet_wide_service_scoped` call. The
 // round-1/round-2 "gate denial -> no data" (fixture-faked FleetReadGate)
 // and "refuses an admitted-but-confined caller" (canned-FleetReadGate-
@@ -8055,7 +8053,7 @@ TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown fa
     CHECK(unknown->body.find("-32602") != std::string::npos);
 }
 
-// ADR-0031 WS-A4 PR-1 / Fraser decision 1: get_dex_catalogue -- the Catalogue
+// ADR-0031 WS-A4 PR-1: get_dex_catalogue -- the Catalogue
 // View 1 family cards. Cross-checks the SAME shape GET /api/v1/dex/catalogue
 // serves (both call dex_api_->catalogue(...) / dex_catalogue_json, Rule 1).
 TEST_CASE("MCP DEX: get_dex_catalogue returns the family cards, bad os -> invalid params",
@@ -8193,8 +8191,7 @@ TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)
     CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating): restored to base's own coverage — see get_dex_app's
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — see get_dex_app's
 // equivalent test for the full rationale (the round-1/round-2 gate-denial
 // and admitted-but-confined tests this replaces relied on `fleet_read_fn_`,
 // which is no longer this tool's gate).

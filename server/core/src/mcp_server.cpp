@@ -14897,7 +14897,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // WS-A4 PR-1 Gate 7 fix round (third revision): `DexApi::app`
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::app`
                 // no longer takes a `visible` parameter at all — the
                 // per-caller resolver this used to thread through
                 // (`dex_visible_fn_`) was retired permanently (see
@@ -15248,7 +15248,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // WS-A4 PR-1 Gate 7 fix round (third revision): `DexApi::
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::
                 // overview` no longer takes a `visible` parameter at all —
                 // see get_dex_app's comment above for why. Every admitted
                 // caller gets the same unfiltered top-devices list.

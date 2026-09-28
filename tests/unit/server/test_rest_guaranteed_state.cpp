@@ -291,7 +291,7 @@ struct RestGsHarness {
     // WS-A4 PR-1 first/second fix rounds' attempt to migrate GET
     // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
     // /api/v1/dex/signals/{obs_type} onto `fleet_read_fn` as their sole
-    // gate, are ALL RETIRED (third revision, Fraser decision: revert to
+    // gate, are ALL RETIRED (reverted to
     // base gating — bare `perm_fn` + `deny_fleet_wide_service_scoped`, no
     // per-caller `visible` resolver at all). A test proving confinement/
     // elevation now drives the REAL rbac_/mgmt_ bundles +
@@ -650,7 +650,7 @@ struct RestGsHarness {
                             // production (GET /dex/perf/devices, GET
                             // /executions, GET /responses/*, ...) — see this
                             // struct's own comment on why the DEX routes are
-                            // NOT among its callers as of the third revision.
+                            // NOT among its callers.
                             RestApiV1::FleetReadFn{fleet_read_fn},
                             // #4033: this harness doesn't exercise GET
                             // /api/v1/devices or the agent-count preview —
@@ -1273,8 +1273,7 @@ TEST_CASE("REST gs.events: a service-scoped token MAY still read its own agent v
 // /network/devices all served fleet-wide identity-linked per-agent rows under
 // a bare global gate, confining nothing for a service-scoped token. ──────────
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating): the route's OWN `deny_fleet_wide_service_scoped` call is the
+// WS-A4 PR-1 Gate 7 fix round: the route's OWN `deny_fleet_wide_service_scoped` call is the
 // gate here, reading the harness's stub `auth_fn` (which answers from
 // `session_token_scope_service`, not real request headers) — same pattern
 // as the sibling GET /api/v1/dex/perf/devices test right below this one, NOT
@@ -1302,8 +1301,7 @@ TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route
     CHECK(res->status == 200);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating): the route gates SOLELY on a bare `perm_fn`. Production's
+// WS-A4 PR-1 Gate 7 fix round: the route gates SOLELY on a bare `perm_fn`. Production's
 // `AuthRoutes::require_permission` resolves a caller's role through DIRECT
 // user grants and RBAC-native "group" grants ONLY (rbac_store.cpp's
 // `roles_for_user`) — a `ManagementGroup`-scoped role assignment (a
@@ -2417,7 +2415,7 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     REQUIRE(missing);
     CHECK(missing->status == 400);
 
-    // WS-A4 PR-1 Gate 7 fix round (third revision): the route's OWN
+    // WS-A4 PR-1 Gate 7 fix round: the route's OWN
     // `deny_fleet_wide_service_scoped` call is the gate — see GET
     // /api/v1/dex/signals/{obs_type}'s equivalent test for why this is
     // `session_token_scope_service`, not `service_scoped_token_headers()`.
@@ -2428,8 +2426,7 @@ TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating) — see GET /api/v1/dex/signals/{obs_type}'s equivalent test
+// WS-A4 PR-1 Gate 7 fix round — see GET /api/v1/dex/signals/{obs_type}'s equivalent test
 // for the full rationale: this harness's `perm_fn` cannot distinguish a
 // global grant from a management-group-scoped one, so the closest
 // available proof of the denial path is `grant_perms = false`.
@@ -2506,7 +2503,7 @@ TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no aud
     CHECK(missing->status == 400);
 }
 
-// ADR-0031 WS-A4 PR-1 / Fraser decision 1: GET /api/v1/dex/catalogue -- the
+// ADR-0031 WS-A4 PR-1: GET /api/v1/dex/catalogue -- the
 // Catalogue View 1 family cards. Same aggregate posture as apps/catalogue-
 // group/health/trends above (no audit, no per-device confinement -- it emits
 // no agent_ids at all, asserted below).
@@ -2648,7 +2645,7 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
             audited = true;
     CHECK(audited);
 
-    // WS-A4 PR-1 Gate 7 fix round (third revision): the route's OWN
+    // WS-A4 PR-1 Gate 7 fix round: the route's OWN
     // `deny_fleet_wide_service_scoped` call is the gate — see GET
     // /api/v1/dex/signals/{obs_type}'s equivalent test for why this is
     // `session_token_scope_service`, not `service_scoped_token_headers()`.
@@ -2659,8 +2656,7 @@ TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denie
     CHECK(denied->status == 403);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
-// base gating) — see GET /api/v1/dex/app's equivalent test for the full
+// WS-A4 PR-1 Gate 7 fix round — see GET /api/v1/dex/app's equivalent test for the full
 // rationale: this harness's `perm_fn` cannot distinguish a global grant
 // from a management-group-scoped one, so the closest available proof of
 // the denial path is `grant_perms = false`.
@@ -3947,7 +3943,7 @@ TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][sig
     CHECK(h.audit_log.empty());
 }
 
-// WS-A4 PR-1 Gate 7 fix round (third revision): superseded by "REST
+// WS-A4 PR-1 Gate 7 fix round: superseded by "REST
 // dex/signals/{obs_type}: permission denied -> 403 before any audit" above
 // — this route reverted off `require_fleet_read`/real RBAC gating back onto
 // the harness's bare `perm_fn` stand-in (`grant_perms`), so the real

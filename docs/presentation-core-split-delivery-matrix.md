@@ -196,7 +196,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   (arch-1/sec8-1/sec8-2, "aggregates GLOBAL-ONLY") found every field these three routes return —
   including their device-list arrays — is a fleet-wide aggregate with no per-caller SQL slice
   (ADR-0017 INV-3 / the `software_catalog` ruling), so it added a 403 refusal for any admitted call
-  whose composed scope was ENGAGED rather than serving a narrowed list. **Round 3 (Fraser decision)
+  whose composed scope was ENGAGED rather than serving a narrowed list. **Round 3 (operator decision)
   reverted both migrations**: `require_fleet_read`'s confinement bought nothing real for three
   routes that can never serve a per-caller-narrowed answer, and the two-round detour cost more
   review cycles than the bug it was fixing. All three routes are back on their ORIGINAL bare

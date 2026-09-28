@@ -2158,7 +2158,7 @@ if build_server
   # suffix MINUS `~[dex]`, since every one of these cases carries the [dex]
   # tag) matched exactly 15 + 13 = 28 cases with zero overlap between them
   # and zero overlap against L's pre-existing six clauses. Re-measured
-  # 2026-09-28 (Gate 7 fix round, third revision) after the same round's
+  # 2026-09-28 (Gate 7 fix round) after the same round's
   # confinement-test rewrite removed 13 now-inapplicable [dex]/[mcp] cases
   # (the retired fleet_read_fn-gate/real-RBAC-rig coverage for GET
   # /api/v1/dex/{signals/{obs_type},app,overview} + their MCP twins, whose

@@ -102,7 +102,7 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
                                           const std::string& since,
                                           const std::set<std::string>* visible);
 
-/// ADR-0031 WS-A4 PR-1 (Fraser decision 1) — the Catalogue View 1 read model
+/// ADR-0031 WS-A4 PR-1 — the Catalogue View 1 read model
 /// (per-family cards + fleet coverage + the "Other (uncatalogued)" list), the
 /// first public resource the /dex Catalogue grid's own fragment computation
 /// has ever had (previously fragment-only: no REST/MCP twin served the

@@ -47,8 +47,8 @@ public:
 
     [[nodiscard]] DexAppModel app(const std::string& process_name,
                                   const std::string& window) const override {
-        // `DexApi::app` has no `visible` parameter (WS-A4 PR-1 Gate 7 fix
-        // round, third revision — see dex_api.hpp's own doc comment); the
+        // `DexApi::app` has no `visible` parameter (WS-A4 PR-1 — see
+        // dex_api.hpp's own doc comment); the
         // builder itself keeps its own `visible` parameter for the
         // dashboard fragment rewire (PR-2) to decide the fate of, so this
         // seam always passes `nullptr`.

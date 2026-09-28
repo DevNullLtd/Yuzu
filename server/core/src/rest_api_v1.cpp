@@ -2073,20 +2073,17 @@ void RestApiV1::register_routes(
     // #4035 hardening (governance)'s bespoke `resolve_dex_visible` resolver
     // for GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
     // /api/v1/dex/signals/{obs_type} is RETIRED, permanently (WS-A4 PR-1
-    // Gate 7 fix round, third revision): it was dormant for a management-
+    // Gate 7 fix round): it was dormant for a management-
     // group-confined-only caller (the bare `perm_fn` gate on all three
     // routes resolves via `RbacStore::check_permission`, GLOBAL roles only,
     // so a confined-only operator is 403'd before this resolver would ever
     // run) and it wrongly narrowed a JIT-elevated administrator to their
     // BASE identity's management-group grant instead of the unfiltered view
-    // elevation earns (sec-2). Two intermediate designs were tried and
-    // reverted in review — pinning the fan-out onto `require_fleet_read`
-    // (round 1) and then adding a `refuse_confined_aggregate_read` 403 for
-    // an admitted-but-scoped caller (round 2) — before landing on Fraser's
-    // final call: restore the base `perm_fn` + `deny_fleet_wide_service_
-    // scoped` gate exactly (see the three route registrations below), and
-    // remove the `visible` parameter from `DexApi::app`/`DexApi::overview`
-    // entirely (dex_api.hpp) rather than resolve it from a retired provider.
+    // elevation earns (sec-2). The three routes keep the base `perm_fn` +
+    // `deny_fleet_wide_service_scoped` gate (see the route registrations
+    // below): their aggregates are not confined per caller (ADR-0017 INV-3),
+    // so they stay global-only, and `DexApi::app`/`DexApi::overview` take no
+    // `visible` parameter (dex_api.hpp).
     // Net effect: every caller who reaches the handler body (a global grant,
     // or an elevated administrator) now sees the SAME unfiltered device
     // list — nothing is narrowed for anyone admission ever lets through.
@@ -15872,7 +15869,7 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
             return;
         }
-        // WS-A4 PR-1 Gate 7 fix round (third revision): `DexApi::app` no
+        // WS-A4 PR-1 Gate 7 fix round: `DexApi::app` no
         // longer takes a `visible` parameter at all — the caller-narrowing
         // resolver this used to thread through was retired permanently (see
         // the block comment above the route registrations for why), so
@@ -15910,7 +15907,7 @@ void RestApiV1::register_routes(
 
     // GET /dex/catalogue?os=&window= -- the Catalogue View 1 family cards +
     // fleet coverage + the "Other (uncatalogued)" list (ADR-0031 WS-A4 PR-1 /
-    // Fraser decision 1: first public resource for this data — previously
+    // first public resource for this data — previously
     // fragment-only). No per-agent identity -- no audit, same aggregate
     // posture as the sibling catalogue/group/health/trends twins.
     sink.Get("/api/v1/dex/catalogue",
@@ -16107,7 +16104,7 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 // WS-A4 PR-1 Gate 7 fix round (third revision): `DexApi::
+                 // WS-A4 PR-1 Gate 7 fix round: `DexApi::
                  // overview` no longer takes a `visible` parameter at all —
                  // see the block comment above GET /dex/app for why. Every
                  // admitted caller gets the same unfiltered top-devices list.
