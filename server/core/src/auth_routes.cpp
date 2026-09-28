@@ -867,7 +867,8 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
 bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& securable_type,
-                                     const std::string& operation) {
+                                     const std::string& operation,
+                                     bool actionable_permission) {
     if (session.mcp_tier.empty())
         return true; // Not an MCP token — nothing this belt enforces (#4309).
 
@@ -877,11 +878,17 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
                       ":" + operation);
         res.status = 403;
         // A4 unified envelope (#1470) — the kPermissionDenied specialisation
-        // names the missing grant in the structured `permission` field.
+        // names the missing grant in the structured `permission` field, but
+        // ONLY when holding it would actually admit the caller (clause 5,
+        // docs/auth-architecture.md) — a gate-less caller (actionable_permission
+        // == false) gets the message without the field, since no RBAC grant
+        // here would self-remediate the denial.
         const std::string perm = securable_type + ":" + operation;
-        res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
-                                          detail::A4ErrorOpts{.permission = perm}),
-                        "application/json");
+        res.set_content(
+            detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                              actionable_permission ? detail::A4ErrorOpts{.permission = perm}
+                                                    : detail::A4ErrorOpts{}),
+            "application/json");
         return false;
     }
     // Approval-gated operations (supervised tier on destructive ops).
@@ -898,14 +905,20 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
                       securable_type + ":" + operation + " on a non-MCP transport");
         res.status = 403;
         const std::string perm = securable_type + ":" + operation;
+        // Same clause-5 rule as the tier_allows() denial above — omit
+        // `.permission` for a gate-less caller (actionable_permission ==
+        // false), keep `.remediation` unconditionally (it correctly steers to
+        // the ticket-then-recall flow regardless of whether an RBAC grant
+        // would separately admit the caller).
         res.set_content(
-            detail::a4_denial(res, 403,
-                              "operation requires approval for this MCP tier on this transport",
-                              detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
-                                                       "for the supervised MCP tier; use the MCP "
-                                                       "ticket-then-recall flow (POST /mcp/v1/) or "
-                                                       "the dashboard",
-                                        .permission = perm}),
+            detail::a4_denial(
+                res, 403, "operation requires approval for this MCP tier on this transport",
+                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
+                                             "for the supervised MCP tier; use the MCP "
+                                             "ticket-then-recall flow (POST /mcp/v1/) or "
+                                             "the dashboard",
+                            .permission = actionable_permission ? std::string_view(perm)
+                                                                : std::string_view{}}),
             "application/json");
         return false;
     }

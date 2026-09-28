@@ -78,6 +78,11 @@ struct Harness {
     std::string session_mcp_tier;         // empty = untiered (default)
     std::string session_scope_service;    // non-empty = service-scoped token
     std::string session_principal_kind{"human"};
+    // #5047 fix round: when false, register_routes is wired with an empty
+    // tier_policy_fn — proving rest_api_v1.cpp's own default-empty-callback
+    // 503 branch (the REST twin of result_set_routes.cpp's identical,
+    // already-tested posture), not merely this harness's fake belt.
+    bool tier_policy_fn_wired{true};
 
     // #5047 pair-pinning: the fake tier_policy_fn records the LAST
     // (securable_type, operation) it was called with, so the tests below can
@@ -87,7 +92,8 @@ struct Harness {
     bool tier_policy_fn_called{false};
     std::string last_tier_securable, last_tier_operation;
 
-    explicit Harness(pg::PgPool& pool) {
+    explicit Harness(pg::PgPool& pool, bool wire_tier_policy = true) {
+        tier_policy_fn_wired = wire_tier_policy;
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
@@ -163,7 +169,7 @@ struct Harness {
             /*list_read_fn=*/{}, /*fleet_read_fn=*/{}, /*agents_fn=*/{},
             /*response_visible_set_fn=*/{}, /*dex_visible_fn=*/{},
             /*verify_api=*/{}, /*device_api=*/{}, /*dex_api=*/{}, /*dex_perf_api=*/{},
-            /*guardian_api=*/{}, tier_policy_fn);
+            /*guardian_api=*/{}, tier_policy_fn_wired ? tier_policy_fn : TierPolicyFn{});
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
@@ -365,4 +371,27 @@ TEST_CASE("REST /api/v1/result-sets: an engine-principal session (hard-"
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     CHECK_FALSE((*row)->pinned);
+}
+
+TEST_CASE("REST /api/v1/result-sets: an unwired tier_policy_fn fails CLOSED "
+          "(503) for a TIERED session but passes through for an untiered "
+          "one — the REST twin of result_set_routes.cpp's identical "
+          "fragment-side test (#5047 fix round; TierPolicyFn's own "
+          "misconfiguration-posture contract)",
+          "[pg][result_set][tier_policy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, tier_policy_result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    Harness h(pool, /*wire_tier_policy=*/false);
+
+    h.session_mcp_tier = "supervised";
+    int status = 0;
+    h.post_raw("/api/v1/result-sets", R"({"name":"t"})", status);
+    CHECK(status == 503);
+
+    // Untiered session, still unwired: passes through — nothing this belt
+    // enforces on it, so ownership (create needs none) admits it normally.
+    Harness h2(pool, /*wire_tier_policy=*/false);
+    int status2 = 0;
+    h2.post_raw("/api/v1/result-sets", R"({"name":"t"})", status2);
+    CHECK(status2 != 503);
 }

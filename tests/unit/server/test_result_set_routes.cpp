@@ -366,10 +366,11 @@ TEST_CASE("result_set_routes: tier_policy_fn is NOT called on the 2 read "
 }
 
 TEST_CASE("result_set_routes: a supervised-tier session pinning/creating its "
-          "own result set is now denied (Infrastructure:Write is on "
-          "tier_allows' supervised path but this asserts the WIRING, not "
-          "just tier_allows in isolation) — a false return halts the "
-          "handler before the store is touched",
+          "own result set is allowed (Infrastructure:Write is on "
+          "tier_allows' supervised path — this asserts the WIRING calls "
+          "through correctly, not just tier_allows in isolation); only a "
+          "false tier_policy_fn return would halt the handler before the "
+          "store is touched",
           "[server][routes][result_set_routes]") {
     // Sanity: supervised tier DOES allow Infrastructure:Write per
     // tier_allows() -- so pin/create should NOT be blocked by tier_allows.

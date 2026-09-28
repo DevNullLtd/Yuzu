@@ -187,9 +187,19 @@ public:
     /// transports (MCP JSON-RPC and REST API) so a token cannot bypass the
     /// tier by switching endpoints" (#520) — this method IS that promise,
     /// callable from a route that isn't RBAC-gated at all.
+    /// `actionable_permission` (default `true`, preserving `require_permission`'s
+    /// own call unchanged) controls whether a denial's A4 body names
+    /// `securable_type:operation` in the structured `.permission` field.
+    /// docs/auth-architecture.md's service-scope clause 5 (MUST, CATASTROPHIC)
+    /// forbids naming a `.permission` a denial would not, by itself, admit the
+    /// caller with -- true on an RBAC-gated route (holding the grant WOULD
+    /// admit them), false on a gate-less route like the result-set family
+    /// (there is no RBAC check to admit against; `securable_type`/`operation`
+    /// here are borrowed tier-bucketing labels, not a real securable). Pass
+    /// `false` from any NEW caller with no RBAC gate of its own.
     bool require_tier_policy(const httplib::Request& req, httplib::Response& res,
                              const auth::Session& session, const std::string& securable_type,
-                             const std::string& operation);
+                             const std::string& operation, bool actionable_permission = true);
 
     /// Scoped RBAC-aware permission check for device-specific operations.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,

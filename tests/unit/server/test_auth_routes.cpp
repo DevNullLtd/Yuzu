@@ -1829,3 +1829,74 @@ TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
     CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
     CHECK(res.status == 403);
 }
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (adversarial review, both Kimi and Codex,
+// independently): the two denial arms above unconditionally named
+// `Infrastructure:Write`/`:Delete` as the A4 `.permission` field, which
+// falsely implies holding that grant would admit the caller — true on
+// require_permission's own RBAC-gated context (unchanged: default
+// `actionable_permission = true`), but NOT on a gate-less route like the
+// result-set write family, which has no RBAC check at all (clause 5,
+// docs/auth-architecture.md "Service-scoped token fleet-wide confinement",
+// CATASTROPHIC MUST — a denial must not name a `.permission` that would not,
+// by itself, admit the caller). These tests pin BOTH the preserved default
+// behaviour (true) and the new opt-out (false) on both denial arms.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission defaults "
+          "true, preserving require_permission's own envelope (the "
+          "tier_allows denial names .permission)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\":\"Infrastructure:Write\"") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's tier_allows denial "
+          "(#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    // The message still steers correctly — only the structured self-
+    // remediation field is withheld.
+    CHECK(res.body.find("does not allow") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's requires_approval "
+          "denial too, keeping .remediation (#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets/rs_deadbeef0123"; // non-MCP transport
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}

@@ -14781,8 +14781,11 @@ private:
                                         const auth::Session& session,
                                         const std::string& securable_type,
                                         const std::string& operation) -> bool {
+                                     // false: gate-less route, no RBAC check
+                                     // to admit against (clause 5).
                                      return auth_routes_->require_tier_policy(
-                                         req, res, session, securable_type, operation);
+                                         req, res, session, securable_type, operation,
+                                         /*actionable_permission=*/false);
                                  },
                              .store = result_set_store_.get(),
                              .metrics = &metrics_,
@@ -19162,8 +19165,10 @@ private:
             [this](const httplib::Request& req, httplib::Response& res,
                    const auth::Session& session, const std::string& securable_type,
                    const std::string& operation) -> bool {
+                // false: gate-less route, no RBAC check to admit against (clause 5).
                 return auth_routes_->require_tier_policy(req, res, session, securable_type,
-                                                         operation);
+                                                         operation,
+                                                         /*actionable_permission=*/false);
             });
 
         // -- Register MCP server routes ----------------------------------------
