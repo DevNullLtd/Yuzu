@@ -2496,6 +2496,65 @@ Check whether the current user has a specific permission.
 
 ---
 
+#### `GET /api/v1/rbac/roles/assignments`
+
+Fleet-wide "who currently holds which RBAC role": every
+`(principal_type, principal_id, role_name)` grant row on record, across all
+three principal types (user/group/engine), in one bulk read. This reuses the
+same `RbacStore::list_all_principal_roles_checked()` bulk read the SOC 2
+CC6.2 access-review export (`GET /api/v1/access-reviews/export`) is built on
+— it is the complete, ungated grant table, not a management-group-confined
+slice.
+
+**Permission:** `AccessReview:Read` — the SAME dedicated securable the
+access-review export uses, deliberately **not** `UserManagement:Read` like
+the plain role catalog above: a confinement-filtered view would be
+incomplete evidence, so this route needs the same bar as the export. Also
+subject to the RBAC-off authorization-topology floor
+(`docs/auth-architecture.md` "The authorization topology floor (#2376)"),
+which applies **only** in the legacy RBAC-off fallback: with RBAC
+**disabled**, the floor additionally requires an effective local admin
+role; with RBAC **enabled**, any principal actually granted
+`AccessReview:Read` — including the seeded, non-admin `Reviewer` role — is
+admitted, exactly as intended (#2324 seeded `Reviewer` specifically to
+reach this class of surface without full Administrator authority).
+
+No pagination: `list_all_principal_roles_checked()` is a single bulk read
+with no limit/offset, and the response carries no `pagination` block at all
+(matching `GET /api/v1/access-reviews`, the route this one mirrors) — a
+`data` array of the complete grant table plus `meta` only.
+
+Self-audited as `rbac.assignments.list`.
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "principal_type": "user",
+      "principal_id": "alice",
+      "role_name": "Administrator"
+    },
+    {
+      "principal_type": "engine",
+      "principal_id": "engine:nvd-sync",
+      "role_name": "Viewer"
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| 403 | Requires `AccessReview:Read` |
+| 503 | RBAC store unavailable, or a genuine read failure |
+
+---
+
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
 Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
