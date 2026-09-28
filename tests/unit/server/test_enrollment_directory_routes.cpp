@@ -28,6 +28,7 @@
 #include "enrollment_directory_model.hpp" // directory_status_json — direct builder test
 #include "enrollment_directory_routes.hpp"
 #include "pg/pg_exec.hpp"
+#include "test_auth_db_pg_helper.hpp" // WS-6 6.2: pending-agent state is PG-backed
 #include "test_directory_sync_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
@@ -38,6 +39,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
@@ -86,6 +88,15 @@ struct EnrollmentDirectoryRouteHarness {
 
     yuzu::server::test::TestRouteSink sink;
     EnrollmentDirectoryRoutes routes;
+
+    // WS-6 6.2: pending-agent state lives only in AuthDB (Postgres). Only the
+    // pending-agents tests attach one (lazily, so the many PG-free tests here
+    // stay PG-free); without it the route must fail closed (503).
+    std::unique_ptr<yuzu::test::AuthDbPgShared> auth_db;
+    void attach_auth_db() {
+        auth_db = std::make_unique<yuzu::test::AuthDbPgShared>();
+        auth_mgr.set_auth_db(auth_db->get());
+    }
 
     explicit EnrollmentDirectoryRouteHarness() {
         auto auth_fn = [](const httplib::Request&, httplib::Response&)
@@ -370,17 +381,18 @@ TEST_CASE("REST enrollment/directory: settings/oidc 503s when cfg is null "
     CHECK(res->status == 503);
 }
 
-// ── pending-agents: success shape + audit (in-memory, no PG) ──────────────
+// ── pending-agents: success shape + audit (PG-backed AuthDB, WS-6 6.2) ──────────────
 
 TEST_CASE("REST enrollment/directory: pending-agents returns pending+denied only, EXCLUDES "
           "already-approved agents (Gate 4 fix -- matches render_pending_fragment()'s "
           "identical filter; the route previously returned every agent that had ever "
           "enrolled, silently diverging from its own name/docs/API-parity ledger)",
-          "[rest][enrollment_directory]") {
+          "[rest][enrollment_directory][pg]") {
     EnrollmentDirectoryRouteHarness h;
-    h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
-    h.auth_mgr.add_pending_agent("agent-2", "host2.example.com", "windows", "x86_64", "1.2.3");
-    REQUIRE(h.auth_mgr.approve_pending_agent("agent-2"));
+    h.attach_auth_db();
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3").has_value());
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-2", "host2.example.com", "windows", "x86_64", "1.2.3").has_value());
+    REQUIRE(h.auth_mgr.approve_pending_agent("agent-2", "tester").value());
 
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
@@ -411,10 +423,11 @@ TEST_CASE("REST enrollment/directory: pending-agents returns pending+denied only
 
 TEST_CASE("REST enrollment/directory: pending-agents includes denied agents (only "
           "'approved' is excluded, matching PendingStatus's exact 3-value enum)",
-          "[rest][enrollment_directory]") {
+          "[rest][enrollment_directory][pg]") {
     EnrollmentDirectoryRouteHarness h;
-    h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3");
-    REQUIRE(h.auth_mgr.deny_pending_agent("agent-3"));
+    h.attach_auth_db();
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3").has_value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("agent-3", "tester").value());
 
     auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
     REQUIRE(res);
@@ -431,10 +444,11 @@ TEST_CASE("REST enrollment/directory: pending-agents includes denied agents (onl
 
 TEST_CASE("REST enrollment/directory: pending-agents narrows to an engaged scope -- an "
           "out-of-scope pending agent is dropped, an in-scope one is kept",
-          "[rest][enrollment_directory]") {
+          "[rest][enrollment_directory][pg]") {
     EnrollmentDirectoryRouteHarness h;
-    h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
-    h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3");
+    h.attach_auth_db();
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3").has_value());
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-3", "host3.example.com", "macos", "arm64", "1.2.3").has_value());
     // Engaged (non-nullopt) scope containing only agent-1 -- simulates a
     // management-group-scoped `fleet_read_fn` admit, distinct from the
     // harness default's unfiltered TOP.
@@ -455,7 +469,7 @@ TEST_CASE("REST enrollment/directory: pending-agents admitted-engaged-EMPTY scop
           "an empty list, never a 403 (route half of the under-admission fix: an admitted gate "
           "result is always answered with its real intersection, even when that intersection "
           "is empty, rather than being treated as a denial)",
-          "[rest][enrollment_directory]") {
+          "[rest][enrollment_directory][pg]") {
     // NOTE: `h.fleet_scope` below is a hand-injected fake -- it exercises
     // only this route's own post-gate `authz::in_scope` filtering, not a
     // real RbacStore+ManagementGroupStore composition. It intentionally
@@ -476,7 +490,8 @@ TEST_CASE("REST enrollment/directory: pending-agents admitted-engaged-EMPTY scop
     // RbacStore::authorize_list_read directly, one layer below
     // require_fleet_read.
     EnrollmentDirectoryRouteHarness h;
-    h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3");
+    h.attach_auth_db();
+    REQUIRE(h.auth_mgr.add_pending_agent("agent-1", "host1.example.com", "linux", "x86_64", "1.2.3").has_value());
     // Engaged-empty scope (authz::deny_all() shape) -- admitted, but the
     // real visible-agent intersection is empty.
     h.fleet_scope = std::unordered_set<std::string>{};
@@ -488,6 +503,15 @@ TEST_CASE("REST enrollment/directory: pending-agents admitted-engaged-EMPTY scop
     REQUIRE(j["data"].is_array());
     CHECK(j["data"].empty());
     CHECK(j["pagination"]["total"] == 0);
+}
+
+TEST_CASE("REST enrollment/directory: pending-agents 503s when the enrollment store is "
+          "unavailable -- never an empty 200 that reads as 'nothing pending' (WS-6 6.2)",
+          "[rest][enrollment_directory]") {
+    EnrollmentDirectoryRouteHarness h; // NO AuthDB attached -> the store is unavailable
+    auto res = h.sink.Get("/api/v1/enrollment/pending-agents");
+    REQUIRE(res);
+    CHECK(res->status == 503);
 }
 
 // ── settings/oidc: success shape + secret masking (in-memory, no PG) ──────

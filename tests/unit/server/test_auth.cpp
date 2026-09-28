@@ -1540,408 +1540,416 @@ TEST_CASE("validate_session rejects overly-long tokens (DoS protection #630)", "
     REQUIRE_FALSE(mgr->validate_session(std::string(1000, 'b')).has_value());
 }
 
-// ── Enrollment Tokens ────────────────────────────────────────────────────────
-
-TEST_CASE("create and validate enrollment token", "[auth][enrollment]") {
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("test", 0, std::chrono::hours(1));
-    REQUIRE_FALSE(raw.empty());
-    REQUIRE(mgr->validate_enrollment_token(raw));
-}
-
-TEST_CASE("validate fails with wrong token", "[auth][enrollment]") {
-    auto mgr = make_temp_auth();
-    mgr->create_enrollment_token("test", 0, std::chrono::hours(1));
-    REQUIRE_FALSE(mgr->validate_enrollment_token("definitely-wrong-token"));
-}
-
-TEST_CASE("validate fails after revocation", "[auth][enrollment]") {
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("test", 0, std::chrono::hours(1));
-
-    auto tokens = mgr->list_enrollment_tokens();
-    REQUIRE(tokens.size() == 1);
-    REQUIRE(mgr->revoke_enrollment_token(tokens[0].token_id));
-    REQUIRE_FALSE(mgr->validate_enrollment_token(raw));
-}
-
-TEST_CASE("max_uses enforcement via consume", "[auth][enrollment]") {
-    // W1.4 R2 / UP-H2: validate_enrollment_token is now read-only and no
-    // longer burns a use. Exhaustion still works — but it must be tested
-    // through consume_enrollment_token, which is what the gRPC handlers
-    // call. validate is the observability probe, not the consume path.
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("once", 1, std::chrono::hours(1));
-
-    auto first = mgr->consume_enrollment_token(raw, "agent-1");
-    REQUIRE(first.has_value());
-    auto second = mgr->consume_enrollment_token(raw, "agent-2");
-    REQUIRE_FALSE(second.has_value());
-    CHECK(second.error() == EnrollmentTokenError::already_consumed);
-}
-
-TEST_CASE("batch token creation", "[auth][enrollment]") {
-    auto mgr = make_temp_auth();
-    auto batch = mgr->create_enrollment_tokens_batch("batch", 5, 10, std::chrono::hours(1));
-    REQUIRE(batch.size() == 5);
-
-    // All tokens should be distinct
-    for (size_t i = 0; i < batch.size(); ++i) {
-        for (size_t j = i + 1; j < batch.size(); ++j) {
-            REQUIRE(batch[i] != batch[j]);
-        }
-    }
-}
-
-TEST_CASE("list_enrollment_tokens", "[auth][enrollment]") {
-    auto mgr = make_temp_auth();
-    mgr->create_enrollment_token("alpha", 0, std::chrono::hours(1));
-    mgr->create_enrollment_token("beta", 0, std::chrono::hours(1));
-
-    auto tokens = mgr->list_enrollment_tokens();
-    REQUIRE(tokens.size() == 2);
-}
-
-// ── Enrollment Token — Atomic Consume (W1.4 / #827) ─────────────────────────
+// ── Enrollment tokens + pending agents (WS-6 6.2) ────────────────────────────
 //
-// `consume_enrollment_token` is the new atomic-claim entry point. The legacy
-// `validate_enrollment_token` is now a thin wrapper. The race-loss case is
-// the primary defence against the #827 attack (two Register RPCs presenting
-// the same one-time enrollment token simultaneously, both passing the
-// pre-W1.4 check-then-increment race window).
+// Since slice 6.2 enrollment state lives ONLY in AuthDB (Postgres): the pre-6.2
+// in-memory maps and the enrollment-tokens.cfg / pending-agents.cfg files are
+// gone, so every test here runs against a real PG-backed AuthDB. Tests that
+// asserted file persistence (the UP-C1 "crash-replay from disk" case) and the
+// read-only `validate_enrollment_token` probe (removed — it had no production
+// caller) are deleted; the crash-replay guarantee is now covered by
+// "state survives AuthManager re-construction over the same PG" below.
 
-TEST_CASE("consume_enrollment_token returns claim on success", "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("first-use", 5, std::chrono::hours(1));
+namespace {
 
-    auto claim = mgr->consume_enrollment_token(raw, "agent-A");
-    REQUIRE(claim.has_value());
-    CHECK(claim->use_count_after == 1);
-    CHECK(claim->max_uses == 5);
-    CHECK_FALSE(claim->single_use);
-    CHECK_FALSE(claim->token_id.empty());
+/// An AuthManager wired to a fresh PG-backed AuthDB. `mgr` is what production
+/// code drives; `db` lets a test reach the store/pool directly.
+struct EnrollFixture {
+    yuzu::test::AuthDbPg db;
+    AuthManager mgr;
+    EnrollFixture() { mgr.set_auth_db(db.get()); }
+};
 
-    // Second consume from a different agent also wins — multi-use token.
-    auto claim2 = mgr->consume_enrollment_token(raw, "agent-B");
-    REQUIRE(claim2.has_value());
-    CHECK(claim2->use_count_after == 2);
+using yuzu::server::StoreError;
 
-    // last_consumer_for_token_hash returns the most-recent consumer.
-    auto hash = AuthManager::sha256_hex(raw);
-    CHECK(mgr->last_consumer_for_token_hash(hash) == "agent-B");
+/// Consume with the boilerplate agent metadata; the token/agent are what matter.
+std::expected<ConsumeEnrollResult, StoreError> consume(AuthManager& mgr, std::string_view raw,
+                                                       const std::string& agent) {
+    return mgr.consume_and_enroll(raw, agent, "host-" + agent, "linux", "x86_64", "0.1.0");
 }
 
-TEST_CASE("consume_enrollment_token: not_found on unknown token", "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    mgr->create_enrollment_token("decoy", 1, std::chrono::hours(1));
-
-    auto claim = mgr->consume_enrollment_token("never-issued-token", "agent-X");
-    REQUIRE_FALSE(claim.has_value());
-    CHECK(claim.error() == EnrollmentTokenError::not_found);
+/// Mint a token or fail the test.
+CreatedEnrollmentToken mint(AuthManager& mgr, const std::string& label, int max_uses,
+                            std::chrono::seconds ttl) {
+    auto c = mgr.create_enrollment_token(label, max_uses, ttl, "tester");
+    REQUIRE(c.has_value());
+    return *c;
 }
 
-TEST_CASE("consume_enrollment_token: revoked variant", "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("revoke-me", 0, std::chrono::hours(1));
-    auto tokens = mgr->list_enrollment_tokens();
-    REQUIRE(tokens.size() == 1);
-    REQUIRE(mgr->revoke_enrollment_token(tokens[0].token_id));
+} // namespace
 
-    auto claim = mgr->consume_enrollment_token(raw, "agent-X");
-    REQUIRE_FALSE(claim.has_value());
-    CHECK(claim.error() == EnrollmentTokenError::revoked);
+TEST_CASE("enrollment: create, list, revoke", "[auth][enrollment][pg]") {
+    EnrollFixture f;
+    auto t = mint(f.mgr, "test", 0, std::chrono::hours(1));
+    CHECK(t.raw_token.size() == 64);
+    CHECK(t.token_id.size() == 8);
+
+    auto tokens = f.mgr.list_enrollment_tokens();
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    CHECK((*tokens)[0].token_id == t.token_id);
+    CHECK((*tokens)[0].label == "test");
+    CHECK_FALSE((*tokens)[0].revoked);
+
+    CHECK(f.mgr.revoke_enrollment_token(t.token_id).value());
+    CHECK_FALSE(f.mgr.revoke_enrollment_token("ffffffff").value());
+    CHECK(f.mgr.list_enrollment_tokens().value()[0].revoked);
+
+    // A revoked token no longer admits.
+    auto r = consume(f.mgr, t.raw_token, "agent-1");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == ConsumeEnrollResult::Kind::token_rejected);
+    CHECK(r->token_error == EnrollmentTokenError::revoked);
 }
 
-TEST_CASE("consume_enrollment_token: expired variant", "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    // Negative TTL == expired-on-creation. The implementation treats ttl==0
-    // as "never expires" via time_point::max(); a 1-second TTL with a sleep
-    // would race the test clock — so we cover expired via the revoked
-    // branch above and rely on the implementation correctness here. To
-    // assert the variant mapping we re-use the in-memory mutation pattern
-    // by issuing a token with a 1-tick TTL and racing past it.
-    auto raw = mgr->create_enrollment_token("expire", 0, std::chrono::seconds(1));
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    auto claim = mgr->consume_enrollment_token(raw, "agent-X");
-    REQUIRE_FALSE(claim.has_value());
-    CHECK(claim.error() == EnrollmentTokenError::expired);
+TEST_CASE("enrollment: many tokens are distinct and all listed", "[auth][enrollment][pg]") {
+    // (was "batch token creation": the batch helper moved to the callers; the
+    // property under test is that minted tokens never collide.)
+    EnrollFixture f;
+    std::vector<std::string> raws;
+    for (int i = 0; i < 5; ++i)
+        raws.push_back(mint(f.mgr, "batch-" + std::to_string(i + 1), 10, std::chrono::hours(1)).raw_token);
+    for (size_t i = 0; i < raws.size(); ++i)
+        for (size_t j = i + 1; j < raws.size(); ++j)
+            REQUIRE(raws[i] != raws[j]);
+    CHECK(f.mgr.list_enrollment_tokens().value().size() == 5);
 }
 
-TEST_CASE("consume_enrollment_token: already_consumed after exhaustion",
+TEST_CASE("consume_and_enroll returns a claim on success and enrolls the agent",
           "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("once", 1, std::chrono::hours(1));
+    EnrollFixture f;
+    auto t = mint(f.mgr, "first-use", 5, std::chrono::hours(1));
 
-    // First call wins.
-    auto first = mgr->consume_enrollment_token(raw, "agent-A");
+    auto r = consume(f.mgr, t.raw_token, "agent-A");
+    REQUIRE(r.has_value());
+    REQUIRE(r->kind == ConsumeEnrollResult::Kind::enrolled);
+    CHECK(r->claim.use_count_after == 1);
+    CHECK(r->claim.max_uses == 5);
+    CHECK_FALSE(r->claim.single_use);
+    CHECK(r->claim.token_id == t.token_id);
+    // The agent is approved as part of the SAME atomic call.
+    auto st = f.mgr.get_pending_status("agent-A");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK(**st == PendingStatus::approved);
+
+    // Multi-use: a second agent also wins.
+    auto r2 = consume(f.mgr, t.raw_token, "agent-B");
+    REQUIRE(r2.has_value());
+    REQUIRE(r2->kind == ConsumeEnrollResult::Kind::enrolled);
+    CHECK(r2->claim.use_count_after == 2);
+    CHECK(f.mgr.list_enrollment_tokens().value()[0].last_consumed_by_agent_id == "agent-B");
+}
+
+TEST_CASE("consume_and_enroll: not_found on an unknown token, nobody enrolled",
+          "[auth][enrollment][atomic]") {
+    EnrollFixture f;
+    mint(f.mgr, "decoy", 1, std::chrono::hours(1));
+    auto r = consume(f.mgr, std::string(64, 'a'), "agent-X");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == ConsumeEnrollResult::Kind::token_rejected);
+    CHECK(r->token_error == EnrollmentTokenError::not_found);
+    CHECK_FALSE(f.mgr.get_pending_status("agent-X").value().has_value());
+}
+
+TEST_CASE("consume_and_enroll: expired variant (expiry judged by the DB clock)",
+          "[auth][enrollment][atomic]") {
+    EnrollFixture f;
+    auto t = mint(f.mgr, "expire", 0, std::chrono::hours(1));
+    // Push expires_at into the PG past instead of sleeping: expiry is evaluated
+    // in SQL against now(), so this is exactly what a lapsed TTL looks like.
+    {
+        auto lease = f.db.pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        auto upd = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.enrollment_tokens SET expires_at = now() - interval '1 second' "
+            "WHERE token_id = $1",
+            std::vector<std::string>{t.token_id});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    auto r = consume(f.mgr, t.raw_token, "agent-X");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == ConsumeEnrollResult::Kind::token_rejected);
+    CHECK(r->token_error == EnrollmentTokenError::expired);
+}
+
+TEST_CASE("consume_and_enroll: already_consumed after exhaustion names the winner",
+          "[auth][enrollment][atomic]") {
+    EnrollFixture f;
+    auto t = mint(f.mgr, "once", 1, std::chrono::hours(1));
+
+    auto first = consume(f.mgr, t.raw_token, "agent-A");
     REQUIRE(first.has_value());
-    CHECK(first->single_use);
-    CHECK(first->use_count_after == 1);
+    REQUIRE(first->kind == ConsumeEnrollResult::Kind::enrolled);
+    CHECK(first->claim.single_use);
+    CHECK(first->claim.use_count_after == 1);
 
-    // Second call (after first has landed) sees already_consumed.
-    auto second = mgr->consume_enrollment_token(raw, "agent-B");
-    REQUIRE_FALSE(second.has_value());
-    CHECK(second.error() == EnrollmentTokenError::already_consumed);
-
-    // last_consumer_for_token_hash names the winner so the lost-race audit
-    // detail in agent_service_impl can stamp `already_consumed_by=agent-A`.
-    auto hash = AuthManager::sha256_hex(raw);
-    CHECK(mgr->last_consumer_for_token_hash(hash) == "agent-A");
+    auto second = consume(f.mgr, t.raw_token, "agent-B");
+    REQUIRE(second.has_value());
+    CHECK(second->kind == ConsumeEnrollResult::Kind::token_rejected);
+    CHECK(second->token_error == EnrollmentTokenError::already_consumed);
+    // The lost-race audit detail stamps already_consumed_by=agent-A.
+    CHECK(second->already_consumed_by == "agent-A");
 }
 
-TEST_CASE("consume_enrollment_token: invalid_input on empty token", "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    auto claim = mgr->consume_enrollment_token("", "agent-X");
-    REQUIRE_FALSE(claim.has_value());
-    CHECK(claim.error() == EnrollmentTokenError::invalid_input);
-}
-
-TEST_CASE("consume_enrollment_token: invalid_input on oversize token",
+TEST_CASE("consume_and_enroll: empty / oversize token is InvalidInput",
           "[auth][enrollment][atomic]") {
-    auto mgr = make_temp_auth();
-    // 257 chars — one byte over the kMaxEnrollmentTokenLength bound. The
-    // defence-in-depth length check in consume_enrollment_token rejects
-    // before SHA-256 runs, so it shouldn't matter whether a token of
-    // matching shape was ever issued; we don't create one to make the
-    // intent clear.
+    EnrollFixture f;
+    auto empty = consume(f.mgr, "", "agent-X");
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error() == StoreError::InvalidInput);
+
     std::string oversize(kMaxEnrollmentTokenLength + 1, 'A');
-    auto claim = mgr->consume_enrollment_token(oversize, "agent-X");
-    REQUIRE_FALSE(claim.has_value());
-    CHECK(claim.error() == EnrollmentTokenError::invalid_input);
+    auto big = consume(f.mgr, oversize, "agent-X");
+    REQUIRE_FALSE(big.has_value());
+    CHECK(big.error() == StoreError::InvalidInput);
 }
 
-TEST_CASE("consume_enrollment_token: concurrent claim — exactly one winner",
-          "[auth][enrollment][atomic][race]") {
-    // The canonical #827 race-test. N threads try to consume the same
-    // single-use enrollment token simultaneously. The pre-W1.4 behaviour
-    // (validate-then-increment with the lock released between) allowed
-    // multiple winners; the W1.4 atomic-claim guarantees exactly one.
-    //
-    // We don't use std::barrier here (not yet C++20-ubiquitous on the CI
-    // matrix per the cross-compiler doc) — instead we follow the
-    // ConcurrencyManager race-test pattern (#1031): spin up all threads
-    // and let them race for the lock. With kThreads >> 1 the
-    // contention is real even without an explicit synchronisation point.
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("one-shot", 1, std::chrono::hours(1));
+TEST_CASE("consume_and_enroll: an admin-denied agent is refused and the use is rolled back "
+          "(#1135)",
+          "[auth][enrollment][atomic]") {
+    EnrollFixture f;
+    auto t = mint(f.mgr, "once", 1, std::chrono::hours(1));
+    REQUIRE(f.mgr.add_pending_agent("evil", "h", "linux", "x86_64", "0.1.0").value());
+    REQUIRE(f.mgr.deny_pending_agent("evil", "admin").value());
 
-    constexpr int kThreads = 64;
-    std::atomic<int> winners{0};
-    std::atomic<int> race_losers{0};
-    std::atomic<int> other_rejections{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
+    auto r = consume(f.mgr, t.raw_token, "evil");
+    REQUIRE(r.has_value());
+    CHECK(r->kind == ConsumeEnrollResult::Kind::admin_denied);
+    CHECK(f.mgr.list_enrollment_tokens().value()[0].use_count == 0);
+    CHECK(**f.mgr.get_pending_status("evil") == PendingStatus::denied);
 
-    for (int i = 0; i < kThreads; ++i) {
-        threads.emplace_back([&, i] {
-            std::string agent_id = "agent-" + std::to_string(i);
-            auto result = mgr->consume_enrollment_token(raw, agent_id);
-            if (result.has_value()) {
-                winners.fetch_add(1, std::memory_order_relaxed);
-            } else if (result.error() == EnrollmentTokenError::already_consumed) {
-                race_losers.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                other_rejections.fetch_add(1, std::memory_order_relaxed);
-            }
+    // The single use is still there for the legitimate agent.
+    auto ok = consume(f.mgr, t.raw_token, "good");
+    REQUIRE(ok.has_value());
+    CHECK(ok->kind == ConsumeEnrollResult::Kind::enrolled);
+}
+
+namespace {
+/// N threads race ONE token across a pool big enough that every thread holds its
+/// own connection (the real cross-connection race). Returns {winners, race
+/// losers, anything else}.
+struct RaceOutcome {
+    int winners{0};
+    int race_losers{0};
+    int other{0};
+};
+RaceOutcome race_consume(yuzu::test::AuthDbPg& db, int max_uses, int threads,
+                         std::vector<yuzu::server::auth::EnrollmentToken>* tokens_after) {
+    yuzu::server::pg::PgPool pool{
+        yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = static_cast<std::size_t>(threads)}};
+    REQUIRE(pool.valid());
+    // A SEPARATE codec chain: a SecretCodec registers the mfa column once, so it
+    // cannot be shared with the fixture's own AuthDB. Enrollment never touches the
+    // codec, so it needs no init().
+    yuzu::test::TempDir race_keys;
+    yuzu::server::FileKeyProvider race_provider(race_keys.path);
+    yuzu::server::pg::SecretCodec race_codec(race_provider);
+    yuzu::server::AuthDB adb{pool, race_codec, 0};
+    REQUIRE(adb.is_open());
+    AuthManager mgr;
+    mgr.set_auth_db(&adb);
+    auto t = mint(mgr, "race", max_uses, std::chrono::hours(1));
+
+    std::atomic<bool> go{false};
+    std::atomic<int> winners{0}, losers{0}, other{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < threads; ++i) {
+        ts.emplace_back([&, i] {
+            while (!go.load())
+                std::this_thread::yield();
+            auto r = consume(mgr, t.raw_token, "agent-" + std::to_string(i));
+            if (r.has_value() && r->kind == ConsumeEnrollResult::Kind::enrolled)
+                winners.fetch_add(1);
+            else if (r.has_value() && r->token_error == EnrollmentTokenError::already_consumed)
+                losers.fetch_add(1);
+            else
+                other.fetch_add(1);
         });
     }
-    for (auto& t : threads)
-        t.join();
+    go.store(true);
+    for (auto& th : ts)
+        th.join();
+    *tokens_after = mgr.list_enrollment_tokens().value();
+    return {winners.load(), losers.load(), other.load()};
+}
+} // namespace
 
-    // Exactly one thread won the race. Everyone else saw already_consumed.
-    // No "other" variant should fire — the token exists, isn't revoked,
-    // isn't expired; the only way to fail is to lose the race.
-    CHECK(winners.load() == 1);
-    CHECK(race_losers.load() == kThreads - 1);
-    CHECK(other_rejections.load() == 0);
-
-    // The store-side use_count matches the winner count.
-    auto tokens = mgr->list_enrollment_tokens();
+TEST_CASE("consume_and_enroll: concurrent claim - exactly one winner",
+          "[auth][enrollment][atomic][race]") {
+    // The canonical #827 race-test, now across real PG connections: N threads try
+    // to consume the same single-use token. Exactly one wins; everyone else sees
+    // already_consumed; nothing else fires.
+    yuzu::test::AuthDbPg db;
+    std::vector<yuzu::server::auth::EnrollmentToken> tokens;
+    const auto o = race_consume(db, 1, 16, &tokens);
+    CHECK(o.winners == 1);
+    CHECK(o.race_losers == 15);
+    CHECK(o.other == 0);
     REQUIRE(tokens.size() == 1);
     CHECK(tokens[0].use_count == 1);
     CHECK_FALSE(tokens[0].last_consumed_by_agent_id.empty());
 }
 
-TEST_CASE("consume_enrollment_token: concurrent claim on N-use token — exactly N winners",
+TEST_CASE("consume_and_enroll: concurrent claim on an N-use token - exactly N winners",
           "[auth][enrollment][atomic][race]") {
-    // Generalisation of the previous test. With max_uses == 3, exactly 3
-    // threads win and the rest see already_consumed. This exercises the
-    // `use_count >= max_uses` branch under contention rather than the
-    // single-use special case.
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("three-uses", 3, std::chrono::hours(1));
-
-    constexpr int kThreads = 32;
-    constexpr int kMaxUses = 3;
-    std::atomic<int> winners{0};
-    std::atomic<int> race_losers{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-
-    for (int i = 0; i < kThreads; ++i) {
-        threads.emplace_back([&, i] {
-            std::string agent_id = "agent-" + std::to_string(i);
-            auto result = mgr->consume_enrollment_token(raw, agent_id);
-            if (result.has_value()) {
-                winners.fetch_add(1, std::memory_order_relaxed);
-            } else if (result.error() == EnrollmentTokenError::already_consumed) {
-                race_losers.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-    for (auto& t : threads)
-        t.join();
-
-    CHECK(winners.load() == kMaxUses);
-    CHECK(race_losers.load() == kThreads - kMaxUses);
-
-    auto tokens = mgr->list_enrollment_tokens();
+    yuzu::test::AuthDbPg db;
+    std::vector<yuzu::server::auth::EnrollmentToken> tokens;
+    const auto o = race_consume(db, 3, 16, &tokens);
+    CHECK(o.winners == 3);
+    CHECK(o.race_losers == 13);
+    CHECK(o.other == 0);
     REQUIRE(tokens.size() == 1);
-    CHECK(tokens[0].use_count == kMaxUses);
+    CHECK(tokens[0].use_count == 3);
 }
 
-TEST_CASE("validate_enrollment_token is read-only — does NOT burn a use",
-          "[auth][enrollment][atomic][r2-up-h2]") {
-    // W1.4 R2 / UP-H2: the wrapper used to silently delegate to consume_,
-    // so two consecutive validates on a max_uses=1 token would burn the
-    // token. That was a semantic break with the function name. Restored
-    // to true read-only — N validates leave use_count untouched, and the
-    // subsequent consume still wins.
-    auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("readonly", 1, std::chrono::hours(1));
-
-    // Five validates, no state change.
-    for (int i = 0; i < 5; ++i) {
-        CHECK(mgr->validate_enrollment_token(raw));
-    }
-    auto tokens = mgr->list_enrollment_tokens();
-    REQUIRE(tokens.size() == 1);
-    CHECK(tokens[0].use_count == 0);
-
-    // Consume still wins because validates did not burn the use.
-    auto claim = mgr->consume_enrollment_token(raw, "agent-1");
-    REQUIRE(claim.has_value());
-    CHECK(claim->use_count_after == 1);
-
-    // After exhaustion, validate reports false (read-only check still
-    // catches the exhausted state).
-    CHECK_FALSE(mgr->validate_enrollment_token(raw));
-}
-
-TEST_CASE("validate_enrollment_token: revoked / expired / not-found return false",
-          "[auth][enrollment][atomic][r2-up-h2]") {
-    auto mgr = make_temp_auth();
-    // not_found
-    CHECK_FALSE(mgr->validate_enrollment_token("never-issued"));
-    // empty / oversize (length-bound)
-    CHECK_FALSE(mgr->validate_enrollment_token(""));
-    std::string oversize(kMaxEnrollmentTokenLength + 1, 'A');
-    CHECK_FALSE(mgr->validate_enrollment_token(oversize));
-    // revoked
-    auto raw = mgr->create_enrollment_token("to-revoke", 0, std::chrono::hours(1));
-    CHECK(mgr->validate_enrollment_token(raw));
-    auto tokens = mgr->list_enrollment_tokens();
-    REQUIRE(tokens.size() == 1);
-    REQUIRE(mgr->revoke_enrollment_token(tokens[0].token_id));
-    CHECK_FALSE(mgr->validate_enrollment_token(raw));
-}
-
-TEST_CASE("consume_enrollment_token persists state to disk (UP-C1 crash-replay)",
-          "[auth][enrollment][atomic][r2-up-c1]") {
-    // W1.4 R2 / UP-C1: the PR1 implementation atomically claimed in
-    // memory but did NOT persist the use_count change before returning.
-    // A server SIGKILL between consume and any later save_tokens() call
-    // (revoke, create, manager destruction) would leave on-disk
-    // use_count=0 and let the token replay on the next boot.
-    //
-    // Test the crash by NOT cleanly destructing the first manager. We
-    // instantiate manager A, create+consume a token, then construct a
-    // brand-new manager B against the same cfg path. If save_tokens()
-    // landed inside consume_, B's load_tokens() sees use_count=1 and
-    // a subsequent consume on B fails with already_consumed.
-    // The on-disk enrollment-tokens.cfg lives next to the user cfg
-    // (state_dir() defaults to cfg parent). Other tests share
-    // temp_directory_path(); to keep this test isolated we give it its
-    // own unique subdirectory so the load_tokens() call in mgr_b only
-    // sees the rows mgr_a wrote.
-    auto dir = yuzu::test::unique_temp_path("yuzu-test-auth-crashreplay-");
-    fs::create_directories(dir);
-    auto cfg = dir / "users.cfg";
-
-    // load_config short-circuits if the users cfg file is missing — but the
-    // enrollment-tokens.cfg load lives in load_tokens(), which is called
-    // unconditionally after the user-load loop. Touch an empty cfg so
-    // load_config follows through to load_tokens() in both phases.
-    { std::ofstream(cfg) << "# Version: 1\n"; }
-
+TEST_CASE("enrollment state survives AuthManager re-construction over the same PG",
+          "[auth][enrollment][pg]") {
+    // Replaces the pre-6.2 UP-C1 crash-replay-from-disk test: a consumed token,
+    // a queued agent and a denial are durable in Postgres, so a brand-new
+    // AuthManager (a restarted process, or a second replica) sees them.
+    yuzu::test::AuthDbPg db;
     std::string raw;
     {
         AuthManager mgr_a;
-        mgr_a.load_config(cfg);
-        raw = mgr_a.create_enrollment_token("crash-replay", 1, std::chrono::hours(1));
-        auto claim = mgr_a.consume_enrollment_token(raw, "agent-pre-crash");
+        mgr_a.set_auth_db(db.get());
+        raw = mint(mgr_a, "crash-replay", 1, std::chrono::hours(1)).raw_token;
+        auto claim = consume(mgr_a, raw, "agent-pre-crash");
         REQUIRE(claim.has_value());
-        // SIMULATE CRASH: drop mgr_a without an explicit save call.
-        // The save inside consume_ is what we're proving works.
+        REQUIRE(claim->kind == ConsumeEnrollResult::Kind::enrolled);
+        REQUIRE(mgr_a.add_pending_agent("queued", "h", "linux", "x86_64", "0.1.0").value());
+        REQUIRE(mgr_a.add_pending_agent("refused", "h", "linux", "x86_64", "0.1.0").value());
+        REQUIRE(mgr_a.deny_pending_agent("refused", "admin").value());
     }
-
-    // Fresh manager rebuilds in-memory state from disk only.
     AuthManager mgr_b;
-    mgr_b.load_config(cfg);
+    mgr_b.set_auth_db(db.get());
     auto tokens = mgr_b.list_enrollment_tokens();
-    REQUIRE(tokens.size() == 1);
-    CHECK(tokens[0].use_count == 1);
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    CHECK((*tokens)[0].use_count == 1);
+    CHECK(**mgr_b.get_pending_status("agent-pre-crash") == PendingStatus::approved);
+    CHECK(**mgr_b.get_pending_status("queued") == PendingStatus::pending);
+    CHECK(**mgr_b.get_pending_status("refused") == PendingStatus::denied);
 
-    // Replay attempt fails on the fresh instance — token is exhausted.
-    auto replay = mgr_b.consume_enrollment_token(raw, "agent-post-crash");
-    REQUIRE_FALSE(replay.has_value());
-    CHECK(replay.error() == EnrollmentTokenError::already_consumed);
-
-    // Cleanup
-    std::error_code ec;
-    fs::remove_all(dir, ec);
+    // Replay against the fresh instance: token exhausted, agent already enrolled.
+    auto replay = consume(mgr_b, raw, "agent-post-crash");
+    REQUIRE(replay.has_value());
+    CHECK(replay->kind == ConsumeEnrollResult::Kind::token_rejected);
+    CHECK(replay->token_error == EnrollmentTokenError::already_consumed);
 }
 
 // ── Pending Agents ───────────────────────────────────────────────────────────
 
-TEST_CASE("pending agent lifecycle", "[auth][pending]") {
-    auto mgr = make_temp_auth();
-    mgr->add_pending_agent("agent-1", "host1", "linux", "x86_64", "0.1.0");
+TEST_CASE("pending agent lifecycle", "[auth][pending][pg]") {
+    EnrollFixture f;
+    CHECK(f.mgr.add_pending_agent("agent-1", "host1", "linux", "x86_64", "0.1.0").value() == true);
+    // A second add for the same agent is not "newly added".
+    CHECK(f.mgr.add_pending_agent("agent-1", "host1", "linux", "x86_64", "0.1.0").value() == false);
 
-    auto status = mgr->get_pending_status("agent-1");
+    auto status = f.mgr.get_pending_status("agent-1");
     REQUIRE(status.has_value());
-    REQUIRE(*status == PendingStatus::pending);
+    REQUIRE(status->has_value());
+    REQUIRE(**status == PendingStatus::pending);
 
-    REQUIRE(mgr->approve_pending_agent("agent-1"));
-    status = mgr->get_pending_status("agent-1");
+    REQUIRE(f.mgr.approve_pending_agent("agent-1", "alice").value());
+    status = f.mgr.get_pending_status("agent-1");
     REQUIRE(status.has_value());
-    REQUIRE(*status == PendingStatus::approved);
+    REQUIRE(status->has_value());
+    REQUIRE(**status == PendingStatus::approved);
+    CHECK_FALSE(f.mgr.approve_pending_agent("ghost", "alice").value());
 }
 
-TEST_CASE("deny pending agent", "[auth][pending]") {
-    auto mgr = make_temp_auth();
-    mgr->add_pending_agent("agent-2", "host2", "windows", "x86_64", "0.1.0");
-
-    REQUIRE(mgr->deny_pending_agent("agent-2"));
-    auto status = mgr->get_pending_status("agent-2");
+TEST_CASE("deny pending agent", "[auth][pending][pg]") {
+    EnrollFixture f;
+    f.mgr.add_pending_agent("agent-2", "host2", "windows", "x86_64", "0.1.0").value();
+    REQUIRE(f.mgr.deny_pending_agent("agent-2", "bob").value());
+    auto status = f.mgr.get_pending_status("agent-2");
     REQUIRE(status.has_value());
-    REQUIRE(*status == PendingStatus::denied);
+    REQUIRE(status->has_value());
+    REQUIRE(**status == PendingStatus::denied);
+    // ensure_enrolled never overrides an admin denial.
+    CHECK_FALSE(f.mgr.ensure_enrolled("agent-2", "host2", "windows", "x86_64", "0.1.0", "auto").value());
 }
 
-TEST_CASE("remove pending agent", "[auth][pending]") {
-    auto mgr = make_temp_auth();
-    mgr->add_pending_agent("agent-3", "host3", "linux", "arm64", "0.1.0");
-    REQUIRE(mgr->remove_pending_agent("agent-3"));
-    REQUIRE_FALSE(mgr->get_pending_status("agent-3").has_value());
+TEST_CASE("remove pending agent", "[auth][pending][pg]") {
+    EnrollFixture f;
+    f.mgr.add_pending_agent("agent-3", "host3", "linux", "arm64", "0.1.0").value();
+    REQUIRE(f.mgr.remove_pending_agent("agent-3").value());
+    auto status = f.mgr.get_pending_status("agent-3");
+    REQUIRE(status.has_value());
+    REQUIRE_FALSE(status->has_value()); // absent
 }
 
-TEST_CASE("list_pending_agents", "[auth][pending]") {
-    auto mgr = make_temp_auth();
-    mgr->add_pending_agent("a1", "h1", "linux", "x86_64", "0.1.0");
-    mgr->add_pending_agent("a2", "h2", "windows", "x86_64", "0.1.0");
+TEST_CASE("list_pending_agents", "[auth][pending][pg]") {
+    EnrollFixture f;
+    f.mgr.add_pending_agent("a1", "h1", "linux", "x86_64", "0.1.0").value();
+    f.mgr.add_pending_agent("a2", "h2", "windows", "x86_64", "0.1.0").value();
+    auto agents = f.mgr.list_pending_agents();
+    REQUIRE(agents.has_value());
+    REQUIRE(agents->size() == 2);
+}
 
-    auto agents = mgr->list_pending_agents();
-    REQUIRE(agents.size() == 2);
+// ── Fail-closed: no AuthDB attached (shutdown / never wired) ─────────────────
+
+TEST_CASE("enrollment/pending methods fail CLOSED with no AuthDB attached",
+          "[auth][enrollment][pending][failclosed]") {
+    // server.cpp calls set_auth_db(nullptr) at shutdown while a Register may
+    // still be in flight: it must get a typed store-unavailable, never an
+    // empty/absent/rejected value (#3401).
+    AuthManager mgr; // no set_auth_db
+    auto unavailable = [](const auto& r) {
+        return !r.has_value() && r.error() == StoreError::Unavailable;
+    };
+    CHECK(unavailable(mgr.create_enrollment_token("l", 1, std::chrono::hours(1), "tester")));
+    CHECK(unavailable(mgr.consume_and_enroll(std::string(64, 'a'), "a", "h", "linux", "x", "1")));
+    CHECK(unavailable(mgr.list_enrollment_tokens()));
+    CHECK(unavailable(mgr.revoke_enrollment_token("deadbeef")));
+    CHECK(unavailable(mgr.add_pending_agent("a", "h", "linux", "x", "1")));
+    CHECK(unavailable(mgr.ensure_enrolled("a", "h", "linux", "x", "1", "by")));
+    CHECK(unavailable(mgr.get_pending_status("a")));
+    CHECK(unavailable(mgr.list_pending_agents()));
+    CHECK(unavailable(mgr.approve_pending_agent("a", "p")));
+    CHECK(unavailable(mgr.deny_pending_agent("a", "p")));
+    CHECK(unavailable(mgr.remove_pending_agent("a")));
+    CHECK(yuzu::server::is_store_unavailable(StoreError::Unavailable));
+    CHECK_FALSE(yuzu::server::is_store_unavailable(StoreError::InvalidInput));
+}
+
+TEST_CASE("enrollment store failures are counted in yuzu_auth_enrollment_store_degrade_total",
+          "[auth][enrollment][pending][failclosed]") {
+    yuzu::MetricsRegistry metrics;
+    AuthManager mgr;
+    mgr.set_metrics_registry(&metrics);
+
+    // No store attached -> reason=no_store.
+    CHECK_FALSE(mgr.get_pending_status("a").has_value());
+    CHECK(metrics.counter("yuzu_auth_enrollment_store_degrade_total",
+                          {{"op", "pending_status"}, {"reason", "no_store"}})
+              .value() == 1.0);
+
+    // A query that RUNS and fails -> reason=query_error; bad INPUT is not a degrade.
+    yuzu::test::AuthDbPg db;
+    mgr.set_auth_db(db.get());
+    {
+        auto lease = db.pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(), "DROP TABLE auth.pending_agents",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    auto broken = mgr.get_pending_status("a");
+    REQUIRE_FALSE(broken.has_value());
+    CHECK(broken.error() == StoreError::QueryFailed);
+    CHECK(metrics.counter("yuzu_auth_enrollment_store_degrade_total",
+                          {{"op", "pending_status"}, {"reason", "query_error"}})
+              .value() == 1.0);
+    auto bad = mgr.approve_pending_agent("", "p");
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error() == StoreError::InvalidInput);
+    CHECK(metrics.counter("yuzu_auth_enrollment_store_degrade_total",
+                          {{"op", "approve"}, {"reason", "query_error"}})
+              .value() == 0.0);
 }
 
 // ── Config Persistence ───────────────────────────────────────────────────────

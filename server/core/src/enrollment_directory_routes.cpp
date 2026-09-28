@@ -207,7 +207,14 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth
                 (void)detail::try_persist_audit(audit_fn, req, "enrollment.pending_agents.view",
                                                 "success", "Enrollment", "",
                                                 "REST v1 pending-agents read");
-                auto agents = auth_mgr->list_pending_agents();
+                auto agents_result = auth_mgr->list_pending_agents();
+                if (!agents_result) {
+                    // Fail closed (WS-6 6.2): a store outage is a 503, never an
+                    // empty `data: []` that reads as "nothing pending".
+                    respond_service_unavailable(res, "enrollment store");
+                    return;
+                }
+                const auto& agents = *agents_result;
                 // Filter out already-approved agents — they don't need admin
                 // attention, matching SettingsRoutes::render_pending_fragment()'s
                 // identical filter (settings_routes.cpp) so this route genuinely

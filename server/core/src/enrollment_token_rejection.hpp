@@ -2,7 +2,7 @@
 
 /// @file enrollment_token_rejection.hpp
 /// Wire-boundary collapse + audit/metric expansion contract for
-/// `AuthManager::consume_enrollment_token` rejections (W1.4 / #827).
+/// `AuthManager::consume_and_enroll` token rejections (W1.4 / #827; WS-6 6.2 folded the consume into the atomic consume-and-enroll).
 ///
 /// **Mirror of `device_token_rejection.hpp` (W1.3).** Same hard rule:
 /// every gRPC handler that maps an `EnrollmentTokenError` to a wire
@@ -30,9 +30,23 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include <grpcpp/support/status.h>
+
 #include <string_view>
 
 namespace yuzu::server {
+
+/// gRPC status for a failed enrollment/pending store call (WS-6 6.2), shared by
+/// the direct Register and gateway ProxyRegister handlers. A store outage maps
+/// to UNAVAILABLE — NOT `accepted=false`/`reject_reason`, which the agent treats
+/// as a PERMANENT rejection (agent.cpp:1649-1657, #3401) — so the agent retries
+/// on its normal reconnect backoff. The PG failure detail stays server-side.
+/// Bad caller input (oversize / NUL / empty field) is INVALID_ARGUMENT.
+[[nodiscard]] inline grpc::Status enrollment_store_status(StoreError e) {
+    if (e == StoreError::InvalidInput)
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid enrollment request");
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE, "enrollment temporarily unavailable");
+}
 
 /// Public wire message — single string regardless of variant. The Register
 /// RPC's `reject_reason` field gets this value verbatim. Do not vary by

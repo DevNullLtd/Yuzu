@@ -129,24 +129,6 @@ enum class AuthDBError : std::uint8_t {
            e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
 }
 
-/// Typed failure of the enrollment-token / pending-agent store surface
-/// (WS-6 slice 6.2). Deliberately three-valued and distinct from "not found"/
-/// "rejected", which are successful outcomes carried in the value channel.
-enum class StoreError : std::uint8_t {
-    /// The pool lease could not be acquired (transient outage / saturation).
-    Unavailable,
-    /// A statement or transaction ran (or the connection broke) and failed.
-    QueryFailed,
-    /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
-    /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
-    InvalidInput,
-};
-
-/// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
-[[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
-    return e != StoreError::InvalidInput;
-}
-
 /// `list_users_including_inactive()` row — same fields as `auth::UserEntry`
 /// plus the `is_active` flag `list_users()` deliberately filters out. A NEW
 /// type rather than extending `auth::UserEntry` itself: that struct is a
@@ -718,29 +700,10 @@ public:
     // Text inputs are length-capped (`kMaxEnrollmentTextLength`) and rejected on
     // an embedded NUL (`StoreError::InvalidInput`), never silently truncated.
 
-    /// Result of a successful `create_token`. `raw_token` is shown once.
-    struct CreatedEnrollmentToken {
-        std::string raw_token;
-        std::string token_id; ///< 8 hex chars of the token hash — the admin handle.
-    };
-
-    /// Outcome of the atomic `consume_and_enroll`. Exactly one of three shapes:
-    ///  - `enrolled`       : token use counted AND agent row approved, one txn.
-    ///  - `token_rejected` : the token did not admit (audit/metric reason in
-    ///                       `token_error`; the WIRE message stays uniform).
-    ///                       `already_consumed_by` names the last consumer when
-    ///                       `token_error == already_consumed`.
-    ///  - `admin_denied`   : the token was valid but an administrator has denied
-    ///                       this agent_id. The whole txn ROLLED BACK — the
-    ///                       token's `use_count` is unchanged (closes the
-    ///                       consume-then-deny use-burn, #1135).
-    struct ConsumeEnrollResult {
-        enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
-        Kind kind{Kind::token_rejected};
-        auth::EnrollmentClaim claim{};                                        ///< enrolled only
-        auth::EnrollmentTokenError token_error{auth::EnrollmentTokenError::not_found}; ///< token_rejected only
-        std::string already_consumed_by;                                      ///< token_rejected only
-    };
+    /// Shared with `auth::AuthManager` (defined in auth.hpp, which must not
+    /// include this header): the create result and the atomic-consume outcome.
+    using CreatedEnrollmentToken = auth::CreatedEnrollmentToken;
+    using ConsumeEnrollResult = auth::ConsumeEnrollResult;
 
     /// Maximum length of any free-text field (label, hostname, os, arch,
     /// agent_version, principal) accepted by the enrollment/pending store.

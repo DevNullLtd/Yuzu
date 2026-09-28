@@ -1521,12 +1521,6 @@ int main(int argc, char* argv[]) {
         }
         std::filesystem::remove(probe, ec); // best-effort cleanup
 
-        auth_mgr.set_data_dir(cfg.data_dir);
-        // Re-load tokens and pending agents from the new data directory.
-        // The initial load_config() loaded them from cfg_path_ parent (the old
-        // location) because set_data_dir() hadn't been called yet.
-        auth_mgr.reload_state();
-
         spdlog::info("Data directory: {}", cfg.data_dir.string());
     }
 
@@ -1742,8 +1736,33 @@ int main(int argc, char* argv[]) {
         auto ttl = gen_ttl_hours > 0 ? std::chrono::seconds(gen_ttl_hours * 3600)
                                      : std::chrono::seconds(0);
 
-        auto tokens =
-            auth_mgr.create_enrollment_tokens_batch(gen_label, generate_tokens, gen_max_uses, ttl);
+        // WS-6 6.2: tokens live in Postgres (shared by every replica), so mint
+        // through the same auth store the server uses. No auth store => fail
+        // closed, like --mfa-reset (a token minted to a per-host file would be
+        // invisible to the running server).
+        if (!auth_db) {
+            spdlog::error("--generate-tokens requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        const std::string created_by = "cli:" + resolve_os_principal();
+        std::vector<std::string> tokens;
+        tokens.reserve(static_cast<size_t>(generate_tokens));
+        for (int i = 0; i < generate_tokens; ++i) {
+            const auto label = gen_label.empty() ? std::format("batch-{}", i + 1)
+                                                 : std::format("{}-{}", gen_label, i + 1);
+            auto created = auth_db->create_token(label, gen_max_uses, ttl, created_by);
+            if (!created) {
+                spdlog::error("--generate-tokens: token {} of {} failed to persist ({} minted "
+                              "before the failure remain valid; revoke via the dashboard)",
+                              i + 1, generate_tokens, tokens.size());
+                std::cerr << "error: enrollment token could not be persisted\n";
+                return EXIT_FAILURE;
+            }
+            tokens.push_back(std::move(created->raw_token));
+        }
+        spdlog::info("Batch created {} enrollment tokens (prefix='{}')", tokens.size(), gen_label);
 
         // Output JSON to stdout for scripting (Ansible, etc.)
         std::cout << "{\"count\":" << tokens.size() << ",\"tokens\":[\n";

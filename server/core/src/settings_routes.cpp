@@ -665,8 +665,36 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     return html;
 }
 
+namespace {
+// Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
+// an outage must never render as an empty list ("No tokens created") — that
+// would tell an operator there is nothing to act on when the truth is unknown.
+constexpr const char* kEnrollmentStoreUnavailableHtml =
+    "<div class=\"feedback-error\">Enrollment store unavailable - state unknown. "
+    "Retry shortly.</div>";
+} // namespace
+
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
-    auto tokens = auth_mgr_->list_enrollment_tokens();
+    // The reveal block is built first: a freshly minted raw token is shown ONCE, so
+    // it must survive even when the follow-up list read fails.
+    std::string reveal;
+    if (!new_raw_token.empty()) {
+        reveal = "<div class=\"token-reveal\">"
+                 "  <div class=\"token-reveal-header\">"
+                 "    COPY THIS TOKEN NOW — it will not be shown again"
+                 "  </div>"
+                 "  <code>" +
+                 html_escape(new_raw_token) +
+                 "</code><br>"
+                 "  <button class=\"btn btn-secondary\" "
+                 "style=\"margin-top:0.5rem;font-size:0.7rem\" "
+                 "          data-copy-token>Copy to Clipboard</button>"
+                 "</div>";
+    }
+    auto tokens_result = auth_mgr_->list_enrollment_tokens();
+    if (!tokens_result)
+        return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
+    const auto& tokens = *tokens_result;
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
                        "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
@@ -756,19 +784,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
             "</form>"
             "<div class=\"feedback\" id=\"token-feedback\"></div>";
 
-    if (!new_raw_token.empty()) {
-        html += "<div class=\"token-reveal\">"
-                "  <div class=\"token-reveal-header\">"
-                "    COPY THIS TOKEN NOW — it will not be shown again"
-                "  </div>"
-                "  <code>" +
-                html_escape(new_raw_token) +
-                "</code><br>"
-                "  <button class=\"btn btn-secondary\" "
-                "style=\"margin-top:0.5rem;font-size:0.7rem\" "
-                "          data-copy-token>Copy to Clipboard</button>"
-                "</div>";
-    }
+    html += reveal;
 
     return html;
 }
@@ -1718,7 +1734,10 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
-    auto all_agents = auth_mgr_->list_pending_agents();
+    auto all_agents_result = auth_mgr_->list_pending_agents();
+    if (!all_agents_result)
+        return kEnrollmentStoreUnavailableHtml;
+    auto all_agents = std::move(*all_agents_result);
     // Filter out enrolled (approved) agents — they don't need admin attention.
     // Only show pending and denied entries in the approval queue.
     std::vector<auth::PendingAgent> agents;
@@ -5241,11 +5260,26 @@ void SettingsRoutes::register_routes(
 
         auto ttl = ttl_hours > 0 ? std::chrono::seconds(ttl_hours * 3600) : std::chrono::seconds(0);
 
-        auto raw_token = auth_mgr_->create_enrollment_token(label, max_uses, ttl);
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        auto created = auth_mgr_->create_enrollment_token(label, max_uses, ttl, session->username);
+        if (!created) {
+            // Fail closed: nothing was minted. 503 for an outage; 400 for a value
+            // the store bounds reject (over-long label, negative max_uses, ...).
+            const bool bad_input = created.error() == StoreError::InvalidInput;
+            res.status = bad_input ? 400 : 503;
+            res.set_header("HX-Trigger",
+                           bad_input
+                               ? R"({"showToast":{"message":"Invalid token parameters","level":"error"}})"
+                               : R"({"showToast":{"message":"Enrollment store unavailable - token not created","level":"error"}})");
+            res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
+            return;
+        }
 
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
-        res.set_content(render_tokens_fragment(raw_token), "text/html; charset=utf-8");
+        res.set_content(render_tokens_fragment(created->raw_token), "text/html; charset=utf-8");
     });
 
     sink.Delete(R"(/api/settings/enrollment-tokens/(.+))", [this](const httplib::Request& req,
@@ -5253,7 +5287,14 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         auto token_id = req.matches[1].str();
-        auth_mgr_->revoke_enrollment_token(token_id);
+        auto revoked = auth_mgr_->revoke_enrollment_token(token_id);
+        if (!revoked) {
+            res.status = revoked.error() == StoreError::InvalidInput ? 400 : 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Enrollment store unavailable - token NOT revoked","level":"error"}})");
+            res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
+            return;
+        }
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
@@ -5294,7 +5335,31 @@ void SettingsRoutes::register_routes(
 
         auto ttl = ttl_hours > 0 ? std::chrono::seconds(ttl_hours * 3600) : std::chrono::seconds(0);
 
-        auto tokens = auth_mgr_->create_enrollment_tokens_batch(label, count, max_uses, ttl);
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        std::vector<std::string> tokens;
+        tokens.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            const auto tok_label = label.empty() ? std::format("batch-{}", i + 1)
+                                                 : std::format("{}-{}", label, i + 1);
+            auto created =
+                auth_mgr_->create_enrollment_token(tok_label, max_uses, ttl, session->username);
+            if (!created) {
+                // Fail closed. Tokens minted before the failure are real and valid;
+                // return them so the operator can use or revoke them.
+                res.status = created.error() == StoreError::InvalidInput ? 400 : 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", res.status},
+                                               {"message", "enrollment token could not be persisted"}}},
+                                    {"count", tokens.size()},
+                                    {"tokens", tokens}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            tokens.push_back(std::move(created->raw_token));
+        }
 
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
                         "application/json");
@@ -5592,13 +5657,30 @@ void SettingsRoutes::register_routes(
                                                                   httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        auto listed = auth_mgr_->list_pending_agents();
+        if (!listed) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Enrollment store unavailable - nothing approved","level":"error"}})");
+            res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            return;
+        }
         int count = 0;
-        for (const auto& a : auth_mgr_->list_pending_agents()) {
+        bool store_failed = false;
+        for (const auto& a : *listed) {
             if (a.status == auth::PendingStatus::pending) {
-                auth_mgr_->approve_pending_agent(a.agent_id);
+                if (!auth_mgr_->approve_pending_agent(a.agent_id, session->username)) {
+                    store_failed = true;
+                    break;
+                }
                 ++count;
             }
         }
+        if (store_failed)
+            res.status = 503;
         spdlog::info("Bulk approved {} pending agent(s)", count);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) approved","level":"success"}})");
@@ -5609,13 +5691,30 @@ void SettingsRoutes::register_routes(
                                                                httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        auto listed = auth_mgr_->list_pending_agents();
+        if (!listed) {
+            res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Enrollment store unavailable - nothing denied","level":"error"}})");
+            res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            return;
+        }
         int count = 0;
-        for (const auto& a : auth_mgr_->list_pending_agents()) {
+        bool store_failed = false;
+        for (const auto& a : *listed) {
             if (a.status == auth::PendingStatus::pending) {
-                auth_mgr_->deny_pending_agent(a.agent_id);
+                if (!auth_mgr_->deny_pending_agent(a.agent_id, session->username)) {
+                    store_failed = true;
+                    break;
+                }
                 ++count;
             }
         }
+        if (store_failed)
+            res.status = 503;
         spdlog::info("Bulk denied {} pending agent(s)", count);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) denied","level":"warning"}})");
@@ -5627,7 +5726,16 @@ void SettingsRoutes::register_routes(
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
-                  auth_mgr_->approve_pending_agent(agent_id);
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  if (!auth_mgr_->approve_pending_agent(agent_id, session->username)) {
+                      res.status = 503;
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Enrollment store unavailable - agent NOT approved","level":"error"}})");
+                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+                      return;
+                  }
                   res.set_header("HX-Trigger",
                                  R"({"showToast":{"message":"Agent approved","level":"success"}})");
                   res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5638,7 +5746,16 @@ void SettingsRoutes::register_routes(
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
-                  auth_mgr_->deny_pending_agent(agent_id);
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  if (!auth_mgr_->deny_pending_agent(agent_id, session->username)) {
+                      res.status = 503;
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Enrollment store unavailable - agent NOT denied","level":"error"}})");
+                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+                      return;
+                  }
                   res.set_header("HX-Trigger",
                                  R"({"showToast":{"message":"Agent denied","level":"warning"}})");
                   res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
@@ -5649,7 +5766,8 @@ void SettingsRoutes::register_routes(
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
-                    auth_mgr_->remove_pending_agent(agent_id);
+                    if (!auth_mgr_->remove_pending_agent(agent_id))
+                        res.status = 503;
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 

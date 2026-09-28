@@ -384,7 +384,15 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
 
     // Fast path: agent already enrolled from a prior connection
     {
-        auto prior = auth_mgr_.get_pending_status(info.agent_id());
+        // WS-6 6.2: five-state read — a store ERROR fails closed with UNAVAILABLE,
+        // never falls through as "absent" (mirror of the direct Register path).
+        auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
+        if (!prior_result) {
+            spdlog::error("[gateway] Register: enrollment status read failed for agent {}",
+                          info.agent_id());
+            return enrollment_store_status(prior_result.error());
+        }
+        const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", info.agent_id());
             goto gw_enrolled;
@@ -449,10 +457,29 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             }
 
             // -- W1.4 / #827 atomic consume (mirror of AgentServiceImpl) ------
-            auto claim_result =
-                auth_mgr_.consume_enrollment_token(enrollment_token, info.agent_id());
-            if (!claim_result.has_value()) {
-                auto err = claim_result.error();
+            auto consumed = auth_mgr_.consume_and_enroll(
+                enrollment_token, info.agent_id(), info.hostname(), info.platform().os(),
+                info.platform().arch(), info.agent_version());
+            if (!consumed) {
+                spdlog::error("[gateway] Register: enrollment consume failed for agent {}",
+                              info.agent_id());
+                return enrollment_store_status(consumed.error());
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
+                // Valid token, admin-denied agent: the store rolled the use back.
+                if (metrics_) {
+                    metrics_
+                        ->counter("yuzu_register_denied_total",
+                                  {{"source", "gateway_proxy"}, {"event", "security"}})
+                        .increment();
+                }
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::token_rejected) {
+                auto err = consumed->token_error;
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("[gateway] Agent {} enrollment-token consume rejected: variant={}",
@@ -467,11 +494,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     }
                 }
 
-                std::string already_consumed_by;
-                if (err == auth::EnrollmentTokenError::already_consumed) {
-                    auto hash = auth::AuthManager::sha256_hex(enrollment_token);
-                    already_consumed_by = auth_mgr_.last_consumer_for_token_hash(hash);
-                }
+                // WS-6 6.2: classified + last consumer returned by the store txn.
+                const std::string already_consumed_by = consumed->already_consumed_by;
 
                 bool audit_ok = true;
                 if (audit_store_ && audit_store_->is_open()) {
@@ -533,7 +557,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
-            const auto& claim = claim_result.value();
+            // The token use was counted AND the agent enrolled in ONE store
+            // transaction, so the success audit row below only describes a
+            // completed enrollment.
+            const auto& claim = consumed->claim;
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          info.agent_id(), claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -582,13 +609,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 }
             }
 
-            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
-                                           info.platform().arch(), info.agent_version())) {
-                response->set_accepted(false);
-                response->set_reject_reason("enrollment denied by administrator");
-                response->set_enrollment_status("denied");
-                return grpc::Status::OK;
-            }
+            // (Enrollment was persisted by consume_and_enroll above.)
         } else {
             // Auto-approve policies (no peer IP available from gateway yet)
             auth::ApprovalContext approval_ctx;
@@ -599,9 +620,15 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             if (!matched_rule.empty()) {
                 spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
                              matched_rule);
-                if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
-                                               info.platform().os(), info.platform().arch(),
-                                               info.agent_version())) {
+                auto enrolled_auto = auth_mgr_.ensure_enrolled(
+                    info.agent_id(), info.hostname(), info.platform().os(), info.platform().arch(),
+                    info.agent_version(), "auto-approve:" + matched_rule);
+                if (!enrolled_auto) {
+                    spdlog::error("[gateway] Register: auto-approve enroll failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(enrolled_auto.error());
+                }
+                if (!*enrolled_auto) {
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
@@ -609,16 +636,29 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 }
             } else {
                 // Tier 1: pending queue
-                auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+                auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
+                if (!pending_result) {
+                    spdlog::error("[gateway] Register: pending-status read failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(pending_result.error());
+                }
+                const auto& pending_status = *pending_result;
 
                 if (!pending_status) {
-                    auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
-                                                info.platform().os(), info.platform().arch(),
-                                                info.agent_version());
+                    auto added = auth_mgr_.add_pending_agent(
+                        info.agent_id(), info.hostname(), info.platform().os(),
+                        info.platform().arch(), info.agent_version());
+                    if (!added) {
+                        spdlog::error("[gateway] Register: add_pending failed for agent {}",
+                                      info.agent_id());
+                        return enrollment_store_status(added.error());
+                    }
 
                     response->set_accepted(false);
                     response->set_reject_reason("awaiting admin approval");
                     response->set_enrollment_status("pending");
+                    if (!*added)
+                        return grpc::Status::OK; // queued concurrently: the winner publishes
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
                     return grpc::Status::OK;

@@ -45,6 +45,7 @@
 #include "peer_ip.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
@@ -101,6 +102,16 @@ yuzu::test::PgTestTemplate agent_svc_audit_tpl{"agentaudit", [](const std::strin
         throw std::runtime_error("agentaudit template: store failed to migrate");
 }};
 
+/// Mint an enrollment token (WS-6 6.2: AuthManager now returns a typed
+/// `expected` — a store failure here is a test-setup failure). Returns the raw
+/// token, shown-once, exactly as the pre-6.2 `create_enrollment_token` did.
+std::string mint_enrollment_token(yuzu::server::auth::AuthManager& mgr, const std::string& label,
+                                  int max_uses, std::chrono::seconds ttl) {
+    auto created = mgr.create_enrollment_token(label, max_uses, ttl, "test-admin");
+    REQUIRE(created.has_value());
+    return created->raw_token;
+}
+
 /// Minimal harness: real AgentServiceImpl wired against in-memory
 /// ResponseStore. analytics/notification/webhook stores stay null so
 /// the side-effect branches in process_gateway_response short-circuit
@@ -118,6 +129,10 @@ struct GatewayResponseHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
+    // WS-6 6.2: enrollment/pending state lives only in AuthDB (Postgres), so the
+    // harness owns a PG-backed AuthDB (shared clone, reset per fixture) and wires
+    // it into `auth_mgr`. Declared BEFORE auth_mgr so it destructs AFTER it.
+    yuzu::test::AuthDbPgShared auth_db;
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     ResponseStore responses;
@@ -137,6 +152,7 @@ struct GatewayResponseHarness {
 
     explicit GatewayResponseHarness(pg::PgPool& pool) : responses(pool) {
         REQUIRE(responses.is_open());
+        auth_mgr.set_auth_db(auth_db.get());
 
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
@@ -1204,7 +1220,7 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
     req.mutable_info()->set_hostname("gw-host");
     req.mutable_info()->mutable_platform()->set_os("linux");
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
-    req.set_enrollment_token(auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    req.set_enrollment_token(mint_enrollment_token(auth_mgr, "test", 0, std::chrono::hours(1)));
     if (!csr_pem.empty())
         req.set_csr_pem(csr_pem);
     return req;
@@ -1399,7 +1415,7 @@ TEST_CASE("ReportInventory (direct): reaches ingest_app_usage_report and persist
     REQUIRE(usage.is_open());
     h.svc.set_app_usage_store(&usage);
 
-    auto raw = h.auth_mgr.create_enrollment_token("t1", /*max_uses=*/1, std::chrono::hours(1));
+    auto raw = mint_enrollment_token(h.auth_mgr, "t1", /*max_uses=*/1, std::chrono::hours(1));
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id("agent-direct-usage");
     req.mutable_info()->set_hostname("host");
@@ -1762,7 +1778,7 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
     req.mutable_info()->set_hostname("h");
     req.mutable_info()->mutable_platform()->set_os("linux");
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
-    req.set_enrollment_token(h.auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    req.set_enrollment_token(mint_enrollment_token(h.auth_mgr, "test", 0, std::chrono::hours(1)));
     req.set_csr_pem("FAKE-CSR");
 
     apb::RegisterResponse resp;
@@ -1859,7 +1875,7 @@ TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either 
     req.mutable_info()->set_hostname("h");
     req.mutable_info()->mutable_platform()->set_os("linux");
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
-    req.set_enrollment_token(h.auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    req.set_enrollment_token(mint_enrollment_token(h.auth_mgr, "test", 0, std::chrono::hours(1)));
     req.set_csr_pem("FAKE-CSR");
 
     apb::RegisterResponse resp;
@@ -2265,12 +2281,13 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     auto raw =
-        h.auth_mgr.create_enrollment_token("dos-test", /*max_uses=*/1, std::chrono::hours(1));
+        mint_enrollment_token(h.auth_mgr, "dos-test", /*max_uses=*/1, std::chrono::hours(1));
 
     // Mark the attacker's agent_id admin-denied.
-    h.auth_mgr.add_pending_agent("denied-agent", "evil-host", "linux", "x86_64", "0.0.0-test");
-    REQUIRE(h.auth_mgr.deny_pending_agent("denied-agent"));
-    REQUIRE(h.auth_mgr.get_pending_status("denied-agent") ==
+    REQUIRE(h.auth_mgr.add_pending_agent("denied-agent", "evil-host", "linux", "x86_64", "0.0.0-test")
+                .has_value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("denied-agent", "admin").value());
+    REQUIRE(h.auth_mgr.get_pending_status("denied-agent").value() ==
             yuzu::server::auth::PendingStatus::denied);
 
     apb::RegisterRequest req;
@@ -2293,14 +2310,15 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
               .value() == 1.0);
 
     // Core invariant: the denied attempt did NOT consume the token.
-    auto tokens = h.auth_mgr.list_enrollment_tokens();
+    auto tokens = h.auth_mgr.list_enrollment_tokens().value();
     REQUIRE(tokens.size() == 1);
     CHECK(tokens[0].use_count == 0);
 
     // And the single use is still available to a legitimate agent — proving the
     // max_uses=1 token was not depleted by the denied attacker.
-    auto claim = h.auth_mgr.consume_enrollment_token(raw, "good-agent");
-    CHECK(claim.has_value());
+    auto claim = h.auth_mgr.consume_and_enroll(raw, "good-agent", "good-host", "linux", "x86_64", "0.0.0-test");
+    REQUIRE(claim.has_value());
+    CHECK(claim->kind == yuzu::server::auth::ConsumeEnrollResult::Kind::enrolled);
 }
 
 // ── #1065 — success-path enrollment audit is emitted (was fire-and-forget) ──
@@ -2311,7 +2329,7 @@ TEST_CASE("Register: successful token enrollment emits a success audit row (#106
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     auto raw =
-        h.auth_mgr.create_enrollment_token("ok-test", /*max_uses=*/1, std::chrono::hours(1));
+        mint_enrollment_token(h.auth_mgr, "ok-test", /*max_uses=*/1, std::chrono::hours(1));
 
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id("enroll-ok");
@@ -2354,9 +2372,10 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
                                            &h.metrics};
     gateway_svc.set_audit_store(h.audit.get());
     auto raw =
-        h.auth_mgr.create_enrollment_token("gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
-    h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test");
-    REQUIRE(h.auth_mgr.deny_pending_agent("gw-denied"));
+        mint_enrollment_token(h.auth_mgr, "gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
+    REQUIRE(h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test")
+                .has_value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("gw-denied", "admin").value());
 
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id("gw-denied");
@@ -2375,14 +2394,15 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
               .counter("yuzu_register_denied_total",
                        {{"source", "gateway_proxy"}, {"event", "security"}})
               .value() == 1.0);
-    auto tokens = h.auth_mgr.list_enrollment_tokens();
+    auto tokens = h.auth_mgr.list_enrollment_tokens().value();
     REQUIRE(tokens.size() == 1);
     CHECK(tokens[0].use_count == 0); // token not depleted via the gateway path
 
     // The single use is still available — proving non-depletion via the gateway
     // path too (symmetry with the direct-Register #1067 test).
-    auto gw_claim = h.auth_mgr.consume_enrollment_token(raw, "good-gw-agent");
-    CHECK(gw_claim.has_value());
+    auto gw_claim = h.auth_mgr.consume_and_enroll(raw, "good-gw-agent", "good-host", "linux", "x86_64", "0.0.0-test");
+    REQUIRE(gw_claim.has_value());
+    CHECK(gw_claim->kind == yuzu::server::auth::ConsumeEnrollResult::Kind::enrolled);
 }
 
 // ── #1064 — ProxyRegister origin-IP attribution ─────────────────────────────
@@ -2455,7 +2475,7 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
 
     SECTION("success path also attributes the agent origin (gov QE SHOULD)") {
         // The success audit site (valid token → accepted) shares append_origin_detail.
-        auto raw = h.auth_mgr.create_enrollment_token("gw-origin-test", /*max_uses=*/1,
+        auto raw = mint_enrollment_token(h.auth_mgr, "gw-origin-test", /*max_uses=*/1,
                                                       std::chrono::hours(1));
         req.set_enrollment_token(raw);
         req.set_gateway_observed_peer("203.0.113.9");
@@ -2782,6 +2802,15 @@ struct BareServiceHarness {
                          auto_approve,
                          metrics,
                          /*gateway_mode=*/false};
+    // WS-6 6.2: only the tests that drive Register/enrollment need an AuthDB;
+    // attach lazily so the many that don't stay PG-free. Declared LAST so it
+    // destructs FIRST — but auth_mgr only holds a non-owning pointer it never
+    // dereferences during destruction.
+    std::unique_ptr<yuzu::test::AuthDbPgShared> auth_db;
+    void attach_auth_db() {
+        auth_db = std::make_unique<yuzu::test::AuthDbPgShared>();
+        auth_mgr.set_auth_db(auth_db->get());
+    }
 };
 
 /// MEMBER ORDER LOAD-BEARING, same contract as TrackerScope above: the dtor
@@ -2994,6 +3023,7 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
     PgPool npool{{.conninfo = ndb.dsn(), .size = 4}};
 
     BareServiceHarness h;
+    h.attach_auth_db();
     h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::hostname_glob, "*",
                              "match-all (test)", /*enabled=*/true});
     EventSinkScope sinks(h.svc);
