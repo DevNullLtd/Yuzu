@@ -5577,9 +5577,31 @@ void RestApiV1::register_routes(
     // different, stronger decision than reading the grant table).
     // No pagination: list_all_principal_roles_checked() is a single bulk
     // read with no limit/offset (same UP-1 rationale as the access-review
-    // export) — the envelope's pagination.total/start/page_size fields are
-    // the same cosmetic (non-cursor) convention GET /api/v1/rbac/roles above
-    // already uses, not real query-param pagination.
+    // export) — uses ok_json (no pagination block at all), NOT list_json
+    // (fix, governance round 2026-09-28): list_json's cosmetic
+    // pagination.page_size default (50) alongside a `data` array that
+    // already holds the COMPLETE table is internally contradictory for a
+    // dataset this large (an agentic caller honoring the envelope's own
+    // page_size could wrongly infer more pages exist) — GET
+    // /api/v1/access-reviews, the actual template this route mirrors, uses
+    // plain ok_json for exactly this reason; /rbac/roles's own list_json use
+    // is harmless only because its universe (a handful of built-in roles)
+    // is inherently small.
+    //
+    // #2225 chokepoint note (see the export route's own longer version):
+    // this is gated on the dedicated AccessReview:Read securable, never
+    // authorize_list_read/ADR-0017 — a grant/role assignment has no
+    // per-agent/management-group boundary to admit-then-filter against, and
+    // a confinement-filtered slice of the grant table would be worthless as
+    // CC6.2-class evidence. Do not "fix" this onto authorize_list_read.
+    //
+    // Route-registration-order note (mirrors the access-review family's own
+    // comment at its analogous site): this literal path is registered AFTER
+    // the `/rbac/roles/(.+)/permissions` regex above, which requires a
+    // `/permissions` suffix and so cannot shadow it today — but a FUTURE
+    // unanchored regex registered ABOVE this line could silently swallow
+    // `/assignments` as a `{name}` match. Keep this literal registration
+    // above any new broad regex added to this route group.
     sink.Get(
         "/api/v1/rbac/roles/assignments",
         [perm_fn, auth_fn, audit_fn, rbac_store](const httplib::Request& req,
@@ -5619,8 +5641,7 @@ void RestApiV1::register_routes(
             }
             (void)audit_fn(req, "rbac.assignments.list", "success", "AccessReview", "",
                            "count=" + std::to_string(grants_res->size()));
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(grants_res->size())),
-                            "application/json");
+            res.set_content(ok_json(arr.str()), "application/json");
         });
 
     // ── A2: global human role assignment/unassignment ───────────────────

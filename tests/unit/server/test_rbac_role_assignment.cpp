@@ -1665,6 +1665,25 @@ TEST_CASE("REST GET .../rbac/roles/assignments: happy path returns current "
     CHECK(audited);
 }
 
+TEST_CASE("REST GET .../rbac/roles/assignments: AccessReview:Read alone is "
+          "sufficient — no second gate silently ANDed on",
+          "[pg][rest][rbac][list][gate]") {
+    // Mirrors test_rest_access_review.cpp's "a session with only
+    // AccessReview:Read can export but not attest" — the happy-path test
+    // above uses make_caller_admin() (perm_override left null/always-allow),
+    // which would not catch a future regression narrowing this route to
+    // Administrator-only (defeating the seeded Reviewer role's whole
+    // purpose, #2324/#2225). consistency-auditor + compliance-officer,
+    // governance round 2026-09-28.
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && op == "Read"; // ONLY Read is granted
+    };
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
 TEST_CASE("REST GET .../rbac/roles/assignments: 403 without AccessReview:Read",
           "[pg][rest][rbac][list]") {
     RbacRoleHarness h;
@@ -1710,6 +1729,18 @@ TEST_CASE("MCP list_rbac_role_assignments: happy path returns current grants",
             found = true;
     }
     CHECK(found);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: AccessReview:Read alone is "
+          "sufficient — no second gate silently ANDed on",
+          "[pg][mcp][rbac][list][gate]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && op == "Read"; // ONLY Read is granted
+    };
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 TEST_CASE("MCP list_rbac_role_assignments: denied without AccessReview:Read",
@@ -1774,4 +1805,40 @@ TEST_CASE("MCP list_rbac_role_assignments: internal error on a genuine store "
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(res->body.find("\"count\":0") == std::string::npos);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: audit_persisted:false is actually "
+          "emitted when the audit write drops, not just declared in the "
+          "output schema",
+          "[pg][mcp][rbac][list]") {
+    // quality-engineer (Gate 3, governance round 2026-09-28): the schema
+    // fix (adding audit_persisted to the output schema) shipped with no
+    // test proving the handler actually emits the field. Mirrors the
+    // audit-fail-closed test pattern elsewhere in this file.
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.audit_allow = false;
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("result"));
+    const auto& payload = body["result"]["structuredContent"];
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: still 200 on a dropped audit "
+          "write (fire-and-forget, matches the list_access_reviews template "
+          "this route mirrors — tracked family-wide in #5063)",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.audit_allow = false;
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }

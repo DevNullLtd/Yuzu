@@ -2520,9 +2520,9 @@ admitted, exactly as intended (#2324 seeded `Reviewer` specifically to
 reach this class of surface without full Administrator authority).
 
 No pagination: `list_all_principal_roles_checked()` is a single bulk read
-with no limit/offset — `pagination.total`/`start`/`page_size` in the
-response are the same cosmetic (non-cursor) envelope fields `GET
-/api/v1/rbac/roles` already returns, not real query-param pagination.
+with no limit/offset, and the response carries no `pagination` block at all
+(matching `GET /api/v1/access-reviews`, the route this one mirrors) — a
+`data` array of the complete grant table plus `meta` only.
 
 Self-audited as `rbac.assignments.list`.
 
@@ -2542,7 +2542,6 @@ Self-audited as `rbac.assignments.list`.
       "role_name": "Viewer"
     }
   ],
-  "pagination": { "total": 2, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
