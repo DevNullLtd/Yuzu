@@ -84,6 +84,16 @@ struct ScopeV1Harness {
     // construction).
     std::string mock_token_scope_service;
 
+    // #4981 adversarial-review round 2 finding 2: proves a deny fired BEFORE
+    // either downstream callback ran — the absence of a "result_set.access"
+    // audit row alone doesn't distinguish "denied before the ladder ran"
+    // from "the ladder ran and matched (an owner-check success never audits
+    // a denial either) but something else produced the response
+    // afterward". Same idiom as McpTestServer's fleet_read_fn_for_test /
+    // fleet_read_fn_reached in test_mcp_server.cpp (#4980).
+    bool fleet_read_fn_reached = false;
+    bool scope_evaluate_fn_reached = false;
+
     // Kept for source-stability of the register_routes call (still consumed
     // by other agents_fn-driven routes in this harness's registration list,
     // e.g. GET /api/v1/devices if a future test exercises it) — #4981 PR-2:
@@ -177,6 +187,7 @@ struct ScopeV1Harness {
         if (wire_fleet_read) {
             fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
                                    const std::string&, const std::string&) -> authz::FleetReadGate {
+                fleet_read_fn_reached = true;
                 if (!fleet_gate.admitted) {
                     res.status = 403;
                     res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -190,6 +201,7 @@ struct ScopeV1Harness {
             api.set_scope_evaluate_fn(
                 [this, result_set_store](const yuzu::scope::Expression& expr,
                                          const std::string& principal) {
+                    scope_evaluate_fn_reached = true;
                     return registry.evaluate_scope(expr, /*tag_store=*/nullptr,
                                                    /*props_store=*/nullptr, result_set_store,
                                                    principal);
@@ -332,6 +344,18 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview denies a service-scoped token ou
     }
     CHECK(saw_scope_preview_denied);
     CHECK_FALSE(saw_ladder_audit);
+
+    // #4981 adversarial-review round 2 finding 2: the result set here is
+    // owned by "tester" — the SAME username the harness's auth_fn always
+    // returns — so even a SUCCESSFUL ladder evaluation would never write a
+    // "result_set.access" denial row either (a matching owner-check doesn't
+    // audit-deny anything). The audit-absence check above therefore can't
+    // by itself distinguish "denied before the ladder ran" from "the ladder
+    // ran, matched, and something else produced the 403 afterward". These
+    // two flags prove non-reachability of BOTH downstream callbacks
+    // directly, closing that gap.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+    CHECK_FALSE(h.scope_evaluate_fn_reached);
 
     // Clause (5), routed-concerns-access-control.md "Service-scoped API
     // token confinement": no `.permission` label — a service-scoped caller

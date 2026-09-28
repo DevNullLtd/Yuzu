@@ -87,6 +87,21 @@ yuzu::test::PgTestTemplate props_tpl{"customprops", [](const std::string& dsn) {
         throw std::runtime_error("customprops template: store failed to migrate");
 }};
 
+// Run a raw SQL statement against the test database on a second connection —
+// same idiom as test_result_set_store.cpp's exec_sql, used here to
+// deterministically backdate last_used_at/ttl_at so a real touch() is
+// numerically unmistakable from no touch at all (#4981 adversarial-review
+// round 2 finding 1 — now_epoch() truncates to whole seconds, so an
+// in-process create-then-preview within the same second would otherwise
+// leave a real touch() indistinguishable from no touch).
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
 } // namespace
 
 // ── Invalid expression ───────────────────────────────────────────────────
@@ -372,9 +387,29 @@ TEST_CASE("preview_scope_targets: never touches an owned result set's "
     auto set = store.create_materialized(cr, {"agent-win"});
     REQUIRE(set.has_value());
 
+    // Deterministically backdate last_used_at/ttl_at by a wide,
+    // unambiguous margin BEFORE preview runs (same idiom as
+    // test_result_set_store.cpp's TTL-expiry tests, exec_sql above).
+    // now_epoch() truncates to whole seconds, so a real touch() landing in
+    // the same wall-clock second as create() would otherwise write back
+    // the SAME numeric values create_materialized already wrote — an
+    // "==before" assertion taken right after create can't tell a real
+    // touch from no touch at all (#4981 adversarial-review round 2 finding
+    // 1). Backdating by 1800s keeps a comfortable margin under
+    // kDefaultTtlSeconds (3600s, so ttl_at stays >= created_at per the
+    // table's CHECK) while making a real touch's now_epoch()-based
+    // last_used_at/ttl_at land far outside this window.
+    constexpr int64_t kBackdateSeconds = 1800;
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET last_used_at = "
+                       "last_used_at - " + std::to_string(kBackdateSeconds) +
+                       ", ttl_at = ttl_at - " + std::to_string(kBackdateSeconds) +
+                       " WHERE id = '" + set->id + "'");
+
     auto before = store.get(set->id);
     REQUIRE(before.has_value());
     REQUIRE(before->has_value());
+    const int64_t backdated_last_used = before->value().last_used_at;
+    const int64_t backdated_ttl = before->value().ttl_at;
 
     // #4981 PR-3: mirrors server.cpp's `scope_evaluate_fn` byte-for-byte
     // (touch_referenced_result_sets=false) — NOT the default-true shape
@@ -394,10 +429,13 @@ TEST_CASE("preview_scope_targets: never touches an owned result set's "
     auto after = store.get(set->id);
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
-    // Byte-for-byte unchanged, not merely ">=" — a preview must never write
-    // to the store at all, not just "not visibly move the value".
-    CHECK(after->value().last_used_at == before->value().last_used_at);
-    CHECK(after->value().ttl_at == before->value().ttl_at);
+    // Byte-for-byte equal to the BACKDATED values, not merely "unchanged
+    // from creation" — a real touch() would jump last_used_at to
+    // ~now_epoch() and ttl_at to ~now_epoch()+kDefaultTtlSeconds, both
+    // kBackdateSeconds away from what's asserted here, so this is
+    // unambiguous proof the touch never fired.
+    CHECK(after->value().last_used_at == backdated_last_used);
+    CHECK(after->value().ttl_at == backdated_ttl);
 }
 
 TEST_CASE("preview_scope_targets: a real-dispatch-shaped evaluate_scope_fn (no 6th "
@@ -424,8 +462,23 @@ TEST_CASE("preview_scope_targets: a real-dispatch-shaped evaluate_scope_fn (no 6
     cr.source_payload = "{}";
     auto set = store.create_materialized(cr, {"agent-win"});
     REQUIRE(set.has_value());
-    const int64_t orig_ttl = set->ttl_at;
-    const int64_t orig_last_used = set->last_used_at;
+
+    // Same deterministic backdating as the suppression test above (#4981
+    // adversarial-review round 2 finding 1) — proves the touch actually
+    // fired by a wide, unambiguous margin, rather than relying on
+    // "unchanged-or-moved" which a same-wall-clock-second touch could
+    // satisfy either way.
+    constexpr int64_t kBackdateSeconds = 1800;
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET last_used_at = "
+                       "last_used_at - " + std::to_string(kBackdateSeconds) +
+                       ", ttl_at = ttl_at - " + std::to_string(kBackdateSeconds) +
+                       " WHERE id = '" + set->id + "'");
+
+    auto backdated = store.get(set->id);
+    REQUIRE(backdated.has_value());
+    REQUIRE(backdated->has_value());
+    const int64_t orig_ttl = backdated->value().ttl_at;
+    const int64_t orig_last_used = backdated->value().last_used_at;
 
     // Same binding shape as the real dispatch ladder — no 6th argument, so
     // touch_referenced_result_sets defaults to `true` (agent_registry.hpp).
@@ -441,11 +494,13 @@ TEST_CASE("preview_scope_targets: a real-dispatch-shaped evaluate_scope_fn (no 6
     auto after = store.get(set->id);
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
-    // Same idiom as "ResultSetStore: touch extends TTL" in
-    // test_result_set_store.cpp — >= rather than strict > because a touch
-    // within the same wall-clock second as create is a legitimate no-op.
-    CHECK(after->value().ttl_at >= orig_ttl);
-    CHECK(after->value().last_used_at >= orig_last_used);
+    // Strictly greater by (most of) the backdated margin — a real touch()
+    // jumps last_used_at/ttl_at to now_epoch()-based values, comfortably
+    // clear of the backdated window, proving the touch actually fired
+    // rather than merely "not having moved backward".
+    constexpr int64_t kUnambiguousMargin = kBackdateSeconds / 2;
+    CHECK(after->value().ttl_at > orig_ttl + kUnambiguousMargin);
+    CHECK(after->value().last_used_at > orig_last_used + kUnambiguousMargin);
 }
 
 // ── #4981 adversarial-review finding 3: preview's tag:<key> resolution now ──
