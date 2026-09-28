@@ -90,22 +90,36 @@ cannot yet be matched are visible as such, not hidden.
 The consolidated inventory is available to read in three ways, matching how downstream systems
 typically want it: a filtered, pageable list for interactive or scripted queries; an incremental
 feed of what changed since a given point, for a system that wants to stay in sync without
-re-pulling everything; and a bulk export for an initial load or periodic reconciliation. All three
-are pull — something reads from this platform on its own schedule. This platform does not push
-software-inventory data out to another system on its own initiative. That remains a deliberate
-boundary; see Non-goals.
+re-pulling everything; and a bulk export for an initial load, a periodic reconciliation, or simply
+handing a report to someone without API access. The export is offered in four formats — JSON and
+CSV for another system or a script to consume, a spreadsheet format (XLSX) for someone working
+with the data directly, and a formatted document (PDF) for a report meant to be read rather than
+processed — and every one of them is available equally through the operator interface and through
+the API; a format offered in one is offered in the other, never an interface-only convenience. All
+three read paths are pull — something reads from this platform on its own schedule. This platform
+does not push software-inventory data out to another system on its own initiative. That remains a
+deliberate boundary; see Non-goals.
 
-### An operator can force a check — of a chosen group, never the whole fleet unbounded
+### An operator can force a check — a chosen group freely, the whole fleet only under a stronger gate
 
-Waiting for the next scheduled daily pass is not always acceptable — an operator investigating an
-incident, or verifying a rollout, needs current data now. This decision adds that capability, but
-only as a check against the fleet's own search and filter tools: an operator narrows to a group of
-machines first — by tag, by hostname pattern, by operating system, by how long since they last
-reported — and only that narrowed, bounded group can be told to check in immediately. There is no
-control anywhere in the platform that re-checks the entire fleet on demand with no bound. This is
-a deliberate design constraint, not an oversight: an unbounded "check everything now" control is
-an availability risk against the fleet's own endpoints and the platform's own capacity, and this
-decision closes that off structurally rather than relying on operator discipline.
+Waiting for the next scheduled pass is not always acceptable — an operator investigating an
+incident, or verifying a rollout, needs current data now. This decision adds that capability at
+two tiers, deliberately unequal in how much authority each needs.
+
+The ordinary path is a check against a group an operator has first narrowed with the fleet's own
+search and filter tools — by tag, by hostname pattern, by operating system, by how long since a
+host last reported — bounded by a fixed ceiling on how large that narrowed group may be in one
+request. This needs no more authority than an ordinary inventory query already does.
+
+A whole-fleet check — every managed host, no narrowing — is also available, but only behind a
+stronger gate: it requires an explicit, separate confirmation (never a default, and never an empty
+filter silently meaning "everything"), is restricted to a higher-privilege role than the ordinary
+path needs, and is recorded as the higher-consequence action it is. It still delivers through the
+same spread-out pacing this platform already uses for its regular collection, never all at once —
+gating *who* may trigger it and requiring them to clearly mean it is the control for this tier; the
+platform does not additionally shrink a properly-authorised whole-fleet request down to the
+bounded tier's size. Both tiers share the same cooldown and one-request-at-a-time discipline, so
+neither can be used to repeatedly overload the fleet regardless of who is asking.
 
 ### Everything here stays inside the core platform
 
@@ -121,15 +135,15 @@ learns about it; "Stored" is where a reader finds it today.
 
 | Data captured | How it's found | Windows | macOS | Linux | Collected | Stored |
 |---|---|:---:|:---:|:---:|---|---|
-| Registered applications (name, publisher, version, install date) | Read from the operating system's own record of installed software | ✅ | ✅ | ✅ | Daily, changes only | Fleet software inventory |
-| Installer package records (product identifier, install location, how to uninstall) | Read from the operating system's installer subsystem | ✅ | — | — | Daily, changes only | Fleet software inventory |
-| Platform-store packaged applications | Read from the operating system's own app-package registry | ✅ | — | — | Daily, changes only | Fleet software inventory |
-| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | Read from each package manager's own installed-package listing | ✅ | ✅ | — | Daily, changes only | Fleet software inventory |
-| Containerised/sandboxed application formats (Linux) | Read from each format's own installed-application listing | — | — | ✅ | Daily, changes only | Fleet software inventory |
-| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | Read from each runtime's own installation record | ✅ | ✅ | ✅ | Daily, changes only | Fleet software inventory |
-| Device drivers | Read from the operating system's own driver registry | ✅ | — | ✅ | Daily, changes only | Fleet software inventory |
-| Optional operating-system feature set (Windows) | Read from the operating system's own feature-management interface | ✅ | — | — | Daily, changes only | Fleet software inventory |
-| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | Verified against the operating system's own signing mechanism | ✅ | ✅ | Partial | Daily, changes only | Fleet software inventory |
+| Registered applications (name, publisher, version, install date) | Read from the operating system's own record of installed software | ✅ | ✅ | ✅ | Configurable, default daily; changes only | Fleet software inventory |
+| Installer package records (product identifier, install location, how to uninstall) | Read from the operating system's installer subsystem | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
+| Platform-store packaged applications | Read from the operating system's own app-package registry | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
+| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | Read from each package manager's own installed-package listing | ✅ | ✅ | — | Configurable, default daily; changes only | Fleet software inventory |
+| Containerised/sandboxed application formats (Linux) | Read from each format's own installed-application listing | — | — | ✅ | Configurable, default daily; changes only | Fleet software inventory |
+| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | Read from each runtime's own installation record | ✅ | ✅ | ✅ | Configurable, default daily; changes only | Fleet software inventory |
+| Device drivers | Read from the operating system's own driver registry | ✅ | — | ✅ | Configurable, default daily; changes only | Fleet software inventory |
+| Optional operating-system feature set (Windows) | Read from the operating system's own feature-management interface | ✅ | — | — | Configurable, default daily; changes only | Fleet software inventory |
+| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | Verified against the operating system's own signing mechanism | ✅ | ✅ | Partial | Configurable, default daily; changes only | Fleet software inventory |
 | Change history (install / upgrade / removal, with a timestamp) | Derived by the platform itself, by comparing each day's report to the last | ✅ | ✅ | ✅ | Continuous, as detected | Fleet software change record (bounded retention) |
 | Normalised identity (a common product/vendor/version reading, mapped from the raw values above) | Matched by the platform against its own maintained reference list | ✅ | ✅ | ✅ | Recomputed periodically | Fleet software inventory |
 
@@ -138,17 +152,43 @@ per-user software (a user's own, non-machine-wide installs) and anything that re
 the filesystem rather than reading a known operating-system record. Both are addressed in
 Non-goals.
 
+### A worked example
+
+The table below is not a schema — it is what an entry looks like once collected, consolidated,
+and normalised, shown with representative, made-up values rather than a real fleet's data.
+
+| Host | Product | Publisher | Version | Discovered by | First seen | Last confirmed |
+|---|---|---|---|---|---|---|
+| WKS-LDN-0231 | 7-Zip | Igor Pavlov | 23.01 | Registered-application record + installer package record (both agree) | 2026-03-11 | 2026-09-28 |
+| WKS-LDN-0231 | Slack | Slack Technologies | 4.39.2 | Platform-store package record | 2026-06-02 | 2026-09-28 |
+| WKS-BER-1042 | Visual Studio Code | Microsoft | 1.94.1 | Alternate package-manager record | 2026-01-14 | 2026-09-27 |
+| SRV-DB-07 | PostgreSQL client tools | PostgreSQL Global Development Group | 16.4 | Registered-application record | 2025-11-30 | 2026-09-28 |
+| WKS-LDN-0231 | .NET Runtime | Microsoft | 8.0.8 | Runtime installation record | 2026-02-20 | 2026-09-28 |
+
+A corresponding change-history entry for the same fleet might read: *WKS-LDN-0231 — 7-Zip upgraded
+from 22.01 to 23.01 — 2026-07-04.* An export in any of the four formats above carries the same
+information as this table, shaped for its own use — JSON and CSV as machine-readable rows, XLSX as
+a workbook, PDF as a formatted report.
+
 ## Timing and delivery model
 
-- **Collection cadence:** once per managed host per day, spread across the day rather than all at
-  once, so the fleet does not report in a single burst.
+- **Collection cadence:** once per managed host per day by default, spread across the day rather
+  than all at once, so the fleet does not report in a single burst. Both the interval and the time
+  window it runs within are administrator-configurable — an organisation that wants collection
+  confined to a specific quiet period can set that window instead of accepting the platform's own
+  spread across the full day. Changing it is itself a gated action, restricted the same way the
+  whole-fleet check above is, since it trades fleet visibility latency against endpoint load and is
+  not a decision to leave to routine access. Available equally through the operator interface and
+  the API.
 - **What's sent:** nothing, if nothing changed since the last report; only the specific
   differences, if something did; a complete picture only the first time a host is seen, or if the
   platform and the host ever need to re-synchronise.
-- **On-demand check:** available at any time, against an operator-chosen, bounded group of hosts
-  only — never the unbounded fleet — with a fixed ceiling on how large that group may be in one
-  request, and a short cooldown between requests so the mechanism cannot be used to repeatedly
-  overload the fleet.
+- **On-demand check:** available at any time. Against an operator-chosen, bounded group of hosts,
+  with a fixed ceiling on group size, it needs no more authority than an ordinary inventory query.
+  Against the whole fleet, it needs an explicit confirmation and a higher-privilege role, and still
+  delivers through the same spread-out pacing as the daily cadence rather than all at once. Both
+  forms share a cooldown between requests so neither can be used to repeatedly overload the
+  fleet.
 - **Change visibility:** a detected change is reflected in the platform's change record within the
   same reporting cycle that surfaced it; there is no separate, faster path for change events.
 - **No continuous stream:** this is a periodic-plus-on-demand model, not a continuous real-time
@@ -161,7 +201,11 @@ Non-goals.
 it. Every existing reader of today's inventory keeps working. A new software category is future
 work added to the same pass, not a new integration point. An organisation's own tooling can treat
 this platform as a dependable, poll-on-its-own-schedule source of software truth, without this
-platform needing to know anything about that tooling.
+platform needing to know anything about that tooling. An operator who genuinely needs the whole
+fleet re-checked, or a collection cadence that suits their own environment, can have both — behind
+authority strong enough that neither becomes a routine, casual control. And whoever consumes the
+result — a person or another system — can have it in whichever of the four formats already fits
+their own workflow, from either the interface or the API.
 
 **What this costs, or defers, deliberately (non-goals of this decision):**
 
