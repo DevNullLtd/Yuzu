@@ -708,14 +708,34 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
     const auto prefix = action_row_prefix(action);
     std::vector<std::string> rows;
     yuzu::shared::ConstraintAccumulator acc;
+    bool capped = false;
+    // Bounds row growth the same way Tally::row() does for file-backed sources (parsers.hpp
+    // above) -- this path had no cap of its own. An item's identifier is copied into `src` and
+    // then re-embedded in every one of that item's parameter/defect rows, so one policy element
+    // with a long identifier and many parameters multiplies into far more row bytes than its own
+    // capture size (adversarial-review finding: a 100KB identifier x 1000 params reproduced
+    // 100MB+ of row text from a single sub-1MB capture). Last slot reserved for the truncation
+    // marker, same reservation logic as Tally::row.
+    const auto push_row = [&](std::string r) {
+        if (rows.size() + 1 >= kMaxRows) {
+            if (!capped) {
+                acc.add_failure("row_cap");
+                rows.push_back(format_kv_row(prefix, "source_state", "unreadable:row_cap", "pwpolicy"));
+            }
+            capped = true;
+            return;
+        }
+        rows.push_back(std::move(r));
+    };
     for (const auto& it : items) {
+        if (capped) break;
         const bool lock = it.category.find("Authentication") != std::string::npos;
         const bool pw = it.category.rfind("policyCategoryPassword", 0) == 0;
         const std::string& named = it.identifier.empty() ? it.category : it.identifier;
         const std::string src = named.empty() ? std::string{"pwpolicy"} : "pwpolicy:" + named;
         const auto defect_rows = [&] {
             for (const auto& d : it.defects) {
-                rows.push_back(format_kv_row(prefix, "source_state", "unreadable:" + d, src));
+                push_row(format_kv_row(prefix, "source_state", "unreadable:" + d, src));
                 acc.add_failure("pwpolicy:" + d);
             }
         };
@@ -723,7 +743,7 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             // The root non_string_key placeholder has no category to name; a real
             // category -- even an empty-named one -- always keeps its row.
             if (!(it.category.empty() && !it.defects.empty()))
-                rows.push_back(format_kv_row(prefix, "unmodelled_category", it.category, "pwpolicy"));
+                push_row(format_kv_row(prefix, "unmodelled_category", it.category, "pwpolicy"));
             defect_rows();
             continue;
         }
@@ -734,16 +754,16 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             // `policies|none` answer below. Gated on has_content, not content.empty() -- a
             // genuinely present-but-empty policyContent must fall through to the row below,
             // never collapse into this shape-defect case.
-            rows.push_back(format_kv_row(prefix, "source_state", "unreadable:missing_content", src));
+            push_row(format_kv_row(prefix, "source_state", "unreadable:missing_content", src));
             acc.add_failure("pwpolicy:missing_content");
             continue;
         }
-        if (it.has_content) rows.push_back(format_kv_row(prefix, "policy_content", it.content, src));
+        if (it.has_content) push_row(format_kv_row(prefix, "policy_content", it.content, src));
         if (const auto n = pwpolicy_min_length(it.content))
-            rows.push_back(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
+            push_row(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
         for (const auto& [k, v] : it.params) {
-            if (k.rfind("policyAttribute", 0) == 0) rows.push_back(format_kv_row(prefix, k, v, src));
-            else rows.push_back(format_kv_row(prefix, "unmodelled_parameter", k + "=" + v, src));
+            if (k.rfind("policyAttribute", 0) == 0) push_row(format_kv_row(prefix, k, v, src));
+            else push_row(format_kv_row(prefix, "unmodelled_parameter", k + "=" + v, src));
         }
         defect_rows();
     }

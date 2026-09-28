@@ -3,9 +3,12 @@
  * plugin's PAM/login.defs/auditd parsers and pwpolicy row mapping. Runs on every OS:
  * nothing here touches the filesystem, the registry or a process.
  *
- * The sudoers lexer, secedit INI decode/mapping and Windows scratch-sweep decisions are
- * PLANNED, follow as their own PR (see local_security_policy_legs.hpp's banner) -- their
- * tests are not in this file; PR4 restores them.
+ * The sudoers lexer and Windows scratch-sweep decisions are PLANNED, follow as their own PR
+ * (see local_security_policy_legs.hpp's banner) -- their tests are not in this file; PR4
+ * restores them. The secedit export's UTF-16LE decode and case-insensitive INI mapping
+ * (decode_utf16le_bom / CaseInsensitiveLess / parse_inf_sections) have no caller yet either,
+ * but ARE tested below -- they're pure and OS-independent, so there's no reason to ship them
+ * untested ahead of PR4 (adversarial-review finding).
  *
  * No REAL CAPTURE fixtures here (unlike app_control/autoruns/runtimes): this plugin's
  * inputs are host-specific system files (a live pwpolicy plist) that vary machine to
@@ -56,6 +59,102 @@ TEST_CASE("local_security_policy text helpers: trim and line splitting",
     CHECK(split_lines("a\nb\n\nc") == std::vector<std::string_view>{"a", "b", "", "c"});
     CHECK(split_lines("").empty());
     CHECK(split_lines("a") == std::vector<std::string_view>{"a"});
+}
+
+// ── secedit export helpers (UTF-16LE INI) ──────────────────────────────────────────
+// PLANNED for the Windows leg (PR4) -- these are pure, OS-independent parsing/comparison
+// primitives shipped ahead of their caller in this PR (local_security_policy_legs.hpp's
+// "WHEN THE SUDOERS ACTION LANDS" banner). Tested now, matching platform_security's own
+// tested decode_utf16le_bom precedent, so PR4 wires up already-verified logic rather than
+// untested code under deadline pressure (adversarial-review finding K2).
+
+TEST_CASE("local_security_policy decode_utf16le_bom: BOM required, exact round-trip, "
+          "malformed input is nullopt never a truncated guess",
+          "[local_security_policy][parsers][secedit]") {
+    // "AB" as UTF-16LE with a mandatory FF FE BOM.
+    const std::vector<std::uint8_t> ab_bom{0xFF, 0xFE, 0x41, 0x00, 0x42, 0x00};
+    const auto ab = decode_utf16le_bom(ab_bom);
+    REQUIRE(ab.has_value());
+    CHECK(*ab == "AB");
+
+    // A non-ASCII BMP codepoint (U+00E9 'é', UTF-8 0xC3 0xA9).
+    const std::vector<std::uint8_t> e_acute{0xFF, 0xFE, 0xE9, 0x00};
+    const auto e = decode_utf16le_bom(e_acute);
+    REQUIRE(e.has_value());
+    CHECK(*e == "\xC3\xA9");
+
+    // No BOM at all.
+    const std::vector<std::uint8_t> no_bom{0x41, 0x00, 0x42, 0x00};
+    CHECK_FALSE(decode_utf16le_bom(no_bom).has_value());
+
+    // Odd length (a truncated UTF-16 code unit).
+    const std::vector<std::uint8_t> odd{0xFF, 0xFE, 0x41, 0x00, 0x42};
+    CHECK_FALSE(decode_utf16le_bom(odd).has_value());
+
+    // Unpaired high surrogate (no low surrogate follows).
+    const std::vector<std::uint8_t> unpaired_high{0xFF, 0xFE, 0x00, 0xD8};
+    CHECK_FALSE(decode_utf16le_bom(unpaired_high).has_value());
+
+    // Low surrogate with no preceding high surrogate.
+    const std::vector<std::uint8_t> bare_low{0xFF, 0xFE, 0x00, 0xDC};
+    CHECK_FALSE(decode_utf16le_bom(bare_low).has_value());
+
+    // Too short to even carry the BOM.
+    const std::vector<std::uint8_t> tiny{0xFF};
+    CHECK_FALSE(decode_utf16le_bom(tiny).has_value());
+}
+
+TEST_CASE("local_security_policy CaseInsensitiveLess: orders and matches by folded case only",
+          "[local_security_policy][parsers][secedit]") {
+    const CaseInsensitiveLess less{};
+    CHECK(less("abc", "ABD"));      // 'c' < 'd' after folding
+    CHECK_FALSE(less("ABC", "abc")); // equal under folding -> neither is less
+    CHECK_FALSE(less("abc", "ABC"));
+    CHECK(less("ab", "abc")); // shorter prefix sorts first when the shared prefix matches
+    CHECK_FALSE(less("abc", "ab"));
+
+    // is_transparent: a std::map keyed on this comparator is looked up by string_view
+    // without constructing a temporary std::string, and a differently-cased key finds it.
+    std::map<std::string, int, CaseInsensitiveLess> m;
+    m["MinimumPasswordLength"] = 14;
+    REQUIRE(m.find("minimumpasswordlength") != m.end());
+    CHECK(m.find("minimumpasswordlength")->second == 14);
+    REQUIRE(m.find("MINIMUMPASSWORDLENGTH") != m.end());
+}
+
+TEST_CASE("local_security_policy parse_inf_sections: sections, comments, case-insensitive "
+          "repeated-key-keeps-last, pre-section lines ignored",
+          "[local_security_policy][parsers][secedit]") {
+    const auto sections = parse_inf_sections(
+        "; a comment before any section, ignored\n"
+        "OrphanKey = should be ignored, no section yet\n"
+        "[System Access]\n"
+        "; a comment inside a section\n"
+        "MinimumPasswordLength = 8\n"
+        "minimumpasswordlength = 14\n" // repeated, differently-cased -> keeps this last value
+        "PasswordComplexity = 1\n"
+        "\n"
+        "[Event Audit]\n"
+        "AuditLogonEvents = 3\n");
+
+    REQUIRE(sections.size() == 2);
+    // Section lookup is itself case-insensitive.
+    const auto sys = sections.find("system access");
+    REQUIRE(sys != sections.end());
+    REQUIRE(sys->second.size() == 2); // MinimumPasswordLength + PasswordComplexity, not 3
+    CHECK(sys->second.at("MinimumPasswordLength") == "14"); // last write wins
+    CHECK(sys->second.at("PasswordComplexity") == "1");
+
+    const auto audit = sections.find("Event Audit");
+    REQUIRE(audit != sections.end());
+    CHECK(audit->second.at("AuditLogonEvents") == "3");
+
+    // No section named for the pre-section orphan key -- it was silently dropped, not
+    // attributed to a synthetic/default section.
+    CHECK(sections.find("") == sections.end());
+
+    CHECK(parse_inf_sections("").empty());
+    CHECK(parse_inf_sections("; only comments\n; nothing else\n").empty());
 }
 
 // ── kv / PAM / auditd (Linux/macOS file sources) ──────────────────────────────────
@@ -408,5 +507,23 @@ TEST_CASE("local_security_policy pwpolicy_rows: category routing, defects, and t
     const auto none = pwpolicy_rows(LocalPolicyAction::Lockout, {});
     CHECK(none.rows == std::vector<std::string>{"lockout_policy|policies|none|pwpolicy"});
     CHECK(none.status == PolicyStatus::Ok);
+}
+
+TEST_CASE("local_security_policy pwpolicy_rows: row growth is capped, mirroring Tally::row "
+          "(adversarial-review regression -- a single item's identifier previously repeated "
+          "into an unbounded number of parameter rows with no cap at all)",
+          "[local_security_policy][parsers][pwpolicy]") {
+    KvList many_params;
+    for (std::size_t i = 0; i < kMaxRows + 500; ++i)
+        many_params.emplace_back("policyAttribute" + std::to_string(i), "x");
+    const PwPolicyItem huge{.category = "policyCategoryPasswordContent",
+                            .identifier = "huge",
+                            .has_content = false,
+                            .params = many_params};
+    const auto capped = pwpolicy_rows(LocalPolicyAction::Password, {huge});
+    CHECK(capped.rows.size() == kMaxRows); // never grows past the cap, ever
+    CHECK(capped.status == PolicyStatus::Constrained);
+    CHECK(capped.reason.find("row_cap") != std::string::npos);
+    CHECK(capped.rows.back() == "password_policy|source_state|unreadable:row_cap|pwpolicy");
 }
 

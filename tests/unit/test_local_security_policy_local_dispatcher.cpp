@@ -115,3 +115,30 @@ TEST_CASE("local_security_policy: each real action returns at least one well-sha
         CHECK(result.result_completeness != YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
 }
+
+#if defined(_WIN32)
+// Adversarial-review finding: the row-shape/status-declared checks above would stay green even
+// if the Windows planned branch regressed to OK/FULL with rc 0 while keeping a `constrained|...`
+// -shaped row -- the exact false-success outcome the routed-concern row (local_security_policy,
+// clause 2: "a PLANNED leg's placeholder must never report OK/success") forbids. Pin the whole
+// contract exactly, matching test_browser_policy_local_dispatcher.cpp's check_planned_placeholder
+// precedent. Unlike browser_policy's planned leg (rc 0), this plugin's returns rc 1
+// (plugin.cpp:153-159) -- the row is written before returning failure, not instead of it.
+TEST_CASE("local_security_policy: the Windows planned leg is pinned exactly, never OK/FULL",
+          "[local_security_policy][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) return;
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* action : {"password_policy", "lockout_policy", "audit_policy"}) {
+        const auto result = dispatcher.run(plugin->descriptor(), action);
+        INFO(action);
+        CHECK(result.rc == 1);
+        const auto rows = rows_of(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "constrained|windows:planned");
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "windows:planned");
+    }
+}
+#endif

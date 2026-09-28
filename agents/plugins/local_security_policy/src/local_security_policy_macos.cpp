@@ -30,7 +30,7 @@ Collected constrained(std::string token) {
 }
 
 Collected collect_pwpolicy(LocalPolicyAction action) {
-    // sink: local_security_policy/do_password_policy#1
+    // sink: local_security_policy/collect_pwpolicy#1
     // rung 2 on ADR-3002 Decision 1's "no interface exists" evidence category: OpenDirectory
     // publishes per-node and per-record policy, never the GLOBAL account-policy set this action
     // reports, so there is no rung-1 API to pass over. The tool's XML output is read instead.

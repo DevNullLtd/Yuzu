@@ -7,18 +7,20 @@
  * Linux and macOS ship in this PR. Windows (secedit) and the `sudoers` action are PLANNED,
  * follow as their own PR -- until then `execute()` reports both as the honest planned state
  * inline (no collect_windows_policy leg exists in this PR at all; see plugin.cpp), same
- * "report planned, never claim an empty success" property as privacy_permissions'
- * YUZU_SUPPORT_PLANNED placeholder legs (privacy_permissions_macos.cpp).
+ * "report planned, never claim an empty success" property as browser_policy's
+ * mark_result_planned (browser_policy_legs.hpp) -- the one PLANNED-leg precedent actually
+ * present in this tree; a plugin named privacy_permissions cited here in an earlier draft does
+ * not exist in this repo (it is a sibling reconstruction on a separate, unmerged branch).
+ * The portable TU already builds a `local_security_policy.dll` on Windows even in this PR, and
+ * deploy/packaging/windows/yuzu-agent.iss now installs it (adversarial-review finding: an
+ * installed Windows agent previously could not reach even the planned-state row, since the
+ * installer's per-DLL Sources list had no entry for this plugin at all).
  *
  * WHEN THE WINDOWS LEG LANDS: add local_security_policy_win.cpp back to meson.build's
  * files() list and the advapi32 dependency branch, add collect_windows_policy's declaration
  * back here, restore plugin.cpp's #if defined(_WIN32) dispatch to call it, flip the three
  * actions' windows_leg descriptors off YUZU_SUPPORT_PLANNED, then grep the tree for
- * "planned" and "follows as its own PR" and update every hit. Also add a
- * `local_security_policy.dll` Source line to deploy/packaging/windows/yuzu-agent.iss (the
- * portable TU already builds a .dll on Windows even in THIS PR, but the installer's per-DLL
- * Sources list has no entry for it yet -- an installed Windows agent would report
- * plugin-not-installed until this line lands, not the planned row execute() reports today).
+ * "planned" and "follows as its own PR" and update every hit.
  *
  * WHEN THE SUDOERS ACTION LANDS: restore local_security_policy_parsers.hpp's sudoers block
  * (lines 310-845 of the pre-split file: detail::SudoersLexer, parse_sudoers,
