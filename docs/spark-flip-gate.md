@@ -1552,8 +1552,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Compensating control: the server-authored `Guardian T_server` line (neutralised on the server) is
   the authoritative half of the join; no shipped consumer reads agent-log lines; the operator manual
   (`docs/user-manual/server-admin.md`, Upgrade Notes) states which lines print ids as authored.
-- **CONFIRMED and FIXED, branch `feat/4665-log-injection-neutralisation` (starting `2ef5b8d3c`;
-  not yet merged to `dev` as of this entry).** The fix went through three further rounds after
+- **CONFIRMED and FIXED, merged to `dev` via PR #4979 (`63c8420fb`).** The fix went through three further rounds after
   its initial 10 commits (`2ef5b8d3c`..`ebb6600db`) landed: doc corrections (`a3388bf1a`), an
   `/adversarial-review` (Kimi + Codex) fix round (`1ecfa6899`) that found and closed a real,
   previously-unwrapped forgery sink in `guard_registry.cpp`'s registry assertion values
@@ -1608,10 +1607,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   wrapped at the sink with one `log_key_token()` call covering all four producers.
 - Owner: fixed ahead of PR-5 by the author of the #4665 fix series, not deferred to the PR-5 (F14
   flip) author as this entry originally assumed.
-- Milestone: #4665 itself - fix landed on `feat/4665-log-injection-neutralisation`; merge to `dev`
-  still pending as of this entry.
+- Milestone: #4665 itself - fixed and merged via PR #4979.
 - Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer blocked
-  by this entry once the branch above merges.
+  by this entry, now that PR #4979 has merged.
 
 **#4685** (Guardian: Unsupported rules not re-reconciled after a File/Registry episode, #4658)
 - Detection signal: none dedicated. The fleet query and the agent log below are hints, not proof,
@@ -1959,8 +1957,8 @@ piece (server-side, PR-4 in the #4666 ladder) is untouched by either PR-1 or PR-
 remains separately tracked.
 
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
-governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on
-`feat/4665-log-injection-neutralisation`, merge to `dev` still pending as of this entry): agent-side
+governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix, merged to
+`dev` via PR #4979): agent-side
 `Guardian T_detect` and `T_wire` lines may be used as latency evidence only if either every
 operator-authored identifier the agent logs is neutralised or rejected at one ingest chokepoint, or
 the correlator takes its join set from the server-authored `T_server` line and drops any agent line
