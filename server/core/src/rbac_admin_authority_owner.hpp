@@ -35,10 +35,12 @@
 /// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by
 /// construction, empty at that point), so it cannot participate in the
-/// inversion this order guards against; its own ordering is just the
-/// `kSeedAdminLockSql` transaction-scoped advisory lock (serializing it
-/// against `AuthDB::seed_admin_if_empty`/other concurrent `provision_first_admin`
-/// callers across replicas) first, then whatever `bump_generation_in_txn`
+/// inversion this order guards against; its own ordering is just its own
+/// `kProvisionFirstAdminLockSql` transaction-scoped advisory lock (byte-
+/// identical to `AuthDB::seed_admin_if_empty`'s `kSeedAdminLockSql`, so it
+/// serializes against that function's own callers as well as other
+/// concurrent `provision_first_admin` callers across replicas) first, then
+/// whatever `bump_generation_in_txn`
 /// takes on the `write_generation` row. This class never applies the local
 /// cache generation: the caller does that only after a confirmed commit.
 
@@ -129,9 +131,9 @@ public:
 
     /// Outcome of `provision_first_admin`.
     struct ProvisionFirstAdminOutcome {
-        bool ok{false};          ///< false ONLY on a genuine store/query failure (see `err`) —
-                                  ///< a validation refusal or the ordinary "not the first
-                                  ///< account" no-op both leave this true
+        bool ok{false};          ///< false on a genuine store/query failure OR an invalid
+                                  ///< username (see `err` either way) — only the ordinary
+                                  ///< "not the first account" no-op leaves this true
         bool provisioned{false}; ///< true iff THIS call actually created the account+grant
         std::string username;    ///< the identity provisioned; meaningful iff `provisioned`
         std::optional<std::uint64_t> new_gen; ///< present iff `provisioned` and commit confirmed

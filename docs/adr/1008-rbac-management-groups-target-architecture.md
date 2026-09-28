@@ -253,23 +253,24 @@ shape `AuthDB::seed_admin_if_empty` uses, under the SAME `kSeedAdminLockSql` adv
 when `auth.users` is genuinely empty; `RbacStore::provision_first_admin`
 (`rbac_store.hpp:472-489`, `.cpp:2156-2179`) is the thin public wrapper, mirroring
 `unassign_role`'s/`set_rbac_enforcement`'s own delegation pattern exactly. `main.cpp`'s
-fresh-start seed block (`main.cpp:1449-1547`) calls this BEFORE `AuthDB::seed_admin_if_empty`
--- not merely "also", and not after -- because the ordering is forced, not a style choice:
-whichever of the two INSERTs runs second can never see auth.users empty (the first one already
-committed a row), so the account+grant must be created by `provision_first_admin`'s own INSERT,
-in ONE transaction, so a crash between account-creation and grant-creation can never strand an
-account with no grant and no later boot able to fix it (the table would no longer be empty).
-`seed_admin_if_empty` stays as the very next call in `main.cpp`'s fresh-start block (the
-short-lived `auth_db` object it runs against is also needed further down, for the unrelated
-break-glass paths that reference it directly) but is now a guaranteed no-op **within a
-single-version fleet** — `provision_first_admin` has already inserted the row by the time it
-runs, so its own `WHERE NOT EXISTS` sees a non-empty table and correctly declines to write.
+fresh-start seed block calls this and no longer also calls `AuthDB::seed_admin_if_empty`
+-- the account+grant land in ONE transaction, so a crash between account-creation and
+grant-creation can never strand an account with no grant and no later boot able to fix it (the
+table would no longer be empty). `seed_admin_if_empty` is NO LONGER called from `main.cpp`'s
+fresh-start block at all (round 2, governance-round fix, 2026-09-28) -- calling it again
+immediately after `provision_first_admin` succeeded would have been a redundant second no-op with
+its own independent failure mode (a transient PG blip in the no-op call could fatal an
+already-successful, non-retriable bootstrap for no benefit -- a chaos-injector finding from the
+same round). `seed_admin_if_empty` itself is UNCHANGED, stays exported on `AuthDB`'s public API,
+and keeps its own unit test coverage -- it simply has no production caller left after this change.
 
-**Residual: mixed-version first boot is NOT covered by that guarantee.** Both functions share
-the same advisory lock (`kSeedAdminLockSql`/`kProvisionFirstAdminLockSql`, byte-identical), which
-serializes ordering but not WHICH one wins. If an old-binary replica (pre-dating this change)
-races a new-binary replica against the same genuinely-empty database, the old binary's
-`seed_admin_if_empty` can win the lock first and commit the account with NO Administrator grant
+**Residual: mixed-version first boot is NOT covered by a same-version-fleet guarantee.** Both
+functions still share the same advisory lock
+(`kSeedAdminLockSql`/`kProvisionFirstAdminLockSql`, byte-identical), which serializes ordering but
+not WHICH one wins IF an old-binary replica (pre-dating this change) is still running a version
+that calls `seed_admin_if_empty` in its own boot path. If such a replica races a new-binary
+replica against the same genuinely-empty database, the old binary's `seed_admin_if_empty` can win
+the lock first and commit the account with NO Administrator grant
 -- `provision_first_admin` then sees a non-empty table on its own turn and cleanly no-ops,
 permanently (the table is never empty again). This delivery ships with `rbac_enabled` still
 seeded `'false'` (see below), so a stranded account of this shape still authenticates via the
@@ -315,24 +316,42 @@ on with no operator toggle involved). A1's three deviations above (no self-grant
 lock under the toggle's own transaction; MFA step-up posture) all stand exactly as A1 left them,
 unaffected by this delivery.
 
-Observability: a fresh-install provision is logged once, at `spdlog::warn` level (folded into the
-existing "AUTH DATA RESET ON POSTGRES CUTOVER" line rather than a second, separate warning for
-what is now one event -- `main.cpp:1517-1525`); `Config::auth_fresh_start_seeded` (and the
-`yuzu_auth_fresh_start_reset_total` counter it drives, `server.cpp:3130-3163`) is now sourced from
-`provision_first_admin`'s outcome rather than `seed_admin_if_empty`'s, since the former is the
-operation that actually performs the fresh-start INSERT in production now -- the counter's own
-documented contract ("1 iff this boot seeded the sole admin user into an empty auth.users table")
-is unchanged, only which call detects the event. No real `audit_store` row is written for this
-event: `main.cpp` has no `AuditFn` audit callback available this early in boot (confirmed against
-`AuditStore::log()`, which always self-acquires its own pool lease with no connection/transaction
--scoped write API to fold into `provision_first_admin`'s transaction) -- a deliberate, reviewed
-scope boundary for this delivery, not an oversight; a durable audit record for this specific event
-is not built.
+Observability: a fresh-install provision is logged once, at `spdlog::warn` level; `Config::auth_fresh_start_seeded` (and the
+`yuzu_auth_fresh_start_reset_total` counter it drives, `server.cpp:3130-3163`) is sourced from
+`provision_first_admin`'s outcome, since that is the operation that actually performs the
+fresh-start INSERT in production -- the counter's own documented contract ("1 iff this boot seeded
+the sole admin user into an empty auth.users table") is unchanged, only which call detects the
+event.
+
+**A durable `audit_store` row IS written for this event (round 2, governance-round fix,
+2026-09-28).** An earlier version of this note claimed no `AuditFn` callback is available this
+early in boot -- that was factually wrong: `main.cpp`'s `open_one_shot_audit` (the SAME helper
+the `--mfa-reset`/`--break-glass-arm` one-shot CLI paths already use, also pre-`Server::create()`)
+opens a short-lived `AuditStore` against `auth_pg_pool` for exactly this case. The fix mirrors
+break-glass's own two-phase posture: a PRE-FLIGHT check (fail boot fatally if the audit store
+isn't writable, BEFORE calling `provision_first_admin` -- since `WHERE NOT EXISTS` means this
+event gets exactly one chance ever, an audit-store outage at precisely this boot would otherwise
+permanently forfeit the row) followed by a POST-COMMIT write (action `rbac.bootstrap.first_admin`,
+principal/`principal_role` `"system"`, target the provisioned username) that log-and-continues
+rather than fails boot if the write itself fails after the pre-flight passed -- unlike break-glass,
+the mutation here is already durably committed and non-retriable by that point, so failing boot
+would strand an otherwise-healthy install for no benefit. **Known residual, not closed by the
+pre-flight:** if the account+grant transaction commits server-side but the client never observes
+the COMMIT acknowledgement (a network fault between PG processing COMMIT and the reply reaching
+the client), `provision_first_admin` reports failure and this code path never reaches the
+post-commit audit write, yet the mutation is live -- a restart then sees a non-empty table and
+cleanly no-ops, so the account+grant are safe, but that narrow window can still lose the audit row
+despite the pre-flight having passed. Closing it needs either a same-transaction audit write
+(`AuditStore::log()` always self-acquires its own lease, no connection-scoped write API exists to
+fold into `provision_first_admin`'s transaction) or a durable pre-commit marker, both
+disproportionate to this narrow, mutation-safe residual -- accepted as-is, documented here and at
+the call site rather than silently shipped.
 
 Also fixed in passing, in the same code path this note describes: `main.cpp`'s config-loaded
 identity-selection loop previously fell back to `cfg_users.front()` (silently promoting whatever
 the FIRST config entry was to Administrator) when no `Role::admin`-tagged entry was found in a
-hand-edited config file. That fallback is now a fatal boot refusal instead (`main.cpp:1476-1488`)
+hand-edited config file. That fallback is now a fatal boot refusal instead (`main.cpp`'s
+fresh-start seed block, the `!seed_user && !cfg_users.empty()` branch)
 -- the interactive `first_run_setup` flow (`auth.cpp`) always creates the admin account with
 `Role::admin` explicitly, so the fallback was reachable only via a hand-edited config, but it must
 still fail loudly rather than silently provision the wrong identity as the fleet's first

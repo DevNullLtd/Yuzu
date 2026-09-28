@@ -4325,6 +4325,68 @@ TEST_CASE("RbacStore::provision_first_admin races AuthDB::seed_admin_if_empty "
     }
 }
 
+// quality-engineer (Gate 3, governance round 2026-09-28): the two race tests
+// above spawn two genuine std::thread callers with no rendezvous — the
+// invariant they assert (exactly one winner) would hold trivially even if
+// the two calls never actually overlapped on the advisory lock (e.g. the
+// loser's own connection/query setup happened to fully serialize behind the
+// winner for unrelated reasons). This test proves the underlying mechanism
+// both of them rely on: a real `provision_first_admin` call GENUINELY BLOCKS
+// on `kProvisionFirstAdminLockSql` when another connection already holds it
+// — using the same puppeteer-connection + `poll_for_blocked_backend_pid`
+// technique the file's own last-Administrator-guard tests use (see that
+// helper's doc comment above), never a blind sleep_for (CLAUDE.md).
+TEST_CASE("RbacStore::provision_first_admin genuinely blocks on the shared "
+          "advisory lock — not merely a two-thread race that could pass "
+          "without real contention",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // Connection A: take the SAME lock provision_first_admin itself takes
+    // (kProvisionFirstAdminLockSql / kSeedAdminLockSql, byte-identical) and
+    // hold it open, uncommitted.
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(), "SELECT pg_advisory_xact_lock(2037545589, 1)",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> ok{false};
+    std::atomic<bool> provisioned{false};
+    std::thread worker([&] {
+        auto r = store.provision_first_admin("blockedadmin", "hash", "salt");
+        ok = r.has_value();
+        if (r.has_value())
+            provisioned = *r;
+        done = true;
+    });
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{worker};
+
+    // Prove the worker is GENUINELY blocked on connection A's held lock —
+    // not merely slow to start.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(done.load());
+
+    // Release the lock; the worker must then proceed and win (auth.users is
+    // genuinely empty at this point — connection A never wrote a row).
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+    worker.join();
+    CHECK(ok.load());
+    CHECK(provisioned.load());
+    CHECK(store.get_principal_roles("user", "blockedadmin").size() == 1);
+}
+
 TEST_CASE("RbacStore::provision_first_admin refuses an invalid username "
           "before touching auth.users — no account, no grant",
           "[rbac_store][pg]") {
@@ -4332,15 +4394,27 @@ TEST_CASE("RbacStore::provision_first_admin refuses an invalid username "
 
     // is_valid_username runs first in the owner (rbac_admin_authority_owner.cpp),
     // mirroring AuthDB::seed_admin_if_empty's own InvalidUsername refusal —
-    // this entry point now runs BEFORE that one in production, so the same
-    // guard must exist here too rather than relying on the now-vestigial
-    // second call to ever catch it.
+    // this is now the ONLY production entry point that seeds auth.users, so
+    // the guard has to live here rather than relying on seed_admin_if_empty
+    // (no longer called in production) to ever catch it.
     auto result = store.provision_first_admin("not a valid username!", "hash", "salt");
     REQUIRE_FALSE(result.has_value());
     CHECK_FALSE(result.error().empty());
-    // get_user validates its own input and refuses to even look up a
+    // get_user ALSO validates its own input and refuses to even look up a
     // syntactically-invalid username (InvalidUsername, not UserNotFound) —
-    // either way, no such account exists.
+    // which is tautological proof by itself (it would return the same
+    // answer whether or not the guard above actually ran). Prove the guard
+    // ran BEFORE touching auth.users with a raw count on a second
+    // connection instead — this fails if a future regression removes the
+    // pre-INSERT guard and lets a malformed username reach the table
+    // (quality-engineer, governance round 2026-09-28).
+    {
+        pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "SELECT count(*) FROM auth.users")};
+        REQUIRE(r.ok());
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0");
+    }
     CHECK(auth_db->get_user("not a valid username!").error() == AuthDBError::InvalidUsername);
     CHECK(store.get_principal_roles("user", "not a valid username!").empty());
 }

@@ -26,7 +26,12 @@ This is **caller-inclusive and deliberately stricter than a bare fleet-wide "at 
 
 Recommended order for a fresh install:
 
-1. `POST /api/v1/rbac/roles/Administrator/assignments` for yourself (`{"principal_type":"user","principal_id":"<your username>"}`) — see "Fleet-Wide Role Assignment" below.
+1. On a genuinely fresh install, the config-file admin already holds the fleet-wide
+   `Administrator` grant from boot (`RbacStore::provision_first_admin`) — this step is a no-op for
+   that account and only matters for an UPGRADED/pre-existing database whose current operators
+   don't already hold it. `POST /api/v1/rbac/roles/Administrator/assignments` for yourself
+   (`{"principal_type":"user","principal_id":"<your username>"}`) — see "Fleet-Wide Role
+   Assignment" below.
 2. Grant management-group roles to every operator who needs device visibility (see the callout immediately below) — RBAC-on applies role-scoped visibility immediately, and a user with no management-group role sees no agents.
 3. `PUT /api/v1/rbac/enforcement {"enabled": true}`.
 

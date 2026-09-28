@@ -129,9 +129,10 @@ must check them:
 - `yuzu-server.cfg` is a one-shot first-boot seed, not a live source — still
   true; it now seeds the `auth` Postgres schema via
   `RbacStore::provision_first_admin` (account + a durable Administrator
-  grant, one transaction; `seed_admin_if_empty` runs right after it but is
-  a guaranteed no-op in production), not a SQLite `auth.db`. A bootstrap
-  error is FATAL.
+  grant, one transaction, plus a durable `rbac.bootstrap.first_admin` audit
+  row), not a SQLite `auth.db` and not `seed_admin_if_empty` (no longer
+  called in production — see its own header comment). A bootstrap error is
+  FATAL.
 - **(Retired, do NOT reintroduce as invariants):** the former `auth.db` 0600 /
   restricted-ACL-at-create and `MigrationRunner::run(sqlite3*, …)` bullets are
   SQLite-era and no longer apply — AuthDB creates no file and migrates via

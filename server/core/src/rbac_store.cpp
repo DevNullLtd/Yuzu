@@ -2165,12 +2165,28 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
         return std::unexpected("database not open");
     const RbacAdminAuthorityOwner::ProvisionFirstAdminOutcome outcome =
         RbacAdminAuthorityOwner{pool_}.provision_first_admin(username, password_hash, salt_hex);
-    if (!outcome.ok)
-        return std::unexpected(outcome.err.empty() ? "provision_first_admin failed" : outcome.err);
+    if (!outcome.ok) {
+        // `outcome.err` is empty only when `with_txn_for` fails BEFORE the
+        // lambda ever runs (pool-acquire timeout, connect backoff) — the
+        // lambda's own failure branches always set `err`. Thread
+        // `pool_.last_error()` into the fallback so this case is
+        // distinguishable from a genuine in-transaction SQL failure rather
+        // than reporting the same opaque literal for both (Gate 5 chaos
+        // finding, governance round 2026-09-28).
+        if (outcome.err.empty()) {
+            const std::string pool_err = pool_.last_error();
+            return std::unexpected(pool_err.empty() ? "provision_first_admin failed: pool "
+                                                       "acquire failed (no further detail)"
+                                                     : "provision_first_admin failed: " + pool_err);
+        }
+        return std::unexpected(outcome.err);
+    }
     if (!outcome.provisioned)
         return false; // ordinary no-op — not the first account, nothing to apply
-    // `!outcome.new_gen` is unreachable while the owner's lambda only sets
-    // `provisioned` after a confirmed generation bump; guards the
+    // `!outcome.new_gen` is unreachable while `provisioned` (set by the
+    // outer `result.provisioned = provisioned && ok;` tail assignment, not
+    // by the lambda directly) implies the WHOLE transaction — grant INSERT
+    // and generation bump both — committed successfully; guards the
     // dereference below if that ever changes — mirrors unassign_role's own
     // `!outcome.new_gen` unreachable note.
     if (!outcome.new_gen)

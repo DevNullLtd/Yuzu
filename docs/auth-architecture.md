@@ -3880,9 +3880,10 @@ config-file admin AND grants it a durable fleet-wide Administrator role, in
 one transaction, via `RbacStore::provision_first_admin` (docs/adr/1008-rbac-management-groups-target-architecture.md,
 "Delivery note (fresh-install bootstrap)") — `AuthDB::seed_admin_if_empty`'s
 own `INSERT ... SELECT ... WHERE NOT EXISTS` is the same TOCTOU-free shape
-but is now a guaranteed no-op in production, since `provision_first_admin`
-already ran first — and logs a loud "AUTH DATA RESET ON POSTGRES
-CUTOVER" warning. **A legacy SQLite `auth.db` is never read** — any prior
+but is no longer called in production at all (a redundant second call was
+removed; it stays exported for its own tests) — and logs a loud "RBAC
+BOOTSTRAP" warning plus a durable `rbac.bootstrap.first_admin` audit row.
+**A legacy SQLite `auth.db` is never read** — any prior
 local accounts, roles, and MFA enrollments that existed only in a pre-cutover
 `auth.db` are gone on upgrade; SCIM self-heals on the IdP's next sync cycle;
 humans re-enroll MFA. This is a breaking upgrade by design, matching the

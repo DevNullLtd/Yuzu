@@ -2,5 +2,4 @@
   grants the config-file admin a durable, fleet-wide Administrator role alongside seeding the
   account itself (`RbacStore::provision_first_admin`), closing a gap where RBAC's own
   enable/assignment routes had no way to authorize themselves on a database that had never run
-  before. A config file with no admin-role entry now fails the boot loudly instead of silently
-  promoting the wrong account to Administrator.
+  before. The event is recorded as a durable audit row (`rbac.bootstrap.first_admin`).

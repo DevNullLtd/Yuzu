@@ -223,6 +223,28 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
+
+**What changed.** On every boot (not only first boot), the server checks the loaded config's local
+user list: if it is non-empty but none of the entries has `role=admin`, the server now refuses to
+start (`Fatal: the loaded config lists N local user(s) but none has role=admin`). Previously, this
+shape silently promoted the first configured user to Administrator regardless of its declared role
+— a real bug this change fixes — so the check is not new logic layered on top of prior behavior, it
+is a correction that happens to also be fail-loud where the old code was silently wrong.
+
+**Who this affects.** Any deployment whose `yuzu-server.cfg` local-user list was hand-edited to a
+shape with no `role=admin` entry — most plausibly a fleet that migrated fully to SSO/OIDC/SAML and
+removed or demoted its local admin config entry, relying on the old silent-promotion behavior (or
+simply never noticing it) rather than on the actual RBAC/session-role state in the database. This
+check is config-shape-based, independent of whether `auth.users` already has admins in Postgres —
+it fires even on a long-running, fully-provisioned deployment if its config happens to carry this
+shape on the next restart.
+
+**Fix, before or immediately after upgrading.** Either mark exactly one entry in the local user
+list `role=admin` in the config file, or — for an SSO-only fleet — remove all local user entries
+from the config so this check never triggers. The server logs the config's user count and refuses
+to guess; there is no other remediation needed once the config is corrected.
+
 ### vNEXT — `installed_apps list` rows carry two more fields (breaking)
 
 **What changed.** The `installed_apps` agent plugin's operator `list` action (definition

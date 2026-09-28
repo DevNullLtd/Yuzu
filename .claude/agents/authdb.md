@@ -122,10 +122,13 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   truth — AND the seed only ever fires when `auth.users` is genuinely
   empty.** `RbacStore::provision_first_admin` is the production seeder (a
   single `INSERT ... SELECT ... WHERE NOT EXISTS` plus the Administrator
-  grant, one transaction, TOCTOU-free against a second server instance
-  racing first boot); `AuthDB::seed_admin_if_empty` is the same shape for
-  the account alone and stays in the boot path right after it, but is a
-  guaranteed no-op in production now. After the first successful seed (or on
+  grant plus a durable `rbac.bootstrap.first_admin` audit row, one
+  transaction for the account+grant, TOCTOU-free against a second server
+  instance racing first boot); `AuthDB::seed_admin_if_empty` is the same
+  shape for the account alone but is NO LONGER called in production at all
+  (a redundant second no-op call was removed from `main.cpp`'s fresh-start
+  block; the function stays exported for its own tests). After the first
+  successful seed (or on
   any subsequent boot where the table is non-empty), edits to the config
   file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
   create, the role endpoint for role change) is the only live mutation path.
