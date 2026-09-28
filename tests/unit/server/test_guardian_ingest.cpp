@@ -585,3 +585,76 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's dedicated async logger never b
                std::string::npos;
     }));
 }
+
+TEST_CASE("guardian ingest: #4666 PR-4 T_server's overrun_oldest genuinely evicts and never "
+          "blocks producers, past the real 1024-slot queue capacity",
+          "[guardian][ingest][diagnostics]") {
+    // Closes a gap flagged across governance Gates 3-5 (adversarial-review follow-up, 2026-09-28):
+    // the non-blocking test above only ever queues TWO messages total, so it cannot distinguish
+    // overrun_oldest (evict-oldest-and-continue) from a regression to a blocking enqueue policy --
+    // a future spdlog version bump that silently remapped overrun_oldest onto a blocking policy
+    // would leave that test green. This test genuinely fills the 1024-slot queue (well past
+    // capacity) against a parked sink and asserts BOTH that production never blocks AND that
+    // eviction is real (old messages are dropped, not silently buffered forever).
+    //
+    // Single producer thread, deliberately: the pool's single worker thread races the producer
+    // loop for which message it dequeues first (parked in ParkingSink::log() for the duration),
+    // so which EARLY message ends up "in flight" -- and therefore immune to eviction -- is not
+    // deterministic. The assertions below are written to hold regardless of that race: the
+    // newest message is never evicted (eviction only ever targets the oldest), a solidly
+    // mid-range early message is evicted with overwhelming probability (>1500 messages are
+    // produced after it, against a 1024-slot queue), and the delivered count stays bounded near
+    // capacity rather than growing to the full 2000 -- ruling out both "nothing delivered" (a
+    // blocking-policy regression) and "everything delivered" (a silently-unbounded queue).
+    auto parking_sink = std::make_shared<ParkingSink>();
+    auto t_server_logger =
+        create_t_server_logger(std::vector<spdlog::sink_ptr>{parking_sink}, spdlog::level::info);
+    REQUIRE(t_server_logger != nullptr);
+
+    constexpr int kMessageCount = 2000; // well past the 1024-slot queue capacity
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kMessageCount; ++i)
+        t_server_logger->info("probe seq={} END", i);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    // A blocking-policy regression would hang this loop for as long as the sink stays parked
+    // (the TEST_CASE would time out under the harness's own deadline), not merely run slow.
+    CHECK(elapsed < std::chrono::seconds(5));
+    CHECK(parking_sink->text().empty()); // still parked, nothing delivered yet
+
+    parking_sink->release();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return parking_sink->text().find("seq=1999 END") != std::string::npos; }));
+
+    const std::string delivered = parking_sink->text();
+    CHECK(delivered.find("seq=1999 END") != std::string::npos); // newest: never evicted
+    CHECK(delivered.find("seq=500 END") == std::string::npos);  // solidly old: evicted
+
+    // Bounded near capacity (1024 queued + at most 1 in-flight), not the full 2000 -- proves
+    // eviction genuinely happened rather than the queue silently growing unbounded. Loose slack
+    // on both sides to stay clear of the single-message scheduling race described above.
+    std::size_t delivered_count = 0;
+    for (std::size_t pos = delivered.find("END"); pos != std::string::npos;
+         pos = delivered.find("END", pos + 1))
+        ++delivered_count;
+    CHECK(delivered_count >= 1000);
+    CHECK(delivered_count <= 1030);
+}
+
+TEST_CASE("guardian ingest: #4666 PR-4 T_server's logger level is set explicitly at "
+          "construction, not left at spdlog's default",
+          "[guardian][ingest][diagnostics]") {
+    // Pins MUST #4 of the #4666 PR-4 spec: spdlog::registry::register_logger() does NOT
+    // retroactively apply the process's current level to a newly-registered logger (only
+    // registry::initialize_logger() does, which create_t_server_logger() never calls) -- so the
+    // explicit logger->set_level(level) call inside create_t_server_logger() is load-bearing, not
+    // redundant. Without it, --log-level warn would silently fail to suppress T_server, since
+    // spdlog::logger defaults to level::info on construction regardless of the process's
+    // configured level.
+    auto sink = std::make_shared<ParkingSink>();
+    auto t_server_logger =
+        create_t_server_logger(std::vector<spdlog::sink_ptr>{sink}, spdlog::level::warn);
+    REQUIRE(t_server_logger != nullptr);
+    CHECK_FALSE(t_server_logger->should_log(spdlog::level::info));
+    CHECK(t_server_logger->should_log(spdlog::level::warn));
+}

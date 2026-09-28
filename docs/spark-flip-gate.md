@@ -1983,7 +1983,8 @@ diagnostic line rather than the whole process's logging), installed once at boot
 (`server/core/src/main.cpp`) over copies of the default logger's own sinks. This is a dedicated
 per-line change, unlike PR-1/PR-2's global default-logger swap on the agent: the server's other
 Guardian-ingest log lines on the same code path (idempotent-redelivery, event-collision/store-
-error, oversized-`detail_json`/parse-failure) are unaffected and stay on the ordinary
+error, oversized-`detail_json`/parse-failure, and the observation-only blast-radius/alert-router
+warning pair) are unaffected and stay on the ordinary
 synchronous default logger — only `T_server` itself, the one line the architect Gate 8 review
 adjudicated ACCEPT-WITH-PRECONDITION over, moved. Deliberately much lighter than PR-1's
 `LogHandoff`: no teardown watchdog — an ACCEPTED exposure, not an eliminated one (corrected by
