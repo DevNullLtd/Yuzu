@@ -1716,7 +1716,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — an empty mcp_tier is a no-op "
     req.path = "/api/v1/result-sets";
     httplib::Response res;
 
-    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
     CHECK(res.status == -1); // httplib::Response's unset default — nothing written
 }
 
@@ -1731,7 +1732,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — readonly tier is denied "
     req.path = "/api/v1/result-sets";
     httplib::Response res;
 
-    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
     CHECK(res.status == 403);
 }
 
@@ -1748,13 +1750,15 @@ TEST_CASE("AuthRoutes::require_tier_policy — operator tier is denied "
 
     {
         httplib::Response res;
-        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
         CHECK(res.status == 403);
     }
     {
         httplib::Response res;
         req.path = "/api/v1/result-sets/rs_deadbeef0123";
-        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete"));
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
         CHECK(res.status == 403);
     }
 }
@@ -1772,7 +1776,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — supervised tier IS allowed "
     req.path = "/api/v1/result-sets";
     httplib::Response res;
 
-    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
 }
 
 TEST_CASE("AuthRoutes::require_tier_policy — supervised tier's "
@@ -1788,7 +1793,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — supervised tier's "
     req.path = "/api/v1/result-sets/rs_deadbeef0123"; // a REST (non-MCP) transport
     httplib::Response res;
 
-    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete"));
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
     CHECK(res.body.find("ticket-then-recall") != std::string::npos);
@@ -1807,7 +1813,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — the supervised-tier "
     req.path = "/mcp/v1/";
     httplib::Response res;
 
-    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete"));
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
 }
 
 TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
@@ -1826,7 +1833,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
     req.path = "/api/v1/result-sets";
     httplib::Response res;
 
-    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
     CHECK(res.status == 403);
 }
 
@@ -1844,9 +1852,10 @@ TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
 // behaviour (true) and the new opt-out (false) on both denial arms.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission defaults "
-          "true, preserving require_permission's own envelope (the "
-          "tier_allows denial names .permission)",
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=true "
+          "matches require_permission's own envelope (the tier_allows "
+          "denial names .permission) — actionable_permission has no "
+          "default (#5047 fix round); this pins the explicit-true side",
           "[pg][auth_routes][mcp][tier_policy][clause5]") {
     AuthRoutesFixture fix;
     auth::Session session;
@@ -1856,7 +1865,8 @@ TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission defaults "
     req.path = "/api/v1/result-sets";
     httplib::Response res;
 
-    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write"));
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
     CHECK(res.status == 403);
     CHECK(res.body.find("\"permission\":\"Infrastructure:Write\"") != std::string::npos);
 }
@@ -1880,6 +1890,10 @@ TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
     // The message still steers correctly — only the structured self-
     // remediation field is withheld.
     CHECK(res.body.find("does not allow") != std::string::npos);
+    // A remediation string fills the gap instead (enterprise-readiness Gate
+    // 6 finding, #5047 governance fix round) — a caller hitting this cold
+    // gets a next step, not just a bare "not X" with an unexplained label.
+    CHECK(res.body.find("higher MCP token tier") != std::string::npos);
 }
 
 TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
@@ -1899,4 +1913,69 @@ TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
     CHECK(res.status == 403);
     CHECK(res.body.find("\"permission\"") == std::string::npos);
     CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (Gate 3 quality-engineer + Gate 4 unhappy-path,
+// converged independently): every test above calls `require_tier_policy`
+// directly with an explicit literal `actionable_permission` — none of them
+// exercise what `server.cpp` actually WIRES into production. A regression
+// reverting either `server.cpp` call site back to naming `.permission` would
+// have passed every test above. `AuthRoutes::gateless_tier_policy_fn()` is
+// the SOLE production factory both `server.cpp` sites now call (no more
+// locally-duplicated lambdas) — this test obtains the REAL callable via that
+// factory, the exact same object `server.cpp` wires into `RestApiV1`/
+// `result_set::Deps`, and drives it directly. A regression at either
+// `server.cpp` call site is now unreachable (they can no longer diverge from
+// this factory), and a regression IN the factory itself (e.g. someone
+// changes its `false` to `true`) fails this test.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
+          "TierPolicyFn both server.cpp sites wire omits .permission on "
+          "both denial arms (#5047 fix round, closes the wiring-coverage "
+          "gap Gate 3/4 found)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    yuzu::server::TierPolicyFn real_production_fn = fix.ar->gateless_tier_policy_fn();
+    REQUIRE(real_production_fn);
+
+    SECTION("tier_allows denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "readonly";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("higher MCP token tier") != std::string::npos);
+    }
+
+    SECTION("requires_approval denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "supervised";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets/rs_deadbeef0123";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Delete"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+    }
+
+    SECTION("untiered pass-through, still the real fn") {
+        auth::Session session;
+        session.username = "test_user";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == -1); // nothing written — a genuine pass-through
+    }
 }

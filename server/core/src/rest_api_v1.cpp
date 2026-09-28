@@ -10711,13 +10711,22 @@ void RestApiV1::register_routes(
         // the full contract; `{}` unwired fails closed (503) for a TIERED
         // caller only, since an untiered/plain-RBAC session has nothing this
         // belt enforces.
-        auto tier_ok = [tier_policy_fn, rs_err](const httplib::Request& req, httplib::Response& res,
-                                                const auth::Session& session,
-                                                const std::string& securable_type,
-                                                const std::string& operation) -> bool {
+        auto tier_ok = [tier_policy_fn, rs_err, audit_fn](const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const auth::Session& session,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation) -> bool {
             if (tier_policy_fn)
                 return tier_policy_fn(req, res, session, securable_type, operation);
             if (!session.mcp_tier.empty()) {
+                // A degraded/misconfigured security control (the belt this
+                // whole route family exists to add just stopped being
+                // enforceable) MUST leave an evidence trail, not just a
+                // test-covered response — audited so a SOC 2 review of
+                // "does every access-control degradation get logged" finds
+                // this branch (#5047 governance fix round).
+                audit_fn(req, "result_set.tier_policy_unavailable", "failure", "ResultSet", "",
+                         "tier-policy check misconfigured (unwired TierPolicyFn)");
                 rs_err(res, 503,
                        "RESULT_SET_TIER_POLICY_UNAVAILABLE: tier-policy check misconfigured");
                 return false;

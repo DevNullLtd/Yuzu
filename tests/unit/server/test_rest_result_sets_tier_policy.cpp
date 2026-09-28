@@ -269,6 +269,33 @@ TEST_CASE("REST /api/v1/result-sets: a supervised-tier bearer DELETE-ing its "
     CHECK(row->has_value());
 }
 
+TEST_CASE("REST /api/v1/result-sets: a supervised-tier bearer's create/pin "
+          "SUCCEEDS end-to-end (Infrastructure:Write is on tier_allows()'s "
+          "supervised path and is never approval-gated) — the one tiered "
+          "case that legitimately passes through to the store; the fragment "
+          "twin (test_result_set_routes.cpp) already pins this, this file "
+          "did not (Gate 4 happy-path finding, #5047 governance fix round)",
+          "[pg][result_set][tier_policy][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, tier_policy_result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    Harness h(pool);
+
+    h.session_mcp_tier = "supervised";
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets", R"({"name":"t"})", status);
+    REQUIRE(status == 201);
+    const std::string id = created["data"]["id"].get<std::string>();
+
+    int pin_status = 0;
+    h.post_raw("/api/v1/result-sets/" + id + "/pin", "", pin_status);
+    CHECK(pin_status == 200);
+
+    auto row = h.store->get(id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->pinned);
+}
+
 TEST_CASE("REST /api/v1/result-sets: an operator-tier bearer create/pin on "
           "its own scope is denied (403) — Infrastructure:Write is not on "
           "tier_allows()'s operator allow-list",
@@ -390,8 +417,11 @@ TEST_CASE("REST /api/v1/result-sets: an unwired tier_policy_fn fails CLOSED "
 
     // Untiered session, still unwired: passes through — nothing this belt
     // enforces on it, so ownership (create needs none) admits it normally.
+    // Assert the actual success code (201, matching every other create
+    // assertion in this file), not merely "not 503" — the weaker check
+    // would also pass on a 400/401/500 (#5047 governance fix round).
     Harness h2(pool, /*wire_tier_policy=*/false);
     int status2 = 0;
     h2.post_raw("/api/v1/result-sets", R"({"name":"t"})", status2);
-    CHECK(status2 != 503);
+    CHECK(status2 == 201);
 }

@@ -324,6 +324,37 @@ MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string 
 post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
 document both tokens explicitly).
 
+### vNEXT — the 4 result-set write routes now enforce MCP tier/approval, closing a cross-transport bypass (#5047, breaking)
+
+**What changed.** `POST /api/v1/result-sets`, `/{id}/pin`, `/{id}/unpin`, and `DELETE
+/api/v1/result-sets/{id}` — and their dashboard-fragment equivalents — previously had no RBAC or
+MCP-tier gate at all beyond ownership; only their MCP tool twins (`create_result_set`,
+`pin_result_set`, `unpin_result_set`, `delete_result_set`) enforced the tier/approval belt every
+other MCP-tiered operation gets. An MCP-tiered bearer token could reach the identical mutation
+its own tool is gated for simply by calling REST or a dashboard fragment instead of `/mcp/v1/`.
+All 8 sites now apply the same belt MCP already did: a `readonly`- or `operator`-tier bearer is
+denied `Infrastructure:Write`/`Infrastructure:Delete` outright; a `supervised`-tier bearer
+deleting a set must use the MCP ticket-then-recall flow (REST/fragment delete now requires
+approval on every transport except `/mcp/v1/` itself, matching create/pin/unpin's own approval
+posture — the routes never granted approval, they simply had no gate to enforce it). Ownership
+remains the primary, and for a plain (untiered) session the ONLY, gate — this is not a new RBAC
+securable and does not change who can reach their own result sets; see
+[rbac.md's "Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets).
+The still-open, separately-tracked [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) gap — a
+plain RBAC session or an API token minted with no `mcp_tier` skips this belt entirely, on every
+transport, including MCP itself — is unaffected by this change.
+
+**Who this affects.** Any integration that mints MCP-tiered bearer tokens (readonly/operator/
+supervised) and calls the JSON `/api/v1/result-sets*` routes or the dashboard fragments directly,
+rather than going through `/mcp/v1/`. A `readonly`- or `operator`-tier caller that previously
+reached create/pin/unpin/delete on their own result sets via REST now gets `403`
+(`"MCP token tier does not allow Infrastructure:Write"` or `:Delete`). A `supervised`-tier caller
+deleting via REST now gets `403` with a `remediation` pointing at the MCP ticket-then-recall
+flow, instead of succeeding directly. A `supervised`-tier caller's create/pin/unpin is unaffected
+(never approval-gated at any tier). An untiered caller (a plain cookie session, or an API token
+minted with no `mcp_tier`) sees no behavior change. See [rest-api.md](rest-api.md)'s per-route
+Errors tables for the exact new status codes.
+
 ### vNEXT — `POST /api/policies/{id}/evaluate` and `/remediate` can now answer `503` where they previously answered `409`/`400` (#4981; breaking)
 
 **What changed.** Both routes previously classified a degraded scope evaluation — a `from_result_set:`

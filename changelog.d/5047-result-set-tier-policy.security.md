@@ -1,4 +1,4 @@
-- **Fixed — result-set write routes could no longer bypass the MCP tier/approval belt by
+- **Breaking — result-set write routes can no longer bypass the MCP tier/approval belt by
   switching transports (#5047).** `create`/`pin`/`unpin`/`delete_result_set` have no RBAC
   securable of their own (ownership-scoped by design, unchanged — see
   `docs/user-manual/rbac.md`'s new "Not RBAC-gated: per-operator result sets" section), but an
@@ -8,4 +8,8 @@
   `require_permission`, same tier/approval logic, no behavior change there) now also runs on all
   8 of those write sites, closing the cross-transport gap for tiered callers — an untiered
   caller (plain RBAC session, or an API token minted with no `mcp_tier`) is unaffected, which
-  stays the separate, already-tracked #4309 design question.
+  stays the separate, already-tracked #4309 design question. See `docs/user-manual/server-admin.md`
+  "Upgrade Notes" for who this affects and the new REST error shapes.
+  Ships without an API version bump under the security carve-out in
+  `docs/api-versioning-policy.md` (minimal tightening closing the cited cross-transport bypass;
+  ownership-scoping and every other behavior are unchanged).

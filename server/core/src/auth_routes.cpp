@@ -720,7 +720,11 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // a token cannot bypass the tier by switching endpoints. Extracted to
     // `require_tier_policy` (#5047) so a non-RBAC-gated route (e.g. the
     // result-set write routes, owner-scoped only) can apply the SAME belt.
-    if (!require_tier_policy(req, res, *session, securable_type, operation))
+    // true: this path is RBAC-gated (the caller reached here via
+    // require_permission), so holding securable_type:operation WOULD admit
+    // the caller -- naming it in a denial is accurate, not a false claim.
+    if (!require_tier_policy(req, res, *session, securable_type, operation,
+                             /*actionable_permission=*/true))
         return false;
 
     // Service-scoped tokens (PR 3 — the flip, #2298 durable fix): ITServiceOwner
@@ -882,12 +886,25 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // ONLY when holding it would actually admit the caller (clause 5,
         // docs/auth-architecture.md) — a gate-less caller (actionable_permission
         // == false) gets the message without the field, since no RBAC grant
-        // here would self-remediate the denial.
+        // here would self-remediate the denial. That caller instead gets a
+        // `.remediation` string naming the actual fix (a higher MCP tier),
+        // so the response isn't just "not X" with no next step (#5047
+        // governance fix round — an integration hitting this cold otherwise
+        // has nothing but the bare label to go on).
         const std::string perm = securable_type + ":" + operation;
+        // Named local, not a temporary embedded in the initializer below —
+        // same reasoning as `perm` itself: its lifetime must cover the
+        // synchronous `a4_denial` call this same statement makes.
+        const std::string gateless_remediation =
+            "this operation requires a higher MCP token tier; " + perm +
+            " is a tier-bucketing label here, not an RBAC grant, and cannot be requested or "
+            "self-remediated";
         res.set_content(
-            detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
-                              actionable_permission ? detail::A4ErrorOpts{.permission = perm}
-                                                    : detail::A4ErrorOpts{}),
+            detail::a4_denial(
+                res, 403, "MCP token tier does not allow " + perm,
+                actionable_permission
+                    ? detail::A4ErrorOpts{.permission = perm}
+                    : detail::A4ErrorOpts{.remediation = gateless_remediation}),
             "application/json");
         return false;
     }
@@ -923,6 +940,15 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         return false;
     }
     return true;
+}
+
+TierPolicyFn AuthRoutes::gateless_tier_policy_fn() {
+    return [this](const httplib::Request& req, httplib::Response& res,
+                  const auth::Session& session, const std::string& securable_type,
+                  const std::string& operation) -> bool {
+        return require_tier_policy(req, res, session, securable_type, operation,
+                                   /*actionable_permission=*/false);
+    };
 }
 
 bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,

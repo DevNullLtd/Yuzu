@@ -47,6 +47,11 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         if (deps.tier_policy_fn)
             return deps.tier_policy_fn(req, res, session, securable_type, operation);
         if (!session.mcp_tier.empty()) {
+            // Same rule as the REST twin (rest_api_v1.cpp): a degraded
+            // security control must leave an evidence trail, not just a
+            // test-covered response (#5047 governance fix round).
+            deps.audit_fn(req, "result_set.tier_policy_unavailable", "failure", "ResultSet", "",
+                          "tier-policy check misconfigured (unwired TierPolicyFn)");
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"tier-policy check misconfigured"}})",

@@ -187,19 +187,39 @@ public:
     /// transports (MCP JSON-RPC and REST API) so a token cannot bypass the
     /// tier by switching endpoints" (#520) — this method IS that promise,
     /// callable from a route that isn't RBAC-gated at all.
-    /// `actionable_permission` (default `true`, preserving `require_permission`'s
-    /// own call unchanged) controls whether a denial's A4 body names
+    /// `actionable_permission` controls whether a denial's A4 body names
     /// `securable_type:operation` in the structured `.permission` field.
     /// docs/auth-architecture.md's service-scope clause 5 (MUST, CATASTROPHIC)
     /// forbids naming a `.permission` a denial would not, by itself, admit the
     /// caller with -- true on an RBAC-gated route (holding the grant WOULD
     /// admit them), false on a gate-less route like the result-set family
     /// (there is no RBAC check to admit against; `securable_type`/`operation`
-    /// here are borrowed tier-bucketing labels, not a real securable). Pass
-    /// `false` from any NEW caller with no RBAC gate of its own.
+    /// here are borrowed tier-bucketing labels, not a real securable).
+    ///
+    /// DELIBERATELY NO DEFAULT VALUE (#5047 governance fix round, mirrors
+    /// `rbac_admin_predicate.hpp`'s `RbacAdminSurface` precedent for the
+    /// same reason): a silent default is exactly how the ORIGINAL clause-5
+    /// violation this parameter exists to prevent shipped in the first
+    /// place, and a defaulted bool gives a future 9th gate-less caller a
+    /// way to inherit `true` by omission with no compiler signal. Every
+    /// caller, including `require_permission`'s own (which passes `true`
+    /// explicitly, since its callers ARE RBAC-gated and the grant WOULD
+    /// admit them), must state its intent.
     bool require_tier_policy(const httplib::Request& req, httplib::Response& res,
                              const auth::Session& session, const std::string& securable_type,
-                             const std::string& operation, bool actionable_permission = true);
+                             const std::string& operation, bool actionable_permission);
+
+    /// The SOLE production factory for a gate-less-route `TierPolicyFn` (#5047
+    /// governance fix round). Returns a callable that invokes
+    /// `require_tier_policy(..., /*actionable_permission=*/false)` — both
+    /// `server.cpp` wiring sites (REST + dashboard fragments) call this
+    /// SAME function rather than each writing its own near-identical
+    /// lambda, so there is exactly one place a future reviewer needs to
+    /// check for clause-5 compliance, and a unit test can exercise the
+    /// REAL production callable directly (see test_auth_routes.cpp) rather
+    /// than a hand-rolled test double that can drift from what `server.cpp`
+    /// actually wires.
+    TierPolicyFn gateless_tier_policy_fn();
 
     /// Scoped RBAC-aware permission check for device-specific operations.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
