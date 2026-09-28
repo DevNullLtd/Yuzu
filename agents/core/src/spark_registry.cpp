@@ -649,16 +649,20 @@ public:
             // Publish the inertness: without this the mechanism stays REGISTERED and
             // reports byte-identically to a healthy idle one on the heartbeat, so the
             // fleet sees a registry capability that can never watch anything
-            // (governance Gate-3 cross-platform / Gate-6 sre).
-            inert_.store(true, std::memory_order_release);
+            // (governance Gate-3 cross-platform / Gate-6 sre). BOOT-TIME (#4685):
+            // CreateThreadpool failing means every watch() is refused.
+            boot_inert_.store(true, std::memory_order_release);
             return;
         }
         // #1907 condition 2: a pinned PRIVATE pool, bounded min=2/max=4 — the
         // watch count, not the thread count, is what scales.
-        // Symmetric with spark_file.cpp: clear inert on the SUCCESS path too, or a
-        // failed-then-successful start() would report a working mechanism as inert forever
-        // and silently drop it from the capability CSV (governance Gate-3 cpp-expert).
-        inert_.store(false, std::memory_order_release);
+        // Symmetric with spark_file.cpp: clear BOTH flags on the SUCCESS path too
+        // (#4685) - a failed-then-successful start() would otherwise report a working
+        // mechanism as inert forever and silently drop it from the capability CSV
+        // (governance Gate-3 cpp-expert), and a restart after a runtime-degraded
+        // episode must boot clean.
+        boot_inert_.store(false, std::memory_order_release);
+        degraded_.store(false, std::memory_order_release);
         ::SetThreadpoolThreadMinimum(core->pool, 2);
         ::SetThreadpoolThreadMaximum(core->pool, 4);
         ::InitializeThreadpoolEnvironment(&core->env);
@@ -988,14 +992,22 @@ public:
         sweep_cursor_.clear();
     }
 
+    /// Each atomic read exactly ONCE into a local here (#4685 / governance Gate-8
+    /// risk-7): `.inert` and `.boot_inert` are then both derived from those SAME two
+    /// reads, so the `boot_inert => inert` implication holds within this one returned
+    /// snapshot without a lock or a cross-field runtime assert across
+    /// independently-sampled atomics.
     [[nodiscard]] SparkMechanismStats stats() const override {
+        const bool boot = boot_inert_.load(std::memory_order_acquire);
+        const bool degraded = degraded_.load(std::memory_order_acquire);
         return {
             .retiring = retiring_gauge_.load(std::memory_order_relaxed),
             .retiring_cap = retiring_cap(),
             .watch_rejected_total = watch_rejected_.load(std::memory_order_relaxed),
             .quarantined_total = quarantined_.load(std::memory_order_relaxed),
             .slow_op_total = slow_op_.load(std::memory_order_relaxed),
-            .inert = inert_.load(std::memory_order_acquire),
+            .inert = boot || degraded,
+            .boot_inert = boot,
         };
     }
 
@@ -1941,8 +1953,10 @@ private:
                     po.recovered = true;
                     po.failures = failures;
                     failures = 0;
+                    // RUNTIME half only (#4685) - never boot_inert_, which start() alone
+                    // writes.
                     if (core_)
-                        inert_.store(false, std::memory_order_release);
+                        degraded_.store(false, std::memory_order_release);
                 }
                 lk.unlock();
                 log_pass_outcome(po); // #4704: off mu_ - see PassOutcome
@@ -1955,11 +1969,13 @@ private:
             sweep_pass_failed_.fetch_add(1, std::memory_order_relaxed);
             ++failures;
             const auto delay = doubled(sweep_cadence(), failures, kRegAdmissionBackoffCap);
+            // #4685: RUNTIME half only - degraded_, never boot_inert_ (start() alone writes
+            // that one). #4704: constructed here, logged off-lock via PassOutcome below.
             PassOutcome po;
             po.failures = failures;
             po.delay_ms = delay.count();
-            if (failures >= kSweeperInertAfterFailures && !inert_.load(std::memory_order_acquire)) {
-                inert_.store(true, std::memory_order_release);
+            if (failures >= kSweeperInertAfterFailures && !degraded_.load(std::memory_order_acquire)) {
+                degraded_.store(true, std::memory_order_release);
                 po.flipped_inert = true;
             }
             lk.unlock();
@@ -2094,12 +2110,17 @@ private:
     SparkDetachedLane probe_lane_;
     SparkDetachedLane drain_lane_;
 
-    /// Started, but the mechanism cannot service watches: CreateThreadpool failed
-    /// (every watch() refused), or the sweeper has failed kSweeperInertAfterFailures
-    /// passes in a row (no late commit, no health edge would be produced). Cleared
-    /// by a successful start() and by the first successful pass after failures.
-    /// Atomic so stats() (const, heartbeat thread) reads it without mu_.
-    std::atomic<bool> inert_{false};
+    /// BOOT-TIME (#4685): CreateThreadpool failed at start() - every watch() is
+    /// refused. Cleared only by a successful start(). Atomic so stats() (const,
+    /// heartbeat thread) reads it without mu_.
+    std::atomic<bool> boot_inert_{false};
+    /// RUNTIME (#4685): the sweeper has failed kSweeperInertAfterFailures passes in a
+    /// row (no late commit, no health edge would be produced), but watch() is still
+    /// accepted - the obligation is served once a pass next succeeds. Cleared by the
+    /// first successful pass after failures, and by a successful start() (a restart
+    /// must boot clean). Atomic so stats() (const, heartbeat thread) reads it without
+    /// mu_.
+    std::atomic<bool> degraded_{false};
     std::atomic<std::uint64_t> retiring_gauge_{0};
     std::atomic<std::uint64_t> watch_rejected_{0};
     std::atomic<std::uint64_t> quarantined_{0};

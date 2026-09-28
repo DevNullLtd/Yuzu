@@ -71,7 +71,16 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    # A here-string, not `echo "$haystack" | grep -q "$needle"`: that pipeline can
+    # spuriously report no-match under `set -o pipefail` when the needle is found
+    # early in a large multi-line haystack — grep(1) exits the instant it matches,
+    # closing the pipe while echo(1) is still mid-write of the remaining bytes,
+    # SIGPIPE kills echo, and pipefail surfaces THAT non-zero exit rather than
+    # grep's success (this exact failure was already hand-worked-around once, at
+    # the openapi.json check below, but every other large-body assert_contains
+    # call site — e.g. GET /metrics — stayed exposed). A here-string has no writer
+    # process to SIGPIPE.
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"

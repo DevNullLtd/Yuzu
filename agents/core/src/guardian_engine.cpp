@@ -1804,6 +1804,11 @@ std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
     return last_rearm_degrade_message_for_test_;
 }
 
+GuardianEngine::UnsupportedLogRecord GuardianEngine::last_unsupported_log_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_unsupported_log_for_test_;
+}
+
 std::string GuardianEngine::last_file_expected_hash_for_test() const {
     std::lock_guard lock(mtx_);
     return last_file_expected_hash_for_test_;
@@ -2429,15 +2434,26 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
 
     const bool try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available;
     if (try_spark) {
-        // Capability set: registered AND functional (non-inert) mechanisms
-        // only - mirrors spark_heartbeat.hpp's own inert-filtering exactly,
-        // so a mechanism that started but could not bind its OS facility is
-        // never misclassified as armable (Sol's rev-2 review).
+        // Capability set: registered AND ARMABLE (not boot-inert) mechanisms (#4685) -
+        // NOT spark_heartbeat.hpp's own inert-filtering, which excludes the UNION of
+        // boot-inert and runtime-degraded. A mechanism mid a TRANSIENT runtime-degraded
+        // episode (Registry's sweeper / File's worker, three consecutive failed passes)
+        // still accepts watch() and serves it once a pass next succeeds, so it must stay
+        // armable here - filtering it out would strand every rule of that type
+        // Unsupported for the whole episode with nothing to proactively re-reconcile on
+        // recovery (the bug this fixes). Only a mechanism that could not bind its OS
+        // facility at start() (every watch() refused) is excluded. `registered` tracks
+        // every type this engine has ANY mechanism for, regardless of boot_inert - it
+        // backs the Unsupported-branch log split below (never-registered vs
+        // registered-but-boot-inert).
         std::set<SparkType> supported;
+        std::set<SparkType> registered;
         if (spark_engine_)
-            for (const auto& [type, ms] : spark_engine_->stats_by_type())
-                if (!ms.inert)
+            for (const auto& [type, ms] : spark_engine_->stats_by_type()) {
+                registered.insert(type);
+                if (!ms.boot_inert)
                     supported.insert(type);
+            }
         const RulePlacement placement = classify(rule.spark().type(), supported);
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
@@ -2509,13 +2525,15 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             return ReconcileOutcome::Inert;
         }
         // placement == Unsupported (F7, #2298 rung 2 / design doc §R2 + §Platform-
-        // rejection): a known spark type with NO mechanism registered on this host.
-        // A distinct terminal state now, not a legacy fallback - withdraw from BOTH
-        // backends and record it. Enforcement is unchanged from before F7 for the
-        // common off-Windows File/Registry case (legacy already no-ops there); what
+        // rejection): a known spark type with NO mechanism registered on this host, OR
+        // one that is registered but BOOT-INERT (#4685) - a TRANSIENT runtime-degraded
+        // mechanism is EXCLUDED from this branch (it stays armable, see the capability
+        // set above). A distinct terminal state now, not a legacy fallback - withdraw
+        // from BOTH backends and record it. Enforcement is unchanged from before F7 for
+        // the common off-Windows File/Registry case (legacy already no-ops there); what
         // changes is reporting. That is NOT a universal guarantee, though:
-        // classify() keys off the REGISTERED-AND-NON-INERT capability set above, so
-        // a registration failure or a registered-but-inert mechanism can also land a
+        // classify() keys off the REGISTERED-AND-ARMABLE capability set above, so a
+        // registration failure or a registered-but-boot-inert mechanism can also land a
         // rule here on a platform where legacy might otherwise have worked. Fleet-loud
         // via mech_unsupported_total (rungs 2-3); per-rule REST/MCP surfacing is rung
         // 4 - get_status() is deliberately untouched here.
@@ -2534,11 +2552,31 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             auto it = unsupported_rules_.find(rule.rule_id());
             const bool changed = (it == unsupported_rules_.end()) || (it->second != *type);
             unsupported_rules_[rule.rule_id()] = *type;
-            if (changed) // log only on a genuine edge (new, or a different type than before)
-                spdlog::info("Guardian: rule '{}' classified unsupported ({} has no "
-                             "mechanism on this host) - enforced by neither backend, "
-                             "a routine cross-platform gap, not an error",
-                             log_id_token(rule.rule_id()), rule.spark().type());
+            if (changed) { // log only on a genuine edge (new, or a different type than before)
+                ++last_unsupported_log_for_test_.edge_count;
+                last_unsupported_log_for_test_.rule_id = rule.rule_id();
+                last_unsupported_log_for_test_.type = *type;
+                if (registered.contains(*type)) {
+                    // Registered but boot-inert (#4685): start() could not bind this
+                    // mechanism's OS facility, so every watch() is refused - a real host
+                    // capability was expected and did not come up, distinct from "no
+                    // mechanism on this host at all" below. Loud (warn), never emitted
+                    // for a merely runtime-degraded episode (that mechanism stays in
+                    // `supported` above and never reaches this branch at all).
+                    last_unsupported_log_for_test_.level = UnsupportedLogLevel::Warn;
+                    spdlog::warn("Guardian: rule '{}' classified unsupported ({} is "
+                                 "registered but initialisation refused at start() "
+                                 "(boot-inert)) - enforced by neither backend until the "
+                                 "agent restarts",
+                                 log_id_token(rule.rule_id()), rule.spark().type());
+                } else {
+                    last_unsupported_log_for_test_.level = UnsupportedLogLevel::Info;
+                    spdlog::info("Guardian: rule '{}' classified unsupported ({} has no "
+                                 "mechanism on this host) - enforced by neither backend, "
+                                 "a routine cross-platform gap, not an error",
+                                 log_id_token(rule.rule_id()), rule.spark().type());
+                }
+            }
         }
         return ReconcileOutcome::Inert; // pinned: "an all-unsupported push still advances
                                         // policy_generation" (test_guardian_engine_spark_reconcile.cpp)

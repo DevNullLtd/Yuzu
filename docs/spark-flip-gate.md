@@ -1685,17 +1685,43 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (g)(1) of `docs/spark-stage2-guardian-consumer-design.md` and in the operator manual. `inert`
   is reached about 150 ms of backoff after the first failure at the default cadence (R5.7 (g)(4)),
   so once Spark is live an episode does not need to be long to open the window.
-- Owner: unassigned; until #4685 is picked up, the author of the PR-5 (F14 flip) change, as for
-  #4665.
-- Milestone: #4685 itself; no PR slot assigned yet.
-- Revisit trigger: before the F14 flip. **Not risk-accepted** - #4685 is a real, filed, open
-  defect and remains a gating item for the flip until it is fixed or closed; this entry records
-  the disclosure and the compensating control only. Severity as the #4658 governance ledger
-  records it (`gap-a-guardian-no-rereconcile`): LOW for the #4658 merge, because while
-  `prefer_spark_` is false the wrong outcome (rules enforced by neither backend) cannot occur in
-  a shipped build; HIGH and blocking at the F14 flip, when that protection lapses. The ledger's
-  impact, exposure and severity codes are defined under "Severity - DERIVE it, do not choose it"
-  in `.claude/skills/governance/SKILL.md`.
+- **CONFIRMED and FIXED, branch `fix/4685-guardian-boot-inert-split` (not yet merged to `dev` as
+  of this entry).** `SparkMechanismStats` gained an additive `boot_inert` field (declared after
+  `inert` for designated-initializer order): TRUE only for the BOOT-TIME case (`start()` could not
+  bind the mechanism's OS facility, every `watch()` refused), FALSE for a TRANSIENT
+  runtime-degraded episode (Registry's sweeper / File's worker, three consecutive failed passes).
+  `spark_file.cpp`/`spark_registry.cpp` split their single `inert_` atomic into `boot_inert_`
+  (written only by `start()`) and `degraded_` (written only by the runtime worker/sweeper),
+  deriving both `SparkMechanismStats` fields from one pair of local reads in `stats()`;
+  `spark_service.cpp` (no runtime-inert concept) reports `.boot_inert` as the same atomic as
+  `.inert`. `guardian_engine.cpp`'s `reconcile_rule_locked` now builds its capability set from
+  `!ms.boot_inert` instead of `!ms.inert`, so a rule reconciled during a runtime-degraded episode
+  Arms (the runtime reports it Committed, `subscription_establishment()` reports `coverage ==
+  None` until the mechanism's next successful pass) instead of landing `Unsupported` - closing
+  exactly the "nothing re-reconciles when `inert` clears" gap this entry's Detection
+  signal/Operator action/Compensating control bullets above describe. The Unsupported branch's own
+  log line now distinguishes the two remaining causes: `warn` for "registered but initialisation
+  refused at start() (boot-inert)", the existing `info` for "no mechanism on this host at all" -
+  `guardian_spark_bridge.hpp`'s `classify()` doc comment and `RulePlacement::Unsupported`'s own
+  comment are rewritten to match (the pre-fix wording claimed the capability filter "mirrors the
+  heartbeat's own inert-filtering exactly", which is now the defect this fix closes, not an
+  accurate description). `boot_inert` stays agent-local only - it is never serialised onto the
+  wire or into the heartbeat, so the fleet-level query and the promtool fixtures in this entry's
+  Detection signal bullet remain accurate as a description of the REMAINING (boot-inert-only)
+  case, and the per-mechanism alert this entry's Detection signal bullet says is missing (tracked
+  in #2084) is still missing - this fix adds no new telemetry. Registry parity for every test.
+- Owner: fixed ahead of PR-5 by the author of the #4685 fix series, not deferred to the PR-5 (F14
+  flip) author as this entry originally assumed.
+- Milestone: #4685 itself - fix landed on `fix/4685-guardian-boot-inert-split`; merge to `dev`
+  still pending as of this entry.
+- Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer
+  blocked by this entry once the branch above merges. What changed: the pre-fix "capability set
+  keys off the UNION `inert`" defect (Detection signal/Operator action/Compensating control above)
+  is fixed by the additive `boot_inert` split described in the paragraph above - a runtime-degraded
+  episode no longer strands a rule `Unsupported` with nothing to re-reconcile it on recovery. The
+  severity the #4658 governance ledger recorded (`gap-a-guardian-no-rereconcile`, LOW while
+  `prefer_spark_` is false, HIGH and blocking at the F14 flip) no longer applies once this fix
+  lands, since the wrong outcome it described can no longer occur regardless of `prefer_spark_`.
 
 **#4704** (File worker / Registry sweeper: a blocked log sink stalls the mechanism thread - on
 Registry while holding `mu_`; found by #4658's governance run)
@@ -1714,8 +1740,8 @@ Registry while holding `mu_`; found by #4658's governance run)
   (allocation failure) with something due, which an observe-only engine with no watches never
   has. The pre-fix window in a shipped build was therefore effectively zero; at the F14 flip it
   would have opened at every runtime-inert episode, which is why this gated the flip.
-- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, open,
-  not yet merged - `<sha>`/`<date>` filled at merge).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
+- **CONFIRMED and FIXED, PR #5004 (branch `fix/spark-4704-registry-sweeper-log-off-lock`, merged
+  `063885c9e`, 2026-09-27).** Ruled 2026-09-24 (Dave, on the issue): fix at minimum scope, mirroring
   File's shipped #4658 shape, not the shared-async-primitive option. `sweeper_main()` now
   captures a value `PassOutcome` (failure count, backoff ms, flipped-inert, recovered) under
   `mu_`, releases the lock on the branch's existing unlock, and writes the line through a
@@ -1964,13 +1990,15 @@ driver.
 
 **NEW precondition for the F14 flip (added 2026-09-21, from the #4658 File worker governance run):
 #4685 (Guardian rules classified Unsupported during a runtime-inert File or Registry episode are
-not re-reconciled on recovery) must be fixed or closed first; see its section 5 entry. The
+not re-reconciled on recovery) is now SATISFIED - fixed on `fix/4685-guardian-boot-inert-split`
+(the additive `boot_inert` field, `guardian_engine.cpp`'s capability filter narrowed to
+`!boot_inert`); see its section 5 entry, now closed. The
 per-mechanism fleet alert tracked in #2084 must ship before the flip as well; it is an episode
 detector, not a stuck-state detector (its `for:` hold means it does not see an episode shorter than
 the hold, and short episodes are the ones that leave rules stuck), and this entry tracks no alert
 on the section 5 query. #4704 (a blocked log sink stalled the Registry sweeper WHILE IT HELD
 `mu_`, so `arm()`/`disarm()` on that mechanism stalled with it; File's equivalent lines were
-already off-lock) is FIXED (PR #5004, open - `<sha>` filled at merge): both mechanisms now write their pass-outcome
+already off-lock) is FIXED (PR #5004, merged `063885c9e`): both mechanisms now write their pass-outcome
 lines off-lock, see the section 5 entry. What remains is the shared, disclosed limit that a
 stalled sink stalls the worker's own loop, bounded only on shutdown (R5.7 (g)(4)) - plus the
 residual per-key warn sites named in #4999 (Registry) and #5002 (File, untracked mirror,

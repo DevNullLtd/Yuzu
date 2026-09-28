@@ -1306,6 +1306,7 @@ if build_server
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
+      'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery

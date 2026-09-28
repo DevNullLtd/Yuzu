@@ -69,7 +69,7 @@ history:
     written before #4658 landed on this branch, narrowed the check to Registry-only and
     contradicted them — caught and fixed in adversarial review before merge, see the counter
     rule's `pass_failed` fix too).
-  - 2026-09-XX - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
+  - 2026-09-27 - #4704, R5.7 (g)(4) - the Registry sweeper's three pass-outcome lines (`pass
     failed`, `failing persistently`, `pass recovered`) now use File's `PassOutcome` /
     `log_pass_outcome()` shape and are written after `mu_` is released (they ran under `mu_`
     before, stalling `arm()`/`disarm()` on a blocked sink). (g)(4)'s blocked-sink bullet
@@ -78,7 +78,7 @@ history:
     deadline-stamp bullet gains the matching clause. The operator manual's "Diagnosing an inert
     File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
     gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
-    fixed. PR #5004 (open, not yet merged), full `/governance` (Spark row).
+    fixed. PR #5004, merged `063885c9e`, full `/governance` (Spark row).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -216,10 +216,13 @@ Verified safe to change now:
   inspection, the one documented inert case shows no delta - legacy fails identically
   there too - but the guarantee is narrower than this bullet's original wording
   implied). A runtime-inert File worker or Registry sweeper (R5.7 (b)/(g), #4658) is a
-  second inert case and it DOES show a delta: the legacy File guard does not depend on
-  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode is
-  classified `Unsupported` and stays disarmed after recovery until the next reconcile or
-  restart (R5.7 (g)(1)).
+  second inert case, and PRE-#4685 it DID show a delta: the legacy File guard does not depend on
+  Spark's `inert`, while under `prefer_spark_` a rule reconciled during the episode was
+  classified `Unsupported` and stayed disarmed after recovery until the next reconcile or
+  restart (R5.7 (g)(1)). **FIXED (#4685):** Guardian's capability filter now keys off the
+  additive `boot_inert` field rather than the union `inert`, so a rule reconciled during a
+  transient runtime-degraded episode stays Arm/Committed instead - the delta this bullet used to
+  document no longer exists for that case.
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.
@@ -1397,29 +1400,38 @@ cap), logs at failures 1, 2, 4, 8, ... and flips `inert` after three consecutive
 clearing on the next success. Two residuals remain: a real directory notification during an
 episode still runs a (failing) pass, so the pass rate is bounded by the kernel's notification rate
 rather than the backoff; and a single poison obligation fails the whole pass, starving the others
-until it clears (same as Registry). A third, the Guardian re-reconcile gap, is KNOWN and open
-(#4685). The list below sets out that gap, the contract a consumer of `inert` needs and two
-further recorded limits.
+until it clears (same as Registry). A third, the Guardian re-reconcile gap, was tracked as open
+and is now FIXED (#4685, see (g)(1) below). The list below sets out the fix, the contract a
+consumer of `inert` needs and two further recorded limits.
 
 **R5.7 (g), continued: the File worker-failure contract (#4658).**
 
-1. KNOWN open gap, a precondition for the F14 flip. Tracked as issue #4685, with an entry in the
-   flip-gate risk-accept register (`docs/spark-flip-gate.md` section 5). While File is
-   runtime-inert, a Guardian reconcile (a full-sync policy push, for example) builds its capability
-   set without File (`GuardianEngine::reconcile_rule_locked()`), so `classify()` places every File
-   rule it touches `Unsupported`. That branch (`RulePlacement::Unsupported`) also DETACHES a rule
-   already armed through Spark and withdraws its legacy guard, and a full sync tears both backends
-   down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in `apply_rules()`).
-   Live File rules are therefore disarmed for the episode. Clearing `inert` notifies no consumer, so
-   they stay disarmed (enforced by neither backend, recorded in `unsupported_rules_`) until the next
-   reconcile or an agent restart. Dormant while `prefer_spark_` is false. A Registry sweeper flip
-   has the same shape and predates #4658. `guardian_engine.cpp` is unchanged by #4658, so it is
-   cited by symbol.
+1. **FIXED (#4685).** While File is runtime-inert, a Guardian reconcile (a full-sync policy push,
+   for example) used to build its capability set from the UNION `inert` bit
+   (`GuardianEngine::reconcile_rule_locked()`), so `classify()` placed every File rule it touched
+   `Unsupported` for the whole episode. That branch (`RulePlacement::Unsupported`) also DETACHES a
+   rule already armed through Spark and withdraws its legacy guard, and a full sync tears both
+   backends down first (`stop_all_guards_locked()` and `spark_runtime_->detach_all()` in
+   `apply_rules()`), so live File rules were disarmed for the episode and clearing `inert` notified
+   no consumer - they stayed disarmed (enforced by neither backend, recorded in
+   `unsupported_rules_`) until the next reconcile or an agent restart. The fix adds an additive
+   `boot_inert` field to `SparkMechanismStats` (see (2) below) and moves Guardian's capability
+   filter onto `!boot_inert` instead of `!inert`: a mechanism mid a transient runtime-degraded
+   episode now stays in the capability set, so it Arms (not Unsupported) and the runtime's own
+   `subscription_establishment()` overlay (already reading the union `inert`, untouched by this
+   fix) reports `coverage == None` for the episode's duration and recovers on the mechanism's next
+   successful pass with no push or restart needed. A Registry sweeper flip has the same shape and
+   the same fix (predates #4658, R5.7 (b)). The flip-gate risk-accept register entry
+   (`docs/spark-flip-gate.md` section 5) is closed, not deleted.
 2. `inert` is a polled bit, not an event. Read it through `stats_by_type()`: it is not latched,
    nothing announces a flip or a clear, and a heartbeat only sees an episode it happens to sample.
-   `SparkMechanismStats` cannot tell a boot-time inert (`start()` could not bind its OS facility,
-   so every `watch()` is refused) from a runtime one (watches are accepted but cannot be served
-   until a pass succeeds).
+   `SparkMechanismStats` now DOES tell a boot-time inert (`start()` could not bind its OS facility,
+   so every `watch()` is refused) apart from a runtime one (watches are accepted but cannot be
+   served until a pass succeeds) - told apart via the additive `boot_inert` field (#4685), which is
+   TRUE only for the boot-time case. `inert` itself is unchanged: still the polled union both
+   `emit_spark_heartbeat_tags` (the CSV) and `subscription_establishment()`'s coverage overlay read,
+   since either kind of gap means "not currently serviceable" for their purposes; only Guardian's
+   own capability filter narrows to `!boot_inert`.
 3. File and Registry differ:
    - Retry wake. File's wake IS its retry: an open episode always has a retry scheduled, at the
      backoff deadline or at once if that deadline has already passed, so an otherwise idle worker
@@ -1432,10 +1444,10 @@ further recorded limits.
      pass-outcome line, then `SweepWork` destruction).
    - Completion passes. A File pass run for a real IOCP completion counts toward the three
      failures and is never throttled or absorbed; a successful one ends the episode.
-   - Clearing `inert`. File clears it on the first successful pass with no equivalent of
+   - Clearing `degraded_`. File clears it on the first successful pass with no equivalent of
      Registry's `if (core_)` check (Registry clears it only while its thread pool exists). The
-     File worker is the only writer of `inert` while it runs, so a recovery cannot clear a
-     boot-time inert.
+     File worker is the only writer of `degraded_` while it runs (`boot_inert_` is written only
+     by `start()`, #4685), so a recovery pass cannot clear a boot-time `boot_inert_`.
 4. Latency and limits, at the default 50 ms cadence:
    - `inert` flips after three consecutive failed passes, about 150 ms of backoff (50 ms, then
      100 ms) after the first failure, and clears at the next successful pass. After the cause is
@@ -1463,9 +1475,9 @@ further recorded limits.
      `run()`'s teardown, ends in `hard_exit(4)` rather than an indefinite hang). Since #4704 the
      two mechanisms share one shape for their pass-outcome lines (`pass failed`, `failing
      persistently`, `pass recovered`): each is written OFF `mu_`, after the pass's bookkeeping
-     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2928-2943`), called
-     after `lk.unlock()` at `:3303-3304` and `:3358-3359`. Registry: its own `PassOutcome` /
-     `log_pass_outcome()` (`spark_registry.cpp:1888-1903`), called after the `lk.unlock()` on
+     has released the lock. File: `log_pass_outcome()` (`spark_file.cpp:2941-2956`), called
+     after `lk.unlock()` at `:3316-3317` and `:3371-3372`. Registry: its own `PassOutcome` /
+     `log_pass_outcome()` (`spark_registry.cpp:1883-1912`), called after the `lk.unlock()` on
      each of `sweeper_main()`'s two branches (recovery, and failure with the inert transition).
      Before #4704 those three Registry lines ran while `mu_` was held, so a stalled sink there
      also stalled every other `mu_` caller (`arm()`, `disarm()`, `apply_test_controls()`), a
@@ -1490,8 +1502,11 @@ further recorded limits.
    signals are the log lines `spark_file: worker pass failed (consecutive #N) - retrying in M ms`,
    `spark_file: worker failing persistently - file sparks reported inert until a pass succeeds`
    and `spark_file: worker pass recovered after N failure(s)`, and the exclusion of `file` from
-   `yuzu.spark_mechs`. The fleet series cannot tell a boot-time inert from a runtime one, and no
-   alert on `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
+   `yuzu.spark_mechs`. The fleet series STILL cannot tell a boot-time inert from a runtime one even
+   after #4685: `boot_inert` is agent-local only (Guardian's own in-process capability filter),
+   never serialised onto the wire or into the heartbeat - this fix does not give fleet telemetry a
+   way to distinguish startup refusal from runtime degradation - and no alert on
+   `yuzu_fleet_spark_mechanisms` ships today. A per-OS, per-mechanism alert is an F14
    precondition: it needs a `for:` hold of at least two heartbeats so a self-clearing episode does
    not fire it, a paging alert wants at least 10 minutes, tuned on fleet data, and it compares
    `_reporting` with the one mechanism's series, not the sum over mechanisms (see

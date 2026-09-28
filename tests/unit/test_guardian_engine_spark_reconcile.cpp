@@ -22,6 +22,7 @@
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::set_detach_fault_for_test (rung 9c PR-2 Unit 6 test (b))
 #include "shutdown_deadline_guard.hpp" // #2233 item 3 ("S+") wedge-pattern test
 #include "spark_engine.hpp"
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags (#4685 AC8)
 #include "spark_mechanism.hpp"
 
 #include "test_helpers.hpp"
@@ -63,6 +64,9 @@
 
 namespace fs = std::filesystem;
 namespace gpb = ::yuzu::guardian::v1;
+using yuzu::agent::emit_spark_heartbeat_tags; // #4685 AC8
+using yuzu::agent::FileMechanismTestControls; // #4685 AC2 (Windows-only real-mechanism test)
+using yuzu::agent::FileSparkParams;           // #4685 AC2/AC7 raw-consumer spec
 using yuzu::agent::GuardianEngine;
 using yuzu::agent::ISparkMechanism;
 using yuzu::agent::KvStore;
@@ -70,14 +74,20 @@ using yuzu::agent::make_file_mechanism;
 using yuzu::agent::make_registry_mechanism;
 using yuzu::agent::make_service_mechanism;
 using yuzu::agent::OutboxEntry;
+using yuzu::agent::RegistryMechanismTestControls; // #4685 AC3 (Windows-only real-mechanism test)
+using yuzu::agent::RegistrySparkParams;            // #4685 AC3 raw-consumer spec
 using yuzu::agent::SendResult;
+using yuzu::agent::set_file_test_controls_for_test;     // #4685 AC2
+using yuzu::agent::set_registry_test_controls_for_test; // #4685 AC3
 using yuzu::agent::ServiceSparkParams; // #2818 pin: the raw sibling's spec
 using yuzu::agent::SparkData;
 using yuzu::agent::SparkEmitFn;
 using yuzu::agent::SparkEngine;
 using yuzu::agent::SparkEvent; // #2818 pin: the raw sibling's queued handler
 using yuzu::agent::SparkFaultFn;
+using yuzu::agent::SparkMechanismStats; // #4685
 using yuzu::agent::SparkParams;
+using yuzu::agent::spark_type_token; // #4685 AC8
 using yuzu::agent::SparkSpec; // #2818 pin
 using yuzu::agent::SparkType;
 
@@ -224,6 +234,19 @@ public:
         watched_.erase(key);
     }
     void stop() override {}
+    /// #4685: drives Guardian's capability-set inputs directly - both default false,
+    /// matching SparkMechanismStats' own field defaults, so a test that never calls
+    /// either sees byte-identical stats() output to before this seam existed
+    /// (governance risk-register item 6: this default must never silently flip a
+    /// pre-existing test onto the Unsupported path). Lock-free, like every real
+    /// mechanism's stats() - called under the engine's own lock, never this
+    /// mechanism's mu_.
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = inert_for_test_.load(std::memory_order_relaxed),
+                .boot_inert = boot_inert_for_test_.load(std::memory_order_relaxed)};
+    }
+    void set_inert(bool b) { inert_for_test_.store(b, std::memory_order_relaxed); }
+    void set_boot_inert(bool b) { boot_inert_for_test_.store(b, std::memory_order_relaxed); }
     void set_fail_next_watch() {
         std::lock_guard<std::mutex> lk{mu_};
         fail_next_watch_ = true;
@@ -274,6 +297,8 @@ public:
 
 private:
     std::atomic<int> watch_calls_{0};
+    std::atomic<bool> inert_for_test_{false};
+    std::atomic<bool> boot_inert_for_test_{false};
     std::mutex mu_;
     std::set<std::string> watched_;
     bool fail_next_watch_{false};
@@ -309,7 +334,12 @@ gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled =
 }
 
 // File: NO mechanism registered in this fixture -> a routine Unsupported gap.
-gpb::GuaranteedStateRule make_file_rule(const std::string& id, bool enabled = true) {
+// `path` defaults to a fixed placeholder (this fixture never registers a File
+// mechanism, so nothing ever opens it); #4685's real-mechanism tests pass a real
+// ScratchDir path instead, mirroring make_service_rule's `service` parameter.
+gpb::GuaranteedStateRule
+make_file_rule(const std::string& id, bool enabled = true,
+               const std::string& path = "/tmp/yuzu-reconcile-test-target") {
     gpb::GuaranteedStateRule r;
     r.set_rule_id(id);
     r.set_name(id);
@@ -318,14 +348,19 @@ gpb::GuaranteedStateRule make_file_rule(const std::string& id, bool enabled = tr
     r.mutable_spark()->set_type("file-change");
     auto* a = r.mutable_assertion();
     a->set_type("file-exists");
-    (*a->mutable_params())["path"] = "/tmp/yuzu-reconcile-test-target";
+    (*a->mutable_params())["path"] = path;
     return r;
 }
 
 // Registry: also NO mechanism registered in this fixture -> also a routine
 // Unsupported gap (F7). Field shape mirrors test_guardian_engine.cpp's
 // make_registry_rule() so validation/spec derivation succeeds identically.
-gpb::GuaranteedStateRule make_registry_rule(const std::string& id, bool enabled = true) {
+// `key` defaults to a fixed placeholder; #4685's real-mechanism test passes a
+// real ScratchRegKey subkey instead, mirroring make_service_rule's `service`
+// parameter.
+gpb::GuaranteedStateRule
+make_registry_rule(const std::string& id, bool enabled = true,
+                   const std::string& key = "SOFTWARE\\YuzuTest\\GuardStatusTest") {
     gpb::GuaranteedStateRule r;
     r.set_rule_id(id);
     r.set_name(id);
@@ -335,7 +370,7 @@ gpb::GuaranteedStateRule make_registry_rule(const std::string& id, bool enabled 
     auto* a = r.mutable_assertion();
     a->set_type("registry-value-equals");
     (*a->mutable_params())["hive"] = "HKCU";
-    (*a->mutable_params())["key"] = "SOFTWARE\\YuzuTest\\GuardStatusTest";
+    (*a->mutable_params())["key"] = key;
     (*a->mutable_params())["value_name"] = "Flag";
     (*a->mutable_params())["value_type"] = "REG_DWORD";
     (*a->mutable_params())["expected"] = "1";
@@ -368,16 +403,23 @@ struct SparkReconcileFixture {
     /// `backend_op_deadline`, when set, shrinks GuardianSparkRuntime::Config's bounded
     /// arm/disarm wait (production default 5s) so a test can drive a deterministic
     /// "backend parked" scenario without a real multi-second wait (rung 9c PR-2:
-    /// set_spark_backend_op_deadline_for_test, guardian_engine.hpp).
+    /// set_spark_backend_op_deadline_for_test, guardian_engine.hpp). `mechanism_type`
+    /// (#4685) defaults to Service, unchanged for every existing call site - a test
+    /// wanting Registry parity for a fake-mechanism scenario passes
+    /// SparkType::Registry and builds its rules with make_registry_rule() instead of
+    /// make_service_rule(); FakeServiceMechanism is entirely type-agnostic (its
+    /// watch()/unwatch() do not look at which SparkType it is registered under), so
+    /// this changes only what the fixture registers it AS, nothing else.
     explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
-                                   std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt) {
+                                   std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
+                                   SparkType mechanism_type = SparkType::Service) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
 
         auto mech = std::make_unique<FakeServiceMechanism>();
         mechanism = mech.get();
-        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        REQUIRE(spark_engine.register_mechanism(mechanism_type, std::move(mech)).has_value());
         spark_engine.start();
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
@@ -3541,3 +3583,730 @@ TEST_CASE("rung 9c PR-5e (#4221): K-bound waives a persistently Wedged-only rule
 
     // (the parked mechanism is released by `release_parked` above on every exit path)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4685 — Guardian's capability filter must key off `boot_inert` alone
+// (registered, but start() refused to bind the OS facility) rather than the
+// UNION `inert` (which also includes a mechanism's TRANSIENT runtime-degraded
+// episode - Registry's sweeper / File's worker, three consecutive failed
+// passes, cleared on the next success). Before this fix, a reconcile that ran
+// during such an episode misclassified every rule of that type Unsupported,
+// withdrew it from both backends, and left it stranded there with nothing to
+// proactively re-reconcile once the mechanism recovered. `inert` itself is
+// UNCHANGED - still the union the heartbeat CSV (spark_heartbeat.hpp) and the
+// subscription_establishment() coverage overlay (spark_engine.cpp) read; only
+// Guardian's OWN capability filter (guardian_engine.cpp's
+// reconcile_rule_locked) narrows to `!boot_inert`.
+//
+// FakeServiceMechanism is entirely type-agnostic (its watch()/unwatch() never
+// look at which SparkType they were registered under), so Registry parity for
+// every fake-based case below is a second TEST_CASE registering the SAME kind
+// of fake under SparkType::Registry via SparkReconcileFixture's
+// `mechanism_type` parameter and building rules with make_registry_rule()
+// instead of make_service_rule() - never a second, hand-duplicated
+// engine/mechanism wiring block. File's real-mechanism coverage (AC2/AC3) is
+// the Windows-only section at the end of this file.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+gpb::GuaranteedStateRule make_rule_for_type(SparkType type, const std::string& id,
+                                            bool enabled = true) {
+    switch (type) {
+    case SparkType::Registry: return make_registry_rule(id, enabled);
+    case SparkType::File: return make_file_rule(id, enabled);
+    default: return make_service_rule(id, enabled);
+    }
+}
+
+/// AC8 (scoped per plan §9 must-fix 2 - no rule -> SubscriptionId / establishment-sink
+/// test seam exists on FakeServiceMechanism or GuardianEngine, so this stays at what IS
+/// testable without inventing one): a runtime-degraded (not boot-inert) mechanism
+/// drops out of the heartbeat CSV (the UNION `inert` spark_heartbeat.hpp reads,
+/// unchanged by this fix) but stays Guardian-armable (the narrower `!boot_inert`
+/// guardian_engine.cpp's capability filter reads, #4685). The union-overlay's own
+/// coverage behavior (seed a cached Notification report -> None while inert ->
+/// restored Notification on clear, with no new report in between) is ALREADY pinned
+/// by "Establishment: an inert mechanism overlays coverage to None..." in
+/// test_spark_mechanism.cpp - untouched by this fix, not re-tested here. Also doubles
+/// as AC4's "degraded alone (no hang) -> Committed" case via the arm_stats() check
+/// below (the hanging variant is the separate Wedged-parity case further down).
+void check_runtime_degraded_stays_armable(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+    f.mechanism->set_inert(true); // runtime-degraded (union `inert`); boot_inert stays false
+
+    std::map<std::string, std::string> tags;
+    emit_spark_heartbeat_tags(tags, f.spark_engine.is_running(), f.spark_engine.stats(),
+                              f.spark_engine.stats_by_type());
+    CAPTURE(tags["yuzu.spark_mechs"]);
+    CHECK(tags["yuzu.spark_mechs"].find(spark_type_token(type)) == std::string::npos);
+
+    f.apply(make_rule_for_type(type, "r1"));
+    CHECK(f.engine->spark_armed_rule_count() == 1); // Arm, not Unsupported
+    CHECK(f.engine->unsupported_counts_by_type().count(type) == 0);
+    CHECK(f.mechanism->watch_call_count() == 1); // a real watch() was made - never filtered out
+    CHECK(f.engine->last_unsupported_log_for_test().edge_count == 0); // never Unsupported
+
+    const auto s = f.engine->arm_stats(); // AC4: Committed, never Wedged/Failed
+    REQUIRE(s.has_value());
+    CHECK(s->failed == 0);
+}
+
+/// AC6: a mechanism that IS registered but BOOT-INERT (start() refused to bind its OS
+/// facility) still classifies Unsupported - but the log now distinguishes this from
+/// "no mechanism at all" (never emitted for a runtime-only episode, which stays
+/// armable and never reaches this branch at all - see
+/// check_runtime_degraded_stays_armable above). boot_inert and (union) inert are
+/// correlated, not independent, in this case (plan §8) - both are set together. The
+/// pre-existing "no mechanism at all -> info" case is already pinned by "an
+/// unsupported type arms neither backend..." above - untouched by this fix.
+void check_boot_inert_registered_warns(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+    f.mechanism->set_boot_inert(true);
+    f.mechanism->set_inert(true);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(7);
+    *p.add_rules() = make_rule_for_type(type, "r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(f.engine->armed_guard_count() == 0);
+    CHECK(f.mechanism->watch_call_count() == 0); // never reached watch() at all
+    CHECK(f.engine->unsupported_counts_by_type().at(type) == 1);
+    CHECK(f.engine->policy_generation() == 7); // Unsupported/Inert still advances generation
+
+    const auto log = f.engine->last_unsupported_log_for_test();
+    CHECK(log.level == GuardianEngine::UnsupportedLogLevel::Warn);
+    CHECK(log.rule_id == "r1");
+    CHECK(log.type == type);
+    CHECK(log.edge_count == 1);
+}
+
+/// AC7: a runtime-degraded (not boot-inert) mechanism, degraded BEFORE
+/// wire_spark_engine()/start_local() run, still Arms a rule cached from a prior boot's
+/// KV, in PRODUCTION wiring order (agent.cpp: register_mechanism -> start() ->
+/// wire_spark_engine -> start_local(), NOT the fixture's reversed order). Mirrors "a
+/// production-order restart reconstructs unsupported_rules_ from cached KV" above,
+/// which pins the analogous NO-mechanism-at-all case.
+void check_production_order_degraded_still_arms(SparkType type) {
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: persist the rule definition while the mechanism is healthy - only the
+    // durable KV row matters here; how phase 1 itself classified the rule is not under
+    // test.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(type, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_rule_for_type(type, "r1");
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        // Settle before stop(): the dispatch's attach is NonWaiting (rung 9c PR-2 Unit
+        // 6) - calling stop() while that attempt is still in flight raced a SIGSEGV
+        // under repeated seeded reruns (#4685 PR #5021, external adversarial review).
+        // Every test whose push actually arms something settles before tearing down
+        // (a push that only classifies Unsupported, e.g. :769, never add_pending()s
+        // anything, so there's nothing to settle); this Phase-1 block's push arms a
+        // rule (its own classification isn't under test) and had skipped it.
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine.journal_maintenance_tick();
+            return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+        }));
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: fresh boot, PRODUCTION order - the mechanism is runtime-degraded BEFORE
+    // wire_spark_engine()/start_local() run over the cached rule (#4685 AC7).
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    FakeServiceMechanism* mechanism = mech.get();
+    REQUIRE(spark_engine.register_mechanism(type, std::move(mech)).has_value());
+    spark_engine.start();
+    mechanism->set_inert(true);
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    REQUIRE(engine.start_local().has_value());
+
+    // start_local()'s re-arm walk dispatches the arm the same NonWaiting way apply_rules()
+    // does (rung 9c PR-2 Unit 6) - it does not settle before returning, so wait for the
+    // commit rather than asserting immediately (mirrors "start_local degrades per-rule..."
+    // above: REQUIRE(spin_until([&] { return engine.spark_armed_rule_count() == 2; })).
+    // Also wait for full quiescence (ack_pending_count_for_test()==0 &&
+    // active_io_workers()==0), not just the count becoming visible, before this
+    // function's own stop() calls below - same class of gap as the AC7 Phase-1
+    // SIGSEGV this file's other settle-waits were added to fix (cpp-safety Gate 3,
+    // this scoped review round).
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+               engine.active_io_workers() == 0;
+    }));
+
+    CHECK(engine.rule_count() == 1);
+    CHECK(engine.armed_guard_count() == 0);
+    CHECK(engine.unsupported_counts_by_type().count(type) == 0);
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+/// Direct regression for option (b)'s own failure-mode rationale (plan §8): boot_inert
+/// stays false, but the mechanism SYNCHRONOUSLY refuses the watch() call - a genuine
+/// arm ATTEMPT that failed, never a misclassification into Unsupported (which would
+/// require boot_inert) and never a silent legacy fallback. Distinct from the
+/// hanging-watch Wedged case pinned elsewhere in this file: a synchronous refusal
+/// resolves Failed immediately, never eligible for the Wedged-only K-bound generation
+/// waiver, so the generation stays held across every identical retry - not just the
+/// first three.
+void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(11);
+    *p.add_rules() = make_rule_for_type(type, "r1");
+    const auto push_bytes = p.SerializeAsString();
+
+    for (int i = 0; i < 3; ++i) {
+        f.mechanism->set_fail_next_watch(); // single-shot - re-arm before every retry
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        REQUIRE(dr.exit_code == 0);
+        // Drain to full quiescence before asserting or re-arming the fail flag for the
+        // next iteration - guardian_dispatch_push_bytes_for_test's own attach is
+        // NonWaiting (rung 9c PR-2 Unit 6): without this wait, a still-in-flight
+        // resolution from THIS iteration can consume the NEXT iteration's single-shot
+        // set_fail_next_watch() instead of a fresh watch() call, so a genuine refusal
+        // gets silently skipped and the retry arms for real - observed as a CI flake
+        // (spark_armed_rule_count()==1 on an intermediate retry, #4685 PR #5021).
+        REQUIRE(yuzu::test::spin_until([&] {
+            f.engine->journal_maintenance_tick();
+            return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
+        }));
+        CHECK(f.engine->policy_generation() == 0); // held, every retry - no K-waiver for Failed
+        CHECK(f.engine->armed_guard_count() == 0); // no legacy fallback
+        CHECK(f.engine->spark_armed_rule_count() == 0);
+        CHECK(f.engine->unsupported_counts_by_type().count(type) == 0); // Failed, not Unsupported
+    }
+}
+
+/// AC5(i) (plan §8 split): a COMMITTED rule going away (disabled here, to sidestep the
+/// "a replacement may legitimately leave a NEW generation armed" ambiguity a
+/// superseding-push variant would carry - see §8) during an OPEN runtime-degraded
+/// episode still withdraws exactly as it would with a healthy mechanism - the episode
+/// never changes disarm semantics. Mirrors "disable withdraws from spark; re-enable
+/// re-arms via spark" above, adding the degraded episode and the "disarmed" journal
+/// assertion.
+void check_committed_rule_disable_during_degraded_episode_disarms(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+    f.apply(make_rule_for_type(type, "r1"));
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
+
+    f.mechanism->set_inert(true); // episode open at disable time
+
+    f.apply(make_rule_for_type(type, "r1", /*enabled=*/false), /*full_sync=*/false);
+
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+    CHECK(f.mechanism->watching_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return std::any_of(f.sent.begin(), f.sent.end(), [](const OutboxEntry& e) {
+            return e.rule_id == "r1" && e.lifecycle_kind == "disarmed";
+        });
+    }));
+}
+
+/// AC5(ii) (plan §8 split): an arm that never committed (still parked mid watch()) is
+/// withdrawn (disabled) WHILE pending - cancellation/cleanup only, no "disarmed" audit
+/// (the rule was never actually armed -
+/// GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked's own "pending arm
+/// withdrawn -> no lifecycle entry" contract, guardian_spark_runtime.cpp:2621). The
+/// episode being open at the time changes nothing about this contract.
+void check_pending_arm_withdrawal_no_disarmed_record(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+    f.mechanism->set_inert(true); // episode open - still armable, still reaches watch()
+    f.mechanism->hang_next_watch();
+    struct ReleaseOnExit {
+        FakeServiceMechanism* mech;
+        ~ReleaseOnExit() { mech->release_hang(); }
+    } release_guard{f.mechanism};
+
+    auto dr1 = f.dispatch_raw(make_rule_for_type(type, "r1"));
+    REQUIRE(dr1.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+    CHECK(f.engine->spark_armed_rule_count() == 0); // still pending, never committed
+
+    auto dr2 = f.dispatch_raw(make_rule_for_type(type, "r1", /*enabled=*/false));
+    REQUIRE(dr2.exit_code == 0);
+
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; },
+                                   std::chrono::seconds(15)));
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+    {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        CHECK_FALSE(std::any_of(f.sent.begin(), f.sent.end(), [](const OutboxEntry& e) {
+            return e.rule_id == "r1" && e.lifecycle_kind == "disarmed";
+        }));
+    }
+}
+
+/// AC5(iii) (plan §8 split): stop() during an OPEN episode is sticky, exactly as during
+/// a healthy shutdown - GuardianEngine::stop() does not call detach_all() (§8), and
+/// journal_maintenance_tick() is a documented no-op once stopped_ is set
+/// (guardian_engine.cpp's own stop() comment), so nothing commits and nothing crashes
+/// post-shutdown. Cleanup runs via the real owner shutdown sequence (stop(), not a
+/// test-only teardown shortcut).
+void check_shutdown_during_degraded_episode_is_sticky(SparkType type) {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
+    f.apply(make_rule_for_type(type, "r1"));
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
+    const auto gen_before = f.engine->policy_generation();
+
+    f.mechanism->set_inert(true); // episode still open at shutdown
+
+    f.engine->stop(); // real owner shutdown sequence - matches the fixture's own dtor order
+
+    CHECK(f.engine->spark_armed_rule_count() == 1); // sticky - stop() never erases it (R4)
+    f.engine->journal_maintenance_tick(); // documented no-op post-stop; must not crash
+    CHECK(f.engine->policy_generation() == gen_before); // no new commit post-shutdown
+}
+
+} // namespace
+
+TEST_CASE("#4685 AC4/AC8: a runtime-degraded (not boot-inert) mechanism stays "
+          "Guardian-armable though the heartbeat CSV drops it - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_runtime_degraded_stays_armable(SparkType::Service);
+}
+TEST_CASE("#4685 AC4/AC8: a runtime-degraded (not boot-inert) mechanism stays "
+          "Guardian-armable though the heartbeat CSV drops it - Registry parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_runtime_degraded_stays_armable(SparkType::Registry);
+}
+
+TEST_CASE("#4685 AC6: a registered but boot-inert mechanism still classifies "
+          "Unsupported, warn-level and distinguished from the no-mechanism-at-all "
+          "case - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_boot_inert_registered_warns(SparkType::Service);
+}
+TEST_CASE("#4685 AC6: a registered but boot-inert mechanism still classifies "
+          "Unsupported, warn-level and distinguished from the no-mechanism-at-all "
+          "case - Registry parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_boot_inert_registered_warns(SparkType::Registry);
+}
+TEST_CASE("#4685 AC6: a registered but boot-inert mechanism still classifies "
+          "Unsupported, warn-level and distinguished from the no-mechanism-at-all "
+          "case - File parity (the issue's own AC6 names File, Registry AND Service)",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_boot_inert_registered_warns(SparkType::File);
+}
+
+TEST_CASE("#4685 AC7: production-order restart - a runtime-degraded mechanism still "
+          "Arms the cached rule via start_local()'s re-arm walk - Service",
+          "[spark][guardian][reconcile][boot][boot_inert]") {
+    check_production_order_degraded_still_arms(SparkType::Service);
+}
+TEST_CASE("#4685 AC7: production-order restart - a runtime-degraded mechanism still "
+          "Arms the cached rule via start_local()'s re-arm walk - Registry parity",
+          "[spark][guardian][reconcile][boot][boot_inert]") {
+    check_production_order_degraded_still_arms(SparkType::Registry);
+}
+
+TEST_CASE("#4685 option-(b) regression: boot_inert=false but watch() is synchronously "
+          "refused - Failed, held generation across repeated retries, never "
+          "Unsupported, never a legacy fallback - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_boot_inert_false_but_watch_refused_stays_failed(SparkType::Service);
+}
+TEST_CASE("#4685 option-(b) regression: boot_inert=false but watch() is synchronously "
+          "refused - Failed, held generation across repeated retries, never "
+          "Unsupported, never a legacy fallback - Registry parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_boot_inert_false_but_watch_refused_stays_failed(SparkType::Registry);
+}
+
+TEST_CASE("#4685 AC5(i): a committed rule's disable during an open runtime-degraded "
+          "episode still withdraws and journals \"disarmed\" - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_committed_rule_disable_during_degraded_episode_disarms(SparkType::Service);
+}
+TEST_CASE("#4685 AC5(i): a committed rule's disable during an open runtime-degraded "
+          "episode still withdraws and journals \"disarmed\" - Registry parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_committed_rule_disable_during_degraded_episode_disarms(SparkType::Registry);
+}
+
+TEST_CASE("#4685 AC5(ii): a pending (never-committed) arm withdrawn during an open "
+          "episode is cancelled with no \"disarmed\" audit - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_pending_arm_withdrawal_no_disarmed_record(SparkType::Service);
+}
+TEST_CASE("#4685 AC5(ii): a pending (never-committed) arm withdrawn during an open "
+          "episode is cancelled with no \"disarmed\" audit - Registry parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_pending_arm_withdrawal_no_disarmed_record(SparkType::Registry);
+}
+
+TEST_CASE("#4685 AC5(iii): stop() during an open runtime-degraded episode is sticky - "
+          "no new committed generation, no active processing post-shutdown - Service",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_shutdown_during_degraded_episode_is_sticky(SparkType::Service);
+}
+TEST_CASE("#4685 AC5(iii): stop() during an open runtime-degraded episode is sticky - "
+          "no new committed generation, no active processing post-shutdown - Registry "
+          "parity",
+          "[spark][guardian][reconcile][boot_inert]") {
+    check_shutdown_during_degraded_episode_is_sticky(SparkType::Registry);
+}
+
+// ── #4685 AC2/AC3 — Windows-only, REAL File/Registry mechanisms ─────────────────────
+// The fake-mechanism coverage above proves Guardian's OWN classifier change; these
+// prove the real mechanisms' stats() split (spark_file.cpp/spark_registry.cpp) feeds
+// it correctly end to end, mirroring the "direct" pass-failure tests in
+// test_spark_mechanism.cpp (File: pass_fail_hook, ~:7005; Registry: sweep_hook,
+// ~:10957) but through GuardianEngine::reconcile_rule_locked rather than the raw
+// mechanism, and covering the SAME already-armed-rule-mid-episode shape §8 asks for.
+#ifdef _WIN32
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace {
+
+// Mirrors test_spark_mechanism.cpp's ScratchDir exactly (own copy: that struct is
+// file-local to test_spark_mechanism.cpp, not exported).
+struct Guardian4685ScratchDir {
+    std::filesystem::path dir;
+    std::filesystem::path file;
+    explicit Guardian4685ScratchDir(const char* tag) {
+        dir = yuzu::test::unique_temp_path("yuzu_test_guardian_4685_" + std::string(tag) + "_");
+        std::filesystem::create_directories(dir);
+        file = dir / "watched.txt";
+        { std::ofstream(file) << "seed"; }
+    }
+    ~Guardian4685ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    Guardian4685ScratchDir(const Guardian4685ScratchDir&) = delete;
+    Guardian4685ScratchDir& operator=(const Guardian4685ScratchDir&) = delete;
+};
+
+// Mirrors test_spark_mechanism.cpp's ScratchRegKey exactly (own copy, same reason).
+struct Guardian4685ScratchRegKey {
+    std::string sub;
+    HKEY h{nullptr};
+    explicit Guardian4685ScratchRegKey(const char* tag) {
+        static std::atomic<int> n{0};
+        sub = std::string("Software\\Yuzu\\Guardian4685_") + tag + "_" +
+              std::to_string(::GetCurrentProcessId()) + "_" +
+              std::to_string(yuzu::test::process_random_salt() % 1000000000) + "_" +
+              std::to_string(n.fetch_add(1));
+        ::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &h,
+                          nullptr);
+    }
+    ~Guardian4685ScratchRegKey() {
+        if (h)
+            ::RegCloseKey(h);
+        ::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str());
+    }
+    Guardian4685ScratchRegKey(const Guardian4685ScratchRegKey&) = delete;
+    Guardian4685ScratchRegKey& operator=(const Guardian4685ScratchRegKey&) = delete;
+};
+
+} // namespace
+
+TEST_CASE("#4685 AC2 (File, real mechanism): an already-armed rule undergoing a full "
+          "sync mid runtime-degraded episode stays Arm/Committed, coverage stays None "
+          "and recovers with no second push",
+          "[spark][guardian][reconcile][windows][boot_inert]") {
+    Guardian4685ScratchDir a("file");
+    auto mech_owned = make_file_mechanism();
+    REQUIRE(mech_owned != nullptr);
+    ISparkMechanism* mech = mech_owned.get(); // borrowed - the engine takes ownership below
+
+    std::atomic<bool> failing{false};
+    std::atomic<int> throws{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = std::chrono::milliseconds(50); // fast retry, bounded test runtime
+        ctl.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::File, std::move(mech_owned)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test-4685-file", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    // First push, mechanism healthy: the rule arms for real.
+    gpb::GuaranteedStatePush p1;
+    p1.set_full_sync(true);
+    *p1.add_rules() = make_file_rule("r1", true, a.file.string());
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p1.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+    }));
+    REQUIRE(engine.spark_armed_rule_count() == 1);
+
+    // A raw consumer arms the IDENTICAL spec (same spark key) purely to obtain a
+    // SubscriptionId this test can query directly: Guardian itself exposes no
+    // rule_id -> SubscriptionId accessor (the same gap plan §9 must-fix 2 names for
+    // AC8). arm_impl() DEDUPS an identical key onto the SAME armed_[key] entry rather
+    // than dispatching a second backend watch (spark_engine.cpp's own comment on the
+    // "fresh key on a running engine" vs "dedup" split), so this SubscriptionId's
+    // subscription_establishment() reads the IDENTICAL coverage Guardian's own arm
+    // produced - the same technique the "#2818" sibling-consumer test earlier in this
+    // file already uses for an unrelated purpose, not a new seam.
+    auto raw = spark_engine.register_consumer("raw-4685-file", [](const SparkEvent&) {});
+    REQUIRE(raw.has_value());
+    const SparkSpec spec{SparkType::File, FileSparkParams{a.file.string()}};
+    auto raw_sub = spark_engine.arm(*raw, spec);
+    REQUIRE(raw_sub.has_value());
+
+    // Open the runtime-degraded episode and wait for the mechanism to genuinely report
+    // it (three consecutive failed passes, #4658) BEFORE the mid-episode full sync.
+    // A real, established, Idle File watch has NOTHING due - wait_timeout_locked()'s
+    // default is a 1h ceiling, and nothing else re-invokes run_pass_hook_locked() on
+    // its own once the initial arm's own control-wake pass already happened (before
+    // `failing` flipped true, so it didn't throw). Force exactly ONE more pass via
+    // apply_test_controls()'s own existing "nudge" (it unconditionally posts a control
+    // wake - see its own comment at the end of apply_test_controls()); that single
+    // hook throw alone starts note_pass_outcome_locked's backoff episode, which is then
+    // self-sustaining (every failed pass reschedules its own retry via
+    // wait_timeout_locked's pass-failure-backoff clause) all the way to the 3rd
+    // consecutive failure with no further nudging needed.
+    failing.store(true, std::memory_order_release);
+    {
+        FileMechanismTestControls nudge;
+        nudge.sweep_cadence = std::chrono::milliseconds(50);
+        nudge.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(nudge)));
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return mech->stats().inert; }, std::chrono::seconds(10)));
+    CHECK_FALSE(mech->stats().boot_inert); // runtime, never boot-time
+
+    // A full sync mid-episode - the real destructive detach-and-reconcile path
+    // (#4685 AC2): the rule stays Arm/Committed, never Unsupported.
+    gpb::GuaranteedStatePush p2;
+    p2.set_full_sync(true);
+    p2.set_policy_generation(3);
+    *p2.add_rules() = make_file_rule("r1", true, a.file.string());
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p2.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+    }));
+
+    CHECK(engine.spark_armed_rule_count() == 1); // still Arm/Committed
+    CHECK(engine.policy_generation() == 3);      // advanced - never held for an Unsupported push
+    CHECK(engine.unsupported_counts_by_type().count(SparkType::File) == 0);
+    CHECK(engine.last_unsupported_log_for_test().edge_count == 0); // no "gap" line, either level
+
+    const auto mid_est = spark_engine.subscription_establishment(*raw_sub);
+    REQUIRE(mid_est.has_value());
+    CHECK(mid_est->coverage == yuzu::agent::SparkCoverage::None); // overlaid while degraded
+
+    // Recovery: no second push, no restart - just the mechanism's next successful pass.
+    failing.store(false, std::memory_order_release);
+    REQUIRE(yuzu::test::spin_until([&] { return !mech->stats().inert; }, std::chrono::seconds(15)));
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            const auto est = spark_engine.subscription_establishment(*raw_sub);
+            return est.has_value() && est->coverage != yuzu::agent::SparkCoverage::None;
+        },
+        std::chrono::seconds(15)));
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoing a "
+          "full sync mid runtime-degraded episode stays Arm/Committed, coverage stays "
+          "None and recovers with no second push",
+          "[spark][guardian][reconcile][windows][boot_inert]") {
+    Guardian4685ScratchRegKey a("registry");
+    auto mech_owned = make_registry_mechanism();
+    REQUIRE(mech_owned != nullptr);
+    ISparkMechanism* mech = mech_owned.get();
+
+    std::atomic<bool> failing{false};
+    std::atomic<int> throws{0};
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.sweep_cadence = std::chrono::milliseconds(5);
+        ctl.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(
+        spark_engine.register_mechanism(SparkType::Registry, std::move(mech_owned)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test-4685-registry", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    gpb::GuaranteedStatePush p1;
+    p1.set_full_sync(true);
+    *p1.add_rules() = make_registry_rule("r1", true, a.sub);
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p1.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+    }));
+    REQUIRE(engine.spark_armed_rule_count() == 1);
+
+    auto raw = spark_engine.register_consumer("raw-4685-registry", [](const SparkEvent&) {});
+    REQUIRE(raw.has_value());
+    const SparkSpec spec{SparkType::Registry, RegistrySparkParams{"HKCU", a.sub}};
+    auto raw_sub = spark_engine.arm(*raw, spec);
+    REQUIRE(raw_sub.has_value());
+
+    // Unlike File's wait_timeout_locked (which has an explicit "an open failure
+    // episode always has a retry scheduled" clause, #4658), spark_registry.cpp's
+    // next_wake_locked() has NO failure-backoff clause at all: sweeper_main()'s own
+    // post-failure cv_.wait_until(delay) (the "retrying in N ms" log line) elapses,
+    // but the very next loop iteration recomputes next_wake_locked() from scratch,
+    // which for an Idle/armed/no-resync-debt watch returns its ~1h default ceiling -
+    // so a single nudge opens the episode (confirmed: exactly one "consecutive #1"
+    // log line, then nothing for the rest of a 10s window) but does not keep it
+    // self-sustaining. Real production traffic (another Pending probe, a resync,
+    // etc.) would normally supply that wake; this test's single Idle watch has none,
+    // so it supplies its own repeated nudge instead - same primitive as the File
+    // twin above, just applied throughout the wait rather than once.
+    auto nudge_registry = [&] {
+        RegistryMechanismTestControls c;
+        c.sweep_cadence = std::chrono::milliseconds(5);
+        c.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1, std::memory_order_relaxed);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(c)));
+    };
+
+    failing.store(true, std::memory_order_release);
+    bool became_degraded = false;
+    for (int i = 0; i < 2000 && !became_degraded; ++i) {
+        nudge_registry();
+        became_degraded = mech->stats().inert;
+        if (!became_degraded)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(became_degraded);
+    CHECK_FALSE(mech->stats().boot_inert);
+
+    gpb::GuaranteedStatePush p2;
+    p2.set_full_sync(true);
+    p2.set_policy_generation(3);
+    *p2.add_rules() = make_registry_rule("r1", true, a.sub);
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p2.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.ack_pending_count_for_test() == 0 && engine.active_io_workers() == 0;
+    }));
+
+    CHECK(engine.spark_armed_rule_count() == 1);
+    CHECK(engine.policy_generation() == 3);
+    CHECK(engine.unsupported_counts_by_type().count(SparkType::Registry) == 0);
+    CHECK(engine.last_unsupported_log_for_test().edge_count == 0);
+
+    const auto mid_est = spark_engine.subscription_establishment(*raw_sub);
+    REQUIRE(mid_est.has_value());
+    CHECK(mid_est->coverage == yuzu::agent::SparkCoverage::None);
+
+    // Recovery: same gap as above - a successful pass needs the sweeper to actually
+    // run one, which next_wake_locked() alone will not schedule promptly for this
+    // test's single Idle watch. Keep supplying the nudge (now non-throwing, since
+    // `failing` is false) until the mechanism and the coverage overlay both observe
+    // the recovery - no second push, no restart, matching AC3's own acceptance
+    // criterion, just not a bare wall-clock wait.
+    failing.store(false, std::memory_order_release);
+    bool recovered = false;
+    for (int i = 0; i < 3000 && !recovered; ++i) {
+        nudge_registry();
+        recovered = !mech->stats().inert;
+        if (!recovered)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(recovered);
+
+    bool coverage_restored = false;
+    for (int i = 0; i < 3000 && !coverage_restored; ++i) {
+        nudge_registry();
+        const auto est = spark_engine.subscription_establishment(*raw_sub);
+        coverage_restored = est.has_value() && est->coverage != yuzu::agent::SparkCoverage::None;
+        if (!coverage_restored)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(coverage_restored);
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+#endif // _WIN32
