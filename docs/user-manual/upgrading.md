@@ -35,6 +35,38 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 No config or data migration is required.
 
+## Informational: internal-CA CRL publish/audit/observability follow-ups (HA WS-6, #4828–#4830)
+
+No schema, config, or wire-shape change — this is documentation of behaviour that already
+shipped with HA WS-6 slice 6.1 (`ca_crl_versions` migrations v3/v4, PR #4126) plus additive
+audit/metrics coverage.
+
+**Migration v3/v4 boot-time lock window (informational, applies to any upgrade crossing them).**
+`ca_crl_versions` migration v3 (`revoked_count` column) and v4 (the `ca_issued_keep_revoked`
+append-only trigger) each take a schema-level lock guarded by a 30 s `lock_timeout` — long
+enough to outlast a legitimate in-flight CRL publish (which holds `SHARE ROW EXCLUSIVE` on the
+same table for at most its own 5 s lock wait plus signing time), but a rolling upgrade that has
+one replica already on the new schema while an older replica is still publishing can see up to
+~30 s of the migrating replica's readers/writers queueing behind the older replica's lock. This
+is a one-time cost on first contact with each version and does not recur.
+
+**`ca.crl.published` is now audited on every publish path, not only operator revoke (#4829).**
+Every CRL publish — the boot pre-publish, the leader-gated freshness re-publish, the
+count-compare self-heal re-publish, and the two operator-triggered paths (revoke, subordinate-CA
+import on REST/MCP/dashboard) — now writes a `ca.crl.published` audit row. The three paths with
+no live operator request (boot, freshness, self-heal) audit under `principal=system`; every row
+carries a `reason=` token (`startup`/`freshness`/`self_heal`/`revoke`/`import_chain`) so a
+self-heal republish that resolves an earlier revoke-triggered failure leaves its own
+`result=success reason=self_heal` row as the resolution, rather than the silence a prior gap left
+here. See `docs/user-manual/audit-log.md`.
+
+**New Prometheus counters (#4830):** `yuzu_server_ca_crl_publish_failure_reason_total{reason}`
+(a bounded, closed cause breakdown alongside the existing
+`yuzu_server_ca_crl_publish_failures_total`) and
+`yuzu_server_ca_unpublished_revocation_check_failures_total` (the freshness pass's own
+self-heal *check* failing — distinct from a publish failing outright). See
+`docs/user-manual/metrics.md`. No operator action required; both are additive.
+
 ## ⚠️ Breaking: `GET /api/v1/openapi.json` now requires authentication (#2057)
 
 The OpenAPI spec endpoint used to be public — any unauthenticated client could
