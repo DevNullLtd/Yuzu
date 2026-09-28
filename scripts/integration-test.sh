@@ -202,7 +202,15 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    # A here-string, not `echo "$haystack" | grep -q "$needle"`: that pipeline can
+    # spuriously report no-match under `set -o pipefail` when the needle is found
+    # early in a large multi-line haystack — grep(1) exits the instant it matches,
+    # closing the pipe while echo(1) is still mid-write of the remaining bytes,
+    # SIGPIPE kills echo, and pipefail surfaces THAT non-zero exit rather than
+    # grep's success. Same #988 SIGPIPE-under-pipefail class as
+    # poll_metric_at_least's awk-no-exit workaround below — a here-string has no
+    # writer process to SIGPIPE, so it needs no such workaround.
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -819,7 +827,9 @@ if [[ "$AGENT_COUNT" -ge 1 ]]; then
     heartbeat_seen=false
     for attempt in $(seq 1 30); do
         METRICS_POLL=$(curl -sf "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
-        if echo "$METRICS_POLL" | grep -q "yuzu_heartbeats_received_total"; then
+        # Here-string, not a pipe (see assert_contains's comment on the same
+        # SIGPIPE-under-pipefail hazard) — this body is large enough to trigger it.
+        if grep -qF -- "yuzu_heartbeats_received_total" <<< "$METRICS_POLL"; then
             heartbeat_seen=true
             log "  Heartbeats observed after ${attempt}s"
             break
@@ -847,7 +857,7 @@ log "Test: Server metrics endpoint"
 METRICS_RESP=$(curl -sf "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
 if [[ -n "$METRICS_RESP" ]]; then
     TESTS=$((TESTS + 1))
-    if echo "$METRICS_RESP" | grep -q "yuzu_"; then
+    if grep -qF -- "yuzu_" <<< "$METRICS_RESP"; then
         pass "Server /metrics returns Prometheus metrics"
     else
         pass "Server /metrics endpoint accessible"
@@ -865,7 +875,7 @@ if [[ -n "$METRICS_RESP" ]]; then
     # Agents need time for heartbeats to arrive, so fleet by-os may not be populated
     # in short tests; just check the metric name is declared
     TESTS=$((TESTS + 1))
-    if echo "$METRICS_RESP" | grep -q "yuzu_fleet_agents_by_os\|yuzu_fleet_commands_executed_total"; then
+    if grep -q "yuzu_fleet_agents_by_os\|yuzu_fleet_commands_executed_total" <<< "$METRICS_RESP"; then
         pass "Fleet agent breakdown metrics present"
     else
         pass "Fleet metrics declared (agents may not have heartbeated yet)"

@@ -645,6 +645,7 @@ yuzu_server_core_lib = static_library(
     # key_provider.cpp lives in the yuzu_key_provider leaf target above
     # (ADR-0010 arch-S3); the dep below carries it.
     'src/ca_store.cpp',
+    'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
     'src/kek_routes.cpp',
