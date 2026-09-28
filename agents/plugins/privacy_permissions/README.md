@@ -138,5 +138,5 @@ permissions|linux|-|full_disk_access|unsupported|-|-|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp`
 - Tests: `tests/unit/test_privacy_permissions_local_dispatcher.cpp` · `tests/unit/test_privacy_permissions_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave8-pr8.5-privacy_permissions.added.md`
+- Changelog: `changelog.d/5064-privacy_permissions.added.md`
 <!-- END GENERATED -->
