@@ -129,6 +129,33 @@ TEST_CASE("build_dex_catalogue_model: uncatalogued lists an obs_type in no curat
     CHECK(yuzu::server::dex_family_index("future.newsignal") == -1);
 }
 
+// Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary read
+// must never render as a healthy, zero-event catalogue (health 100). DROP
+// TABLE forces the fleet-wide read to degrade while the store itself stays
+// open — mirrors test_dex_routes.cpp's identically-shaped #4855 per-device
+// degrade test.
+TEST_CASE("build_dex_catalogue_model: a degraded fleet signal-summary read reports "
+          "degraded=true, never a healthy zero-event catalogue",
+          "[pg][dex][catalogue][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_catalogue_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    const auto m = yuzu::server::build_dex_catalogue_model(&store, DexFleet{}, "all", "7d");
+    CHECK(m.degraded);
+    CHECK(m.families.empty());
+    CHECK(m.uncatalogued.empty());
+}
+
 TEST_CASE("DexApi::catalogue matches the shared builder (seam is a pure forward)",
           "[pg][dex][catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_catalogue_tpl);

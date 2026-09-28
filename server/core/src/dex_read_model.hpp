@@ -356,6 +356,18 @@ struct DexCatalogueModel {
     int total_types{0};
     std::vector<DexCatalogueFamilyRow> families; ///< dex_signal_groups() order
     std::vector<DexSignalCount> uncatalogued;
+    /// Fix 2 (WS-A4 PR-1 fix round, sec-5): true when the underlying
+    /// fleet signal-summary read DEGRADED (store closed / pool-acquire
+    /// timeout / query error) rather than genuinely finding zero events —
+    /// `families`/`uncatalogued` stay empty in this case too, but a caller
+    /// MUST check this field first: a degraded model must never be
+    /// served/rendered as a healthy, zero-event catalogue (the same
+    /// #4855 shape `DexDeviceScoreModel::degraded` closes for the
+    /// per-device read). Deliberately NOT serialized by `dex_catalogue_json`
+    /// (see its own comment) — callers translate it into their own
+    /// surface's degrade response (REST 503 / MCP retryable error) BEFORE
+    /// ever reaching the serializer.
+    bool degraded{false};
 };
 
 /// (`build_dex_catalogue_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)

@@ -793,7 +793,17 @@ DexCatalogueModel build_dex_catalogue_model(GuaranteedStateStore* store, const D
         return m; // degrade to zero families -- caller's !store_ptr 503 guard is authoritative
 
     const std::string since = dex_iso_since(dex_window_to_days(window));
-    const auto signals = store->dex_signal_summary(since, plat);
+    const auto checked_signals = store->dex_signal_summary_checked(since, plat);
+    // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary
+    // read must never render as a healthy, zero-event catalogue (health
+    // 100) — refuse here, same posture as the per-device score builder's
+    // #4855 guard. `m.families`/`m.uncatalogued` stay empty, matching the
+    // model's own doc comment on `degraded`.
+    if (!checked_signals) {
+        m.degraded = true;
+        return m;
+    }
+    const auto& signals = *checked_signals;
 
     std::vector<std::string> scope;
     if (m.os == "all") {
@@ -849,6 +859,11 @@ DexCatalogueModel build_dex_catalogue_model(GuaranteedStateStore* store, const D
 }
 
 std::string dex_catalogue_json(const DexCatalogueModel& model) {
+    // Fix 2 (WS-A4 PR-1 fix round, sec-5): mirrors dex_device_score_json's
+    // guard — a degraded model has no honest wire shape to serve; every
+    // caller must translate it into its own surface's degrade response
+    // before ever calling this.
+    assert(!model.degraded && "dex_catalogue_json: caller must handle model.degraded first");
     json families = json::array();
     for (const auto& f : model.families) {
         json fj{{"name", f.name}, {"monitored", f.monitored}, {"total", f.total},
