@@ -499,3 +499,35 @@ CATASTROPHIC-IF-VIOLATED:
    host that is actually constrained or disabled, which is a false negative a
    downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).
+
+### 2026-09-28 — Software Estate (ADR-3007): current-state-only posture amended with a bounded change ledger
+
+**Decision.** ADR-3007 extends the `installed_software` source (§7's typed
+`SoftwareInventoryStore` projection) beyond this framework's original
+current-state-only posture (§7, "coexistence: generic baseline + typed
+Postgres projection"). Alongside the existing replace-on-change current-state
+row, the server now derives and retains a **bounded** history of install/
+upgrade/removal events per host, computed from consecutive reports rather
+than pushed by the agent. This is a deliberate, scoped amendment — not a
+reversal: TAR remains the edge-history warehouse (ADR-0004); this ledger is
+narrower (install/upgrade/removal events for the `installed_software` source
+only, fixed retention, no general-purpose event log) and exists because a
+downstream consumer of the fleet's software inventory needs "what changed
+since I last asked" without re-diffing full snapshots itself.
+
+Also amended, within the same source and its existing hash-skip/`need_full`
+protocol (§4): the agent now reports row-level differences instead of a full
+blob when something changed (the protocol already skips the blob entirely
+when nothing changed — this is a further refinement of the changed case, not
+a new mechanism), and the weekly forced-full floor is dropped for this source
+specifically, since the server's own re-verification of the row-hash set on
+every apply already provides the self-healing the floor existed to
+guarantee.
+
+Several additional discovery mechanisms (packaged-application formats,
+alternate package managers, language runtimes, device drivers, and signed
+binary evidence) are folded into the same source's single daily report as new
+row kinds — no new sync source, per §2's "generic per-source framework"
+intent and this ADR's own "one source is one map key" design.
+
+Full detail: ADR-3007 and its accompanying delivery roadmap.
