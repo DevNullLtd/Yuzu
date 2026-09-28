@@ -1714,13 +1714,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   flip) author as this entry originally assumed.
 - Milestone: #4685 itself - fixed and merged via PR #5021.
 - Revisit trigger: fired, and resolved. Criterion-10 sign-off and the F14 flip are no longer
-  blocked by this entry once the branch above merges. What changed: the pre-fix "capability set
+  blocked by this entry, now that PR #5021 has merged. What changed: the pre-fix "capability set
   keys off the UNION `inert`" defect (Detection signal/Operator action/Compensating control above)
   is fixed by the additive `boot_inert` split described in the paragraph above - a runtime-degraded
   episode no longer strands a rule `Unsupported` with nothing to re-reconcile it on recovery. The
   severity the #4658 governance ledger recorded (`gap-a-guardian-no-rereconcile`, LOW while
-  `prefer_spark_` is false, HIGH and blocking at the F14 flip) no longer applies once this fix
-  lands, since the wrong outcome it described can no longer occur regardless of `prefer_spark_`.
+  `prefer_spark_` is false, HIGH and blocking at the F14 flip) no longer applies now that this fix
+  has landed, since the wrong outcome it described can no longer occur regardless of
+  `prefer_spark_`.
 
 **#4704** (File worker / Registry sweeper: a blocked log sink stalls the mechanism thread - on
 Registry while holding `mu_`; found by #4658's governance run)
