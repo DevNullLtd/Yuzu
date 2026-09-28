@@ -379,9 +379,12 @@ public:
     /// slow-op are ReadDirectoryChangesW-specific — #1979/#1980/#1982); its own
     /// fault-tiering and retry counters are tracked separately (#1929/#1931). What it
     /// MUST publish is `inert`, so the fleet can tell a service mechanism that bound
-    /// the system bus from one that never did (the container case).
+    /// the system bus from one that never did (the container case). `inert_` here is
+    /// ENTIRELY boot-time (#4685) — Linux Service has no runtime-inert concept, unlike
+    /// File/Registry — so `.boot_inert` is the same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = inert_.load(std::memory_order_acquire)};
+        const bool boot = inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:
@@ -1599,9 +1602,12 @@ public:
 
     /// See the Linux twin: this mechanism tracks none of the File-mechanism counters,
     /// but it MUST publish `inert` so an SCM-denied service mechanism is distinguishable
-    /// from a healthy idle one.
+    /// from a healthy idle one. `started_inert_` here is ENTIRELY boot-time (#4685) —
+    /// Windows Service has no runtime-inert concept either — so `.boot_inert` is the
+    /// same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = started_inert_.load(std::memory_order_acquire)};
+        const bool boot = started_inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:
