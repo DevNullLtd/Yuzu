@@ -34,6 +34,18 @@
  * 2026-06-15 window-drift lesson). The expected HTML embeds the SAME
  * variable used to seed the timestamp (never a re-computed wall-clock read at
  * assertion time), so there is no clock-race between seed and assert.
+ *
+ * FULL-OUTPUT LAYER (added after the initial pass, per senior follow-up):
+ * the `find()` anchors above catch drift AT the anchored points but cannot
+ * see a change to the markup BETWEEN them. `check_golden(cell, html)` (below)
+ * additionally compares the COMPLETE rendered body, byte-for-byte, against a
+ * committed file under `tests/unit/server/golden/dex/<cell>.html` for every
+ * matrix cell exercised in this file (one file per cell; every anchor stays,
+ * since it documents WHY a cell's content is what it is). Regeneration is
+ * `YUZU_UPDATE_GOLDEN=1`, which OVERWRITES the touched files and then FAILS
+ * the run on purpose (a golden rewrite is never a silent pass) — re-run
+ * without the env var to verify. `check_golden`'s own doc comment states the
+ * ONE normalisation pattern applied to both sides before comparing.
  */
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
@@ -44,10 +56,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <optional>
+#include <regex>
 #include <set>
 #include <string>
 #include <vector>
@@ -125,6 +142,98 @@ std::string iso_ago(std::chrono::seconds dur) {
 const std::string kRecent = iso_ago(std::chrono::minutes(30));
 const std::string kOld = iso_ago(std::chrono::hours(24 * 3));
 
+// ── Full-output golden-file layer ───────────────────────────────────────
+//
+// `tests/unit/server/golden/dex/` (committed) holds one `<cell>.html` file
+// per exercised matrix cell. `YUZU_TEST_GOLDEN_DIR` (tests/meson.build)
+// resolves the source-root-relative path at compile time so this works from
+// the out-of-tree build directory the same way `YUZU_SERVER_SRC_DIR` does
+// for test_body_cap_route_inventory.cpp.
+std::filesystem::path golden_dir() { return std::filesystem::path(YUZU_TEST_GOLDEN_DIR) / "dex"; }
+
+// The normalisation applied to BOTH the freshly-rendered HTML and the stored
+// golden file before the byte-for-byte compare in `check_golden` below.
+// Rewrites exactly two patterns, applied in this order (the second only
+// matches what the first left behind, since a full timestamp's leading
+// "YYYY-MM-DD" would otherwise ALSO match the second pattern):
+//   1. an ISO-8601 UTC timestamp, "YYYY-MM-DDTHH:MM:SSZ" (the shape of every
+//      `kRecent`/`kOld` seed timestamp in this file, and so of every
+//      `last_seen`/`observed_at`/`first_seen`/history-row timestamp the
+//      renderers embed verbatim) -> the fixed token "<TS>".
+//   2. a bare calendar date, "YYYY-MM-DD" (the by-day activity chart's title
+//      attributes and the trends heatmap/day-bucket labels are grouped by
+//      *calendar day*, so they carry today's/yesterday's real date with no
+//      time component — a second, independently wall-clock-dependent shape
+//      the seed timestamps above don't cover) -> the fixed token "<DATE>".
+// Nothing else is rewritten — no whitespace collapsing, no other
+// substitution. A cell with neither shape is unaffected: regex_replace with
+// zero matches returns its input unchanged, so this is safe to call
+// unconditionally rather than threading a per-cell "has timestamps?" flag.
+std::string normalize_time(const std::string& in) {
+    static const std::regex kIso8601Utc(R"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)");
+    static const std::regex kBareDate(R"(\d{4}-\d{2}-\d{2})");
+    return std::regex_replace(std::regex_replace(in, kIso8601Utc, "<TS>"), kBareDate, "<DATE>");
+}
+
+// Up to `ctx` bytes on each side of `pos` in `s`, clamped to `s`'s bounds —
+// used by `check_golden`'s mismatch report so a multi-KB body diff doesn't
+// dump the whole string into the test log.
+std::string context_at(const std::string& s, std::size_t pos, std::size_t ctx = 200) {
+    if (s.empty())
+        return "(empty)";
+    const std::size_t start = pos > ctx ? pos - ctx : 0;
+    const std::size_t end = std::min(s.size(), pos + ctx);
+    return s.substr(start, end - start);
+}
+
+// Golden-file byte-for-byte compare for one rendered HTML fragment (or, when
+// YUZU_UPDATE_GOLDEN is set in the environment, REGENERATION instead of
+// comparison). `cell` is a stable, descriptive filename stem (no
+// extension) — `<renderer>__<matrix-cell-description>`, matching the call
+// sites below.
+//
+// Regeneration: `YUZU_UPDATE_GOLDEN=1 <binary> "[golden]"` overwrites every
+// golden file this run touches and the test FAILS afterwards ON PURPOSE
+// (a golden-file rewrite must never read as a silent pass) — re-run WITHOUT
+// the env var to confirm the freshly written files now compare equal.
+void check_golden(const std::string& cell, const std::string& html) {
+    const std::string actual = normalize_time(html);
+    const auto path = golden_dir() / (cell + ".html");
+    if (std::getenv("YUZU_UPDATE_GOLDEN") != nullptr) {
+        std::error_code ec;
+        std::filesystem::create_directories(golden_dir(), ec);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << actual;
+        out.close();
+        FAIL_CHECK("YUZU_UPDATE_GOLDEN=1: (re)wrote " << path.string()
+             << " -- re-run WITHOUT YUZU_UPDATE_GOLDEN to verify it now matches.");
+        return;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        FAIL_CHECK("golden file missing: " << path.string()
+             << " -- run with YUZU_UPDATE_GOLDEN=1 to create it, then re-run to verify.");
+        return;
+    }
+    std::string expected((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    // CHECK (not a manual if/FAIL_CHECK) so a MATCHING golden also registers
+    // as a counted, passing assertion — otherwise the successful-comparison
+    // path is invisible in the assertion tally (a silent no-op that happens
+    // to agree), which is exactly the kind of false-green closure this
+    // golden layer exists to avoid for the rewire it's guarding.
+    std::size_t diff = 0;
+    const std::size_t n = std::min(expected.size(), actual.size());
+    while (diff < n && expected[diff] == actual[diff])
+        ++diff;
+    INFO("golden mismatch for '" << cell << "' (" << path.string() << ") at byte offset " << diff
+         << " (expected " << expected.size() << " bytes, got " << actual.size() << " bytes)\n"
+         << "--- expected, around offset " << diff << " ---\n" << context_at(expected, diff)
+         << "\n--- actual, around offset " << diff << " ---\n" << context_at(actual, diff));
+    CHECK(expected == actual);
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -132,9 +241,10 @@ const std::string kOld = iso_ago(std::chrono::hours(24 * 3));
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: catalogue fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_catalogue_fragment(nullptr, "", 7, DexFleet{}, "all") ==
-         "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal observation store "
-         "is not open.</div>");
+    const auto html = render_dex_catalogue_fragment(nullptr, "", 7, DexFleet{}, "all");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("catalogue__null", html);
 }
 
 TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os matrix",
@@ -165,6 +275,7 @@ TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os 
                         "monitored</span></div><div class=\"fev ok\">94</div><div "
                         "class=\"fmeta\">health score</div><div class=\"ftop\"><b>App crash</b> "
                         "&middot; 3 events</div>") != std::string::npos);
+        check_golden("catalogue__os-all_win-all", html);
     }
     // os=all, window=24h: only the recent crash + the hang are in-window (2
     // events); the score is UNCHANGED (94) since device-radius is unaffected.
@@ -175,6 +286,7 @@ TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os 
                         "monitored</span></div><div class=\"fev ok\">94</div><div "
                         "class=\"fmeta\">health score</div><div class=\"ftop\"><b>App crash</b> "
                         "&middot; 2 events</div>") != std::string::npos);
+        check_golden("catalogue__os-all_win-24h", html);
     }
     // os=linux: no platform-tagged-"linux" events exist (everything above was
     // seeded platform=windows) and fleet.linux_online=0 -> the "no online
@@ -188,6 +300,7 @@ TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os 
                         "class=\"fmeta\">no online agents reporting</div><div class=\"ftop\">"
                         "monitored, but no device is online to report</div>") !=
              std::string::npos);
+        check_golden("catalogue__os-linux_win-all", html);
     }
     {
         const auto html =
@@ -197,6 +310,7 @@ TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os 
                         "class=\"fmeta\">no online agents reporting</div><div class=\"ftop\">"
                         "monitored, but no device is online to report</div>") !=
              std::string::npos);
+        check_golden("catalogue__os-linux_win-24h", html);
     }
 }
 
@@ -205,10 +319,11 @@ TEST_CASE("DEX golden: catalogue fragment — App reliability card, window x os 
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: catalogue group fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_catalogue_group_fragment(nullptr, "", 7, "App reliability", DexFleet{},
-                                              "all") ==
-         "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal observation store "
-         "is not open.</div>");
+    const auto html =
+        render_dex_catalogue_group_fragment(nullptr, "", 7, "App reliability", DexFleet{}, "all");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("catalogue_group__null", html);
 }
 
 TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, window x os matrix",
@@ -261,6 +376,7 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
                         "class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">Windows"
                         "</span></td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
                         "<td>watched</td></tr>") != std::string::npos);
+        check_golden("catalogue_group__os-all_win-all", html);
     }
     // os=all, window=24h — the two counts drop to 1 each (the old crash ages
     // out); the score stays 94 (device-radius unchanged), last_seen unchanged
@@ -276,6 +392,7 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
                         "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">"
                         "Windows</span></td><td class=\"gp-num\">1</td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
+        check_golden("catalogue_group__os-all_win-24h", html);
     }
     // os=linux: only process.crashed/process.hung are monitored (2 of 12);
     // no linux-platform events exist -> the health-score tile is OMITTED
@@ -310,6 +427,7 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
                         "<span class=\"gp-pill draft\">not collected on linux</span></td>"
                         "<td class=\"gp-num\">&mdash;</td><td class=\"gp-num\">&mdash;</td>"
                         "<td>&mdash;</td></tr>") != std::string::npos);
+        check_golden("catalogue_group__os-linux_win-all", html);
     }
 }
 
@@ -317,9 +435,11 @@ TEST_CASE("DEX golden: catalogue group fragment — unknown family name", "[pg][
     YUZU_REQUIRE_PG_DB_TPL(db, golden_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
-    CHECK(render_dex_catalogue_group_fragment(&store, "", 7, "No Such Family", DexFleet{}, "all") ==
-         "<div class=\"gp-placeholder\"><b>Unknown family</b>No such signal family: No Such "
-         "Family</div>");
+    const auto html =
+        render_dex_catalogue_group_fragment(&store, "", 7, "No Such Family", DexFleet{}, "all");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Unknown family</b>No such signal family: No "
+                  "Such Family</div>");
+    check_golden("catalogue_group__unknown-family", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -328,9 +448,10 @@ TEST_CASE("DEX golden: catalogue group fragment — unknown family name", "[pg][
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: catalogue signal fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_catalogue_signal_fragment(nullptr, "", 7, "process.crashed") ==
-         "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal observation store "
-         "is not open.</div>");
+    const auto html = render_dex_catalogue_signal_fragment(nullptr, "", 7, "process.crashed");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("catalogue_signal__null", html);
 }
 
 TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down, full matrix",
@@ -363,6 +484,7 @@ TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down,
                         kRecent + "</td></tr>") != std::string::npos);
         CHECK(html.find("<tr><td>dex-gold-2</td><td class=\"gp-num\">1</td><td class=\"gp-mute\">" +
                         kRecent + "</td></tr>") != std::string::npos);
+        check_golden("catalogue_signal__os-all_win-all_visible-null", html);
     }
     // window=24h: the old crash ages out (events 3->2), device count unchanged.
     {
@@ -374,6 +496,7 @@ TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down,
                         kRecent + "</td></tr>") != std::string::npos);
         CHECK(html.find("<tr><td>dex-gold-2</td><td class=\"gp-num\">1</td><td class=\"gp-mute\">" +
                         kRecent + "</td></tr>") != std::string::npos);
+        check_golden("catalogue_signal__os-all_win-24h_visible-null", html);
     }
     // os=linux: no linux-platform events -> the devices/subjects lists are
     // empty -> the "No data" placeholders (a different code path from the
@@ -385,6 +508,7 @@ TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down,
                         "in the window.</div>") != std::string::npos);
         CHECK(html.find("<div class=\"gp-placeholder\"><b>No data</b>No devices reported this "
                         "signal in the window.</div>") != std::string::npos);
+        check_golden("catalogue_signal__os-linux_win-all_visible-null", html);
     }
     // visible = proper subset (dex-gold-1 only): dex-gold-2's row is dropped,
     // dex-gold-1's stays — the table shell + the surviving row both render.
@@ -394,6 +518,7 @@ TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down,
             render_dex_catalogue_signal_fragment(&store, "", 0, "process.crashed", "all", &visible);
         CHECK(html.find("<tr><td>dex-gold-1</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
+        check_golden("catalogue_signal__os-all_win-all_visible-subset", html);
     }
     // PR-2 DELTA: visible = a set containing NEITHER listed device. Every row
     // is dropped by the per-row filter, but `devices` was non-empty BEFORE
@@ -413,13 +538,15 @@ TEST_CASE("DEX golden: catalogue signal fragment — process.crashed drill-down,
              std::string::npos);
         CHECK(html.find("dex-gold-1") == std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
+        check_golden("catalogue_signal__os-all_win-all_visible-none", html);
     }
 }
 
 TEST_CASE("DEX golden: catalogue signal fragment — degenerate empty obs_type", "[dex][golden]") {
-    CHECK(render_dex_catalogue_signal_fragment(nullptr, "", 7, "") ==
-         "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal observation store "
-         "is not open.</div>");
+    const auto html = render_dex_catalogue_signal_fragment(nullptr, "", 7, "");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Catalogue unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("catalogue_signal__degenerate-empty-obstype", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -427,9 +554,10 @@ TEST_CASE("DEX golden: catalogue signal fragment — degenerate empty obs_type",
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: health fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_health_fragment(nullptr, "", 7, DexFleet{}, "default") ==
-         "<div class=\"gp-placeholder\"><b>Health score unavailable</b>The signal observation "
-         "store is not open.</div>");
+    const auto html = render_dex_health_fragment(nullptr, "", 7, DexFleet{}, "default");
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Health score unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("health__null", html);
 }
 
 TEST_CASE("DEX golden: health fragment — window matrix (score is window-invariant here)",
@@ -460,6 +588,7 @@ TEST_CASE("DEX golden: health fragment — window matrix (score is window-invari
         CHECK(html.find("<div class=\"gp-sscore\"><div class=\"nm\">App reliability</div><div "
                         "class=\"vv band-good\">78</div><div class=\"ds\">&minus;6.0 pts &middot; "
                         "high weight</div></div>") != std::string::npos);
+        check_golden("health__win-all", html);
     }
     // window=24h: only total_crashes drops (1); the composite is unaffected
     // (device-radius based, not event-count based).
@@ -470,6 +599,7 @@ TEST_CASE("DEX golden: health fragment — window matrix (score is window-invari
         CHECK(html.find("<div class=\"vdiv\"></div><div><div class=\"big sec\">1</div><div "
                         "class=\"lbl\">Crashes (window)</div></div></div>") != std::string::npos);
         CHECK(html.find("<div class=\"num\">94</div>") != std::string::npos);
+        check_golden("health__win-24h", html);
     }
 }
 
@@ -488,6 +618,7 @@ TEST_CASE("DEX golden: health fragment — no reporting agents suppresses the co
                     "score &amp;mdash; a composite would be a fabricated 100, so it is withheld "
                     "rather than shown. It populates as agents report.</div>") !=
          std::string::npos);
+    check_golden("health__no-reporting-agents", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -495,9 +626,10 @@ TEST_CASE("DEX golden: health fragment — no reporting agents suppresses the co
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: trends fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_trends_fragment(nullptr, "", 7, DexFleet{}) ==
-         "<div class=\"gp-placeholder\"><b>Trends unavailable</b>The signal observation store is "
-         "not open.</div>");
+    const auto html = render_dex_trends_fragment(nullptr, "", 7, DexFleet{});
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Trends unavailable</b>The signal observation "
+                  "store is not open.</div>");
+    check_golden("trends__null", html);
 }
 
 TEST_CASE("DEX golden: trends fragment — window matrix", "[pg][dex][golden]") {
@@ -520,6 +652,7 @@ TEST_CASE("DEX golden: trends fragment — window matrix", "[pg][dex][golden]") 
         CHECK(html.find("<span class=\"smn\">App reliability</span><span class=\"smv\">3</span>") !=
              std::string::npos);
         CHECK(html.find("<span class=\"hlbl\">App reliability</span>") != std::string::npos);
+        check_golden("trends__win-all", html);
     }
     {
         const auto html = render_dex_trends_fragment(&store, dex_iso_since(1), 1, fleet);
@@ -529,6 +662,7 @@ TEST_CASE("DEX golden: trends fragment — window matrix", "[pg][dex][golden]") 
              std::string::npos);
         CHECK(html.find("<span class=\"smn\">App reliability</span><span class=\"smv\">2</span>") !=
              std::string::npos);
+        check_golden("trends__win-24h", html);
     }
 }
 
@@ -538,9 +672,10 @@ TEST_CASE("DEX golden: trends fragment — window matrix", "[pg][dex][golden]") 
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: overview fragment — null store placeholder", "[dex][golden]") {
-    CHECK(render_dex_overview_fragment(nullptr, "", 7, DexFleet{}) ==
-         "<div class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal observation "
-         "store is not open.</div>");
+    const auto html = render_dex_overview_fragment(nullptr, "", 7, DexFleet{});
+    CHECK(html == "<div class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal "
+                  "observation store is not open.</div>");
+    check_golden("overview__null", html);
 }
 
 TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex][golden]") {
@@ -589,6 +724,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
                         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
                         "style=\"cursor:pointer;\">dex-gold-2</a></td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
+        check_golden("overview__win-all_visible-null", html);
     }
     // window=24h: same composite (device-radius-based, window-invariant).
     {
@@ -600,6 +736,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
                         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
                         "style=\"cursor:pointer;\">dex-gold-1</a></td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
+        check_golden("overview__win-24h_visible-null", html);
     }
     // visible = {dex-gold-1} only: dex-gold-2's row is dropped from the
     // "most-affected devices" table (the Experience distribution above is
@@ -610,6 +747,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
         const auto html = render_dex_overview_fragment(&store, "", 0, fleet, &visible);
         CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
+        check_golden("overview__win-all_visible-subset", html);
     }
     // PR-2 DELTA: visible names neither device. Both rows drop, but `devices`
     // was non-empty before filtering, so the table shell (not the "No data"
@@ -624,6 +762,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
              std::string::npos);
         CHECK(html.find("dex-gold-1</a>") == std::string::npos);
         CHECK(html.find("dex-gold-2</a>") == std::string::npos);
+        check_golden("overview__win-all_visible-none", html);
     }
 }
 
@@ -633,21 +772,23 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=24h)", "[dex][golden]") {
-    CHECK(render_dex_app_fragment(nullptr, "app1.exe", "24h") ==
-         "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
-         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
-         "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store is not "
-         "open.</div>");
+    const auto html = render_dex_app_fragment(nullptr, "app1.exe", "24h");
+    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+                  "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
+                  "is not open.</div>");
+    check_golden("app__null_win-24h", html);
 }
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=all)", "[dex][golden]") {
-    CHECK(render_dex_app_fragment(nullptr, "app1.exe", "all") ==
-         "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
-         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
-         "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store is not "
-         "open.</div>");
+    const auto html = render_dex_app_fragment(nullptr, "app1.exe", "all");
+    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+                  "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
+                  "is not open.</div>");
+    check_golden("app__null_win-all", html);
 }
 
 TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible matrix",
@@ -680,6 +821,7 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
                         "</td></tr>") != std::string::npos);
         CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2</a></td><td class=\"gp-num\">1</td>") != std::string::npos);
+        check_golden("app__win-all_visible-null", html);
     }
     // window=24h: the old crash ages out -> crashes=2, first_seen==last_seen
     // (only kRecent remains in-window).
@@ -691,6 +833,7 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
                         "</div><div class=\"l\">First seen</div></div>") != std::string::npos);
         CHECK(html.find("<tr><td>ntdll.dll</td><td class=\"gp-num\">2</td></tr>") !=
              std::string::npos);
+        check_golden("app__win-24h_visible-null", html);
     }
     // visible = {dex-gold-1} only: dex-gold-2's row drops.
     {
@@ -698,6 +841,7 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
         const auto html = render_dex_app_fragment(&store, "app1.exe", "all", &visible);
         CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
+        check_golden("app__win-all_visible-subset", html);
     }
     // PR-2 DELTA: visible names neither device -> the "Affected devices"
     // table shell renders with an empty <tbody> (the same existence-oracle
@@ -711,6 +855,7 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
              std::string::npos);
         CHECK(html.find("dex-gold-1</a>") == std::string::npos);
         CHECK(html.find("dex-gold-2</a>") == std::string::npos);
+        check_golden("app__win-all_visible-none", html);
     }
 }
 
@@ -721,6 +866,7 @@ TEST_CASE("DEX golden: app fragment — no crashes/hangs for this app", "[pg][de
     const auto html = render_dex_app_fragment(&store, "quiet-app.exe", "all");
     CHECK(html.find("<div class=\"gp-placeholder\"><b>No crashes</b>No crashes or hangs recorded "
                     "for this application.</div>") != std::string::npos);
+    check_golden("app__no-crashes", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -728,21 +874,23 @@ TEST_CASE("DEX golden: app fragment — no crashes/hangs for this app", "[pg][de
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=24h)", "[dex][golden]") {
-    CHECK(render_dex_device_fragment(nullptr, "dex-gold-1", "24h") ==
-         "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
-         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
-         "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store is not "
-         "open.</div>");
+    const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "24h");
+    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+                  "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
+                  "is not open.</div>");
+    check_golden("device__null_win-24h", html);
 }
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=all)", "[dex][golden]") {
-    CHECK(render_dex_device_fragment(nullptr, "dex-gold-1", "all") ==
-         "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
-         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
-         "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store is not "
-         "open.</div>");
+    const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "all");
+    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+                  "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
+                  "is not open.</div>");
+    check_golden("device__null_win-all", html);
 }
 
 TEST_CASE("DEX golden: device fragment — dex-gold-1 signal history, window matrix",
@@ -776,6 +924,7 @@ TEST_CASE("DEX golden: device fragment — dex-gold-1 signal history, window mat
                         "hx-swap=\"innerHTML\"><td class=\"gp-mute\">" + kOld +
                         "</td><td>App hang</td><td>app2.exe</td><td class=\"gp-drift\">"
                         "NOT_RESPONDING</td><td></td></tr>") != std::string::npos);
+        check_golden("device__win-all", html);
     }
     // window=24h: the hang ages out entirely (event_id=h1's row is gone).
     {
@@ -786,6 +935,7 @@ TEST_CASE("DEX golden: device fragment — dex-gold-1 signal history, window mat
                         "class=\"l\">Hangs</div></div>") != std::string::npos);
         CHECK(html.find("event_id=c1") != std::string::npos);
         CHECK(html.find("event_id=h1") == std::string::npos);
+        check_golden("device__win-24h", html);
     }
 }
 
@@ -796,6 +946,7 @@ TEST_CASE("DEX golden: device fragment — no signals for this device", "[pg][de
     const auto html = render_dex_device_fragment(&store, "quiet-device", "all");
     CHECK(html.find("<div class=\"gp-placeholder\"><b>No signals</b>No reliability signals "
                     "recorded for this device.</div>") != std::string::npos);
+    check_golden("device__no-signals", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -803,14 +954,16 @@ TEST_CASE("DEX golden: device fragment — no signals for this device", "[pg][de
 // ─────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("DEX golden: apps fragment — null store placeholder, window matrix", "[dex][golden]") {
-    CHECK(render_dex_apps_fragment(nullptr, "", 1).find("<div class=\"gp-placeholder\"><b>Apps "
-                                                        "unavailable</b>The signal store is not "
-                                                        "open.</div>") != std::string::npos);
-    CHECK(render_dex_apps_fragment(nullptr, "", 0).find("<div class=\"gp-placeholder\"><b>Apps "
-                                                        "unavailable</b>The signal store is not "
-                                                        "open.</div>") != std::string::npos);
-    CHECK(render_dex_apps_fragment(nullptr, "", 1).find("<h1>Applications</h1>") !=
-         std::string::npos);
+    const auto html_24h = render_dex_apps_fragment(nullptr, "", 1);
+    CHECK(html_24h.find("<div class=\"gp-placeholder\"><b>Apps unavailable</b>The signal store "
+                        "is not open.</div>") != std::string::npos);
+    CHECK(html_24h.find("<h1>Applications</h1>") != std::string::npos);
+    check_golden("apps__null_win-24h", html_24h);
+
+    const auto html_all = render_dex_apps_fragment(nullptr, "", 0);
+    CHECK(html_all.find("<div class=\"gp-placeholder\"><b>Apps unavailable</b>The signal store "
+                        "is not open.</div>") != std::string::npos);
+    check_golden("apps__null_win-all", html_all);
 }
 
 TEST_CASE("DEX golden: apps fragment — ranked app list, window matrix", "[pg][dex][golden]") {
@@ -835,6 +988,7 @@ TEST_CASE("DEX golden: apps fragment — ranked app list, window matrix", "[pg][
                         "style=\"cursor:pointer;\">app2.exe</a></td><td class=\"gp-num\">0</td>"
                         "<td class=\"gp-num\">1</td><td class=\"gp-num\">1</td><td "
                         "class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
+        check_golden("apps__win-all", html);
     }
     // window=24h: app1.exe crashes drop to 2.
     {
@@ -844,6 +998,7 @@ TEST_CASE("DEX golden: apps fragment — ranked app list, window matrix", "[pg][
                         "style=\"cursor:pointer;\">app1.exe</a></td><td class=\"gp-num\">2</td>"
                         "<td class=\"gp-num\">0</td><td class=\"gp-num\">2</td><td "
                         "class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
+        check_golden("apps__win-24h", html);
     }
 }
 
@@ -854,6 +1009,7 @@ TEST_CASE("DEX golden: apps fragment — no data in window", "[pg][dex][golden]"
     const auto html = render_dex_apps_fragment(&store, "", 0);
     CHECK(html.find("<div class=\"gp-placeholder\"><b>No data</b>No app crashes or hangs "
                     "recorded in this window.</div>") != std::string::npos);
+    check_golden("apps__no-data", html);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -874,16 +1030,23 @@ TEST_CASE("DEX golden: observation fragment — every field, byte-exact", "[dex]
     r.metric = 0.0; // process.crashed carries no metric -> "&mdash;"
     r.platform = "windows";
 
-    CHECK(render_dex_observation_fragment(r) ==
-         "<div class=\"gp-sech\">App crash <span class=\"gp-mute\" "
-         "style=\"font-family:var(--mono);text-transform:none;letter-spacing:0\">process.crashed"
-         "</span></div><div class=\"gp-spec\"><span class=\"k\">When</span><code>"
-         "2026-01-01T00:00:00Z</code><span class=\"k\">Subject</span><code>notepad.exe</code>"
-         "<span class=\"k\">Code</span><code>0xC0000005</code><span class=\"k\">Symbolic</span>"
-         "<code>ACCESS_VIOLATION</code><span class=\"k\">Component</span><code>ntdll.dll</code>"
-         "<span class=\"k\">Metric</span><code>&mdash;</code><span class=\"k\">Device</span>"
-         "<code>dex-gold-obs-1</code><span class=\"k\">Platform</span><code>windows</code>"
-         "<span class=\"k\">Event id</span><code>evt-golden-1</code></div>");
+    const auto html = render_dex_observation_fragment(r);
+    CHECK(html == "<div class=\"gp-sech\">App crash <span class=\"gp-mute\" "
+                  "style=\"font-family:var(--mono);text-transform:none;letter-spacing:0\">"
+                  "process.crashed</span></div><div class=\"gp-spec\"><span class=\"k\">When"
+                  "</span><code>2026-01-01T00:00:00Z</code><span class=\"k\">Subject</span>"
+                  "<code>notepad.exe</code><span class=\"k\">Code</span><code>0xC0000005</code>"
+                  "<span class=\"k\">Symbolic</span><code>ACCESS_VIOLATION</code><span "
+                  "class=\"k\">Component</span><code>ntdll.dll</code><span class=\"k\">Metric"
+                  "</span><code>&mdash;</code><span class=\"k\">Device</span><code>"
+                  "dex-gold-obs-1</code><span class=\"k\">Platform</span><code>windows</code>"
+                  "<span class=\"k\">Event id</span><code>evt-golden-1</code></div>");
+    // NOTE: this cell's `observed_at` literal ("2026-01-01T00:00:00Z") IS an
+    // ISO-8601 UTC timestamp, so normalize_time() rewrites it to "<TS>" in
+    // the golden file exactly like a wall-clock-anchored one — deliberate
+    // (the normaliser can't and shouldn't distinguish "fixed literal" from
+    // "computed from now()"; both are the same shape).
+    check_golden("observation__full-fields", html);
 }
 
 TEST_CASE("DEX golden: /fragments/dex/observation route — null store never distinguishes from "
@@ -909,6 +1072,7 @@ TEST_CASE("DEX golden: /fragments/dex/observation route — null store never dis
     // DEX fragment (which has its own dedicated "store is not open" wording).
     CHECK(r->body == "<div class=\"gp-placeholder\"><b>Observation not found</b>No such event on "
                      "this device.</div>");
+    check_golden("observation_route__null-store", r->body);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -1515,6 +1515,15 @@ if build_server
                # case, but there is no reason to rely on it. std::filesystem and
                # the Win32 API both accept forward slashes.
                (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
+               '"',
+               # WS-A4 /dex golden files (test_dex_dashboard_golden.cpp): the build
+               # runs out-of-tree, so the committed `tests/unit/server/golden/`
+               # directory (one .html per rendered matrix cell) is located via a
+               # source-root-relative define, same backslash-normalisation
+               # requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_TEST_GOLDEN_DIR="' +
+               (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
+                   '\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
