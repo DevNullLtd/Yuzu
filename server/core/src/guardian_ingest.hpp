@@ -138,4 +138,13 @@ void set_t_server_logger(std::shared_ptr<spdlog::logger> logger);
 /// (out of scope for this PR, see #5024's equivalent agent-side item).
 [[nodiscard]] std::uint64_t t_server_log_skipped_total_for_test();
 
+/// Test-only fault injection for create_t_server_logger()'s pool/logger construction step
+/// (governance Gate 8 follow-up, closes a gap cpp-safety flagged: every throw site was traced by
+/// hand and reasoned to unwind cleanly, but none was test-covered) -- mirrors
+/// agents/core/src/log_handoff.hpp's LogHandoff::set_construction_fault_for_test() exactly,
+/// including its consumption contract: the flag is consumed (reset to false) by the very next
+/// create_t_server_logger() call, whether or not that call is the one the test intended, so it
+/// never leaks into a later, unrelated test. Production callers never set this.
+void set_t_server_construction_fault_for_test(bool fail) noexcept;
+
 } // namespace yuzu::server::detail

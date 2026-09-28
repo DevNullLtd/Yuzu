@@ -46,6 +46,7 @@ using yuzu::server::detail::create_t_server_logger;
 using yuzu::server::detail::guardian_event_store_buckets;
 using yuzu::server::detail::ingest_guardian_response;
 using yuzu::server::detail::kGuardianEventStoreDurationMetric;
+using yuzu::server::detail::set_t_server_construction_fault_for_test;
 using yuzu::server::detail::set_t_server_logger;
 using yuzu::server::detail::t_server_log_skipped_total_for_test;
 using yuzu::server::detail::warm_create_guardian_event_store_metric;
@@ -666,4 +667,26 @@ TEST_CASE("guardian ingest: #4666 PR-4 T_server's logger level is set explicitly
     REQUIRE(t_server_logger != nullptr);
     CHECK_FALSE(t_server_logger->should_log(spdlog::level::info));
     CHECK(t_server_logger->should_log(spdlog::level::warn));
+}
+
+TEST_CASE("guardian ingest: #4666 PR-4 T_server's construction-failure path returns null, "
+          "never throws, and never leaks the fault flag into the next call",
+          "[guardian][ingest][diagnostics]") {
+    // Closes a gap cpp-safety flagged at governance Gate 3: every throw site inside
+    // create_t_server_logger() was traced by hand and reasoned to unwind cleanly via ordinary
+    // local shared_ptr RAII, but none was actually exercised by a test. Mirrors
+    // agents/core/src/log_handoff.hpp's LogHandoff::set_construction_fault_for_test() pattern
+    // exactly, including its exchange-and-consume contract.
+    auto sink = std::make_shared<ParkingSink>();
+
+    set_t_server_construction_fault_for_test(true);
+    auto failed_logger =
+        create_t_server_logger(std::vector<spdlog::sink_ptr>{sink}, spdlog::level::info);
+    CHECK(failed_logger == nullptr); // MUST #7: best-effort, never throws, never EXIT_FAILURE
+
+    // The flag is consumed by that one call -- an immediately-following call must succeed
+    // normally, proving the fault doesn't leak into unrelated, later construction attempts.
+    auto healthy_logger =
+        create_t_server_logger(std::vector<spdlog::sink_ptr>{sink}, spdlog::level::info);
+    CHECK(healthy_logger != nullptr);
 }

@@ -143,6 +143,7 @@ struct TServerErrorState {
 std::mutex g_t_server_logger_mu;
 std::shared_ptr<spdlog::logger> g_t_server_logger; // guarded by g_t_server_logger_mu
 std::atomic<std::uint64_t> g_t_server_log_skipped_total{0};
+std::atomic<bool> g_t_server_construction_fault_for_test{false};
 
 // Snapshot under the lock, then use the returned shared_ptr lock-free: cheap (one refcount
 // bump), and keeps the logger alive for the whole ->info() call even if set_t_server_logger()
@@ -161,6 +162,18 @@ std::shared_ptr<spdlog::logger> create_t_server_logger(std::vector<spdlog::sink_
     // (thread_pool's ctor can throw std::system_error) is caught here, logged via the default
     // logger, and returns nullptr -- NEVER EXIT_FAILURE. Nothing before this point mutates any
     // global state; the seam stays unset until set_t_server_logger() is called with the result.
+    //
+    // Consume the test-fault flag FIRST, unconditionally -- mirrors LogHandoff's own governance
+    // hardening fix (log_handoff.cpp): consuming it AFTER some other early-return path would let
+    // a fault flag set ahead of that path go unconsumed and leak into the next, unrelated call.
+    // This function has no such early-return before the try block today, but the ordering is
+    // kept first-thing regardless, so it stays correct if one is ever added.
+    if (g_t_server_construction_fault_for_test.exchange(false, std::memory_order_relaxed)) {
+        spdlog::warn("Guardian T_server: failed to construct dedicated async logger (injected "
+                     "test fault); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+        return nullptr;
+    }
     try {
         auto pool = std::make_shared<spdlog::details::thread_pool>(kTServerLogQueueCapacity, 1);
         auto logger = std::make_shared<spdlog::async_logger>(
@@ -221,6 +234,10 @@ void set_t_server_logger(std::shared_ptr<spdlog::logger> logger) {
 
 std::uint64_t t_server_log_skipped_total_for_test() {
     return g_t_server_log_skipped_total.load(std::memory_order_relaxed);
+}
+
+void set_t_server_construction_fault_for_test(bool fail) noexcept {
+    g_t_server_construction_fault_for_test.store(fail, std::memory_order_relaxed);
 }
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
