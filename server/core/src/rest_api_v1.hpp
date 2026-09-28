@@ -273,13 +273,20 @@ public:
     // only operator was 403'd by `perm_fn` before this resolver ever ran, so
     // the confinement it computed was dormant on every admitted call (sec-1),
     // and an elevated admin got the BASE identity's narrowed/empty set
-    // instead of an unfiltered read (sec-2). All three routes now gate SOLELY
-    // on `FleetReadFn` (`AuthRoutes::require_fleet_read`, ADR-0017) — the same
-    // admit-then-filter chokepoint `GET /api/v1/dex/perf/app/devices` + MCP
-    // `list_dex_app_perf_devices` already use for an identified per-device
-    // fan-out — and derive their `devices[]`/`top_devices[]` confinement from
-    // the gate's own composed `VisibleSet` (`gate.scope`), never a second,
-    // independently-derived resolver.
+    // instead of an unfiltered read (sec-2). A later fix round tried gating
+    // all three onto `FleetReadFn` (`AuthRoutes::require_fleet_read`,
+    // ADR-0017) instead, but every value these three routes return —
+    // `devices[]`/`top_devices[]` INCLUDED, since those lists are built by a
+    // query that runs a fleet-wide LIMIT before any per-caller filter — is a
+    // FLEET-WIDE AGGREGATE (ADR-0017 INV-3 violation if narrowed per caller
+    // without confining the aggregate math itself), so per Fraser's round-3
+    // decision all three REVERTED to base gating: a bare `perm_fn`
+    // (`GuaranteedState:Read`, global-grant-or-legacy-admin/RBAC-off only —
+    // NEVER management-group-confined) plus each route's own
+    // `deny_fleet_wide_service_scoped` call. `DexApi::app`/`overview`/
+    // `signal_detail` no longer take a `visible` parameter at all — there is
+    // no per-caller confinement resolver on these three routes, dormant or
+    // otherwise, to keep in sync with anything.
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally

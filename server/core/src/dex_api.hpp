@@ -172,9 +172,9 @@ public:
     /// of confinement, and top-N-then-filter meant a confined caller could
     /// see FEWER than `limit` devices while never being told the aggregate
     /// above included excluded ones. Both REST and MCP gate this resource
-    /// on `GuaranteedState:Read` + a service-scoped-token denial (this
-    /// header's own doc comment) — nothing left for a `visible` parameter
-    /// to do here.
+    /// on `GuaranteedState:Read` (global-grant-or-legacy-admin/RBAC-off
+    /// only) plus their own service-scoped-token denial — nothing left for
+    /// a `visible` parameter to do here.
     [[nodiscard]] virtual DexSignalDetailModel
     signal_detail(const std::string& obs_type, const std::string& window,
                   const std::string& os_filter, int limit) const = 0;

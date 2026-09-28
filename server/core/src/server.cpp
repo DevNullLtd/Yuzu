@@ -14623,19 +14623,23 @@ private:
         };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is
-        // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): GET /api/v1/dex/app,
-        // GET /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
-        // (REST + MCP) now gate SOLELY on `fleet_read_fn` below
-        // (`AuthRoutes::require_fleet_read`, ADR-0017) and derive their
-        // confinement from its own composed `VisibleSet` — this resolver's
-        // bare `check_permission` global-read bypass meant a management-
-        // group-confined-only operator was 403'd by the old `perm_fn` gate
-        // in front of it before this resolver ever ran, so its confinement
-        // was dormant on every admitted call; `require_fleet_read` composes
-        // the SAME `RbacStore::authorize_list_read` chokepoint correctly,
-        // with elevated/engine/mcp_tier/service-scope branches handled
-        // internally. See RestApiV1::DexVisibleFn's retirement comment
-        // (rest_api_v1.hpp) for the full rationale.
+        // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): this resolver's bare
+        // `check_permission` global-read bypass meant a management-group-
+        // confined-only operator was 403'd by the old `perm_fn` gate in
+        // front of it before this resolver ever ran, so its confinement was
+        // dormant on every admitted call. A later fix round tried moving GET
+        // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+        // /api/v1/dex/signals/{obs_type} (REST + MCP) onto `fleet_read_fn`
+        // below instead — but every value these three return is a
+        // fleet-wide aggregate, not a per-caller-confinable list, so per
+        // Fraser's round-3 decision all three REVERTED to base gating: a
+        // bare `perm_fn`/`tier_allows` (`GuaranteedState:Read`, global-
+        // grant-or-legacy-admin/RBAC-off only) plus each surface's own
+        // service-scoped-token deny. `fleet_read_fn` is NOT one of these
+        // three routes' gates (it still exists below for the OTHER routes
+        // that are genuinely per-caller-confinable, e.g. GET
+        // /api/v1/dex/perf/app/devices). See RestApiV1::DexVisibleFn's
+        // retirement comment (rest_api_v1.hpp) for the full rationale.
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -19020,8 +19024,10 @@ private:
             // The former `dex_visible_fn` register_routes arg is RETIRED
             // (WS-A4 PR-1 fix round) — GET /api/v1/dex/app, GET
             // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
-            // now confine solely via `fleet_read_fn` above (see this file's
-            // "#4035 review fix's bespoke `dex_visible_fn` resolver" comment).
+            // gate on the bare `perm_fn`/`GuaranteedState:Read` (round-3
+            // revert; NOT `fleet_read_fn` above — see this file's "#4035
+            // review fix's bespoke `dex_visible_fn` resolver" comment for
+            // why) and have no per-caller confinement resolver at all.
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
@@ -19293,9 +19299,12 @@ private:
             // !baseline_store guards exactly.
             mcp_server_->set_guardian_api(guardian_api);
             // The former `mcp_server_->set_dex_visible_fn(dex_visible_fn)`
-            // wiring is RETIRED (WS-A4 PR-1 fix round) — `fleet_read_fn_`
-            // (wired via set_fleet_read_fn above) is now the SOLE gate for
-            // get_dex_app/get_dex_overview/get_dex_signal_detail too.
+            // wiring is RETIRED (WS-A4 PR-1 fix round) — get_dex_app/
+            // get_dex_overview/get_dex_signal_detail gate on the bare
+            // `perm_fn`/`tier_allows` (`GuaranteedState:Read`; round-3
+            // revert, NOT `fleet_read_fn_` — see the "#4035 review fix's
+            // bespoke `dex_visible_fn` resolver" comment above for why) and
+            // have no per-caller confinement resolver at all.
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment

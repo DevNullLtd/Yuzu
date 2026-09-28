@@ -2084,9 +2084,11 @@ void RestApiV1::register_routes(
     // below): their aggregates are not confined per caller (ADR-0017 INV-3),
     // so they stay global-only, and `DexApi::app`/`DexApi::overview` take no
     // `visible` parameter (dex_api.hpp).
-    // Net effect: every caller who reaches the handler body (a global grant,
-    // or an elevated administrator) now sees the SAME unfiltered device
-    // list — nothing is narrowed for anyone admission ever lets through.
+    // Net effect: every caller who reaches the handler body (RBAC-off — any
+    // authenticated non-service session, since `perm_fn`'s legacy fallback
+    // admits unconditionally there — a global grant, or an elevated
+    // administrator) now sees the SAME unfiltered device list — nothing is
+    // narrowed for anyone admission ever lets through.
 
     // PR1.9c: the caller-carrying sibling of the above. Same resolution, same
     // fail-closed posture — it just stops throwing the identity away.
