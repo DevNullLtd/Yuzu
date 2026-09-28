@@ -545,3 +545,19 @@ TEST_CASE("TAR schema: every registered source's every OS row round-trips throug
         }
     }
 }
+
+TEST_CASE("TAR schema: os_support_status looks up the per-OS row (#1846)", "[tar][schema]") {
+    CHECK(os_support_status("perf", "windows") == OsSupportStatus::kSupported);
+    CHECK(os_support_status("perf", "linux") == OsSupportStatus::kSupported);
+    CHECK(os_support_status("perf", "macos") == OsSupportStatus::kPlanned);
+    CHECK(os_support_status("procperf", "macos") == OsSupportStatus::kPlanned);
+    CHECK_FALSE(os_support_status("perf", "plan9").has_value());
+    CHECK_FALSE(os_support_status("nope", "linux").has_value());
+}
+
+TEST_CASE("TAR schema: supported_capture_method is registry-derived (#1846)", "[tar][schema]") {
+    CHECK(supported_capture_method("perf", "windows") == "ntcounters");
+    CHECK(supported_capture_method("perf", "linux") == "procfs");
+    CHECK(supported_capture_method("perf", "macos") == "none");
+    CHECK(supported_capture_method("nope", "linux") == "none");
+}

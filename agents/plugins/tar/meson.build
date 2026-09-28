@@ -95,7 +95,7 @@ elif host_machine.system() == 'darwin'
   tar_objcpp_args += apple_objcpp_args
 endif
 
-shared_library(
+tar_plugin_lib = shared_library(
   'tar',
   tar_sources,
   name_prefix: '',

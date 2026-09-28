@@ -829,7 +829,7 @@ spec:
       - name: events_recorded
         type: int32
         description: >-
-          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete. Values: non-negative integer.
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable. Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 

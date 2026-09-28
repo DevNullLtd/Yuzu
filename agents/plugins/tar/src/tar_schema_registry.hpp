@@ -148,6 +148,17 @@ struct CaptureSourceDef {
 [[nodiscard]] std::vector<std::string>
 accepted_capture_methods_for_os(std::string_view source_name, std::string_view os);
 
+// Support status of `source_name` on `os`, or nullopt for an unknown source or
+// an OS with no row. When a source lists several rows for one OS the best
+// (kSupported > kSupportedConstrained > kPlanned > kUnsupported) wins.
+[[nodiscard]] std::optional<OsSupportStatus> os_support_status(std::string_view source_name,
+                                                               std::string_view os);
+
+// The registry's capture_method for the source's kSupported/kSupportedConstrained
+// row on `os` (first such row); "none" when there is no supported row.
+[[nodiscard]] std::string_view supported_capture_method(std::string_view source_name,
+                                                        std::string_view os);
+
 // ── Effective (actually-wired) network capture mechanism (issue #1528) ─────
 //
 // Returns the capture mechanism the TAR collector ACTUALLY uses, given the

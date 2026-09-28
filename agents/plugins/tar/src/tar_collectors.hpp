@@ -19,6 +19,7 @@
  */
 
 #include "tar_db.hpp"
+#include "tar_schema_registry.hpp" // OsSupportStatus (read_failure_token)
 #include "tar_netqual.hpp" // TcpQualitySample (returned by collect_tcp_quality)
 
 #include <yuzu/agent/process_enum.hpp>
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <functional> // enumerate_services_impl's injectable-runner RunFn (non-Windows)
 #include <string>
 #include <string_view>
@@ -40,12 +42,24 @@ namespace yuzu::tar {
 // The final field of the `tar|collect_<leg>|N|<token>` output lines. These are
 // a documented operator contract (docs/yaml-dsl-spec.md `tar.collect_perf`;
 // operator dashboards parse them) and are pinned verbatim by the unit tests —
-// renaming one is a contract change, not a refactor. NOTE: on Linux,
-// `unsupported_platform` currently also covers "supported platform but the
-// core /proc reads failed" (e.g. a masked /proc); a distinct token for that
-// case is a tracked follow-up.
+// renaming one is a contract change, not a refactor. Two tokens describe a
+// failed perf read: `unsupported_platform` when the running OS has no perf
+// collector, `counters_unavailable` when it does (registry row is
+// kSupported/kSupportedConstrained) but the core counter read failed (e.g. a
+// masked /proc on Linux, a PDH/NT-counter failure on Windows). See
+// read_failure_token().
 inline constexpr std::string_view kCollectStatusSourceDisabled = "source_disabled";
 inline constexpr std::string_view kCollectStatusUnsupportedPlatform = "unsupported_platform";
+inline constexpr std::string_view kCollectStatusCountersUnavailable = "counters_unavailable";
+
+/// Token for a failed perf/procperf counter read, decided by the registry's
+/// support status for the running OS (OS-independent rule).
+[[nodiscard]] constexpr std::string_view
+read_failure_token(std::optional<OsSupportStatus> st) noexcept {
+    return (st == OsSupportStatus::kSupported || st == OsSupportStatus::kSupportedConstrained)
+               ? kCollectStatusCountersUnavailable
+               : kCollectStatusUnsupportedPlatform;
+}
 inline constexpr std::string_view kCollectStatusBaseline = "baseline";
 inline constexpr std::string_view kCollectStatusSampleRecorded = "sample_recorded";
 inline constexpr std::string_view kCollectStatusAppsRecorded = "apps_recorded";
