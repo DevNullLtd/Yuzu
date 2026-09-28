@@ -1012,6 +1012,9 @@ const std::string& openapi_spec() {
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
     },
+    "/rbac/roles/assignments": {
+      "get": {"summary": "Fleet-wide RBAC role assignments (who holds what)", "tags": ["RBAC"], "description": "Requires AccessReview:Read (the same dedicated securable RbacStore::list_all_principal_roles_checked() was built for, NOT UserManagement:Read like the plain role catalog above) — this is the complete, ungated grant table, the same sensitivity class as GET /api/v1/access-reviews/export. Every (principal_type, principal_id, role_name) grant row on record, across all three principal types, in one bulk read; no pagination (the underlying store call has none). Self-audited as rbac.assignments.list.", "responses": {"200": {"description": "data[].{principal_type, principal_id, role_name}"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "RBAC store unavailable, or a genuine read failure"}}}
+    },
     "/rbac/roles/{name}/assignments": {
       "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Invalid JSON, a non-object body, a wrong-typed principal_type/principal_id (degrades to missing/invalid, never a 500), unknown role, ITServiceOwner, principal_type != \"user\", invalid principal_id format, or the store rejects the grant for a genuine client-validation reason (defensive -- not reachable via this route today, since principal_type is hardcoded \"user\" and principal_id has already passed the same charset check DELETE enforces, but kept classified as 400 rather than 503 for when this changes) — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the assign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault while writing the grant (never misreported as a 400 — classified via an allow-list of known validation-error shapes), the defense-in-depth role lookup finding an already-validated role missing from the store, or the audit write for this mutation failed (fail-closed)"}}}
     },
@@ -5551,6 +5554,74 @@ void RestApiV1::register_routes(
                  }
                  res.set_content(ok_json(arr.str()), "application/json");
              });
+
+    // GET /api/v1/rbac/roles/assignments — fleet-wide "who currently holds
+    // which RBAC role", every (principal_type, principal_id, role_name) grant
+    // row on record. Reuses RbacStore::list_all_principal_roles_checked() —
+    // the SAME bulk read build_access_review() (access_review_model.cpp)
+    // already uses as the UP-1 spine for the SOC 2 CC6.2 grant-table export
+    // — rather than a second query. Gated on the SAME dedicated
+    // `AccessReview:Read` securable that store method was built for, NOT the
+    // broader `UserManagement:Read` the plain /rbac/roles catalog route
+    // above uses: this is the complete, ungated grant table (every
+    // principal's role, no management-group confinement), the same
+    // sensitivity class as the access-review export — a second read surface
+    // over identical data needs the identical bar. `AccessReview:Read` is
+    // already in the RBAC-off authorization-topology floor
+    // (authz_topology_floor.hpp), so this route is floored the same way
+    // GET /api/v1/access-reviews and GET /api/v1/access-reviews/export
+    // already are; mirrors those two routes' auth/audit shape (perm_fn ->
+    // store-open check -> auth_fn -> deny_engine_session -> read -> audit ->
+    // respond), not the neighboring POST/DELETE assignment routes' stronger
+    // is_rbac_administrator gate (minting/revoking standing authority is a
+    // different, stronger decision than reading the grant table).
+    // No pagination: list_all_principal_roles_checked() is a single bulk
+    // read with no limit/offset (same UP-1 rationale as the access-review
+    // export) — the envelope's pagination.total/start/page_size fields are
+    // the same cosmetic (non-cursor) convention GET /api/v1/rbac/roles above
+    // already uses, not real query-param pagination.
+    sink.Get(
+        "/api/v1/rbac/roles/assignments",
+        [perm_fn, auth_fn, audit_fn, rbac_store](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Read"))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "rbac.assignments.list",
+                                    "AccessReview"))
+                return;
+
+            auto grants_res = rbac_store->list_all_principal_roles_checked();
+            if (!grants_res) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, grants_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                     .remediation = {},
+                                                                     .permission = {},
+                                                                     .approval_id = {},
+                                                                     .status_url = {}}),
+                                "application/json");
+                return;
+            }
+            JArr arr;
+            for (const auto& g : *grants_res) {
+                arr.add(JObj()
+                            .add("principal_type", g.principal_type)
+                            .add("principal_id", g.principal_id)
+                            .add("role_name", g.role_name));
+            }
+            (void)audit_fn(req, "rbac.assignments.list", "success", "AccessReview", "",
+                           "count=" + std::to_string(grants_res->size()));
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(grants_res->size())),
+                            "application/json");
+        });
 
     // ── A2: global human role assignment/unassignment ───────────────────
     // (.claude/plans/rbac-industry-leading-DELIVERY-PLAN.md §2 "A2 — Global

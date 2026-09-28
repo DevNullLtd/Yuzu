@@ -1615,3 +1615,116 @@ TEST_CASE("rbac_assignable_roles.hpp's kRbacAssignableRoles matches "
     REQUIRE(unassign_schema["properties"].contains("role"));
     CHECK_FALSE(unassign_schema["properties"]["role"].contains("enum"));
 }
+
+// ── GET /api/v1/rbac/roles/assignments + list_rbac_role_assignments MCP
+// twin — the fleet-wide grant-table listing that reuses RbacStore::
+// list_all_principal_roles_checked() (the SAME bulk read build_access_review
+// uses for the SOC 2 CC6.2 export). Gated on perm_fn(AccessReview, Read),
+// UNLIKE every other route in this file (gated on is_rbac_administrator
+// instead) — RbacRoleHarness::perm_override (extracted onto the shared
+// harness for this suite) lets these tests exercise that gate directly. ────
+
+TEST_CASE("REST GET .../rbac/roles/assignments: happy path returns current "
+          "grants",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})")
+               ->status == 201);
+    REQUIRE(h.assign_rest("Viewer", R"({"principal_type":"user","principal_id":"bob"})")
+               ->status == 201);
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("data"));
+
+    bool found_jane = false, found_bob = false;
+    for (const auto& g : body["data"]) {
+        REQUIRE(g.contains("principal_type"));
+        REQUIRE(g.contains("principal_id"));
+        REQUIRE(g.contains("role_name"));
+        if (g["principal_type"] == "user" && g["principal_id"] == "jane" &&
+            g["role_name"] == "Operator")
+            found_jane = true;
+        if (g["principal_type"] == "user" && g["principal_id"] == "bob" &&
+            g["role_name"] == "Viewer")
+            found_bob = true;
+    }
+    CHECK(found_jane);
+    CHECK(found_bob);
+
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "rbac.assignments.list" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: 403 without AccessReview:Read",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Read");
+    };
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: an engine-classed session is denied",
+          "[pg][rest][rbac][list][engine_deny]") {
+    RbacRoleHarness h;
+    h.session_principal_kind = "engine";
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: happy path returns current grants",
+          "[pg][mcp][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})")
+               ->status == 201);
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("result"));
+    const auto& payload = body["result"]["structuredContent"];
+    REQUIRE(payload.contains("assignments"));
+    REQUIRE(payload.contains("count"));
+    CHECK(payload["count"].get<int64_t>() >= 1);
+
+    bool found = false;
+    for (const auto& g : payload["assignments"]) {
+        if (g["principal_type"] == "user" && g["principal_id"] == "jane" &&
+            g["role_name"] == "Operator")
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: denied without AccessReview:Read",
+          "[pg][mcp][rbac][list]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Read");
+    };
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP: list_rbac_role_assignments is advertised in tools/list",
+          "[pg][mcp][rbac][list][integration]") {
+    RbacRoleHarness h;
+    auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"list_rbac_role_assignments\"") != std::string::npos);
+}

@@ -2496,6 +2496,62 @@ Check whether the current user has a specific permission.
 
 ---
 
+#### `GET /api/v1/rbac/roles/assignments`
+
+Fleet-wide "who currently holds which RBAC role": every
+`(principal_type, principal_id, role_name)` grant row on record, across all
+three principal types (user/group/engine), in one bulk read. This reuses the
+same `RbacStore::list_all_principal_roles_checked()` bulk read the SOC 2
+CC6.2 access-review export (`GET /api/v1/access-reviews/export`) is built on
+— it is the complete, ungated grant table, not a management-group-confined
+slice.
+
+**Permission:** `AccessReview:Read` — the SAME dedicated securable the
+access-review export uses, deliberately **not** `UserManagement:Read` like
+the plain role catalog above: a confinement-filtered view would be
+incomplete evidence, so this route needs the same bar as the export. Also
+subject to the RBAC-off authorization-topology floor
+(`docs/auth-architecture.md` "The authorization topology floor (#2376)") —
+an Administrator-equivalent grant is required regardless of whether RBAC
+enforcement is currently on.
+
+No pagination: `list_all_principal_roles_checked()` is a single bulk read
+with no limit/offset — `pagination.total`/`start`/`page_size` in the
+response are the same cosmetic (non-cursor) envelope fields `GET
+/api/v1/rbac/roles` already returns, not real query-param pagination.
+
+Self-audited as `rbac.assignments.list`.
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "principal_type": "user",
+      "principal_id": "alice",
+      "role_name": "Administrator"
+    },
+    {
+      "principal_type": "engine",
+      "principal_id": "engine:nvd-sync",
+      "role_name": "Viewer"
+    }
+  ],
+  "pagination": { "total": 2, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Status | Meaning |
+|---|---|
+| 403 | Requires `AccessReview:Read` |
+| 503 | RBAC store unavailable, or a genuine read failure |
+
+---
+
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
 Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
