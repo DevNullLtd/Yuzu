@@ -631,6 +631,53 @@ TEST_CASE("local_security_policy pwpolicy_rows: a huge identifier is truncated b
     CHECK(result.rows[0].find(std::string(kMaxSourceIdentifierBytes + 1, 'x')) == std::string::npos);
 }
 
+TEST_CASE("local_security_policy pwpolicy_rows: identifier truncation never splits a multibyte "
+          "UTF-8 sequence (fjarvis review finding, PR #5069 -- the byte-256 cut previously could "
+          "sever a character mid-sequence, reaching the wire as invalid UTF-8)",
+          "[local_security_policy][parsers][pwpolicy]") {
+    // 254 ASCII bytes, then a 3-byte U+20AC straddling the 256-byte cap (bytes 254-256), then
+    // more content so truncation actually triggers. The boundary-safe cut backs off to 254 --
+    // the euro sign is excluded WHOLE, never split into dangling continuation bytes.
+    std::string identifier(254, 'x');
+    identifier += "\xE2\x82\xAC"; // U+20AC
+    identifier += "trailing content past the cap, never reached";
+    const PwPolicyItem huge_id{.category = "policyCategoryPasswordContent",
+                               .identifier = identifier,
+                               .content = "no length clause here",
+                               .has_content = true};
+    const auto result = pwpolicy_rows(LocalPolicyAction::Password, {huge_id});
+    REQUIRE(result.rows.size() == 1);
+    const std::string expected_src = "pwpolicy:" + std::string(254, 'x');
+    CHECK(result.rows[0] == "password_policy|policy_content|no length clause here|" + expected_src);
+}
+
+TEST_CASE("local_security_policy join_row: invalid UTF-8 in a value field is sanitized before it "
+          "reaches the wire (fjarvis review finding, PR #5069 -- raw /etc file bytes previously "
+          "passed through format_kv_row/join_row completely unsanitized)",
+          "[local_security_policy][parsers]") {
+    // A lone continuation byte (0x80) is never valid UTF-8 on its own -- the shape a
+    // non-UTF-8-encoded config file value (Latin-1, or simply corrupt) could carry through
+    // e.g. login.defs.
+    const std::string invalid_value = std::string("before") + '\x80' + "after";
+    const auto row =
+        format_kv_row("password_policy", "PASS_MAX_DAYS", invalid_value, "/etc/login.defs");
+    CHECK(row.find('\x80') == std::string::npos); // the raw invalid byte never reaches the wire
+    CHECK(row == "password_policy|PASS_MAX_DAYS|before?after|/etc/login.defs");
+}
+
+TEST_CASE("local_security_policy pwpolicy_rows: minimum_length never leaks into lockout_policy "
+          "even when an Authentication item's content coincidentally matches the .{N,} shape "
+          "(fjarvis review finding, PR #5069)",
+          "[local_security_policy][parsers][pwpolicy]") {
+    const PwPolicyItem lock_coincidence{.category = "policyCategoryAuthentication",
+                                        .identifier = "coincidence",
+                                        .content = "policyAttributeSomething matches '.{14,}'",
+                                        .has_content = true};
+    const auto result = pwpolicy_rows(LocalPolicyAction::Lockout, {lock_coincidence});
+    for (const auto& r : result.rows)
+        CHECK(r.find("minimum_length") == std::string::npos);
+}
+
 #if defined(__APPLE__)
 // ── pwpolicy_plist_to_items (the real CF-XML bridge, macOS only) ───────────────────────────
 // Governance quality-engineer finding: every test above drives pwpolicy_rows() with hand-built

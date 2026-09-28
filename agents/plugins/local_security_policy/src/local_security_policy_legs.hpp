@@ -9,8 +9,8 @@
  * inline (no collect_windows_policy leg exists in this PR at all; see plugin.cpp), same
  * "report planned, never claim an empty success" property as browser_policy's
  * mark_result_planned (browser_policy_legs.hpp) -- the one PLANNED-leg precedent actually
- * present in this tree; a plugin named privacy_permissions cited here in an earlier draft does
- * not exist in this repo (it is a sibling reconstruction on a separate, unmerged branch).
+ * present in this tree; privacy_permissions (#5064) also ships the same pattern and now
+ * lives in this repo at agents/plugins/privacy_permissions/.
  * The portable TU already builds a `local_security_policy.dll` on Windows even in this PR, and
  * deploy/packaging/windows/yuzu-agent.iss now installs it (adversarial-review finding: an
  * installed Windows agent previously could not reach even the planned-state row, since the
@@ -118,7 +118,10 @@ int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action);
 /// fields, not 4 -- if a future file-source failure is ever counted WITHOUT emitting
 /// its row, this fallback would write a 4-field row into a 7-field contract. Keep the
 /// pairing, or give this function the action-shaped fallback before you break it.
-/// No test pins the pairing (the plugin has no dedicated suite); the `sudoers.d`
+/// No direct test pins this specific pairing: the empty-rows fallback (the `if (c.rows.empty())`
+/// arms above) is reachable only from a real pwpolicy subprocess failure, which
+/// LocalDispatcher-based tests can't force deterministically, and a bare CommandContext
+/// can't be cheaply constructed outside that harness for a standalone call. The `sudoers.d`
 /// truncation arm was the one site that counted without emitting, and it no longer does.
 inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
                            std::string_view action_prefix) {

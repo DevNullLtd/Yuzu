@@ -357,11 +357,20 @@ inline PolicyStatus select_status(std::size_t readable, std::size_t denied, std:
 /// A NUL never reaches write_output, which takes a C string and would silently end the
 /// row there. Every source already refuses one upstream (kReadEmbeddedNul, cf_to_utf8,
 /// secedit:embedded_nul), so this substitution (U+FFFD, visible) is defence in depth.
+///
+/// Every field goes through sanitize_utf8 before safe_output_field -- same order as
+/// runtimes_parsers.hpp's field formatter. This is the ONE call site every row in this
+/// plugin passes through (format_kv_row has no other caller), so it is also the single
+/// chokepoint closing two independent invalid-byte paths at once: raw /etc file content
+/// (login.defs/pwquality.conf/faillock.conf/audit.rules values, PAM control/args) is never
+/// scrubbed before reaching a row, and a byte-offset truncation elsewhere in this file
+/// (pwpolicy_rows' identifier cut) could otherwise leave a severed multibyte sequence at
+/// the end of a field (fjarvis review finding, PR #5069).
 inline std::string join_row(std::string_view head, std::initializer_list<std::string_view> fields) {
     std::string r{head};
     for (auto f : fields) {
         r += '|';
-        r += yuzu::util::safe_output_field(f);
+        r += yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{f}));
     }
     for (std::size_t at = 0; (at = r.find('\0', at)) != std::string::npos;)
         r.replace(at, 1, "\xEF\xBF\xBD");
@@ -739,8 +748,20 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
         const bool lock = it.category.find("Authentication") != std::string::npos;
         const bool pw = it.category.rfind("policyCategoryPassword", 0) == 0;
         const std::string& named_raw = it.identifier.empty() ? it.category : it.identifier;
-        const std::string_view named =
-            std::string_view{named_raw}.substr(0, kMaxSourceIdentifierBytes);
+        // Cut at a UTF-8 character boundary, never mid-sequence -- same walk-back pattern
+        // as installed_apps_parsers.hpp's list_field: back off while the byte AT the cut
+        // point is a continuation byte (top bits 10xxxxxx), so a multibyte character
+        // straddling kMaxSourceIdentifierBytes is excluded whole rather than severed
+        // (fjarvis review finding, PR #5069 -- join_row's sanitize_utf8 below is a second,
+        // independent line of defence, not a substitute for cutting cleanly here).
+        std::string_view named = std::string_view{named_raw}.substr(0, kMaxSourceIdentifierBytes);
+        if (named_raw.size() > kMaxSourceIdentifierBytes) {
+            std::size_t cut = named.size();
+            while (cut > 0 &&
+                  (static_cast<unsigned char>(named_raw[cut]) & 0xC0) == 0x80)
+                --cut;
+            named = named.substr(0, cut);
+        }
         const std::string src = named.empty() ? std::string{"pwpolicy"} : "pwpolicy:" + std::string{named};
         const auto defect_rows = [&] {
             for (const auto& d : it.defects) {
@@ -768,8 +789,14 @@ inline Collected pwpolicy_rows(LocalPolicyAction action, const std::vector<PwPol
             continue;
         }
         if (it.has_content) push_row(format_kv_row(prefix, "policy_content", it.content, src));
-        if (const auto n = pwpolicy_min_length(it.content))
-            push_row(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
+        // Gated on pw: minimum_length is a password_policy-only key (README-documented
+        // scope). Without this gate, a lockout/Authentication item whose content
+        // coincidentally matches the `.{N,}` shape leaks minimum_length into lockout_policy
+        // rows too (fjarvis review finding, PR #5069).
+        if (pw) {
+            if (const auto n = pwpolicy_min_length(it.content))
+                push_row(format_kv_row(prefix, "minimum_length", std::to_string(*n), src));
+        }
         for (const auto& [k, v] : it.params) {
             if (k.rfind("policyAttribute", 0) == 0) push_row(format_kv_row(prefix, k, v, src));
             else push_row(format_kv_row(prefix, "unmodelled_parameter", k + "=" + v, src));
