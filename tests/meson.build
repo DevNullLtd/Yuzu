@@ -1255,6 +1255,7 @@ if build_server
       'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
+      'unit/server/test_dex_dashboard_golden.cpp', # WS-A4 PR-1: pins /dex fragment HTML before the DexApi rewire
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
