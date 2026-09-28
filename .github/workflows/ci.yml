@@ -1357,6 +1357,15 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
 
+      # Fresh-install Administrator bootstrap: the fatal refusal when the config
+      # lists local users but none has role=admin, and the durable
+      # rbac.bootstrap.first_admin audit row on a successful bootstrap — neither
+      # is exercisable by the Catch2 suite (which never drives main()).
+      - name: First-admin bootstrap CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_first_admin_bootstrap_refusal.sh
+
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
       # completely — and three shutdown defects shipped and were each caught only by a human
