@@ -89,7 +89,7 @@ TEST_CASE("privacy_permissions: unknown action reports rc=1 and a named row",
     CHECK(result.rc == 1);
     const auto rows = rows_of(result.captured);
     REQUIRE(rows.size() == 1);
-    CHECK(rows.front().rfind("unknown action:", 0) == 0);
+    CHECK(rows.front() == "unknown action: not_a_real_action");
 }
 
 TEST_CASE("privacy_permissions: permissions always returns at least one 8-field row",

@@ -3,8 +3,10 @@
  * classifier, the xdg-desktop-portal PermissionStore table map, the per-table permission-list
  * decode, the `Lookup` error/reply-shape decisions and the all-vs-some ServiceUnknown rule. No
  * sd-bus header, no syscall: privacy_permissions_linux.cpp performs the real sd_bus calls and
- * hands this file plain values (an errno, a D-Bus error name, the decoded a{sas} entries), same
- * split as privacy_permissions_macos_parsers.hpp / privacy_permissions_win_parsers.hpp.
+ * hands this file plain values (an errno, a D-Bus error name, the decoded a{sas} entries). The
+ * same split is PLANNED for privacy_permissions_macos_parsers.hpp / privacy_permissions_win_parsers.hpp
+ * once those legs land (see privacy_permissions_legs.hpp's "WHEN A LEG LANDS" note) -- neither
+ * file exists yet.
  *
  * REAL SHAPES (xdg-desktop-portal 1.20.3, Debian 13 container, 2026-09-23): `Lookup(s table,
  * s id) -> (a{sas} permissions, v data)`. The `devices` table (ids `camera`, `microphone`)

@@ -41,10 +41,12 @@ namespace {
 
 #if defined(_WIN32)
 constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowWindows;
+#elif defined(__linux__)
+constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowLinux;
 #elif defined(__APPLE__)
 constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowMacos;
 #else
-constexpr std::string_view kInternalErrorRow = yuzu::privacy_permissions::kInternalErrorRowLinux;
+#error "privacy_permissions: unsupported platform"
 #endif
 
 const YuzuActionDescriptor kActionDescriptors[] = {
