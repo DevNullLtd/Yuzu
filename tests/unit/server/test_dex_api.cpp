@@ -200,7 +200,7 @@ TEST_CASE("DexApi: fleet-dependent reads use the injected FleetFn", "[pg][dex_ap
         fleet_called = true;
         return DexFleet{1, 1, {"windows"}};
     });
-    (void)api->overview("7d", /*visible=*/nullptr);
+    (void)api->overview("7d");
     CHECK(fleet_called); // the seam obtains the fleet from the injected FleetFn
 }
 
@@ -239,7 +239,7 @@ TEST_CASE("DexApi: builder-backed methods match their shared builders", "[pg][de
         CHECK_FALSE(api->observation("a2", "e1").has_value()); // e1 belongs to a1
     }
     SECTION("app") {
-        const auto a = api->app("notepad.exe", w, /*visible=*/nullptr);
+        const auto a = api->app("notepad.exe", w);
         const auto b = yuzu::server::build_dex_app_model(&store, "notepad.exe", w, since, nullptr);
         CHECK(a.process_name == b.process_name);
         CHECK(a.devices.size() == b.devices.size());

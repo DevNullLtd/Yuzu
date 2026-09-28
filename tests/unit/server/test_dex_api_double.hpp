@@ -33,7 +33,6 @@
 
 #include <functional>
 #include <optional>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,9 +47,8 @@ public:
         const std::string& agent_id, const std::string& window)>;
     using ObservationFn = std::function<std::optional<yuzu::server::GuardianObservationRow>(
         const std::string& agent_id, const std::string& event_id)>;
-    using AppFn = std::function<yuzu::server::DexAppModel(
-        const std::string& process_name, const std::string& window,
-        const std::set<std::string>* visible)>;
+    using AppFn = std::function<yuzu::server::DexAppModel(const std::string& process_name,
+                                                           const std::string& window)>;
     using AppsFn = std::function<yuzu::server::DexAppsModel(const std::string& window)>;
     using CatalogueFn = std::function<yuzu::server::DexCatalogueModel(
         const std::string& os_filter, const std::string& window)>;
@@ -59,8 +57,8 @@ public:
     using HealthFn = std::function<yuzu::server::DexHealthModel(const std::string& weighting,
                                                                 const std::string& window)>;
     using TrendsFn = std::function<yuzu::server::DexTrendsModel(const std::string& window)>;
-    using OverviewFn = std::function<yuzu::server::DexOverviewModel(
-        const std::string& window, const std::set<std::string>* visible)>;
+    using OverviewFn =
+        std::function<yuzu::server::DexOverviewModel(const std::string& window)>;
     using SignalsFn = std::function<std::vector<yuzu::server::DexSignalCount>(
         const std::string& window, const std::string& os_filter)>;
     using ScopeFn = std::function<std::vector<yuzu::server::DexOsScope>(const std::string& window)>;
@@ -113,15 +111,14 @@ public:
     }
 
     [[nodiscard]] yuzu::server::DexAppModel
-    app(const std::string& process_name, const std::string& window,
-        const std::set<std::string>* visible) const override {
+    app(const std::string& process_name, const std::string& window) const override {
         if (!app_fn_) {
             yuzu::server::DexAppModel m;
             m.process_name = process_name;
             m.window = window;
             return m;
         }
-        return app_fn_(process_name, window, visible);
+        return app_fn_(process_name, window);
     }
 
     [[nodiscard]] yuzu::server::DexAppsModel apps(const std::string& window) const override {
@@ -180,13 +177,13 @@ public:
     }
 
     [[nodiscard]] yuzu::server::DexOverviewModel
-    overview(const std::string& window, const std::set<std::string>* visible) const override {
+    overview(const std::string& window) const override {
         if (!overview_fn_) {
             yuzu::server::DexOverviewModel m;
             m.window = window;
             return m;
         }
-        return overview_fn_(window, visible);
+        return overview_fn_(window);
     }
 
     [[nodiscard]] std::vector<yuzu::server::DexSignalCount>

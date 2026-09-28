@@ -45,9 +45,14 @@ public:
         return build_dex_observation_model(store_, agent_id, event_id);
     }
 
-    [[nodiscard]] DexAppModel app(const std::string& process_name, const std::string& window,
-                                  const std::set<std::string>* visible) const override {
-        return build_dex_app_model(store_, process_name, window, since_of(window), visible);
+    [[nodiscard]] DexAppModel app(const std::string& process_name,
+                                  const std::string& window) const override {
+        // `DexApi::app` has no `visible` parameter (WS-A4 PR-1 Gate 7 fix
+        // round, third revision — see dex_api.hpp's own doc comment); the
+        // builder itself keeps its own `visible` parameter for the
+        // dashboard fragment rewire (PR-2) to decide the fate of, so this
+        // seam always passes `nullptr`.
+        return build_dex_app_model(store_, process_name, window, since_of(window), nullptr);
     }
 
     [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
@@ -75,11 +80,11 @@ public:
         return build_dex_trends_model(store_, fleet(), window, since_of(window));
     }
 
-    [[nodiscard]] DexOverviewModel
-    overview(const std::string& window, const std::set<std::string>* visible) const override {
+    [[nodiscard]] DexOverviewModel overview(const std::string& window) const override {
+        // Same nullptr-always posture as `app` above — see its comment.
         const int window_days = dex_window_to_days(window);
         return build_dex_overview_model(store_, fleet(), window, window_days,
-                                        dex_iso_since(window_days), visible);
+                                        dex_iso_since(window_days), nullptr);
     }
 
     // ── Builder-less (raw store reads assembled inline in the handler today) ──

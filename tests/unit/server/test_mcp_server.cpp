@@ -1525,12 +1525,13 @@ private:
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
 
-        // #4035 hardening (governance)'s bespoke `set_dex_visible_fn` wiring
-        // is RETIRED (WS-A4 PR-1 fix round): get_dex_app/get_dex_overview/
-        // get_dex_signal_detail now gate SOLELY on `fleet_read_fn_` (wired
-        // via set_fleet_read_fn above) — see fleet_read_fn_for_test's own
-        // doc comment for the fixture-level fake gate every test in this
-        // file now drives those three tools through.
+        // #4035 hardening (governance)'s bespoke `set_dex_visible_fn` wiring,
+        // and the WS-A4 PR-1 first/second fix rounds' migration of
+        // get_dex_app/get_dex_overview/get_dex_signal_detail onto
+        // `fleet_read_fn_` as their sole gate, are ALL RETIRED (third
+        // revision, Fraser decision: revert to base gating). Those three
+        // tools gate on `perm_fn` + `deny_fleet_wide_service_scoped` again —
+        // see each tool's own test for the current coverage shape.
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -7551,14 +7552,19 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
-// WS-A4 PR-1 fix round (sec-1/sec-2): migrated onto fleet_read_fn_
-// (require_fleet_read, ADR-0017) as the SOLE gate — no more
-// deny_fleet_wide_service_scoped call. Real service-scope RBAC coverage
-// lives in test_authz_gates.cpp; this proves the TOOL correctly stops (no
-// data, no success audit) when the (fixture-faked, standing in for a real
-// service-scoped-token denial) gate denies — same shape as
-// list_dex_app_perf_devices' own unwired/denied coverage.
-TEST_CASE("MCP DEX: get_dex_signal_detail: gate denies -> no data, no success audit",
+// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
+// base gating): this tool reverted off `fleet_read_fn_`/real RBAC composition
+// back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
+// worth of fleet-read-gate coverage this test replaced (a fixture-faked
+// FleetReadGate denial, then a real AuthRoutes/RbacStore/ManagementGroupStore
+// rig proving an admitted-but-confined caller is refused) no longer applies
+// — neither `fleet_read_fn_for_test` nor `ResponseExecutionAuthzPgRig` is a
+// call site of this tool's gate anymore. Restored to base's own coverage:
+// a service-scoped token is denied via the tool's own stub-driven
+// `deny_fleet_wide_service_scoped` call, same class as the REST sibling GET
+// /api/v1/dex/signals/{obs_type} deny.
+TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
+          "denial audited",
           "[pg][mcp][integration][dex][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -7567,362 +7573,35 @@ TEST_CASE("MCP DEX: get_dex_signal_detail: gate denies -> no data, no success au
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
-    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
-                                   const std::string&,
-                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
-        res.status = 403;
-        res.set_content(R"({"error":"forbidden"})", "application/json");
-        return {};
-    };
+    ts.mock_token_scope_service = "printers";
     ts.start("readonly");
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":46,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
     REQUIRE(res);
-    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 
+    // Denial is audited, and the tool returns before the success-path
+    // dex.signal.view|success or the generic mcp.get_dex_signal_detail|success
+    // rows fire.
+    bool saw_denied = false;
     for (const auto& a : ts.audit_log) {
+        if (a == "dex.signal.view|denied")
+            saw_denied = true;
         CHECK(a != "dex.signal.view|success");
         CHECK(a != "mcp.get_dex_signal_detail|success");
     }
+    CHECK(saw_denied);
 }
 
-// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
-// "aggregates GLOBAL-ONLY", ADR-0017 INV-3 / the software_catalog ruling):
-// subjects/by_os/devices/by_day are ALL fleet-wide aggregates with no
-// per-caller SQL slice — an ADMITTED-but-ENGAGED (confined) `gate.scope`
-// must now be REFUSED, never served a narrowed result. Retires the earlier
-// "devices[] confined to the gate's VisibleSet" posture (ADR-0031 WS-A4
-// PR-1 decision 3). qa-1 (Gate 7 fix round): unlike the sibling
-// canned-FleetReadGate-lambda tests elsewhere in this file, this ONE test
-// drives the tool through a REAL AuthRoutes + RbacStore + ManagementGroupStore
-// composition (the `ResponseExecutionAuthzPgRig` shared fixture, #1550's
-// rig) rather than a fixture-faked gate, so the confined-refusal AND
-// global-admits-unfiltered outcomes are proven against the actual
-// production chokepoint, not a test double standing in for it.
-TEST_CASE("MCP DEX: get_dex_signal_detail refuses an admitted-but-confined caller "
-          "(ADR-0017 INV-3, real RBAC/ManagementGroup composition)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
-    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
-    REQUIRE(authz.rbac.create_role({"GsReader1634", "", false, 0}).has_value());
-    REQUIRE(
-        authz.rbac.set_permission({"GsReader1634", "GuaranteedState", "Read", "allow"})
-            .has_value());
-    REQUIRE(
-        authz.mgmt.assign_role({authz.bob_group, "user", "bob", "GsReader1634"}).has_value());
-
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "sa1", "bob-agent", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "sa2", "alice-agent", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
-    ts.mock_username = "bob";
-    ts.start("operator");
-
-    const auto token = authz.mint_bob();
-    auto confined = ts.call_raw(
-        "POST",
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9731,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})",
-        {{"Authorization", "Bearer " + token}});
-    REQUIRE(confined);
-    // bob's ONLY GuaranteedState:Read grant is group-scoped (AdmitScoped,
-    // ENGAGED) -> refused, no device identity anywhere in the body.
-    CHECK(confined->body.find("bob-agent") == std::string::npos);
-    CHECK(confined->body.find("alice-agent") == std::string::npos);
-    auto cbody = nlohmann::json::parse(confined->body);
-    REQUIRE(cbody.contains("error"));
-    CHECK(cbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    int denied_count = 0, success_count = 0;
-    for (const auto& a : ts.audit_log) {
-        if (a == "dex.signal.view|denied")
-            ++denied_count;
-        if (a == "dex.signal.view|success")
-            ++success_count;
-    }
-    CHECK(denied_count == 1);
-    CHECK(success_count == 0);
-
-    // Upgrade bob to a GLOBAL GuaranteedState:Read grant (RbacStore::
-    // assign_role, not ManagementGroupStore) -> AdmitAll (TOP) at the
-    // management axis, and bob carries no service scope -> overall
-    // unfiltered. Both device identities are now served.
-    REQUIRE(authz.rbac.assign_role({"user", "bob", "GsReader1634"}).has_value());
-    auto global_grant = ts.call_raw(
-        "POST",
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9732,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})",
-        {{"Authorization", "Bearer " + token}});
-    REQUIRE(global_grant);
-    auto gbody = nlohmann::json::parse(global_grant->body);
-    auto gpayload =
-        nlohmann::json::parse(gbody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(gpayload["devices"].is_array());
-    CHECK(gpayload["devices"].size() == 2);
-}
-
-// The canned-FleetReadGate-lambda posture (qa-1) for the two boundary cases
-// the real-rig test above doesn't exercise: `nullopt` (unfiltered, e.g.
-// RBAC-off/elevated) proceeds to the read; an engaged-but-EMPTY VisibleSet
-// (ADR-0017 INV-2: a management group with zero members) is STILL an
-// engaged scope and is refused exactly like a non-empty confined scope —
-// never a substitute for unconfined.
-TEST_CASE("MCP DEX: get_dex_signal_detail: nullopt scope proceeds; engaged-empty scope is "
-          "refused",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    // `McpServer::set_fleet_read_fn` takes a snapshot at `start()` time —
-    // mutating `fleet_read_fn_for_test` afterward does not re-wire it, so
-    // each scope variant below needs its OWN McpTestServer instance.
-    McpTestServer ts_unconfined;
-    ts_unconfined.guaranteed_state_store_for_test = &store;
-    ts_unconfined.start("readonly");
-    auto unconfined = ts_unconfined.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9731,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    CHECK(upayload["devices"].size() == 2);
-
-    McpTestServer ts_empty;
-    ts_empty.guaranteed_state_store_for_test = &store;
-    ts_empty.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                         const std::string&,
-                                         const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{}};
-    };
-    ts_empty.start("readonly");
-    auto denied_scope = ts_empty.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9733,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
-    REQUIRE(denied_scope);
-    auto dbody = nlohmann::json::parse(denied_scope->body);
-    REQUIRE(dbody.contains("error"));
-    CHECK(dbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    CHECK(denied_scope->body.find("WS-1") == std::string::npos);
-    CHECK(denied_scope->body.find("WS-2") == std::string::npos);
-}
-
-// WS-A4 PR-1 fix round: a genuinely UNWIRED fleet_read_fn_ (never set via
-// set_fleet_read_fn) is the tool's OWN misconfiguration -- it must REFUSE
-// (internal error), never silently serve fleet-wide. No dedicated audit row:
-// mirrors list_dex_app_perf_devices' own unwired test exactly -- the tool
-// checks `!fleet_read_fn_` BEFORE ever reaching the read.
-TEST_CASE("MCP DEX: get_dex_signal_detail unwired fleet_read_fn_ fails closed",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "u1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.fleet_read_fn_for_test = {}; // genuinely empty, matches production's unwired state
-    ts.start("readonly");
-
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9735,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
-    REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-    for (const auto& a : ts.audit_log)
-        CHECK(a != "dex.signal.view|success");
-}
-
-TEST_CASE("MCP DEX: get_dex_app unwired fleet_read_fn_ fails closed",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "u1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.fleet_read_fn_for_test = {};
-    ts.start("readonly");
-
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9736,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-    for (const auto& a : ts.audit_log)
-        CHECK(a != "dex.app.view|success");
-}
-
-TEST_CASE("MCP DEX: get_dex_overview unwired fleet_read_fn_ fails closed",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.fleet_read_fn_for_test = {};
-    ts.start("readonly");
-
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9737,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-    for (const auto& a : ts.audit_log)
-        CHECK(a != "dex.overview.view|success");
-}
-
-// ADR-0031 WS-A4 PR-1 decision 3 — engine-principal coverage. An
-// engine-principal session (auth_routes.cpp: `synth.username =
-// api_token.principal_id`, i.e. the literal string "engine:<slug>") flows
-// through the SAME `RbacStore::visible_agents_for_permission(username, ...)`
-// call the production `dex_visible_fn` lambda in server.cpp makes — RBAC
-// resolves grants by username string, independent of principal type.
-//
-// FINDING (this test was originally written to prove a management-group
-// -SCOPED engine grant narrows devices[] the same way a human operator's
-// would; it cannot be — recorded here rather than silently dropped):
-// `ManagementGroupStore::assign_role` REJECTS `principal_type == "engine"`
-// outright ("engine principals cannot hold scoped role assignments in this
-// release" — PR 4.2 only ships FLEET-WIDE engine grants; scoped engine role
-// assignment is a Phase-5 deliverable). Even setting that check aside,
-// `get_assignments_for_principal`'s SQL hardcodes
-// `principal_type='user' AND principal_id=$1` for the direct-principal
-// branch, so a stray `principal_type='engine'` row would never be read back
-// by the resolver anyway. THIRD clause found while building the fleet-wide
-// fallback below: even `RbacStore::assign_role` (the "ONE supported grant
-// shape") further restricts an engine principal to a CUSTOM (non-`is_system`)
-// role — its own F1 guard rejects ANY built-in role, e.g. "Operator" (not
-// just the admin-class roles `validate_assignment`'s narrower "no admin,
-// ever" bar names) — so this test grants a test-only custom role rather than
-// a seeded built-in one. **The conclusion:** an engine principal's
-// `dex_visible_fn` resolution can ONLY ever answer `nullopt` (a
-// global/fleet-wide grant of a CUSTOM role via `RbacStore::assign_role`, the
-// one grant shape PR 4.2 supports) or an empty set (no grant) — NEVER a
-// genuinely narrowed non-empty subset, today. This test instead proves the mechanism
-// that DOES apply end-to-end: an engine-principal SESSION correctly resolves
-// through a REAL RbacStore's global grant, AND that the scoped-assignment
-// attempt is rejected exactly where the confinement gap would otherwise be
-// invisible. If/when Phase-5 lands scoped engine grants, flip this test's
-// final assertion to the narrowed-set shape the two REMOVED CHECK_FALSE
-// candidates below describe.
-static yuzu::test::PgTestTemplate mcp_dex_engine_principal_tpl{
-    "mcpdexengineprincipal", [](const std::string& dsn) {
-        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
-        GuaranteedStateStore store{pool};
-        yuzu::server::RbacStore rbac{pool};
-        yuzu::server::ManagementGroupStore mgmt{pool};
-        if (!store.is_open() || !rbac.is_open() || !mgmt.is_open())
-            throw std::runtime_error("mcpdexengineprincipal template: a store failed to migrate");
-    }};
-
-TEST_CASE("MCP DEX: get_dex_app — engine-principal session resolves via a REAL "
-          "RbacStore global grant; a scoped (management-group) engine grant is "
-          "rejected outright (PR 4.2 boundary, not this fix's scope)",
-          "[pg][mcp][integration][dex][scope][engine_principal]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_dex_engine_principal_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    yuzu::server::RbacStore rbac(pool);
-    yuzu::server::ManagementGroupStore mgmt(pool);
-    REQUIRE(store.is_open());
-    REQUIRE(rbac.is_open());
-    REQUIRE(mgmt.is_open());
-    rbac.set_rbac_enabled(true); // RBAC-off would answer nullopt for every caller
-
-    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "e2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-
-    // The confinement gap this test set out to probe: a management-group
-    // -scoped grant for an engine principal is refused at the WRITE side.
-    yuzu::server::ManagementGroup group;
-    group.name = "Engine scope group";
-    group.membership_type = "static";
-    group.created_by = "admin";
-    auto group_id = mgmt.create_group(group);
-    REQUIRE(group_id.has_value());
-    REQUIRE(mgmt.add_member(*group_id, "WS-1").has_value());
-    yuzu::server::GroupRoleAssignment scoped_grant;
-    scoped_grant.group_id = *group_id;
-    scoped_grant.principal_type = "engine";
-    scoped_grant.principal_id = "engine:dex-reader";
-    scoped_grant.role_name = "Operator";
-    auto scoped_result = mgmt.assign_role(scoped_grant);
-    REQUIRE_FALSE(scoped_result.has_value());
-    CHECK(scoped_result.error().find("scoped role assignments") != std::string::npos);
-
-    // PR 4.2's ONE supported grant shape: a global (fleet-wide, non-group)
-    // RbacStore role assignment -- and even THAT is further restricted to a
-    // CUSTOM (non-`is_system`) role (`RbacStore::assign_role`'s own F1 guard
-    // rejects ANY built-in role, e.g. "Operator", for principal_type=="engine"
-    // -- "no built-in role, ever" generalizes validate_assignment's narrower
-    // "no admin, ever" bar). A custom role is the mechanism engine principals
-    // actually use for a fleet-wide grant.
-    yuzu::server::RbacRole custom_role;
-    custom_role.name = "EngineDexReader";
-    custom_role.description = "test-only custom role for engine-principal DEX read coverage";
-    custom_role.is_system = false;
-    REQUIRE(rbac.create_role(custom_role).has_value());
-    yuzu::server::Permission perm;
-    perm.role_name = "EngineDexReader";
-    perm.securable_type = "GuaranteedState";
-    perm.operation = "Read";
-    perm.effect = "allow";
-    REQUIRE(rbac.set_permission(perm).has_value());
-    yuzu::server::PrincipalRole global_grant;
-    global_grant.principal_type = "engine";
-    global_grant.principal_id = "engine:dex-reader";
-    global_grant.role_name = "EngineDexReader";
-    REQUIRE(rbac.assign_role(global_grant).has_value());
-
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.mock_username = "engine:dex-reader"; // engine-principal session keying
-    ts.rbac_store_for_test = &rbac;
-    ts.mgmt_store_for_test = &mgmt;
-    // WS-A4 PR-1 fix round: replicate AuthRoutes::require_fleet_read's OWN
-    // engine branch verbatim (authz_gates.cpp) against the REAL RbacStore
-    // above — an engine principal resolves RBAC-only (never
-    // visible_agents_for_permission/a management-group scope: the engine
-    // branch returns TOP unconditionally on a passing check_permission), so
-    // this finding stands unchanged by the migration off the retired
-    // dex_visible_fn resolver: PR 4.2's engine grants can only ever answer
-    // nullopt (global) or deny, never a genuinely narrowed subset.
-    ts.fleet_read_fn_for_test =
-        [&rbac](const httplib::Request&, httplib::Response&, const std::string& type,
-                const std::string& op) -> yuzu::server::authz::FleetReadGate {
-        if (!rbac.is_open() || !rbac.is_rbac_enabled() ||
-            !rbac.check_permission("engine:dex-reader", type, op))
-            return {}; // denied
-        return {true, std::nullopt}; // TOP -- fleet-wide only, engine principals have no scope concept
-    };
-    ts.start("readonly");
-
-    // The global grant resolves nullopt (unfiltered) -- the SAME
-    // "wired-and-unfiltered" case a human operator with a global grant gets;
-    // both WS-1 and WS-2 appear, because there is no group-scoped grant to
-    // narrow against (the rejected assignment above never landed).
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9738,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("result"));
-    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(payload["devices"].is_array());
-    CHECK(payload["devices"].size() == 2);
-}
+// WS-A4 PR-1 Gate 7 fix round (third revision): the `fleet_read_fn_`-scope
+// boundary/unwired coverage this test, the sibling get_dex_app/
+// get_dex_overview "unwired fleet_read_fn_" tests, and the get_dex_app
+// engine-principal test provided is retired — `fleet_read_fn_` is no
+// longer one of these three tools' gates at all (reverted to base's
+// `perm_fn` + `deny_fleet_wide_service_scoped`).
 
 // ── #4035 (api-parity #2146 Batch A): get_dex_device_score — the MCP-only gap ──
 //    closing GET /api/v1/dex/devices/{id}'s REST-only twin. Per-device SCOPED
@@ -8274,8 +7953,15 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
 
+// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
+// base gating): restored to base's own coverage — a service-scoped token
+// is denied via the tool's own `deny_fleet_wide_service_scoped` call. The
+// round-1/round-2 "gate denial -> no data" (fixture-faked FleetReadGate)
+// and "refuses an admitted-but-confined caller" (canned-FleetReadGate-
+// lambda ADR-0017 INV-3 coverage) tests are retired — `fleet_read_fn_` is
+// no longer this tool's gate.
 TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.view, "
-          "gate denial -> no data",
+          "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -8304,89 +7990,15 @@ TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.v
             saw_view = true;
     CHECK(saw_view);
 
-    // WS-A4 PR-1 fix round: fleet_read_fn_ is the SOLE gate now — a denying
-    // gate (standing in for a real RBAC/service-scoped denial, covered in
-    // test_authz_gates.cpp) -> no data.
+    // service-scoped token -> 403, no data.
     McpTestServer ts2;
     ts2.guaranteed_state_store_for_test = &store;
-    ts2.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
-                                    const std::string&,
-                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
-        res.status = 403;
-        res.set_content(R"({"error":"forbidden"})", "application/json");
-        return {};
-    };
+    ts2.mock_token_scope_service = "printers";
     ts2.start("readonly");
     auto denied = ts2.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":973,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe"}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
-// "aggregates GLOBAL-ONLY", ADR-0017 INV-3): get_dex_app's crash/hang
-// summary is a fleet-wide aggregate — an ADMITTED-but-ENGAGED (confined)
-// `gate.scope` is now REFUSED, never served a narrowed result. Retires the
-// earlier "devices[] confined to the gate's VisibleSet" posture (ADR-0031
-// WS-A4 PR-1 decision 3). Canned-FleetReadGate-lambda posture (qa-1) — see
-// get_dex_signal_detail's sibling test above for the ONE real-RBAC-
-// composition case in this family.
-TEST_CASE("MCP DEX: get_dex_app refuses an admitted-but-confined caller "
-          "(ADR-0017 INV-3)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    // `McpServer::set_fleet_read_fn` snapshots at `start()` time — each
-    // scope variant needs its OWN McpTestServer instance.
-    McpTestServer ts_unconfined;
-    ts_unconfined.guaranteed_state_store_for_test = &store;
-    ts_unconfined.start("readonly");
-    auto unconfined = ts_unconfined.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9721,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    CHECK(upayload["devices"].size() == 2);
-
-    McpTestServer ts_confined;
-    ts_confined.guaranteed_state_store_for_test = &store;
-    ts_confined.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                            const std::string&,
-                                            const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{"WS-1"}};
-    };
-    ts_confined.start("readonly");
-    auto confined = ts_confined.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9722,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    REQUIRE(cbody.contains("error"));
-    CHECK(cbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    CHECK(confined->body.find("WS-1") == std::string::npos);
-    CHECK(confined->body.find("WS-2") == std::string::npos);
-
-    // Engaged-but-EMPTY VisibleSet (ADR-0017 INV-2) is STILL refused, never
-    // a substitute for unconfined.
-    McpTestServer ts_empty;
-    ts_empty.guaranteed_state_store_for_test = &store;
-    ts_empty.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                         const std::string&,
-                                         const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{}};
-    };
-    ts_empty.start("readonly");
-    auto empty_scope = ts_empty.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9723,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(empty_scope);
-    auto ebody = nlohmann::json::parse(empty_scope->body);
-    REQUIRE(ebody.contains("error"));
-    CHECK(ebody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 }
 
 TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
@@ -8581,8 +8193,13 @@ TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)
     CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
 }
 
+// WS-A4 PR-1 Gate 7 fix round (third revision, Fraser decision: revert to
+// base gating): restored to base's own coverage — see get_dex_app's
+// equivalent test for the full rationale (the round-1/round-2 gate-denial
+// and admitted-but-confined tests this replaces relied on `fleet_read_fn_`,
+// which is no longer this tool's gate).
 TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overview.view, "
-          "gate denial -> no data",
+          "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -8612,89 +8229,15 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
             saw_view = true;
     CHECK(saw_view);
 
-    // WS-A4 PR-1 fix round: fleet_read_fn_ is the SOLE gate now — a denying
-    // gate (standing in for a real RBAC/service-scoped denial, covered in
-    // test_authz_gates.cpp) -> no data.
+    // service-scoped token -> 403, no data.
     McpTestServer ts2;
     ts2.guaranteed_state_store_for_test = &store;
-    ts2.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
-                                    const std::string&,
-                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
-        res.status = 403;
-        res.set_content(R"({"error":"forbidden"})", "application/json");
-        return {};
-    };
+    ts2.mock_token_scope_service = "printers";
     ts2.start("readonly");
     auto denied = ts2.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2, Fraser decision:
-// "aggregates GLOBAL-ONLY", ADR-0017 INV-3): get_dex_overview's health/
-// score/distribution summary is a fleet-wide aggregate — an
-// ADMITTED-but-ENGAGED (confined) `gate.scope` is now REFUSED, never served
-// a narrowed result. Retires the earlier "top_devices[] confined to the
-// gate's VisibleSet" posture (ADR-0031 WS-A4 PR-1 decision 3). Canned-
-// FleetReadGate-lambda posture (qa-1), same as get_dex_app above.
-TEST_CASE("MCP DEX: get_dex_overview refuses an admitted-but-confined caller "
-          "(ADR-0017 INV-3)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "st1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "st2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    // `McpServer::set_fleet_read_fn` snapshots at `start()` time — each
-    // scope variant needs its OWN McpTestServer instance.
-    McpTestServer ts_unconfined;
-    ts_unconfined.guaranteed_state_store_for_test = &store;
-    ts_unconfined.start("readonly");
-    auto unconfined = ts_unconfined.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9801,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(upayload["top_devices"].is_array());
-    CHECK(upayload["top_devices"].size() == 2);
-
-    McpTestServer ts_confined;
-    ts_confined.guaranteed_state_store_for_test = &store;
-    ts_confined.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                            const std::string&,
-                                            const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{"WS-1"}};
-    };
-    ts_confined.start("readonly");
-    auto confined = ts_confined.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9802,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    REQUIRE(cbody.contains("error"));
-    CHECK(cbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    CHECK(confined->body.find("WS-1") == std::string::npos);
-    CHECK(confined->body.find("WS-2") == std::string::npos);
-
-    // Engaged-but-EMPTY VisibleSet (ADR-0017 INV-2) is STILL refused, never
-    // a substitute for unconfined.
-    McpTestServer ts_empty;
-    ts_empty.guaranteed_state_store_for_test = &store;
-    ts_empty.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                         const std::string&,
-                                         const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{}};
-    };
-    ts_empty.start("readonly");
-    auto empty_scope = ts_empty.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9803,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(empty_scope);
-    auto ebody = nlohmann::json::parse(empty_scope->body);
-    REQUIRE(ebody.contains("error"));
-    CHECK(ebody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 }
 
 TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "
