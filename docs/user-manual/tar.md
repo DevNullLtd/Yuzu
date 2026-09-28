@@ -396,8 +396,9 @@ When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agen
 - **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
 
 **Fleet visibility.** A quarantine is reported off-device: the tar plugin
-publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic) and
-`heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin storage, which the
+publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic in the
+common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
+storage, which the
 agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
 `yuzu.plugin.tar.db_quarantine_last`. The server exposes
 `yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes a
@@ -416,7 +417,13 @@ the two heartbeat keys rather than resetting the count — `status` still report
 instead the record write itself fails persistently (as opposed to a read of it),
 there is currently no fleet-visible signal beyond that same local warning — a
 device stuck this way is silently excluded from `yuzu_fleet_tar_db_corruption_agents`
-until the fault clears; tracked as a follow-up.
+until the fault clears; tracked as a follow-up. The count is not monotonic in one
+further edge case: a *transient* fault on the read that decides whether a prior
+record exists (rather than the read above) is indistinguishable in-plugin from
+"no prior record," so a faulted read followed by a successful write on a later
+tick restarts the count at 1 for that device rather than resuming it — the fleet
+gauge counts affected agents, not events, so this narrows to a small undercount
+rather than a lost signal; tracked as #5037.
 
 Two things worth knowing about the timing of this signal. **A mass event** (many
 devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still

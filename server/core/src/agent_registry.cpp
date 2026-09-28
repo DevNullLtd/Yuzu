@@ -2382,6 +2382,14 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             it != snap.status_tags.end() && !it->second.empty()) {
             std::string_view rest{it->second};
             int tokens = 0;
+            // #1567 round-2: dedupe within THIS agent's tag value before counting.
+            // An honest agent never repeats a plugin name (plugins_failed_ is a
+            // set, one entry per failed plugin), so this only matters for a
+            // malformed or compromised agent sending e.g. "tar,tar" — without the
+            // dedupe that one agent would inflate yuzu_fleet_plugin_init_failed by
+            // its repeat count instead of by 1. `seen_this_agent` holds views into
+            // `it->second`, which outlives this block.
+            std::unordered_set<std::string_view> seen_this_agent;
             while (!rest.empty() && tokens < 32) {
                 ++tokens; // every split counts toward the cap, valid or not
                 const auto comma = rest.find(',');
@@ -2394,6 +2402,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                (ch >= '0' && ch <= '9') || ch == '_';
                     }))
                     continue;
+                if (!seen_this_agent.insert(tok).second)
+                    continue; // already counted for this agent this sweep
                 ++plugin_init_failed[std::string{tok}];
             }
         }

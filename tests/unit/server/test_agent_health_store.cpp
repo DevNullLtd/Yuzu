@@ -1906,10 +1906,16 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
     // 40 empty tokens then a valid name: the 32-split cap bites first, no label.
     beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + "late"}});
+    // #1567 round-2: a repeated token from ONE agent counts once, not once per
+    // repeat — plugins_failed_ is a set on an honest agent, so this only fires
+    // for a malformed/compromised one. MUTATION-TESTED: dropping the
+    // agent_registry.cpp dedup (seen_this_agent) makes tar's count 4.0 here
+    // instead of 3.0, red-first-confirmed then restored.
+    beat_tags(store, "f", {{"yuzu.plugins_failed", "tar,tar"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     auto out = metrics.serialize();
     CHECK(out.find("plugin=\"late\"") == std::string::npos);
-    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"tar\"} ") == 2.0);
+    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"tar\"} ") == 3.0);
     CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
     // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
     CHECK(out.find("plugin=\"t31\"") != std::string::npos);
