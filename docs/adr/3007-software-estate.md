@@ -213,22 +213,26 @@ or requires such a module to exist, now or later.
 ## What the dataset looks like
 
 Every row below is gathered in the same single pass described above, from the same host, and
-lands in the same consolidated record. "Collected" is how often the platform learns about it;
+lands in the same consolidated record. "How it's found" names the plugin, and the action within
+it, that gathers each row. These are the platform's ordinary plugins: an operator can also run any
+of them directly as an instruction, a route that never feeds the inventory. Each is marked
+*existing* (used as it ships today), *extended* (an existing plugin gains a new action or covers
+another operating system) or *new*. "Collected" is how often the platform learns about it;
 "Stored" is where a reader finds it today.
 
 | Data captured | How it's found | Windows | macOS | Linux | Collected | Stored |
 |---|---|:---:|:---:|:---:|---|---|
-| Registered applications (name, publisher, version, install date) | Read from the operating system's own record of installed software | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Installer package records (product identifier, install location, how to uninstall) | Read from the operating system's installer subsystem | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Platform-store packaged applications | Read from the operating system's own app-package registry | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | Read from each package manager's own installed-package listing | ✅ | ✅ | — | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Containerised/sandboxed application formats (Linux) | Read from each format's own installed-application listing | — | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | Read from each runtime's own installation record | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Device drivers | Read from the operating system's own driver registry | ✅ | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Optional operating-system feature set (Windows) | Read from the operating system's own feature-management interface | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
-| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | Verified against the operating system's own signing mechanism | ✅ | ✅ | Partial | Per group, off by default until proven; changes only | Fleet software inventory |
-| Change history (install / upgrade / removal, with a timestamp) | Derived by the platform itself, by comparing each day's report to the last | ✅ | ✅ | ✅ | Continuous, as detected | Fleet software change record (bounded retention) |
-| Normalised identity (a common product/vendor/version reading, mapped from the raw values above) | Matched by the platform against its own maintained reference list | ✅ | ✅ | ✅ | Recomputed periodically | Fleet software inventory |
+| Registered applications (name, publisher, version, install date) | `installed_apps` plugin, `list_inventory` action — the operating system's own record of installed software. *Existing, extended.* | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Installer package records (product identifier, install location, how to uninstall) | `msi_packages` plugin, new `list_inventory` action — the operating system's installer subsystem, read machine-wide. *Extended.* | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Platform-store packaged applications | `pkg_inventory` plugin, new `store_packages` action — the operating system's own app-package registry. *Extended.* | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Alternate package-manager installs (e.g. a secondary Windows package manager, a macOS community package manager) | `pkg_inventory` plugin, `packages` and `managers` actions — each package manager's own installed-package listing. *Existing on macOS, extended to Windows.* | ✅ | ✅ | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Containerised/sandboxed application formats (Linux) | `pkg_inventory` plugin, the same new `store_packages` action — each format's own installed-application listing. *Extended.* | — | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Language and application runtimes (e.g. a managed-runtime framework, a Java runtime) | `runtimes` plugin, `dotnet` and `jvm` actions — each runtime's own installation record. *Existing on Linux, extended to Windows and macOS.* | ✅ | ✅ | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Device drivers | `hardware` plugin, new `drivers_inventory` action beside today's `drivers` — the operating system's own driver registry. *Extended.* | ✅ | — | ✅ | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Optional operating-system feature set (Windows) | `windows_optional_features` plugin, `list` action — the operating system's own feature-management interface. *Existing.* | ✅ | — | — | Per group (default daily, overnight); changes only | Fleet software inventory |
+| Integrity evidence (publisher's digital signature, a content fingerprint of the installed binary where one can be resolved without searching the filesystem) | `software_evidence` plugin, `list_inventory` action — verified against the operating system's own signing mechanism. *New.* | ✅ | ✅ | Partial | Per group, off by default until proven; changes only | Fleet software inventory |
+| Change history (install / upgrade / removal, with a timestamp) | No plugin — derived by the platform itself, by comparing each report to the last | ✅ | ✅ | ✅ | Continuous, as detected | Fleet software change record (bounded retention) |
+| Normalised identity (a common product/vendor/version reading, mapped from the raw values above) | No plugin — matched by the platform against its own maintained reference list | ✅ | ✅ | ✅ | Recomputed periodically | Fleet software inventory |
 
 Two things are deliberately out of this table because they are out of scope for this decision:
 per-user software (a user's own, non-machine-wide installs) and anything that requires searching
