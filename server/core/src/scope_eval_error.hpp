@@ -82,4 +82,38 @@ inline const char* to_string(ScopeEvalError::Kind k) {
     return "unknown";
 }
 
+/// True for a PERMANENT scope-evaluation abort — a retry will NOT fix it
+/// (no dispatching principal was supplied, or a required store was never
+/// wired at this call site); false for a TRANSIENT one — a backend read
+/// that may recover on its own (a genuine store or presence degrade).
+/// Exhaustive switch, deliberately with NO `default:` case: a future 6th
+/// `Kind` value must be classified here explicitly, or `-Werror=switch`
+/// (`server/core/meson.build`'s `switch_werror_args`, already applied to
+/// this translation unit) fails the build — rather than the value silently
+/// and untestedly landing in whichever bucket a raw string comparison
+/// happened to leave it in (#4981 fix-round finding).
+///
+/// `OwnerCheckFailed` is never actually handed to this function by either of
+/// today's two callers (`rest_api_v1.cpp`'s and `mcp_server.cpp`'s
+/// `preview_scope_targets` handlers) — both intercept it before reaching
+/// the generic permanent/transient split, answering with their own
+/// dedicated existence-oracle-safe RESULT_SET_NOT_FOUND response instead
+/// (a non-owner must stay indistinguishable from an absent set). Classified
+/// `true` here anyway, purely so the switch stays exhaustive for any future
+/// caller that does not pre-filter it — the same "retrying against the same
+/// absent/foreign set never helps" reasoning as the other two permanent
+/// cases.
+inline bool scope_abort_is_permanent(ScopeEvalError::Kind k) {
+    switch (k) {
+    case ScopeEvalError::Kind::PrincipalUnresolved:
+    case ScopeEvalError::Kind::Unresolvable:
+    case ScopeEvalError::Kind::OwnerCheckFailed:
+        return true;
+    case ScopeEvalError::Kind::StoreDegraded:
+    case ScopeEvalError::Kind::PresenceDegraded:
+        return false;
+    }
+    return false;
+}
+
 } // namespace yuzu::server

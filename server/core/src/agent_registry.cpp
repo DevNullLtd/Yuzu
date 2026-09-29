@@ -1625,7 +1625,8 @@ std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                                    const CustomPropertiesStore* props_store,
                                    ResultSetStore* rs_store, std::string_view principal,
-                                   ScopePopulation population) const {
+                                   ScopePopulation population,
+                                   bool touch_referenced_result_sets) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
     // store query per agent while holding mu_ (review finding F). The owner join
@@ -1706,7 +1707,15 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                 // already failed the whole evaluation for that case above). A
                 // touch racing a concurrent GC sweep is a harmless no-op (an
                 // UPDATE affecting 0 rows).
-                rs_store->touch(rsid);
+                // #4981 PR-3: gated on `touch_referenced_result_sets` — a
+                // read-only preview evaluation (evaluate_scope's own
+                // `touch_referenced_result_sets = false` caller) must resolve
+                // `from_result_set:` membership identically to a real dispatch
+                // WITHOUT extending the set's TTL merely for being referenced
+                // in a dry-run check. Every real dispatch/enforcement caller
+                // leaves this at its default `true` and is unaffected.
+                if (touch_referenced_result_sets)
+                    rs_store->touch(rsid);
                 rs_members.emplace(rsid, std::move(*mem));
             }
         }
@@ -1943,9 +1952,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
 std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                               const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                              std::string_view principal) const {
+                              std::string_view principal,
+                              bool touch_referenced_result_sets) const {
     return evaluate_scope_impl(expr, tag_store, props_store, rs_store, principal,
-                               ScopePopulation::Fleet);
+                               ScopePopulation::Fleet, touch_referenced_result_sets);
 }
 
 std::expected<std::vector<std::string>, ScopeEvalError>
@@ -1956,9 +1966,13 @@ AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const T
     // never consulted) and can never return Kind::OwnerCheckFailed (no
     // from_result_set: atom can resolve here regardless — an rs_store-null
     // call site collects the same Unresolvable abort evaluate_scope would
-    // give a no-store caller).
+    // give a no-store caller). `touch_referenced_result_sets` is passed as
+    // `true` (its default meaning) but is a no-op here regardless, since
+    // rs_store is always null for LocalOnly — the touch call site can never
+    // execute without a store to touch through.
     return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
-                               /*principal=*/{}, ScopePopulation::LocalOnly);
+                               /*principal=*/{}, ScopePopulation::LocalOnly,
+                               /*touch_referenced_result_sets=*/true);
 }
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
