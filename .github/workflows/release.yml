@@ -220,6 +220,18 @@ jobs:
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
             --bin-dir build-linux --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm packages
         run: |
@@ -403,6 +415,18 @@ jobs:
           bash deploy/packaging/debian/build-gateway-deb.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm package
         run: |
