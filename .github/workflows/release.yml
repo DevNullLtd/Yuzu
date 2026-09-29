@@ -507,9 +507,23 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Install Meson and ccache
+      - name: Check Meson, PyYAML and ccache (pre-provisioned)
         run: |
-          pip install --require-hashes -r requirements-ci.txt
+          # Never pip-install into the runner's machine-wide Python here. Wee
+          # Tam's toolchain (incl. meson) is pinned by
+          # deploy/windows/toolchain-contract.json and checked by the next
+          # step; a bare `pip install -r requirements-ci.txt` upgraded the
+          # shared C:\Python314 meson to requirements-ci.txt's newer pin,
+          # failed that check, and left every ci.yml Windows job on the box
+          # failing it too. Same guard as ci.yml's Windows job: only an
+          # absent PyYAML (needed by embed_content.py at meson setup) triggers
+          # a --user install.
+          python -c "import yaml" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            python -m pip install --user --require-hashes -r requirements-ci.txt
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          meson --version
           # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
           # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
           # installed there, so the old `choco install ccache` aborted the
