@@ -49,10 +49,12 @@ class PgPool;
 
 namespace yuzu::server {
 
-/// One installed-software entry. **Machine-wide scope only** — no per-user /
-/// username / SID / user-path (ADR-0016: no PII, no works-council trigger).
+/// One installed-software entry. **Machine-scope collection only** (see
+/// ADR-0016 §8): no per-user rows and no username/SID fields. `install_location`
+/// is a machine-scope path; it can carry an account segment when a machine-wide
+/// installer placed it there.
 ///
-/// Blob contract v2: member order == the wire/hash field order (append-only —
+/// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
 /// the canonical hash and the agent's blob builder walk this exact sequence).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
@@ -72,12 +74,26 @@ struct SoftwareEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
+    // Extended tail: these four enter the canonical hash ONLY when at least one
+    // is non-empty — a v2 agent's 12-field bytes are unchanged.
+    std::string install_location;
+    std::string uninstall_string;
+    std::string package_id;
+    std::string source; // <plugin>.<action> that produced the row
 };
 
 /// One fleet-query row: which agent carries which entry.
 struct SoftwareFleetRow {
     std::string agent_id;
     SoftwareEntry entry;
+    std::int64_t install_id{0}; ///< row id (BIGSERIAL); keyset tiebreak, churns on full replace
+};
+
+/// Keyset position for `SoftwareFleetQuery::after`: the last row of the previous page.
+struct SoftwareCursor {
+    std::string name;
+    std::string agent_id;
+    std::int64_t install_id{0};
 };
 
 /// One fleet-catalogue row — a software title rolled up across the WHOLE fleet
@@ -121,12 +137,23 @@ struct CatalogRollupMeta {
     std::int64_t total_devices{0};
 };
 
-/// Fleet-wide software query. Empty filters match all; results are capped.
+/// Fleet-wide software query. Empty filters match all; results are ordered by
+/// (name, agent_id, install_id).
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
     std::string name;     ///< exact software-name filter ("" = all names)
+    /// Page size. Silently clamped to kFleetQueryRowCap (100000) by the store, so a
+    /// short page is NOT proof of exhaustion: page until an EMPTY page.
     int limit{1000};
-    // No offset: see query_software (gov consistency N1) — keyset is the #1634 follow-up.
+    std::string q;         ///< case-insensitive substring over name|publisher|ecosystem|source
+    std::string kind;      ///< exact kind filter
+    std::string ecosystem; ///< exact ecosystem filter
+    std::string source;    ///< exact source filter
+    /// Resume strictly after this (name, agent_id, install_id) in result order. Page with
+    /// `after = {last.entry.name, last.agent_id, last.install_id}` until an empty page.
+    /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
+    /// one agent's resync can repeat or skip that agent's same-name rows.
+    std::optional<SoftwareCursor> after;
 };
 
 class SoftwareInventoryStore {
