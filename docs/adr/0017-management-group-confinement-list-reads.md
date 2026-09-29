@@ -311,8 +311,7 @@ gate.
     for pinning it global-only is different: it is simply **not yet confined per-caller** — an
     INV-3-respecting per-caller SQL slice (a `WHERE agent_id IN (...)` narrowing derived from the
     caller's visible set, applied INSIDE the aggregation, not a post-aggregate filter) has not been
-    built for these three queries yet. Filing that as its own tracking issue is future work, not
-    this fix round's scope. The `/fragments/dex/overview`, `/fragments/dex/app`, and
+    built for these three queries yet; tracked as #5090. The `/fragments/dex/overview`, `/fragments/dex/app`, and
     `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by this fix round: they also
     gate on the SAME global `perm_fn` (a group-only operator is denied `403` there too, same as the
     REST/MCP surfaces) — the residual is the OPPOSITE of a confined-caller leak: among callers who
