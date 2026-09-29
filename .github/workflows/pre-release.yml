@@ -747,11 +747,19 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
+          # The control Version spells a pre-release with `~` (0.14.0~rc3) so dpkg
+          # orders it BEFORE 0.14.0; the tag and the .deb file name use `-`
+          # (0.14.0-rc3). Compare against the Debian spelling of the tag.
+          WANT="${VERSION/-/\~}"
           for deb in *.deb; do
             echo "=== $deb ==="
             dpkg-deb --field "$deb" Package Version
             DEB_VER=$(dpkg-deb --field "$deb" Version)
-            [ "$DEB_VER" = "$VERSION" ] && echo "PASS: version matches" || echo "WARN: version $DEB_VER != $VERSION"
+            if [ "$DEB_VER" = "$WANT" ]; then
+              echo "PASS: version $DEB_VER matches $VERSION"
+            else
+              echo "WARN: version $DEB_VER != $WANT (tag $VERSION)"
+            fi
           done
 
       - name: Inspect RPM metadata
