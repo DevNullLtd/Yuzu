@@ -72,8 +72,10 @@ struct ActiveRpcCtxGuard {
         slot.store(nullptr, std::memory_order_release);
     }
     // The lock is held only inside the ctor/dtor BODIES, never for the guard's lifetime —
-    // the blocking RPC runs with it released. (Mirrors AgentImpl::CtxSlot; holding it across
-    // the RPC would deadlock stop() for the whole of a stalled download.)
+    // the blocking RPC runs with it released. (Follows AgentImpl::CtxSlot's
+    // publish/retract-under-mutex pattern and adds the post-publish stop re-check that
+    // CtxSlot leaves to its call sites; holding the lock across the RPC would deadlock
+    // stop() for the whole of a stalled download.)
     ActiveRpcCtxGuard(const ActiveRpcCtxGuard&) = delete;
     ActiveRpcCtxGuard& operator=(const ActiveRpcCtxGuard&) = delete;
 };

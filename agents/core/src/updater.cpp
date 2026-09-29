@@ -294,7 +294,7 @@ bool Updater::run_check_loop(void* stub, std::chrono::seconds interval) {
         auto result = check_and_apply(stub);
         if (result.has_value() && result.value())
             return true;
-        if (!result.has_value())
+        if (!result.has_value() && !stop_requested_.load(std::memory_order_acquire))
             spdlog::warn("OTA update check failed: {}", result.error().message);
         // Wait out the interval on the stop state so stop() wakes us immediately.
         std::unique_lock lk(stop_mu_);
@@ -540,12 +540,14 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     dl_platform->set_arch(arch_);
 
     grpc::ClientContext dl_ctx;
-    auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
-    // Publish dl_ctx for the whole streaming read below. Declared after dl_ctx
-    // so it is destroyed first on ANY exit from here — including every
-    // cleanup_and_fail early return inside the loop — clearing the slot before
-    // dl_ctx dies. stop() TryCancels this to abort a stalled reader->Read().
+    // Publish dl_ctx BEFORE the call starts, so a stop requested before DownloadUpdate
+    // is cancelled by the guard's ctor re-check (gRPC records a cancel issued before
+    // StartCall and applies it at call creation). Declared after dl_ctx and before
+    // reader, so it is destroyed after reader and before dl_ctx on ANY exit from here,
+    // including every cleanup_and_fail early return inside the loop, clearing the slot
+    // before dl_ctx dies. stop() TryCancels this to abort a stalled reader->Read().
     ActiveRpcCtxGuard dl_guard{ctx_mu_, active_rpc_ctx_, dl_ctx, stop_requested_};
+    auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
 
     // Cleanup helper: on Windows the path-based fs::remove fails with
     // ERROR_SHARING_VIOLATION while h_guard holds the file with dwShareMode=0,

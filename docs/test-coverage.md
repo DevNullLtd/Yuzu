@@ -23,7 +23,7 @@ Run all tests: `meson test -C build-linux --print-errorlogs`
 |------|-----------|----------------|
 | `test_sdk_utilities.cpp` | SDK utilities | split_lines, table_to_json, json_to_table, generate_sequence, C ABI wrappers |
 | `test_plugin_loader.cpp` | Plugin loader | Nonexistent/empty directory handling |
-| `test_updater.cpp` | OTA updater | current_executable_path, cleanup_old_binary, rollback_if_needed, run_check_loop stop/wake and interval clamp, RPC-ctx guard cancel-on-stop (#2182) |
+| `test_updater.cpp` | OTA updater | current_executable_path, cleanup_old_binary, rollback_if_needed, run_check_loop stop/wake and interval bounds (#2182); RPC-ctx guard cancel-on-stop (#2182) is in `test_updater_signature.cpp` |
 | `test_temp_file.cpp` | Temp file API | create_temp_file, create_temp_dir, RAII wrappers, move semantics |
 | `test_filesystem_read.cpp` | Filesystem plugin | validate_path, read parameters, CRLF stripping, binary detection, pagination |
 | `test_string_utils.cpp` | Shared utilities | icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line |

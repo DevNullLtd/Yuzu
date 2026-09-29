@@ -246,10 +246,10 @@ TEST_CASE("Updater::run_check_loop returns at once when already stopped",
     CHECK_FALSE(fut.get());
 }
 
-TEST_CASE("Updater::run_check_loop clamps an absurd or non-positive interval",
+TEST_CASE("Updater::stop ends run_check_loop for extreme intervals",
           "[updater][stop][2182]") {
-    // seconds::max() would overflow wait_for's now()+interval; 0 and negative would spin.
-    // Either way stop() must still end the loop promptly.
+    // Checks only that stop() ends the loop within the bound for seconds::max(), 0 and
+    // negative intervals; it cannot observe a spin, so it does not prove the clamp itself.
     for (auto interval : {std::chrono::seconds::max(), std::chrono::seconds{0},
                           std::chrono::seconds{-5}}) {
         UpdateConfig config;
