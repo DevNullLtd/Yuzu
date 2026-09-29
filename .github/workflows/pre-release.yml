@@ -165,12 +165,6 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # Override the workflow-level REGISTRY, which carries the mixed-case owner
-    # (`ghcr.io/DevNullLtd`) that Docker refuses to pull. See resolve's "Lowercase
-    # registry owner".
-    env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,148 +181,40 @@ jobs:
           username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull release images
-        env:
-          # Bind tag to env to avoid code-injection via crafted ref name.
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          for img in yuzu-server yuzu-agent-chisel yuzu-gateway; do
-            docker pull "$REGISTRY/$img:${TAG#v}"
-          done
-
-      - name: Generate server config
-        run: |
-          mkdir -p /tmp/yuzu-qa
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'qapassword1', salt, 100000, dklen=32)
-          print(f'qaadmin:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-qa/yuzu-server.cfg
-
-      - name: Create Docker Compose for QA
+      # The stack is the shipped reference template
+      # (deploy/docker/docker-compose.reference-gateway.yml): Postgres, TLS on
+      # every hop, a per-install CA, and an agent that enrols with a one-off
+      # token and receives its own mTLS leaf. scripts/ci/qa-stack.sh drives
+      # it; `compose pull` fetches exactly the images the stack runs, so there
+      # is no separate image list here to drift from what ships (#5126).
+      - name: Start stack
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          cat > /tmp/yuzu-qa/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:$VERSION
-              command:
-                - "--listen"
-                - "0.0.0.0:50051"
-                - "--no-tls"
-                - "--no-https"
-                - "--gateway-upstream"
-                - "0.0.0.0:50055"
-                - "--gateway-mode"
-                - "--gateway-command-addr"
-                - "gateway:50063"
-                - "--web-address"
-                - "0.0.0.0"
-                - "--web-port"
-                - "8080"
-                - "--metrics-no-auth"
-                - "--config"
-                - "/var/lib/yuzu/yuzu-server.cfg"
-              ports:
-                - "8080:8080"
-                - "50055:50055"
-              volumes:
-                - /tmp/yuzu-qa/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
-              # \`curl\` is NOT in the server runtime image (it installs only
-              # libssl3, libpq5, ca-certificates and bash), so this healthcheck
-              # could never pass: the container would sit \`unhealthy\` forever and
-              # \`gateway\`, which waits on \`condition: service_healthy\`, would
-              # never start. Use bash's /dev/tcp pseudo-device — the same probe
-              # deploy/docker/docker-compose.reference.yml uses. The gate added
-              # in #751 verifies bash + /dev/tcp survive in the image.
-              healthcheck:
-                test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-
-            gateway:
-              image: $REGISTRY/yuzu-gateway:$VERSION
-              environment:
-                - YUZU_GW_UPSTREAM_ADDR=server
-              ports:
-                - "50051:50051"
-                - "50063:50063"
-                - "8081:8081"
-                - "9568:9568"
-              depends_on:
-                server:
-                  condition: service_healthy
-
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:$VERSION
-              command:
-                - "--server"
-                - "gateway:50051"
-                - "--no-tls"
-                - "--log-level"
-                - "info"
-              depends_on:
-                - gateway
-          COMPOSE
-
-      - name: Start stack
-        working-directory: /tmp/yuzu-qa
-        run: |
-          docker compose up -d
-          echo "Waiting for stack to be healthy..."
-          # Wait for server
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8080/livez &>/dev/null; then break; fi
-            sleep 2
-          done
-          # Wait for gateway
-          for i in $(seq 1 20); do
-            if curl -sf http://localhost:8081/readyz &>/dev/null; then break; fi
-            sleep 2
-          done
-          # Wait for agent registration
-          for i in $(seq 1 30); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            if [ "$COUNT" -ge 1 ]; then break; fi
-            sleep 2
-          done
-          echo "Stack ready"
+        run: bash scripts/ci/qa-stack.sh up "$VERSION"
 
       - name: Test — Dashboard reachable
         run: |
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
-          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+          CODE=$(curl -s --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE (verified against the install CA)" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
       - name: Test — Gateway health
         run: |
-          HEALTH=$(curl -sf http://localhost:8081/readyz)
+          HEALTH=$(curl -sf http://127.0.0.1:8081/readyz)
           echo "$HEALTH" | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: $HEALTH"; exit 1; }
 
       - name: Test — Agent registered
         run: |
-          COUNT=$(curl -s http://localhost:8080/metrics | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
           [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) registered" || { echo "FAIL: 0 agents"; exit 1; }
 
       - name: Test — Gateway sees agent
         run: |
-          COUNT=$(curl -s http://localhost:9568/metrics | \
-            grep -oP 'yuzu_gw_agents_connected_total\{[^}]*\} \K[0-9]+' || echo "0")
+          COUNT=$(bash scripts/ci/qa-stack.sh metric gateway yuzu_gw_agents_connected_total)
           [ "$COUNT" -ge 1 ] && echo "PASS: Gateway shows $COUNT agent(s)" || { echo "FAIL: 0 agents"; exit 1; }
 
       - name: Test — Command round-trip (os_info)
         run: |
-          # Login
-          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
-            -d "username=qaadmin&password=qapassword1" -o /dev/null
-
-          # Dispatch command
-          RESP=$(curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
-            -H "Content-Type: application/json" \
-            -d '{"plugin":"os_info","action":"os_name"}')
+          RESP=$(bash scripts/ci/qa-stack.sh api POST /api/command '{"plugin":"os_info","action":"os_name"}')
           CMD_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null)
 
           if [ -z "$CMD_ID" ]; then
@@ -341,7 +227,7 @@ jobs:
           # Poll for response
           for i in $(seq 1 20); do
             sleep 2
-            RESULT=$(curl -s -b /tmp/cookies.txt "http://localhost:8080/api/responses/$CMD_ID" | \
+            RESULT=$(bash scripts/ci/qa-stack.sh api GET "/api/responses/$CMD_ID" | \
               python3 -c "
           import sys,json
           d=json.load(sys.stdin)
@@ -363,10 +249,7 @@ jobs:
 
       - name: Collect logs
         if: always()
-        working-directory: /tmp/yuzu-qa
-        run: |
-          docker compose logs > /tmp/yuzu-qa/integration-logs.txt 2>&1
-          docker compose ps
+        run: bash scripts/ci/qa-stack.sh logs /tmp/yuzu-qa/integration-logs.txt
 
       - name: Upload logs
         if: always()
@@ -378,8 +261,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        working-directory: /tmp/yuzu-qa
-        run: docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── Installer smoke tests: .deb on multiple distros ─────────────────
   install-deb:
@@ -743,20 +625,31 @@ jobs:
         run: |
           cd artifacts
 
+          # Each check fails the step on its own: `check && echo PASS` under
+          # bash -e only fails when it is the step's LAST command, so every
+          # earlier miss used to pass silently.
+          has() { tar tzf "$1" | grep -q "$2" && echo "PASS: $3" || { echo "FAIL: $3 ($2 not in $1)"; exit 1; }; }
+
           echo "=== Linux x64 archive ==="
-          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: server binary"
-          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: agent binary"
+          has yuzu-linux-x64.tar.gz 'bin/yuzu-server' "server binary"
+          has yuzu-linux-x64.tar.gz 'bin/yuzu-agent' "agent binary"
           PLUGINS=$(tar tzf yuzu-linux-x64.tar.gz | grep -c '\.so$' || true)
           echo "Plugins: $PLUGINS"
           [ "$PLUGINS" -ge 30 ] && echo "PASS: plugin count" || { echo "FAIL: only $PLUGINS plugins"; exit 1; }
 
           echo "=== Gateway archive ==="
-          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'bin/yuzu_gw' && echo "PASS: gateway binary"
-          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'releases/' && echo "PASS: Erlang release structure"
+          has yuzu-gateway-linux-x64.tar.gz 'bin/yuzu_gw' "gateway binary"
+          has yuzu-gateway-linux-x64.tar.gz 'releases/' "Erlang release structure"
 
-          echo "=== ARM64 archive ==="
-          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: ARM64 server"
-          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: ARM64 agent"
+          # release.yml does not build a Linux ARM64 archive yet (its release
+          # notes list it as "coming soon"); check it only once it ships.
+          if [ -f yuzu-linux-arm64.tar.gz ]; then
+            echo "=== ARM64 archive ==="
+            has yuzu-linux-arm64.tar.gz 'bin/yuzu-server' "ARM64 server"
+            has yuzu-linux-arm64.tar.gz 'bin/yuzu-agent' "ARM64 agent"
+          else
+            echo "SKIP: no yuzu-linux-arm64.tar.gz in this release"
+          fi
 
       - name: Inspect Linux binaries
         run: |
@@ -896,7 +789,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
+      QA_STATE_DIR: /tmp/yuzu-soak
+      QA_PROJECT: yuzu-soak
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -916,102 +810,41 @@ jobs:
       - name: Start stack
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          mkdir -p /tmp/yuzu-soak
-
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'soakpass1', salt, 100000, dklen=32)
-          print(f'soak:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-soak/yuzu-server.cfg
-
-          cat > /tmp/yuzu-soak/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:$VERSION
-              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
-              ports: ["8080:8080","50055:50055"]
-              volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
-              # curl is NOT in the server runtime image — see the integration
-              # job's compose above. bash + /dev/tcp is the supported probe.
-              healthcheck:
-                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-            gateway:
-              image: $REGISTRY/yuzu-gateway:$VERSION
-              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50051:50051","50063:50063","8081:8081","9568:9568"]
-              depends_on:
-                server:
-                  condition: service_healthy
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:$VERSION
-              command: ["--server","gateway:50051","--no-tls"]
-              depends_on: [gateway]
-          COMPOSE
-
-          cd /tmp/yuzu-soak
-          docker compose up -d
-
-          # Wait for full stack
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
-          echo "Stack ready, agent registered"
+        run: bash scripts/ci/qa-stack.sh up "$VERSION"
 
       - name: Run soak (10 minutes)
         run: |
           echo "Starting 10-minute soak test..."
-          echo "timestamp,server,gateway,agent,agents_registered" > /tmp/yuzu-soak/soak.csv
-
-          # Login for commands
-          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
-            -d "username=soak&password=soakpass1" -o /dev/null
+          echo "timestamp,memory,agents_registered" > /tmp/yuzu-soak/soak.csv
 
           FAILURES=0
           for i in $(seq 1 20); do
             TS=$(date +%H:%M:%S)
 
-            # Check all containers running
-            RUNNING=$(cd /tmp/yuzu-soak && docker compose ps --format json | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          states = [c.get('State','') for c in (data if isinstance(data, list) else [data])]
-          print(len([s for s in states if s == 'running']))
-          " 2>/dev/null || echo "0")
+            # All four services (server, gateway, agent, postgres) running
+            RUNNING=$(bash scripts/ci/qa-stack.sh running)
 
-            # Check agent count
-            AGENTS=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+            # Agent count
+            AGENTS=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
 
-            # Check gateway health
+            # Gateway health
             GW_OK="yes"
-            curl -sf http://localhost:8081/readyz &>/dev/null || GW_OK="no"
+            curl -sf http://127.0.0.1:8081/readyz &>/dev/null || GW_OK="no"
 
-            # Memory (container RSS)
-            SERVER_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-server-1 2>/dev/null | cut -d/ -f1 || echo "?")
-            GW_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-gateway-1 2>/dev/null | cut -d/ -f1 || echo "?")
-            AGENT_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-agent-1 2>/dev/null | cut -d/ -f1 || echo "?")
+            # Memory (container usage)
+            MEM=$(bash scripts/ci/qa-stack.sh stats)
 
-            echo "$TS  containers=$RUNNING  agents=$AGENTS  gw=$GW_OK  mem=[S:$SERVER_MEM G:$GW_MEM A:$AGENT_MEM]"
-            echo "$TS,$SERVER_MEM,$GW_MEM,$AGENT_MEM,$AGENTS" >> /tmp/yuzu-soak/soak.csv
+            echo "$TS  running=$RUNNING/4  agents=$AGENTS  gw=$GW_OK  mem=[$MEM]"
+            echo "$TS,$MEM,$AGENTS" >> /tmp/yuzu-soak/soak.csv
 
-            if [ "$RUNNING" -lt 3 ] || [ "$AGENTS" -lt 1 ] || [ "$GW_OK" = "no" ]; then
+            if [ "$RUNNING" -lt 4 ] || [ "$AGENTS" -lt 1 ] || [ "$GW_OK" = "no" ]; then
               FAILURES=$((FAILURES + 1))
               echo "WARNING: degraded state at $TS"
             fi
 
             # Send a command every 30s to exercise the data path
             if [ $((i % 2)) -eq 0 ]; then
-              curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
-                -H "Content-Type: application/json" \
-                -d '{"plugin":"status","action":"ping"}' > /dev/null 2>&1
+              bash scripts/ci/qa-stack.sh api POST /api/command '{"plugin":"status","action":"ping"}' > /dev/null 2>&1 || true
             fi
 
             sleep 30
@@ -1028,9 +861,8 @@ jobs:
       - name: Check for crashes in logs
         if: always()
         run: |
-          cd /tmp/yuzu-soak
-          docker compose logs > soak-logs.txt 2>&1
-          if grep -iE 'segfault|ASAN|UBSAN|panic|SIGABRT|core dump' soak-logs.txt; then
+          bash scripts/ci/qa-stack.sh logs /tmp/yuzu-soak/soak-logs.txt
+          if grep -iE 'segfault|ASAN|UBSAN|panic|SIGABRT|core dump' /tmp/yuzu-soak/soak-logs.txt; then
             echo "FAIL: crash detected in logs"
             exit 1
           else
@@ -1049,7 +881,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: cd /tmp/yuzu-soak && docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── Upgrade test ────────────────────────────────────────────────────
   upgrade-test:
@@ -1057,9 +889,10 @@ jobs:
     needs: [resolve, integration]
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
+      QA_STATE_DIR: /tmp/yuzu-upgrade
+      QA_PROJECT: yuzu-upgrade
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1076,78 +909,24 @@ jobs:
           username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
+      # Same reference stack, started at the previous stable release, then
+      # every service moved to the new version with the Postgres volume, the
+      # install CA and the agent's issued leaf kept — i.e. a real in-place
+      # upgrade of the shipped template, including the schema migrations.
       - name: Start previous release
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
-          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
           PREV_VER="${PREV_TAG#v}"
-          mkdir -p /tmp/yuzu-upgrade
-
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'upgradepass1', salt, 100000, dklen=32)
-          print(f'upgrade:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-upgrade/yuzu-server.cfg
-
-          # Compose file with variable image tags
-          cat > /tmp/yuzu-upgrade/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:\${YUZU_VER}
-              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
-              ports: ["8080:8080","50055:50055"]
-              volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
-              # curl is NOT in the server runtime image — see the integration
-              # job's compose above. bash + /dev/tcp is the supported probe.
-              healthcheck:
-                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-            gateway:
-              image: $REGISTRY/yuzu-gateway:\${YUZU_VER}
-              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50051:50051","50063:50063","8081:8081"]
-              depends_on:
-                server:
-                  condition: service_healthy
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:\${YUZU_VER}
-              command: ["--server","gateway:50051","--no-tls"]
-              depends_on: [gateway]
-          COMPOSE
-
-          cd /tmp/yuzu-upgrade
           echo "Starting previous release: $PREV_VER"
-          YUZU_VER="$PREV_VER" docker compose up -d
-
-          # Wait for stack
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
-          echo "Previous release stack ready ($PREV_VER)"
+          bash scripts/ci/qa-stack.sh up "$PREV_VER"
 
       - name: Upgrade to new release
         env:
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          cd /tmp/yuzu-upgrade
-
           echo "Upgrading to: $NEW_VER"
-          YUZU_VER="$NEW_VER" docker compose up -d
-
-          # Wait for stack to recover
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
+          bash scripts/ci/qa-stack.sh upgrade "$NEW_VER"
 
       - name: Verify post-upgrade
         env:
@@ -1155,22 +934,21 @@ jobs:
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
           # Dashboard reachable
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
-          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+          CODE=$(curl -s --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
           # Agent reconnected
-          COUNT=$(curl -s http://localhost:8080/metrics | \
-            grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
           [ "$COUNT" -ge 1 ] && echo "PASS: Agent reconnected ($COUNT)" || { echo "FAIL: Agent not reconnected"; exit 1; }
 
           # Gateway healthy
-          curl -sf http://localhost:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
+          curl -sf http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
 
           echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
       - name: Collect logs
         if: always()
-        run: cd /tmp/yuzu-upgrade && docker compose logs > upgrade-logs.txt 2>&1
+        run: bash scripts/ci/qa-stack.sh logs /tmp/yuzu-upgrade/upgrade-logs.txt
 
       - name: Upload logs
         if: always()
@@ -1182,7 +960,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: cd /tmp/yuzu-upgrade && docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── QA summary ──────────────────────────────────────────────────────
   report:
