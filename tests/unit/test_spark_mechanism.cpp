@@ -11005,7 +11005,7 @@ TEST_CASE("Registry mechanism (direct): a sweeper whose passes keep failing repo
 // test-owned gate) and requires a mu_ taker to complete while the sweeper is still parked.
 // Falsifier: move `log_pass_outcome(po)` above either branch's `lk.unlock()` in
 // sweeper_main() and the matching case(s) fail at the 2000 ms `done` wait (verified red on
-// DGRHP, PR #N). PfStallLogger's preconditions apply: one instance at a time, declared before
+// DGRHP, PR #5004). PfStallLogger's preconditions apply: one instance at a time, declared before
 // the mechanism, `hits() > 0` asserted (#3355), and no other thread logs while it lives -
 // the driver below emits nothing on the test thread, the probe worker, or the TP_WAIT
 // callback (its emit is a no-op, so on_fire()'s emit-threw warn cannot fire).

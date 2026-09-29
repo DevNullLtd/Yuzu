@@ -427,6 +427,12 @@ struct TarStats {
     int retention_days{7};
 };
 
+/// Optional baseline write that commits atomically with a diff-source insert.
+struct StateWrite {
+    std::string collector;
+    std::string json;
+};
+
 class TarDatabase {
 public:
     /**
@@ -465,6 +471,7 @@ public:
      *         failed write (the #538 disable baseline-clear) check this;
      *         best-effort collector writes may ignore it.
      */
+    /// The bool is load-bearing: callers must treat false as "baseline not saved".
     bool set_state(const std::string& collector, const std::string& json);
 
     // ── Cursor-model persistence (tar_cursor.hpp) ────────────────────────────
@@ -574,6 +581,13 @@ public:
     /// path that is not there is worse than admitting the store is dark.
     [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
 
+    /// Epoch at which THIS open() quarantined a corrupt tar.db; nullopt for a
+    /// clean open. Drives only the tar.status db_health value — the durable
+    /// record is tar_config `db_health_last_quarantine_*`.
+    [[nodiscard]] std::optional<int64_t> quarantined_this_open() const noexcept {
+        return quarantined_at_;
+    }
+
     /// Returns false if the write did not persist. Retention's clock guard
     /// depends on this: a silently-dropped write leaves the guard with no
     /// comparison point on the next pass, forever, with nothing to report
@@ -589,15 +603,30 @@ public:
     bool create_warehouse_tables();
 
     // ── Typed inserts ───────────────────────────────────────────────────────
+    //
+    // The eight snapshot-diff inserts take an optional StateWrite: the
+    // tar_state baseline UPSERT then commits in the SAME transaction as the
+    // events, so a failed baseline save can never leave events durable with a
+    // stale baseline (which would re-diff and double-emit). Any failure rolls
+    // back both and returns false. With empty events + a StateWrite only the
+    // state is written (one autocommit statement).
 
-    bool insert_process_events(const std::vector<ProcessEvent>& events);
-    bool insert_network_events(const std::vector<NetworkEvent>& events);
-    bool insert_service_events(const std::vector<ServiceEvent>& events);
-    bool insert_user_events(const std::vector<UserEvent>& events);
-    bool insert_software_events(const std::vector<SoftwareEvent>& events);
-    bool insert_arp_events(const std::vector<ArpEvent>& events);
-    bool insert_dns_events(const std::vector<DnsEvent>& events);
-    bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events);
+    bool insert_process_events(const std::vector<ProcessEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_network_events(const std::vector<NetworkEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_service_events(const std::vector<ServiceEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_user_events(const std::vector<UserEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_software_events(const std::vector<SoftwareEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_arp_events(const std::vector<ArpEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_dns_events(const std::vector<DnsEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
@@ -792,6 +821,11 @@ public:
 private:
     explicit TarDatabase(sqlite3* db);
 
+    /// tar_state UPSERT on an already-locked handle; shared by set_state() and
+    /// the diff-source inserts (which run it inside their transaction).
+    static bool upsert_state_locked(sqlite3* db, const std::string& collector,
+                                    const std::string& json);
+
     /// Internal set_config that assumes caller already holds mu_.
     bool set_config_locked(const std::string& key, const std::string& value);
 
@@ -820,6 +854,7 @@ private:
     // written after construction publishes the object (no runtime close path),
     // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
+    std::optional<int64_t> quarantined_at_{};
     std::mutex mu_;
     std::mutex query_mu_;
 };

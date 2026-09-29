@@ -3878,11 +3878,15 @@ operator sessions (HA WS-1/1a, ADR-2002 §4)") and `auth_kv`
 see "Storage" under SCIM v2 provisioning above.
 
 **This was a fresh-start cutover — NOT a backfill.** On first boot against a
-Postgres database whose `auth.users` table is empty, `main.cpp` seeds
-exactly the config-file admin via `AuthDB::seed_admin_if_empty` (a single
-`INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
-instance racing first boot) and logs a loud "AUTH DATA RESET ON POSTGRES
-CUTOVER" warning. **A legacy SQLite `auth.db` is never read** — any prior
+Postgres database whose `auth.users` table is empty, `main.cpp` seeds the
+config-file admin AND grants it a durable fleet-wide Administrator role, in
+one transaction, via `RbacStore::provision_first_admin` (docs/adr/1008-rbac-management-groups-target-architecture.md,
+"Delivery note (fresh-install bootstrap)") — `AuthDB::seed_admin_if_empty`'s
+own `INSERT ... SELECT ... WHERE NOT EXISTS` is the same TOCTOU-free shape
+but is no longer called in production at all (a redundant second call was
+removed; it stays exported for its own tests) — and logs a loud "RBAC
+BOOTSTRAP" warning plus a durable `rbac.bootstrap.first_admin` audit row.
+**A legacy SQLite `auth.db` is never read** — any prior
 local accounts, roles, and MFA enrollments that existed only in a pre-cutover
 `auth.db` are gone on upgrade; SCIM self-heals on the IdP's next sync cycle;
 humans re-enroll MFA. This is a breaking upgrade by design, matching the

@@ -44,6 +44,7 @@
 #include <httplib.h>
 #include <yuzu/metrics.hpp>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -123,6 +124,16 @@ struct RbacRoleHarness {
     bool auth_enabled{true};
     bool audit_allow{true};
 
+    /// nullptr = always allow — the default every is_rbac_administrator-gated
+    /// route in this file relies on (assign_rbac_role/unassign_rbac_role/
+    /// set_rbac_enforcement never call perm_fn at all). Set to a predicate
+    /// returning FALSE to deny a (securable_type, operation) pair — needed
+    /// for the READ-ONLY GET /api/v1/rbac/roles/assignments route (+ its
+    /// list_rbac_role_assignments MCP twin), which DOES gate on
+    /// perm_fn(AccessReview, Read). Mirrors
+    /// AccessReviewHarness::perm_override (test_rest_access_review.cpp).
+    std::function<bool(const std::string&, const std::string&)> perm_override;
+
     std::vector<AuditRecord> audit_log;
     // MFA step-up seam. Unset = permissive, the default for every test. A test sets it
     // to stand in for a failed or stale step-up: the route contract under test is that
@@ -175,11 +186,21 @@ struct RbacRoleHarness {
             // session never carries one, so this defaults empty.
             return session_of(rest_session_mcp_tier);
         };
-        // Deliberately permissive — neither route under test calls perm_fn at
-        // all (gated on is_rbac_administrator instead); kept only because the
-        // register_routes signature requires one.
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        // Permissive by default — assign_rbac_role/unassign_rbac_role/
+        // set_rbac_enforcement never call perm_fn at all (gated on
+        // is_rbac_administrator instead); GET /api/v1/rbac/roles/assignments
+        // DOES call it (perm_fn(AccessReview, Read)), so `perm_override` lets
+        // a test simulate a denial for that route without disturbing the
+        // is_rbac_administrator-gated routes' own tests.
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
+            if (perm_override && !perm_override(type, op)) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -237,8 +258,17 @@ struct RbacRoleHarness {
                 return std::nullopt;
             return session_of(session_mcp_tier); // mcp_tier from session_mcp_tier — see its own doc comment
         };
-        auto mcp_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                              const std::string&) -> bool { return true; };
+        // Same perm_override shape as the REST perm_fn above — mirrors
+        // AccessReviewHarness::mcp_perm_fn (test_rest_access_review.cpp).
+        auto mcp_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                  const std::string& type, const std::string& op) -> bool {
+            if (perm_override && !perm_override(type, op)) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
         auto mcp_audit_fn = [this](const httplib::Request&, const std::string& action,
                                    const std::string& result, const std::string&,
                                    const std::string& target_id, const std::string& detail) -> bool {
@@ -284,6 +314,11 @@ struct RbacRoleHarness {
             /*auth_db=*/auth_db.get(),
             /*directory_sync=*/nullptr);
     }
+
+    /// GET /api/v1/rbac/roles/assignments — the fleet-wide grant-table
+    /// listing (gated on perm_fn(AccessReview, Read), unlike every other
+    /// route this harness drives).
+    auto list_assignments_rest() { return sink.Get("/api/v1/rbac/roles/assignments"); }
 
     auto assign_rest(const std::string& role, const std::string& body) {
         return sink.Post("/api/v1/rbac/roles/" + role + "/assignments", body);
