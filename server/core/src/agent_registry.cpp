@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <map>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +19,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
+#include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -1626,7 +1629,8 @@ std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                                    const CustomPropertiesStore* props_store,
                                    ResultSetStore* rs_store, std::string_view principal,
-                                   ScopePopulation population) const {
+                                   ScopePopulation population,
+                                   bool touch_referenced_result_sets) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
     // store query per agent while holding mu_ (review finding F). The owner join
@@ -1707,7 +1711,15 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                 // already failed the whole evaluation for that case above). A
                 // touch racing a concurrent GC sweep is a harmless no-op (an
                 // UPDATE affecting 0 rows).
-                rs_store->touch(rsid);
+                // #4981 PR-3: gated on `touch_referenced_result_sets` — a
+                // read-only preview evaluation (evaluate_scope's own
+                // `touch_referenced_result_sets = false` caller) must resolve
+                // `from_result_set:` membership identically to a real dispatch
+                // WITHOUT extending the set's TTL merely for being referenced
+                // in a dry-run check. Every real dispatch/enforcement caller
+                // leaves this at its default `true` and is unaffected.
+                if (touch_referenced_result_sets)
+                    rs_store->touch(rsid);
                 rs_members.emplace(rsid, std::move(*mem));
             }
         }
@@ -1944,9 +1956,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
 std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                               const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                              std::string_view principal) const {
+                              std::string_view principal,
+                              bool touch_referenced_result_sets) const {
     return evaluate_scope_impl(expr, tag_store, props_store, rs_store, principal,
-                               ScopePopulation::Fleet);
+                               ScopePopulation::Fleet, touch_referenced_result_sets);
 }
 
 std::expected<std::vector<std::string>, ScopeEvalError>
@@ -1957,9 +1970,13 @@ AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const T
     // never consulted) and can never return Kind::OwnerCheckFailed (no
     // from_result_set: atom can resolve here regardless — an rs_store-null
     // call site collects the same Unresolvable abort evaluate_scope would
-    // give a no-store caller).
+    // give a no-store caller). `touch_referenced_result_sets` is passed as
+    // `true` (its default meaning) but is a no-op here regardless, since
+    // rs_store is always null for LocalOnly — the touch call site can never
+    // execute without a store to touch through.
     return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
-                               /*principal=*/{}, ScopePopulation::LocalOnly);
+                               /*principal=*/{}, ScopePopulation::LocalOnly,
+                               /*touch_referenced_result_sets=*/true);
 }
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
@@ -1990,14 +2007,43 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog() {
 
 void AgentHealthStore::upsert(const std::string& agent_id,
                               const google::protobuf::Map<std::string, std::string>& tags) {
-    std::lock_guard lock(mu_);
-    auto& snap = snapshots_[agent_id];
-    snap.agent_id = agent_id;
-    snap.status_tags.clear();
-    for (const auto& [k, v] : tags) {
-        snap.status_tags[k] = v;
+    CorruptionSink sink;
+    int64_t corruption_total = 0;
+    std::string quarantine_last;
+    {
+        std::lock_guard lock(mu_);
+        auto& snap = snapshots_[agent_id];
+        snap.agent_id = agent_id;
+        snap.status_tags.clear();
+        for (const auto& [k, v] : tags) {
+            snap.status_tags[k] = v;
+        }
+        snap.last_seen = std::chrono::steady_clock::now();
+
+        // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
+        // deduped here); TarCorruptionAuditGate dedups; a candidate skipped
+        // because the gate's slot was busy retries on the next heartbeat, a
+        // failed write after the 60 s degraded window.
+        if (corruption_sink_) {
+            const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
+            const auto ql = snap.status_tags.find(kTarTagQuarantineLast);
+            if (tot != snap.status_tags.end() && ql != snap.status_tags.end()) {
+                const auto parsed = parse_tar_corruption_total(tot->second);
+                if (parsed && valid_tar_quarantine_last(ql->second)) {
+                    sink = corruption_sink_;
+                    corruption_total = *parsed;
+                    quarantine_last = ql->second;
+                }
+            }
+        }
     }
-    snap.last_seen = std::chrono::steady_clock::now();
+    if (sink)
+        sink(agent_id, corruption_total, quarantine_last); // outside mu_
+}
+
+void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
+    std::lock_guard lock(mu_);
+    corruption_sink_ = std::move(sink);
 }
 
 void AgentHealthStore::remove(const std::string& agent_id) {
@@ -2066,6 +2112,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Clear labeled gauge families before rebuilding
     metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
+    metrics.clear_gauge_family("yuzu_fleet_plugin_init_failed"); // #1567
     metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
     // A4 perf families cleared too: when no agent reports a metric this cycle
@@ -2327,6 +2374,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     };
 
     int ota_signature_refusing = 0;
+    int tar_db_corruption_agents = 0;               // #1567
+    std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2342,6 +2391,42 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (auto it = snap.status_tags.find("yuzu.ota_signature_refused");
             it != snap.status_tags.end() && !it->second.empty() && it->second != "0")
             ++ota_signature_refusing;
+
+        // #1567: agents whose plugin-published corruption total parses > 0, and the
+        // per-plugin count of agents reporting a failed init. Both tags are
+        // agent-controlled: bounded token count, in-place reads (no copies).
+        if (auto it = snap.status_tags.find(kTarTagCorruptionTotal);
+            it != snap.status_tags.end() && parse_tar_corruption_total(it->second))
+            ++tar_db_corruption_agents;
+        if (auto it = snap.status_tags.find("yuzu.plugins_failed");
+            it != snap.status_tags.end() && !it->second.empty()) {
+            std::string_view rest{it->second};
+            int tokens = 0;
+            // #1567 round-2: dedupe within THIS agent's tag value before counting.
+            // An honest agent never repeats a plugin name (plugins_failed_ is a
+            // set, one entry per failed plugin), so this only matters for a
+            // malformed or compromised agent sending e.g. "tar,tar" — without the
+            // dedupe that one agent would inflate yuzu_fleet_plugin_init_failed by
+            // its repeat count instead of by 1. `seen_this_agent` holds views into
+            // `it->second`, which outlives this block.
+            std::unordered_set<std::string_view> seen_this_agent;
+            while (!rest.empty() && tokens < 32) {
+                ++tokens; // every split counts toward the cap, valid or not
+                const auto comma = rest.find(',');
+                const auto tok = rest.substr(0, comma);
+                rest = comma == std::string_view::npos ? std::string_view{}
+                                                       : rest.substr(comma + 1);
+                if (tok.empty() || tok.size() > 64 ||
+                    !std::all_of(tok.begin(), tok.end(), [](char ch) {
+                        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                               (ch >= '0' && ch <= '9') || ch == '_';
+                    }))
+                    continue;
+                if (!seen_this_agent.insert(tok).second)
+                    continue; // already counted for this agent this sweep
+                ++plugin_init_failed[std::string{tok}];
+            }
+        }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
         // by the 4 MB gRPC frame, so `get()` above memcpy's it on every lookup, on every
@@ -2686,6 +2771,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // without this the refusal is invisible outside a per-endpoint log.
     metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
         .set(static_cast<double>(ota_signature_refusing));
+    // #1567: agents reporting a quarantined tar.db (cumulative per agent since
+    // install; a RISING value is the signal), and per-plugin init failures
+    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
+    // lexicographic order, the remainder summed under plugin="other".
+    metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
+        .set(static_cast<double>(tar_db_corruption_agents));
+    {
+        constexpr std::size_t kMaxPluginLabels = 64;
+        std::size_t n = 0;
+        int64_t other = 0;
+        for (const auto& [plugin, count] : plugin_init_failed) {
+            if (n < kMaxPluginLabels) {
+                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                    .set(static_cast<double>(count));
+                ++n;
+            } else {
+                other += count;
+            }
+        }
+        if (other > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
+                .set(static_cast<double>(other));
+    }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
         .set(static_cast<double>(dex_observer_disarmed));

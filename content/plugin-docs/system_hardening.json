@@ -321,9 +321,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave8-pr81b-system_hardening.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/system_hardening.yaml"
     ],

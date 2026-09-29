@@ -6,7 +6,7 @@ import { BY_FILE } from '../nav.mjs';
 //   • target is in the manifest  -> rewrite to the site route   (/Yuzu/manual/<slug>/)
 //   • target is a real repo file -> rewrite to the GitHub blob  (so it still works)
 // Absolute URLs, anchors, and non-.md links are left untouched.
-const REPO_BLOB = 'https://github.com/Tr3kkR/Yuzu/blob/main';
+const REPO_BLOB = 'https://github.com/DevNullLtd/Yuzu/blob/main';
 const BASE = '/Yuzu';
 
 export default function rewriteLinks() {

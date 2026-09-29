@@ -56,6 +56,7 @@
 
 #include "mcp_server_testonly.hpp" // input_schemas_for_test — SHOULD #3's schema<->header sync test
 #include "mfa_step_up.hpp"          // StepUpFn, the step-up seam the REST routes call
+#include "pg/pg_raii.hpp"           // PgConn/PgResult — the list-route query-failure test
 #include "rbac_admin_predicate.hpp" // kRbacAdminGateUnavailableAuditReason
 #include "rbac_assignable_roles.hpp"
 #include "web_utils.hpp" // audit_token — C5's expected-neutralization oracle
@@ -63,6 +64,7 @@
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacStoreOnAuthPool, RbacRoleHarness (A1 Step 6.1 extraction)
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1614,4 +1616,229 @@ TEST_CASE("rbac_assignable_roles.hpp's kRbacAssignableRoles matches "
     REQUIRE_FALSE(unassign_schema.is_discarded());
     REQUIRE(unassign_schema["properties"].contains("role"));
     CHECK_FALSE(unassign_schema["properties"]["role"].contains("enum"));
+}
+
+// ── GET /api/v1/rbac/roles/assignments + list_rbac_role_assignments MCP
+// twin — the fleet-wide grant-table listing that reuses RbacStore::
+// list_all_principal_roles_checked() (the SAME bulk read build_access_review
+// uses for the SOC 2 CC6.2 export). Gated on perm_fn(AccessReview, Read),
+// UNLIKE every other route in this file (gated on is_rbac_administrator
+// instead) — RbacRoleHarness::perm_override (extracted onto the shared
+// harness for this suite) lets these tests exercise that gate directly. ────
+
+TEST_CASE("REST GET .../rbac/roles/assignments: happy path returns current "
+          "grants",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})")
+               ->status == 201);
+    REQUIRE(h.assign_rest("Viewer", R"({"principal_type":"user","principal_id":"bob"})")
+               ->status == 201);
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("data"));
+
+    bool found_jane = false, found_bob = false;
+    for (const auto& g : body["data"]) {
+        REQUIRE(g.contains("principal_type"));
+        REQUIRE(g.contains("principal_id"));
+        REQUIRE(g.contains("role_name"));
+        if (g["principal_type"] == "user" && g["principal_id"] == "jane" &&
+            g["role_name"] == "Operator")
+            found_jane = true;
+        if (g["principal_type"] == "user" && g["principal_id"] == "bob" &&
+            g["role_name"] == "Viewer")
+            found_bob = true;
+    }
+    CHECK(found_jane);
+    CHECK(found_bob);
+
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "rbac.assignments.list" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: AccessReview:Read alone is "
+          "sufficient — no second gate silently ANDed on",
+          "[pg][rest][rbac][list][gate]") {
+    // Mirrors test_rest_access_review.cpp's "a session with only
+    // AccessReview:Read can export but not attest" — the happy-path test
+    // above uses make_caller_admin() (perm_override left null/always-allow),
+    // which would not catch a future regression narrowing this route to
+    // Administrator-only (defeating the seeded Reviewer role's whole
+    // purpose, #2324/#2225). consistency-auditor + compliance-officer,
+    // governance round 2026-09-28.
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && op == "Read"; // ONLY Read is granted
+    };
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: 403 without AccessReview:Read",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Read");
+    };
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: an engine-classed session is denied",
+          "[pg][rest][rbac][list][engine_deny]") {
+    RbacRoleHarness h;
+    h.session_principal_kind = "engine";
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: happy path returns current grants",
+          "[pg][mcp][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"jane"})")
+               ->status == 201);
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("result"));
+    const auto& payload = body["result"]["structuredContent"];
+    REQUIRE(payload.contains("assignments"));
+    REQUIRE(payload.contains("count"));
+    CHECK(payload["count"].get<int64_t>() >= 1);
+
+    bool found = false;
+    for (const auto& g : payload["assignments"]) {
+        if (g["principal_type"] == "user" && g["principal_id"] == "jane" &&
+            g["role_name"] == "Operator")
+            found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: AccessReview:Read alone is "
+          "sufficient — no second gate silently ANDed on",
+          "[pg][mcp][rbac][list][gate]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && op == "Read"; // ONLY Read is granted
+    };
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: denied without AccessReview:Read",
+          "[pg][mcp][rbac][list]") {
+    RbacRoleHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return !(t == "AccessReview" && op == "Read");
+    };
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP: list_rbac_role_assignments is advertised in tools/list",
+          "[pg][mcp][rbac][list][integration]") {
+    RbacRoleHarness h;
+    auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"list_rbac_role_assignments\"") != std::string::npos);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: 503 on a genuine store query "
+          "failure, never a silent 200",
+          "[pg][rest][rbac][list][503]") {
+    // Same technique as RbacStore::provision_first_admin's own failure test
+    // (test_rbac_store.cpp): DROP the table the route's query reads, on a
+    // second connection, so list_all_principal_roles_checked() fails at the
+    // query level rather than never being exercised.
+    RbacRoleHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // A4 envelope, not a bare empty success shape.
+    CHECK(res->body.find("correlation_id") != std::string::npos);
+    CHECK(res->body.find("\"data\":[]") == std::string::npos);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: internal error on a genuine store "
+          "query failure, never a silent empty success",
+          "[pg][mcp][rbac][list][503]") {
+    RbacRoleHarness h;
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("\"count\":0") == std::string::npos);
+}
+
+TEST_CASE("MCP list_rbac_role_assignments: audit_persisted:false is actually "
+          "emitted when the audit write drops, not just declared in the "
+          "output schema",
+          "[pg][mcp][rbac][list]") {
+    // quality-engineer (Gate 3, governance round 2026-09-28): the schema
+    // fix (adding audit_persisted to the output schema) shipped with no
+    // test proving the handler actually emits the field. Mirrors the
+    // audit-fail-closed test pattern elsewhere in this file.
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.audit_allow = false;
+
+    auto res = h.mcp_call_tool("list_rbac_role_assignments", nlohmann::json::object());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("result"));
+    const auto& payload = body["result"]["structuredContent"];
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+}
+
+TEST_CASE("REST GET .../rbac/roles/assignments: still 200 on a dropped audit "
+          "write (fire-and-forget, matches the list_access_reviews template "
+          "this route mirrors — tracked family-wide in #5063)",
+          "[pg][rest][rbac][list]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    h.audit_allow = false;
+
+    auto res = h.list_assignments_rest();
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }

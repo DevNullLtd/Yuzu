@@ -45,7 +45,7 @@ def fake_env(root: Path, attempt: int = 1) -> dict[str, str]:
         "GITHUB_EVENT_NAME": "push",
         "GITHUB_JOB": "linux",
         "GITHUB_WORKFLOW": "CI",
-        "GITHUB_WORKFLOW_REF": "Tr3kkR/Yuzu/.github/workflows/ci.yml@refs/heads/dev",
+        "GITHUB_WORKFLOW_REF": "DevNullLtd/Yuzu/.github/workflows/ci.yml@refs/heads/dev",
         "GITHUB_ENV": str(root / f"github-env-{attempt}"),
     }
 

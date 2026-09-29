@@ -121,6 +121,19 @@ TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[
     CHECK(detail.devices.size() == 2);
 }
 
+// WS-A4 PR-1 Gate 7 fix round (arch-1/sec8-1/sec8-2,
+// "aggregates GLOBAL-ONLY"): signal_detail's `visible` post-limit filter
+// (ADR-0031 WS-A4 PR-1 decision 3) was REMOVED, permanently — there is no
+// confinement-scope concept left on this method to engage or refuse.
+// REST/MCP gate this resource on the bare `GuaranteedState:Read`
+// permission (a global grant; with RBAC off, any authenticated non-service/non-engine session only; round-3 revert,
+// never `fleet_read_fn`) plus their own service-scoped-token denial, since
+// subjects/by_os/by_day stay fleet-wide aggregates a per-row devices[]
+// filter can never confine (ADR-0017 INV-3). The former "confines
+// devices[] to the visible set, post-limit" test asserted exactly the
+// removed parameter and is gone with it — see dex_api.hpp's own doc
+// comment on `signal_detail` for the full rationale.
+
 TEST_CASE("DexApi: device_score matches the shared builder (seam is a pure forward)",
           "[pg][dex_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
@@ -190,7 +203,7 @@ TEST_CASE("DexApi: fleet-dependent reads use the injected FleetFn", "[pg][dex_ap
         fleet_called = true;
         return DexFleet{1, 1, {"windows"}};
     });
-    (void)api->overview("7d", /*visible=*/nullptr);
+    (void)api->overview("7d");
     CHECK(fleet_called); // the seam obtains the fleet from the injected FleetFn
 }
 
@@ -229,7 +242,7 @@ TEST_CASE("DexApi: builder-backed methods match their shared builders", "[pg][de
         CHECK_FALSE(api->observation("a2", "e1").has_value()); // e1 belongs to a1
     }
     SECTION("app") {
-        const auto a = api->app("notepad.exe", w, /*visible=*/nullptr);
+        const auto a = api->app("notepad.exe", w);
         const auto b = yuzu::server::build_dex_app_model(&store, "notepad.exe", w, since, nullptr);
         CHECK(a.process_name == b.process_name);
         CHECK(a.devices.size() == b.devices.size());

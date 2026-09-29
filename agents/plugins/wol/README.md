@@ -165,5 +165,4 @@ mechanism|icmp
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_wol_check_plan.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/2209-wol-macos-ping-timeout.added.md`
 <!-- END GENERATED -->

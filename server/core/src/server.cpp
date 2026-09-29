@@ -47,6 +47,7 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
@@ -206,6 +207,7 @@
 #include "dex_blast_radius.hpp"
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
 #include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
@@ -2167,6 +2169,14 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_tar_db_corruption_agents",
+                          "Agents whose TAR database has ever been quarantined as corrupt "
+                          "(cumulative per agent since install; a rising value is the signal)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_plugin_init_failed",
+                          "Agents reporting a plugin that failed init, by plugin name (absent "
+                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
@@ -3153,11 +3163,17 @@ public:
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
-        // once, iff `seed_admin_if_empty` actually seeded the sole admin row
-        // (an empty `auth.users` table) — a no-op (table already populated,
-        // the common case on every restart) leaves this at 0. No labels: the
-        // event is binary and rare enough that a plain counter (0 forever, or
-        // 1 after the one genuine fresh-start boot) is the whole signal.
+        // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
+        // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
+        // Administrator bootstrap, and the SOLE production seeder now —
+        // `seed_admin_if_empty` has no production caller; see
+        // `Config::auth_fresh_start_seeded`'s doc comment) — true iff the
+        // sole admin row was actually inserted
+        // into a genuinely-empty `auth.users` table this boot. A no-op
+        // (table already populated, the common case on every restart)
+        // leaves this at 0. No labels: the event is binary and rare enough
+        // that a plain counter (0 forever, or 1 after the one genuine
+        // fresh-start boot) is the whole signal.
         metrics_.describe("yuzu_auth_fresh_start_reset_total",
                           "1 iff this boot seeded the sole admin user into an empty auth.users "
                           "table (fresh-start), 0 otherwise",
@@ -5257,6 +5273,55 @@ public:
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
                 (void)audit_store_->log(ev);
+            }
+
+            // #1567: tar.db corruption audit. AgentHealthStore surfaces candidates
+            // from heartbeat tags; the gate dedups DURABLY against the audit store
+            // itself (one row per agent + quarantine identity across health-store
+            // prunes, server restarts and HA node switches).
+            {
+                auto latest = [this](const std::string& agent_id)
+                    -> std::optional<std::optional<std::string>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    AuditQuery q;
+                    q.action = detail::kTarCorruptionAuditAction;
+                    q.target_id = agent_id;
+                    q.limit = 1;
+                    auto rows = audit_store_->query(q);
+                    if (!rows)
+                        return std::nullopt; // degraded store: retry on a later heartbeat
+                    if (rows->empty())
+                        return std::optional<std::string>{};
+                    return detail::decode_tar_quarantine_from_detail(rows->front().detail);
+                };
+                auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
+                health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
+                                                               int64_t total,
+                                                               const std::string& quarantine) {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return;
+                    if (!gate->should_log(agent_id, quarantine))
+                        return;
+                    // Reservation completes the slot even if AuditEvent construction
+                    // or audit_store_->log() throws (log() is not noexcept).
+                    detail::TarCorruptionAuditGate::Reservation res(*gate);
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "system";
+                    ev.principal_role = "system";
+                    ev.action = detail::kTarCorruptionAuditAction;
+                    ev.target_type = detail::kTarCorruptionAuditTargetType;
+                    ev.target_id = agent_id;
+                    ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
+                    ev.result = "success";
+                    if (audit_store_->log(ev))
+                        res.logged(agent_id, quarantine);
+                    else
+                        res.failed();
+                });
             }
 
             // #802 / W7.4 — mirror the viz-disable audit emission pattern:
@@ -14639,37 +14704,25 @@ private:
             if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
             return std::set<std::string>(v->begin(), v->end());
         };
-        // #4035 review fix (colleague review, BLOCKING): get_dex_app's/
-        // get_dex_overview's REST v1 + MCP twins previously reused the
-        // pre-existing `visible_set_fn` below (Infrastructure:Read global
-        // bypass + ManagementGroupStore::get_visible_agents, which is
-        // PERMISSION-AGNOSTIC — see that lambda's own doc comment) as their
-        // ADR-0017 confinement belt. That resolver returns every agent
-        // visible via ANY management-group role the caller holds, not just
-        // GuaranteedState:Read — so a caller with GuaranteedState:Read on
-        // one group and any unrelated role on a second group would see the
-        // second group's device ids/crash data leak into these two DEX
-        // reads. Deliberately a NEW resolver rather than fixing
-        // `visible_set_fn` in place: that lambda is also shared by the
-        // pre-existing `/fragments/dex/app`+`/fragments/dex/overview`
-        // dashboard fragments and an unrelated inventory-devices resolver,
-        // so changing it has a wider blast radius than this fix should
-        // take on — same shape as `response_visible_set_fn` above (D3),
-        // just scoped to GuaranteedState:Read instead of Response:Read.
-        auto dex_visible_fn = [this](const std::string& username)
-            -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "GuaranteedState", "Read");
-            if (global_read) return std::nullopt;
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "GuaranteedState", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
-        };
+        // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
+        // bypass + `RbacStore::visible_agents_for_permission` join) is
+        // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): this resolver's bare
+        // `check_permission` global-read bypass meant a management-group-
+        // confined-only operator was 403'd by the old `perm_fn` gate in
+        // front of it before this resolver ever ran, so its confinement was
+        // dormant on every admitted call. A later fix round tried moving GET
+        // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+        // /api/v1/dex/signals/{obs_type} (REST + MCP) onto `fleet_read_fn`
+        // below instead — but every value these three return is a
+        // fleet-wide aggregate, not a per-caller-confinable list, so per
+        // WS-A4 PR-1 all three stay on base gating: a bare
+        // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or
+        // with RBAC off any authenticated non-service/non-engine session) plus each surface's own
+        // service-scoped-token deny. `fleet_read_fn` is NOT one of these
+        // three routes' gates (it still exists below for the OTHER routes
+        // that are genuinely per-caller-confinable, e.g. GET
+        // /api/v1/dex/perf/app/devices). See RestApiV1::DexVisibleFn's
+        // retirement comment (rest_api_v1.hpp) for the full rationale.
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -18676,6 +18729,35 @@ private:
             return exists.has_value() && *exists;
         };
 
+        // #4981 PR-2: the SOLE scope-evaluation closure `POST
+        // /api/v1/scope/preview` and MCP `preview_scope_targets` both bind —
+        // byte-for-byte the same binding shape `command_routes.cpp`'s Scope
+        // arm and `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp)
+        // already use for a real dispatch, so a scope preview now resolves
+        // `tag:`/`props.`/`from_result_set:` atoms identically to a real
+        // dispatch instead of the old bespoke per-agent resolver that never
+        // populated the latter two (#4981's fleet-wide over-disclosure bug —
+        // see scope_preview.hpp's file header). Defined ONCE as a plain `auto`
+        // closure (RestApiV1::ScopeEvaluateFn and McpServer::ScopeEvaluateFn
+        // are independently-declared class-scoped std::function aliases with
+        // the identical signature — this codebase's convention, see
+        // ExecVisibleFn — so the SAME closure converts cleanly into either
+        // one) and passed to both RestApiV1::set_scope_evaluate_fn and
+        // McpServer::set_scope_evaluate_fn below, so REST and MCP cannot
+        // silently diverge in which agents a preview matches.
+        // #4981 PR-3: `touch_referenced_result_sets = false` — a preview is a
+        // read-only dry run; it must resolve `from_result_set:` membership
+        // identically to a real dispatch WITHOUT extending a referenced
+        // owned set's TTL merely for being named in the check (real dispatch,
+        // via command_routes.cpp's Scope arm and wire_and_dispatch_confined,
+        // is unaffected and keeps the touch at its default `true`).
+        auto scope_evaluate_fn = [this](const yuzu::scope::Expression& parsed,
+                                        const std::string& principal) {
+            return registry_.evaluate_scope(parsed, tag_store_.get(), custom_properties_store_.get(),
+                                            result_set_store_.get(), principal,
+                                            /*touch_referenced_result_sets=*/false);
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
         // Both setters MUST run BEFORE register_routes() (captured by value
         // at registration time, not `this`) — see set_engine_principal_store/
@@ -18687,6 +18769,10 @@ private:
             rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
             rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
         }
+        // #4981 PR-2 — see scope_evaluate_fn's own comment above. MUST run
+        // BEFORE register_routes(), same timing contract as the two setters
+        // immediately above.
+        rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -19051,15 +19137,13 @@ private:
             // DexApi seam's own FleetFn (wired into make_local_dex_api below),
             // not through a register_routes param. The `dex_fleet_fn` local is
             // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
-            // #4035 review fix (colleague review, BLOCKING): a DEDICATED
-            // GuaranteedState:Read-scoped resolver (defined above, see its
-            // own doc comment) — NOT the SAME visible_set_fn
-            // DexRoutes::register_routes above uses, despite this comment's
-            // own earlier (incorrect) claim that they should be identical.
-            // visible_set_fn's permission-agnostic join would leak a
-            // multi-role operator's OTHER groups' device ids into GET
-            // /api/v1/dex/app / GET /api/v1/dex/overview.
-            dex_visible_fn,
+            // The former `dex_visible_fn` register_routes arg is RETIRED
+            // (WS-A4 PR-1 fix round) — GET /api/v1/dex/app, GET
+            // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
+            // gate on the bare `perm_fn`/`GuaranteedState:Read` (round-3
+            // revert; NOT `fleet_read_fn` above — see this file's "#4035
+            // review fix's bespoke `dex_visible_fn` resolver" comment for
+            // why) and have no per-caller confinement resolver at all.
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
@@ -19330,13 +19414,13 @@ private:
             // matching the pre-seam per-route !guaranteed_state_store/
             // !baseline_store guards exactly.
             mcp_server_->set_guardian_api(guardian_api);
-            // #4035 review fix (colleague review, BLOCKING): the SAME
-            // dedicated GuaranteedState:Read-scoped resolver wired into the
-            // REST registration's trailing dex_visible_fn param above (see
-            // that variable's doc comment) — NOT visible_set_fn, whose
-            // permission-agnostic join does not actually confine to this
-            // securable's grants.
-            mcp_server_->set_dex_visible_fn(dex_visible_fn);
+            // The former `mcp_server_->set_dex_visible_fn(dex_visible_fn)`
+            // wiring is RETIRED (WS-A4 PR-1 fix round) — get_dex_app/
+            // get_dex_overview/get_dex_signal_detail gate on the bare
+            // `perm_fn`/`tier_allows` (`GuaranteedState:Read`; round-3
+            // revert, NOT `fleet_read_fn_` — see the "#4035 review fix's
+            // bespoke `dex_visible_fn` resolver" comment above for why) and
+            // have no per-caller confinement resolver at all.
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
@@ -19357,6 +19441,10 @@ private:
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #4981 PR-2 — see scope_evaluate_fn's own comment above (defined
+            // once, shared with rest_api_v1_->set_scope_evaluate_fn above).
+            // MUST run BEFORE register_routes()/build_handler() below.
+            mcp_server_->set_scope_evaluate_fn(scope_evaluate_fn);
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so

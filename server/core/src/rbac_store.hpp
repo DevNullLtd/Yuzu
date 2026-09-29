@@ -469,6 +469,26 @@ public:
                                                     const std::string& principal_id,
                                                     const std::string& role_name);
 
+    /// Fresh-install RBAC-safe-by-default bootstrap (third
+    /// `RbacAdminAuthorityOwner` consumer, same delegation shape as
+    /// `unassign_role`/`set_rbac_enforcement` above). Inserts the FIRST
+    /// `auth.users` row (iff the table is genuinely empty, TOCTOU-free via
+    /// the same advisory lock `AuthDB::seed_admin_if_empty` uses) and grants
+    /// that account `Administrator`, atomically in one transaction — see
+    /// `RbacAdminAuthorityOwner::provision_first_admin`'s own doc comment
+    /// for the full contract. This is the SOLE production seeder;
+    /// `AuthDB::seed_admin_if_empty` has no production caller at all (it
+    /// stays exported only for AuthDB's own unit tests).
+    ///
+    /// Returns `true` iff THIS call actually provisioned the account+grant,
+    /// `false` on the ordinary no-op (not the first account — not an
+    /// error), `unexpected` on a genuine store/query failure OR an invalid
+    /// `username`. Safe to call unconditionally on every boot: the no-op
+    /// path is cheap and harmless on a non-fresh database.
+    std::expected<bool, std::string> provision_first_admin(const std::string& username,
+                                                            const std::string& password_hash,
+                                                            const std::string& salt_hex);
+
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
 

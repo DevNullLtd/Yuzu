@@ -29,6 +29,7 @@
 #include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
+#include "tar_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
 
 #include <yuzu/metrics.hpp>
 
@@ -39,10 +40,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <format>
 #include <vector>
 
 // ── Standalone reproduction of AgentHealthStore ─────────────────────────────
@@ -1850,4 +1855,421 @@ TEST_CASE("REAL AgentHealthStore: per-OS perf gauges (C1) reach the shipped fami
     // ABSENT is not a zero: darwin reported no perf tag, so no darwin series at all.
     CHECK(out.find("yuzu_fleet_perf_os_reporting{os=\"darwin\"}") == std::string::npos);
     CHECK(out.find("yuzu_fleet_perf_os_cpu_pct{stat=\"avg\",os=\"darwin\"}") == std::string::npos);
+}
+
+// ── #1567: tar.db corruption fleet signal (REAL store) ────────────────────────
+
+namespace {
+using yuzu::server::detail::AgentHealthStore;
+
+void beat_tags(AgentHealthStore& store, const std::string& id,
+               const std::vector<std::pair<std::string, std::string>>& kv) {
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    for (const auto& [k, v] : kv)
+        tags[k] = v;
+    store.upsert(id, tags);
+}
+
+double series_val(const std::string& out, const std::string& series) {
+    // Anchor at line start so the "# TYPE <name> gauge" line cannot match first.
+    const auto pos = out.find("\n" + series);
+    REQUIRE(pos != std::string::npos);
+    return std::stod(out.substr(pos + 1 + series.size()));
+}
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_tar_db_corruption_agents counts valid totals > 0",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* k = "yuzu.plugin.tar.db_corruption_total";
+    beat_tags(store, "a", {{k, "2"}});
+    beat_tags(store, "b", {{k, "0"}});
+    beat_tags(store, "c", {});
+    beat_tags(store, "d", {{k, "garbage"}});
+    beat_tags(store, "e", {{k, "-1"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_tar_db_corruption_agents ") == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, capped, absent-not-zero",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    std::string forty;
+    for (int i = 0; i < 40; ++i)
+        forty += (i ? ",t" : "t") + std::to_string(i);
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "tar,wmi"}});
+    beat_tags(store, "b", {{"yuzu.plugins_failed", "tar"}});
+    beat_tags(store, "c", {});
+    beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
+    // 40 empty tokens then a valid name: the 32-split cap bites first, no label.
+    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + "late"}});
+    // #1567 round-2: a repeated token from ONE agent counts once, not once per
+    // repeat — plugins_failed_ is a set on an honest agent, so this only fires
+    // for a malformed/compromised one. MUTATION-TESTED: dropping the
+    // agent_registry.cpp dedup (seen_this_agent) makes tar's count 4.0 here
+    // instead of 3.0, red-first-confirmed then restored.
+    beat_tags(store, "f", {{"yuzu.plugins_failed", "tar,tar"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(out.find("plugin=\"late\"") == std::string::npos);
+    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"tar\"} ") == 3.0);
+    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
+    // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
+    CHECK(out.find("plugin=\"t31\"") != std::string::npos);
+    CHECK(out.find("plugin=\"t32\"") == std::string::npos);
+
+    // Fleet-wide label cap: 70 agents each failing a distinct plugin.
+    AgentHealthStore many;
+    yuzu::MetricsRegistry m2;
+    for (int i = 0; i < 70; ++i) {
+        const auto name = std::format("plug_{:02d}", i);
+        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", name}});
+    }
+    many.recompute_metrics(m2, std::chrono::seconds{300});
+    auto out2 = m2.serialize();
+    size_t named = 0;
+    for (size_t p = out2.find("yuzu_fleet_plugin_init_failed{"); p != std::string::npos;
+         p = out2.find("yuzu_fleet_plugin_init_failed{", p + 1))
+        ++named;
+    CHECK(named == 65); // 64 named + plugin="other"
+    CHECK(series_val(out2, "yuzu_fleet_plugin_init_failed{plugin=\"other\"} ") == 6.0);
+    CHECK(out2.find("plugin=\"plug_63\"") != std::string::npos);
+    CHECK(out2.find("plugin=\"plug_64\"") == std::string::npos);
+
+    // Absent-not-zero: once the reporters are gone the family is cleared.
+    for (int i = 0; i < 70; ++i)
+        many.remove("agent" + std::to_string(i));
+    many.recompute_metrics(m2, std::chrono::seconds{300});
+    CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",
+          "[health_store][tar][corruption][real]") {
+    AgentHealthStore store;
+    struct Call {
+        std::string agent;
+        int64_t total;
+        std::string q;
+    };
+    std::vector<Call> calls;
+
+    // No sink set: must not crash.
+    beat_tags(store, "x", {{"yuzu.plugin.tar.db_corruption_total", "1"},
+                           {"yuzu.plugin.tar.db_quarantine_last", "1:f"}});
+
+    store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
+        calls.push_back({a, t, q});
+    });
+    const char* tot = "yuzu.plugin.tar.db_corruption_total";
+    const char* ql = "yuzu.plugin.tar.db_quarantine_last";
+
+    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}});
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].agent == "a");
+    CHECK(calls[0].total == 1);
+    CHECK(calls[0].q == "100:f1");
+
+    // Same identity surfaces AGAIN: a failed/skipped audit write is retried on
+    // the next heartbeat (the gate, not the store, dedups).
+    beat_tags(store, "a", {{tot, "1"}, {ql, "100:f1"}});
+    REQUIRE(calls.size() == 2);
+    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}}); // new quarantine
+    REQUIRE(calls.size() == 3);
+    CHECK(calls[2].total == 2);
+    CHECK(calls[2].q == "200:f2");
+
+    beat_tags(store, "b", {{tot, "0"}, {ql, "1:f"}});                     // zero total
+    beat_tags(store, "c", {{tot, "1"}});                                   // no quarantine_last
+    beat_tags(store, "d", {{tot, "1"}, {ql, std::string(200, 'q')}});      // oversized
+    beat_tags(store, "d", {{tot, "1"}, {ql, "1:a/b"}});                    // path separator
+    beat_tags(store, "d", {{tot, "1"}, {ql, "100f1"}});                    // missing colon
+    beat_tags(store, "d", {{tot, "1"}, {ql, "x1:f1"}});                    // non-digit epoch
+    CHECK(calls.size() == 3);
+
+    // remove() then re-upsert surfaces too.
+    store.remove("a");
+    beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}});
+    CHECK(calls.size() == 4);
+}
+
+TEST_CASE("TarCorruptionAuditGate: durable dedup against the audit store's newest row",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    std::optional<std::optional<std::string>> answer = std::optional<std::string>{}; // no row
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return answer;
+        },
+        [&] { return clock; });
+
+    // No prior row -> log; mark -> no further lookup.
+    CHECK(gate.should_log("a", "1:f"));
+    CHECK(lookups == 1);
+    gate.mark_logged("a", "1:f");
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == 1);
+
+    // Newest row already carries this identity (prior run / other HA node): no
+    // write, marked, and the second call makes no lookup.
+    answer = std::optional<std::string>{"2:g"};
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    CHECK(lookups == 2);
+
+    // Newest row is a different quarantine -> log.
+    CHECK(gate.should_log("b", "3:h"));
+    gate.mark_logged("b", "3:h");
+
+    // Degraded store: no write, NOT marked; one probe, then no lookups inside
+    // the retry window, and a probe again after it.
+    answer = std::nullopt;
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK(lookups == before + 1);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK_FALSE(gate.should_log("c", "4:i"));
+    CHECK(lookups == before + 2);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+
+    // Two agents with the same quarantine string are independent.
+    answer = std::optional<std::string>{};
+    CHECK(gate.should_log("d", "9:z"));
+    gate.mark_logged("d", "9:z");
+    CHECK(gate.should_log("e", "9:z"));
+    gate.mark_logged("e", "9:z");
+}
+
+TEST_CASE("TarCorruptionAuditGate: a failed audit write is retried, a durable one is not",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    std::optional<std::optional<std::string>> answer = std::nullopt; // degraded
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return answer;
+        },
+        [&] { return clock; });
+    // Degraded store: no write, not marked.
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    // Healthy, no row -> log; the caller's log() fails -> mark_failed opens the
+    // degraded window: no lookup inside it, admitted again after it.
+    answer = std::optional<std::string>{};
+    REQUIRE(gate.should_log("a", "1:f"));
+    const int before_fail = lookups;
+    gate.mark_failed();
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == before_fail);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    REQUIRE(gate.should_log("a", "1:f"));
+    // log() succeeds -> marked; no further lookup.
+    gate.mark_logged("a", "1:f");
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK(lookups == before);
+}
+
+TEST_CASE("TarCorruptionAuditGate: overlapping calls hold one in-flight slot gate-wide",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    int64_t clock = 1000;
+    std::optional<std::optional<std::string>> answer = std::optional<std::string>{};
+    TarCorruptionAuditGate* gp = nullptr;
+    bool reenter = true;
+    bool inner_same = true, inner_other = true;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            if (reenter) {
+                reenter = false;
+                inner_same = gp->should_log("a", "1:f");
+                inner_other = gp->should_log("b", "2:g");
+            }
+            return answer;
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    // Same-agent and other-agent calls from inside the lookup: no admit, no lookup.
+    REQUIRE(gate.should_log("a", "1:f"));
+    CHECK_FALSE(inner_same);
+    CHECK_FALSE(inner_other);
+    CHECK(lookups == 1);
+    CHECK_FALSE(gate.should_log("a", "1:f")); // slot still held until completion
+    CHECK(lookups == 1);
+    gate.mark_logged("a", "1:f");
+    CHECK_FALSE(gate.should_log("a", "1:f")); // the map answers now
+    CHECK(lookups == 1);
+
+    // mark_failed releases the slot (after the degraded window).
+    REQUIRE(gate.should_log("b", "2:g"));
+    gate.mark_failed();
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("b", "2:g"));
+    gate.mark_logged("b", "2:g");
+
+    // Degraded outer lookup under overlap: exactly one probe, re-admitted after the window.
+    answer = std::nullopt;
+    reenter = true;
+    const int before = lookups;
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == before + 1);
+    answer = std::optional<std::string>{};
+    CHECK_FALSE(gate.should_log("c", "3:h")); // inside the window
+    CHECK(lookups == before + 1);
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("c", "3:h"));
+    gate.mark_logged("c", "3:h");
+}
+
+TEST_CASE("TarCorruptionAuditGate::Reservation: a throw between reservation and "
+          "completion releases the slot",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+
+    REQUIRE(gate.should_log("a", "1:f"));
+    try {
+        TarCorruptionAuditGate::Reservation r(gate);
+        throw std::runtime_error("boom");
+    } catch (...) {
+    }
+    // The unwind completed the reservation as failed(): degraded window open,
+    // no lookup admitted for a different agent yet.
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("b", "2:g")); // proves the slot was released, not stranded
+
+    {
+        TarCorruptionAuditGate::Reservation r(gate);
+        r.logged("b", "2:g");
+    }
+    // A committed reservation opens no degraded window: admitted immediately.
+    CHECK(gate.should_log("c", "3:h"));
+}
+
+TEST_CASE("TarCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
+          "[health_store][tar][corruption][gate]") {
+    using yuzu::server::detail::TarCorruptionAuditGate;
+    int lookups = 0;
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    // One past the 65,536 cap: exactly one entry is evicted, never a wholesale clear.
+    constexpr int kAgents = 65537;
+    for (int i = 0; i < kAgents; ++i)
+        gate.mark_logged("agent-" + std::to_string(i), "1:f");
+    // The single evicted entry is admitted (order-independent). Release the
+    // slot (and clear the degraded window) after every admission so each of
+    // the 65,537 probes actually reaches the map instead of being rejected
+    // by a held in-flight slot before the map is even consulted — with a
+    // stranded slot, admitted==1/lookups==1 would hold vacuously even if the
+    // map itself were wrong (e.g. a clear() regression, which now admits
+    // 65,536+ instead).
+    int admitted = 0;
+    for (int i = 0; i < kAgents; ++i) {
+        if (gate.should_log("agent-" + std::to_string(i), "1:f")) {
+            ++admitted;
+            gate.mark_failed();
+            clock += yuzu::server::detail::kTarCorruptionAuditDegradedRetry;
+        }
+    }
+    CHECK(admitted == 1);
+    CHECK(lookups == 1);
+}
+
+TEST_CASE("TarCorruptionAuditGate: a rotating identity is rate-limited per agent",
+          "[health_store][tar][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    int lookups = 0;
+    int64_t clock = 5000;
+    TarCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    REQUIRE(gate.should_log("a", "1:f"));
+    gate.mark_logged("a", "1:f");
+    const int before = lookups;
+    // Rotating identities inside the window: no row, no lookup.
+    clock += 1;
+    CHECK_FALSE(gate.should_log("a", "2:g"));
+    clock += 1;
+    CHECK_FALSE(gate.should_log("a", "3:h"));
+    CHECK(lookups == before);
+    // A different agent is unaffected.
+    REQUIRE(gate.should_log("b", "2:g"));
+    gate.mark_logged("b", "2:g");
+    // Past the window the next identity logs.
+    clock += kTarCorruptionAuditMinRowInterval;
+    CHECK(gate.should_log("a", "3:h"));
+    CHECK(lookups == before + 2);
+}
+
+TEST_CASE("tar corruption audit detail: encode/decode round-trip and sink composition",
+          "[health_store][tar][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    // Pins the verb/target documented in audit-log.md; server.cpp uses the same constants.
+    CHECK(std::string(kTarCorruptionAuditAction) == "tar.db.corruption_quarantined");
+    CHECK(std::string(kTarCorruptionAuditTargetType) == "Agent");
+    const auto d = encode_tar_corruption_detail(3, "1700000000:tar.db.corrupt-1700000000");
+    CHECK(d == "corruption_total=3 quarantine=1700000000:tar.db.corrupt-1700000000");
+    CHECK(decode_tar_quarantine_from_detail(d) == "1700000000:tar.db.corrupt-1700000000");
+    CHECK_FALSE(decode_tar_quarantine_from_detail("corruption_total=3").has_value());
+    CHECK(valid_tar_quarantine_last("1700000000:tar.db.corrupt-1700000000-2"));
+
+    // Store surfaces -> gate decides -> sink logs; the "audit store" is a vector.
+    std::vector<std::string> rows; // encoded details, newest last
+    bool log_ok = false;
+    int64_t clock = 1000;
+    TarCorruptionAuditGate gate([&](const std::string&) -> std::optional<std::optional<std::string>> {
+        if (rows.empty())
+            return std::optional<std::string>{};
+        return decode_tar_quarantine_from_detail(rows.back());
+    }, [&] { return clock; });
+    AgentHealthStore store;
+    store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
+        if (!gate.should_log(a, q))
+            return;
+        // Mirrors server.cpp's sink shape: a Reservation, not raw mark_logged/mark_failed.
+        TarCorruptionAuditGate::Reservation res(gate);
+        if (log_ok) {
+            rows.push_back(encode_tar_corruption_detail(t, q));
+            res.logged(a, q);
+        } else {
+            res.failed();
+        }
+    });
+    const auto beat = [&] {
+        beat_tags(store, "a", {{kTarTagCorruptionTotal, "1"}, {kTarTagQuarantineLast, "5:f"}});
+    };
+    beat(); // log fails: not marked
+    CHECK(rows.empty());
+    log_ok = true;
+    clock += kTarCorruptionAuditDegradedRetry;
+    beat(); // retried after the degraded window
+    REQUIRE(rows.size() == 1);
+    beat(); // durable now: no further row
+    CHECK(rows.size() == 1);
 }

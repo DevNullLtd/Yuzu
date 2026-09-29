@@ -77,6 +77,7 @@
 #include "plugin_config_store.hpp"
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
 #include "result_set_store.hpp" // #2146 Batch B2: ResultSetStore for the 12 result-set MCP tools
+#include "custom_properties_store.hpp" // #4981 PR-2: props.<key> preview_scope_targets [pg] coverage
 // B5 (api-parity #2146) — offload-target / platform-license / software-
 // deployment MCP twins.
 #include "offload_target_store.hpp"
@@ -141,6 +142,42 @@ yuzu::test::PgTestTemplate mcp_workflow_tpl{"mcpworkflow", [](const std::string&
     if (!store.is_open())
         throw std::runtime_error("mcpworkflow template: store failed to migrate");
 }};
+// #4981 PR-2 — preview_scope_targets [pg] coverage. Shares the "resultset"/
+// "customprops" template keys with test_scope_walking_authz.cpp /
+// test_props_scope_authz.cpp / test_scope_preview.cpp (identical setup).
+yuzu::test::PgTestTemplate mcp_scope_rs_tpl{"resultset", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("resultset template: store failed to migrate");
+}};
+yuzu::test::PgTestTemplate mcp_scope_props_tpl{"customprops", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::CustomPropertiesStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("customprops template: store failed to migrate");
+}};
+// #4981 PR-2 — populates a real AgentRegistry to match the fixture's own
+// agents_fn() mock EXACTLY (agent-001 linux/x64, agent-002 windows/x64), so a
+// preview_scope_targets test wiring a real registry via
+// scope_evaluate_fn_for_test keeps every pre-#4981 ostype/arch-only
+// expectation.
+void register_scope_preview_mock_fleet(yuzu::server::detail::AgentRegistry& registry) {
+    yuzu::agent::v1::AgentInfo a1;
+    a1.set_agent_id("agent-001");
+    a1.set_hostname("web-01");
+    a1.mutable_platform()->set_os("linux");
+    a1.mutable_platform()->set_arch("x64");
+    a1.set_agent_version("0.1.3");
+    (void)registry.register_agent(a1);
+    yuzu::agent::v1::AgentInfo a2;
+    a2.set_agent_id("agent-002");
+    a2.set_hostname("db-01");
+    a2.mutable_platform()->set_os("windows");
+    a2.mutable_platform()->set_arch("x64");
+    a2.set_agent_version("0.1.3");
+    (void)registry.register_agent(a2);
+}
 } // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
@@ -1188,15 +1225,6 @@ struct McpTestServer {
     /// field (read LIVE at request time via the wiring lambda below).
     DexFleet dex_fleet_for_test;
 
-    /// #4035 hardening (governance) — the visible-agent-set resolver for
-    /// get_dex_app/get_dex_overview (ADR-0017 World A confinement,
-    /// independent of the service-scoped-token deny belt). nullopt (default)
-    /// = unfiltered, matching every EXISTING test in this file. Ignores
-    /// `username` — this stub doesn't model per-username resolution, only
-    /// whether the caller's set is engaged (read LIVE at request time via the
-    /// wiring lambda below).
-    std::optional<std::set<std::string>> dex_visible_for_test;
-
     /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
     /// hoisted to a member (was a start()-local) so a test can read its #3564
     /// short-circuit witness `lookup_calls` — asserting an out-of-scope
@@ -1275,6 +1303,14 @@ struct McpTestServer {
     /// production's auth_db==nullptr degrade.
     yuzu::server::mcp::McpServer::LockoutClearFn lockout_clear_fn_for_test{};
     yuzu::server::detail::AgentRegistry* agent_registry_for_test{nullptr};
+    /// #4981 PR-2: optionally wire a real scope-evaluation closure (a thin
+    /// binding over a REAL `AgentRegistry::evaluate_scope`, built by the test
+    /// — same pattern `agent_registry_for_test` uses for discover_plugins)
+    /// so `preview_scope_targets` can be exercised end-to-end through the
+    /// ladder. Default unset (empty std::function) keeps every test that
+    /// doesn't opt in on the "scope_evaluate_fn_ unwired" 503 path, matching
+    /// production's fail-closed-when-unwired contract for this setter.
+    yuzu::server::mcp::McpServer::ScopeEvaluateFn scope_evaluate_fn_for_test{};
     /// #4029: optionally wire a real ProductPackStore so list_product_packs /
     /// get_product_pack can be exercised end-to-end. Default nullptr keeps
     /// every other test on the store-unavailable path.
@@ -1489,6 +1525,12 @@ private:
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
 
+        // #4981 PR-2: scope_evaluate_fn rides a setter too — wire before the
+        // handlers are built. Default (empty) leaves preview_scope_targets on
+        // its own "unwired" 503 path; a test opts in via
+        // scope_evaluate_fn_for_test (see that member's doc comment).
+        mcp.set_scope_evaluate_fn(scope_evaluate_fn_for_test);
+
         // #4037: list_read_fn ALSO rides a setter, same pattern as
         // fleet_read_fn above — wire before the handlers are built.
         // Unconditional: the fixture default above already mirrors the
@@ -1534,12 +1576,13 @@ private:
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
 
-        // #4035 hardening (governance): same setter idiom, reads
-        // dex_visible_for_test LIVE at request time (see that field's doc
-        // comment) — unconditional, no-op-shaped default for every
-        // pre-existing test.
-        mcp.set_dex_visible_fn(
-            [this](const std::string&) { return dex_visible_for_test; });
+        // #4035 hardening (governance)'s bespoke `set_dex_visible_fn` wiring,
+        // and the WS-A4 PR-1 first/second fix rounds' migration of
+        // get_dex_app/get_dex_overview/get_dex_signal_detail onto
+        // `fleet_read_fn_` as their sole gate, are ALL RETIRED (reverted to
+        // base gating). Those three
+        // tools gate on `perm_fn` + `deny_fleet_wide_service_scoped` again —
+        // see each tool's own test for the current coverage shape.
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -7560,9 +7603,16 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
-// SEC-3 sibling class (Gate 8 review): a service-scoped token must not read
-// the fleet-wide devices[] this tool returns — mirrors the REST sibling
-// GET /api/v1/dex/signals/{obs_type} deny.
+// WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
+// back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
+// worth of fleet-read-gate coverage this test replaced (a fixture-faked
+// FleetReadGate denial, then a real AuthRoutes/RbacStore/ManagementGroupStore
+// rig proving an admitted-but-confined caller is refused) no longer applies
+// — neither `fleet_read_fn_for_test` nor `ResponseExecutionAuthzPgRig` is a
+// call site of this tool's gate anymore. Restored to base's own coverage:
+// a service-scoped token is denied via the tool's own stub-driven
+// `deny_fleet_wide_service_scoped` call, same class as the REST sibling GET
+// /api/v1/dex/signals/{obs_type} deny.
 TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
           "denial audited",
           "[pg][mcp][integration][dex][security]") {
@@ -7595,6 +7645,13 @@ TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
     }
     CHECK(saw_denied);
 }
+
+// WS-A4 PR-1 Gate 7 fix round: the `fleet_read_fn_`-scope
+// boundary/unwired coverage this test, the sibling get_dex_app/
+// get_dex_overview "unwired fleet_read_fn_" tests, and the get_dex_app
+// engine-principal test provided is retired — `fleet_read_fn_` is no
+// longer one of these three tools' gates at all (reverted to base's
+// `perm_fn` + `deny_fleet_wide_service_scoped`).
 
 // ── #4035 (api-parity #2146 Batch A): get_dex_device_score — the MCP-only gap ──
 //    closing GET /api/v1/dex/devices/{id}'s REST-only twin. Per-device SCOPED
@@ -7946,6 +8003,12 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
 
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — a service-scoped token
+// is denied via the tool's own `deny_fleet_wide_service_scoped` call. The
+// round-1/round-2 "gate denial -> no data" (fixture-faked FleetReadGate)
+// and "refuses an admitted-but-confined caller" (canned-FleetReadGate-
+// lambda ADR-0017 INV-3 coverage) tests are retired — `fleet_read_fn_` is
+// no longer this tool's gate.
 TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.view, "
           "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
@@ -7985,46 +8048,6 @@ TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.v
         R"({"jsonrpc":"2.0","method":"tools/call","id":973,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe"}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap — get_dex_app's devices[] previously ALWAYS passed
-// visible=nullptr to the shared builder, the same defect as its REST twin
-// (see test_rest_guaranteed_state.cpp's matching regression test).
-TEST_CASE("MCP DEX: get_dex_app devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.start("readonly");
-
-    auto unconfined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9721,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    CHECK(upayload["devices"].size() == 2);
-
-    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
-    auto confined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9722,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    auto cpayload =
-        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(cpayload["devices"].is_array());
-    CHECK(cpayload["devices"].size() == 1);
-    CHECK(cpayload["devices"][0]["agent_id"] == "WS-1");
-    for (const auto& d : cpayload["devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
@@ -8081,6 +8104,96 @@ TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown fa
     CHECK(unknown->body.find("-32602") != std::string::npos);
 }
 
+// ADR-0031 WS-A4 PR-1: get_dex_catalogue -- the Catalogue
+// View 1 family cards. Cross-checks the SAME shape GET /api/v1/dex/catalogue
+// serves (both call dex_api_->catalogue(...) / dex_catalogue_json, Rule 1).
+TEST_CASE("MCP DEX: get_dex_catalogue returns the family cards, bad os -> invalid params",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":977,"params":{"name":"get_dex_catalogue","arguments":{"os":"all","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["os"] == "all");
+    CHECK(payload["window"] == "all");
+    CHECK(payload["total_types"].get<int>() > 0);
+    bool saw_app_reliability = false;
+    for (const auto& f : payload["families"])
+        if (f["name"] == "App reliability")
+            saw_app_reliability = true;
+    CHECK(saw_app_reliability);
+    // Aggregate exemption -- no per-agent identity anywhere in the payload.
+    CHECK(body["result"]["content"][0]["text"].get<std::string>().find("WS-1") ==
+         std::string::npos);
+
+    auto bad_os = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":978,"params":{"name":"get_dex_catalogue","arguments":{"os":"solaris"}}})");
+    REQUIRE(bad_os);
+    CHECK(bad_os->body.find("-32602") != std::string::npos);
+}
+
+// Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary read
+// must never render as a healthy, zero-event catalogue -- an error, matching
+// the REST twin's 503 and get_dex_device_score's own degrade branch. DROP
+// TABLE forces the fleet-wide read to degrade while the store stays open.
+TEST_CASE("MCP DEX: get_dex_catalogue reports a degraded read as an error, never a "
+          "healthy zero-event catalogue",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":979,"params":{"name":"get_dex_catalogue","arguments":{"os":"all","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+}
+
+// tools/list must advertise get_dex_catalogue with an inputSchema/outputSchema
+// (the generic malformed-schema net at "tool families cover exactly the
+// tools/list surface" above already proves every kTools[] entry parses; this
+// targets the specific tool by name).
+TEST_CASE("MCP DEX: get_dex_catalogue is listed with schemas", "[mcp][dex]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    bool found = false;
+    for (const auto& t : tools) {
+        if (t["name"] != "get_dex_catalogue")
+            continue;
+        found = true;
+        REQUIRE(t.contains("inputSchema"));
+        REQUIRE(t.contains("outputSchema"));
+        REQUIRE(t.contains("annotations"));
+        CHECK(t["annotations"]["readOnlyHint"].get<bool>());
+        CHECK_FALSE(t["annotations"]["destructiveHint"].get<bool>());
+        CHECK(t["annotations"]["idempotentHint"].get<bool>());
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
@@ -8129,6 +8242,10 @@ TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)
     CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
 }
 
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — see get_dex_app's
+// equivalent test for the full rationale (the round-1/round-2 gate-denial
+// and admitted-but-confined tests this replaces relied on `fleet_read_fn_`,
+// which is no longer this tool's gate).
 TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overview.view, "
           "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
@@ -8160,6 +8277,7 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
             saw_view = true;
     CHECK(saw_view);
 
+    // service-scoped token -> 403, no data.
     McpTestServer ts2;
     ts2.guaranteed_state_store_for_test = &store;
     ts2.mock_token_scope_service = "printers";
@@ -8168,46 +8286,6 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
         R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap on get_dex_overview's top_devices[] — same defect class
-// and same fix as get_dex_app above.
-TEST_CASE("MCP DEX: get_dex_overview top_devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "st1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "st2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.start("readonly");
-
-    auto unconfined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9801,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(upayload["top_devices"].is_array());
-    CHECK(upayload["top_devices"].size() == 2);
-
-    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
-    auto confined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9802,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    auto cpayload =
-        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(cpayload["top_devices"].is_array());
-    CHECK(cpayload["top_devices"].size() == 1);
-    CHECK(cpayload["top_devices"][0]["agent_id"] == "WS-1");
-    for (const auto& d : cpayload["top_devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "
@@ -9190,6 +9268,7 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(fleet["cpu_pct"]["n"] == 16);
     CHECK(fleet["reporting"] == 16);
     CHECK(fleet["windows_online"] == 16);
+    CHECK(fleet["perf_capable_online"] == 16);
     // Additive per-OS fields (C1) — every fixture device is "windows".
     CHECK(fleet["linux_online"] == 0);
     CHECK(fleet["macos_online"] == 0);
@@ -12372,7 +12451,17 @@ TEST_CASE("MCP get_agent_details: unwired fleet_read_fn_ -> fail-closed",
 // ── 21. preview_scope_targets via HTTP ──────────────────────────────────────
 
 TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integration]") {
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
     McpTestServer ts;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, /*tag_store=*/nullptr, /*props_store=*/nullptr,
+                                       /*rs_store=*/nullptr, principal);
+    };
     ts.start();
 
     // Gate 8 BLOCKING fix (#2146 Batch B2 review): this test used the wrong
@@ -12398,21 +12487,69 @@ TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integratio
     CHECK(text["matched_agents"][0] == "agent-001");
 }
 
-TEST_CASE("MCP Integration: preview_scope_targets negating an unresolved atom does NOT "
-          "silently match the whole fleet",
+TEST_CASE("MCP Integration: preview_scope_targets fails closed when scope_evaluate_fn_ is "
+          "unwired",
           "[mcp][integration]") {
-    // Gate 8 BLOCKING fix (#2146 Batch B2 review): preview_scope_targets'
-    // resolver never populates from_result_set:/props.* (only
-    // os(now ostype)/arch/hostname/agent_version/tag:* are resolved), so a
-    // bare from_result_set:<id> atom always resolves unset -> correctly
-    // matches nothing. But NOT of an unset atom flips to true for every
-    // agent -- the identical "NOT inverts a no-match atom into a
-    // fleet-wide match" defect class docs/scope-walking-design.md already
-    // tracks as a fixed M1 governance issue for the REAL dispatch path,
-    // reproduced here (dsl-engineer, Gate 8) as still live on this preview
-    // surface. This test pins the honest (documented) failure direction so
-    // a future fix can't silently regress to the fleet-wide-match shape.
     McpTestServer ts;
+    ts.start(); // scope_evaluate_fn_for_test left unwired (default empty)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"preview_scope_targets","arguments":{"expression":"ostype == \"linux\""}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC envelope stays 200; the error is inside the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP Integration: preview_scope_targets still 400s on an empty expression when "
+          "scope_evaluate_fn_ is ALSO unwired (input-shape checked first)",
+          "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start(); // scope_evaluate_fn_for_test left unwired (default empty)
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"preview_scope_targets","arguments":{"expression":""}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP preview_scope_targets: NOT from_result_set:<id> over an absent set correctly "
+          "ABORTS (RESULT_SET_NOT_FOUND), rather than silently matching the whole fleet "
+          "(#4981 regression — was pinned as a KNOWN GAP matching every agent before this fix)",
+          "[pg][mcp][integration]") {
+    // Pre-#4981 preview_scope_targets' resolver never populated
+    // from_result_set:/props.* (only os(now ostype)/arch/hostname/
+    // agent_version/tag:* were resolved), so a bare from_result_set:<id>
+    // atom always resolved unset -> "correctly" matched nothing, but NOT of
+    // an unset atom flipped to true for every agent — a fleet-wide
+    // over-disclosure (#4981). #4981 PR-2 routes through the real ladder,
+    // which aborts OwnerCheckFailed on an absent/foreign set instead —
+    // never a silent 0 OR a silent fleet-wide match. A genuinely ABSENT id
+    // needs a REAL (empty) ResultSetStore to distinguish from `unresolvable`
+    // (no store wired at all) — a null store can never produce this case.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_scope_rs_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    // Wired to the SAME store instance as the evaluate_scope closure below —
+    // this member feeds the ladder's OWN alias-resolution/owner-check-gate
+    // steps, which must never disagree with what evaluate_scope itself sees.
+    ts.result_set_store_for_test = &store;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal);
+    };
     ts.start();
 
     auto bare = ts.call(
@@ -12420,27 +12557,204 @@ TEST_CASE("MCP Integration: preview_scope_targets negating an unresolved atom do
         R"("params":{"name":"preview_scope_targets","arguments":)"
         R"({"expression":"from_result_set:rs_does_not_exist"}}})");
     REQUIRE(bare);
-    CHECK(bare->status == 200);
     auto bare_body = nlohmann::json::parse(bare->body);
-    auto bare_text =
-        nlohmann::json::parse(bare_body["result"]["content"][0]["text"].get<std::string>());
-    // Documented (correct) direction: an unresolved atom never matches.
-    CHECK(bare_text["matched_count"] == 0);
+    REQUIRE(bare_body.contains("error"));
+    CHECK(bare_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bare_body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
+          std::string::npos);
+    // #4981 fix-round: owner_check_failed used to skip the A4 envelope
+    // entirely (a bare error_response with no `data` object at all). Now
+    // routed through the same a4_error lambda every sibling abort branch
+    // uses — correlation_id present, retry_after_ms null (a permanent
+    // condition: the referenced set doesn't exist or isn't owned by this
+    // caller, so a retry cannot fix it).
+    CHECK_FALSE(bare_body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(bare_body["error"]["data"]["retry_after_ms"].is_null());
 
     auto negated = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":23,)"
         R"("params":{"name":"preview_scope_targets","arguments":)"
         R"({"expression":"NOT from_result_set:rs_does_not_exist"}}})");
     REQUIRE(negated);
-    CHECK(negated->status == 200);
     auto negated_body = nlohmann::json::parse(negated->body);
-    auto negated_text =
-        nlohmann::json::parse(negated_body["result"]["content"][0]["text"].get<std::string>());
-    // KNOWN GAP (tracked, #4307): negating an unresolved atom currently
-    // matches the whole visible fleet (2 agents), not zero. This assertion
-    // pins the CURRENT behavior so a silent regression is caught either
-    // way; it is not an endorsement of this outcome as correct.
-    CHECK(negated_text["matched_count"] == 2);
+    // The concrete #4981 fix: this used to match BOTH agents (matched_count
+    // == 2, the fleet-wide over-disclosure). It now aborts identically to
+    // the bare (non-NOT) form above — no result-set reference this caller
+    // does not own can ever expand a match, negated or not.
+    REQUIRE(negated_body.contains("error"));
+    CHECK(negated_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(negated_body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
+          std::string::npos);
+    CHECK_FALSE(negated_body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(negated_body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// #4981 regression: the actual bug report — a NOT'd reference to an OWNED,
+// VALID result set must EXCLUDE that set's members, never match everyone.
+TEST_CASE("MCP preview_scope_targets: NOT from_result_set:<id> over an owned, valid set "
+          "correctly excludes that set's members (#4981)",
+          "[pg][mcp][integration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_scope_rs_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // matches the fixture's default mock_username
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    McpTestServer ts;
+    // Wired to the SAME store instance as the evaluate_scope closure below —
+    // see the "absent set" test above's comment for why this consistency
+    // matters.
+    ts.result_set_store_for_test = &store;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal);
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":24,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"NOT from_result_set:)" +
+        set->id + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(text["matched_count"] == 1);
+    CHECK(text["matched_agents"][0] == "agent-002");
+}
+
+TEST_CASE("MCP preview_scope_targets: props.<key> resolves against a real "
+          "CustomPropertiesStore",
+          "[pg][mcp][integration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_scope_props_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    CustomPropertiesStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.set_property("agent-001", "role", "web").has_value());
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, &store, /*rs_store=*/nullptr, principal);
+    };
+    ts.start(); // no from_result_set: atom in this test — result_set_store_for_test not needed
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":25,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"props.role == \"web\""}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(text["matched_count"] == 1);
+    CHECK(text["matched_agents"][0] == "agent-001");
+}
+
+TEST_CASE("MCP preview_scope_targets: a degraded result-set store 503-equivalents "
+          "(kInternalError), never a silent 0-match",
+          "[pg][mcp][integration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_scope_rs_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE result_set_store.result_set_members CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = &store;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal);
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":26,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"from_result_set:)" +
+        set->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    // #4981 adversarial-review finding 4: `db_degraded` is TRANSIENT — keeps
+    // the concrete retry hint (contrast the `unresolvable`/PERMANENT test
+    // immediately below, which must carry a null retry_after_ms instead).
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+}
+
+TEST_CASE("MCP preview_scope_targets: an unwired ResultSetStore* (unresolvable) carries a "
+          "null retry_after_ms — a PERMANENT condition, never the same transient hint a "
+          "genuine store degrade carries (#4981 adversarial-review finding 4)",
+          "[mcp][integration]") {
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    // result_set_store_for_test left at its default nullptr — the ladder's
+    // own alias-resolution sees no store, AND the closure below passes
+    // rs_store=nullptr into evaluate_scope — both agree, matching
+    // scope_eval_error.hpp's Kind::Unresolvable case exactly (a required
+    // store not wired, per scope_eval_error.hpp's own doc comment on that
+    // Kind value — a configuration error, not something a retry can fix).
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, nullptr, principal);
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":27,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"from_result_set:rs_anything"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("unresolvable") != std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
 // ── 22. Multiple sequential requests on same server ─────────────────────────
@@ -29593,10 +29907,22 @@ TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-sco
 TEST_CASE("MCP preview_scope_targets: a management-group-confined caller sees only their own "
           "visible agents, never the whole fleet",
           "[mcp][integration][scope]") {
+    // #4981 PR-2: matches unconfined via a REAL AgentRegistry now (the
+    // ladder evaluates fleet-wide, then this test's confinement is
+    // intersected in afterward) — still agent-001 (linux) + agent-002
+    // (windows), both x64, matching the fixture's agents_fn() mock exactly.
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
     McpTestServer ts;
-    // The fixture's default agents_fn stub returns agent-001 (linux) and
-    // agent-002 (windows), both x64 — an unconfined caller previewing
-    // `arch == "x64"` would match both. Confine the caller to agent-001 only.
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, nullptr, principal);
+    };
+    // An unconfined caller previewing `arch == "x64"` would match both.
+    // Confine the caller to agent-001 only.
     ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                    const std::string&,
                                    const std::string&) -> yuzu::server::authz::FleetReadGate {

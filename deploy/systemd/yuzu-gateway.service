@@ -1,6 +1,6 @@
 [Unit]
 Description=Yuzu Erlang/OTP Gateway
-Documentation=https://github.com/Tr3kkR/Yuzu
+Documentation=https://github.com/DevNullLtd/Yuzu
 After=network-online.target yuzu-server.service
 Wants=network-online.target
 # Restart-loop guard. The gateway is a release-built BEAM VM; if it

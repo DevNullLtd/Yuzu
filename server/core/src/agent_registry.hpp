@@ -1097,10 +1097,24 @@ public:
     // paths, where arming nothing is the safe direction). NARROW: a scope
     // with NEITHER a from_result_set: NOR a props.<key> atom is completely
     // unaffected — value_or({}) is safe there.
+    // `touch_referenced_result_sets` (#4981 PR-3, defaulted so every existing
+    // call site compiles unchanged with zero behavior change): every OTHER
+    // real dispatch/enforcement caller (command_routes.cpp's Scope arm,
+    // wire_and_dispatch_confined, PolicyEvaluator::resolve_targets) leaves
+    // this at its default `true`, preserving the existing
+    // `rs_store->touch(rsid)` TTL-keep-alive side effect on every owned
+    // `from_result_set:` reference this evaluation resolves (see the
+    // from_result_set: preload block in the .cpp for the touch itself). The
+    // ONE caller that passes `false` is the shared `preview_scope_targets`
+    // evaluation closure (server.cpp's `scope_evaluate_fn`, bound into both
+    // REST `POST /api/v1/scope/preview` and MCP `preview_scope_targets`) —
+    // a read-only preview must not extend a result set's TTL merely for
+    // being referenced in a dry-run scope check.
     std::expected<std::vector<std::string>, ScopeEvalError>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                    const CustomPropertiesStore* props_store = nullptr,
-                   ResultSetStore* rs_store = nullptr, std::string_view principal = {}) const;
+                   ResultSetStore* rs_store = nullptr, std::string_view principal = {},
+                   bool touch_referenced_result_sets = true) const;
 
     // #4981 PR-1 (Finding B, regression-prevention step B4): a sibling entry
     // point for a caller that by DESIGN never wires a ResultSetStore or a
@@ -1188,11 +1202,16 @@ private:
     // Shared resolver body for evaluate_scope/evaluate_scope_local — see the
     // DRIFT CONTRACT comment in agent_registry.cpp just above the local
     // per-agent resolver lambda: this is the ONE implementation the two
-    // public entry points wrap, never a second copy.
+    // public entry points wrap, never a second copy. `touch_referenced_result_sets`
+    // is an ORTHOGONAL axis to `population` (#4981 PR-3) — see evaluate_scope's
+    // own doc comment above; evaluate_scope_local always passes `true` here,
+    // which is a no-op in practice since it also always passes a null
+    // `rs_store`, so the touch call site can never execute for LocalOnly.
     std::expected<std::vector<std::string>, ScopeEvalError>
     evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                         const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                        std::string_view principal, ScopePopulation population) const;
+                        std::string_view principal, ScopePopulation population,
+                        bool touch_referenced_result_sets) const;
 
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
@@ -1288,6 +1307,25 @@ public:
     void upsert(const std::string& agent_id,
                 const google::protobuf::Map<std::string, std::string>& tags);
 
+    /// #1567: receives a tar.db corruption CANDIDATE `(agent_id, corruption_total,
+    /// quarantine_last)` when a heartbeat carries a valid
+    /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
+    /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
+    /// memory is per-process and pruned every ~90 s): the sink
+    /// (TarCorruptionAuditGate) owns durable dedup and its own rate limit; a
+    /// failed write is retried after the gate's degraded window, and a
+    /// candidate skipped only because the gate's slot was busy is retried on
+    /// the next heartbeat -- see tar_corruption_audit.hpp for the distinction.
+    /// This is the store's first plugin-specific side-effecting hook -- a
+    /// second consumer of the same "surface a candidate, let an injected sink
+    /// durably dedup it" shape should generalize this to a small named-sink
+    /// registry rather than adding a second `set_<plugin>_sink`. Invoked
+    /// OUTSIDE mu_.
+    using CorruptionSink =
+        std::function<void(const std::string& agent_id, int64_t corruption_total,
+                           const std::string& quarantine_last)>;
+    void set_corruption_sink(CorruptionSink sink);
+
     void remove(const std::string& agent_id);
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
@@ -1311,6 +1349,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+    CorruptionSink corruption_sink_;
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

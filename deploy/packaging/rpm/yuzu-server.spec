@@ -3,7 +3,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Yuzu endpoint management server
 License:        AGPL-3.0-or-later
-URL:            https://github.com/Tr3kkR/Yuzu
+URL:            https://github.com/DevNullLtd/Yuzu
 
 %description
 Enterprise endpoint management platform — server component.
