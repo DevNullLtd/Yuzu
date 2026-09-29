@@ -9,7 +9,8 @@
 
 #include "device_lens_routes.hpp"
 #include "dex_api_local.hpp"          // make_local_dex_api
-#include "dex_routes.hpp"             // dex_iso_since / dex_window_to_days / dex_device_score (oracle)
+#include "dex_read_builders.hpp"      // dex_device_score (oracle) -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
+#include "dex_routes.hpp"             // dex_iso_since / dex_window_to_days
 #include "guaranteed_state_store.hpp"
 #include "guardian_api_local.hpp"     // make_local_guardian_api
 #include "pg/pg_pool.hpp"
