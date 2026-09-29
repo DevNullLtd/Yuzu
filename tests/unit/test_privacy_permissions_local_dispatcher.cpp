@@ -77,7 +77,16 @@ TEST_CASE("privacy_permissions: descriptor pins the single action per OS",
     if (!plugin) return;
     const auto* d = plugin->descriptor();
     REQUIRE(d->action_descriptor_count == 1);
-    CHECK(std::string_view{d->action_descriptors[0].action} == "permissions");
+    const auto& a = d->action_descriptors[0];
+    CHECK(std::string_view{a.action} == "permissions");
+    // The whole point of this PR: macOS moves from PLANNED to a real, CONSTRAINED rung-1
+    // leg; Windows stays PLANNED until its own PR lands. A descriptor regression back to
+    // PLANNED (or an accidental Windows promotion) would otherwise pass every other test
+    // in this file, since none of them read the descriptor's support level (code-review
+    // Functional-axis finding, round 1).
+    CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+    CHECK(a.macos_leg.rung == 1);
+    CHECK(a.windows_leg.support == YUZU_SUPPORT_PLANNED);
 }
 
 TEST_CASE("privacy_permissions: unknown action reports rc=1 and a named row",
@@ -145,6 +154,48 @@ TEST_CASE("privacy_permissions: no category is silently omitted -- each of the f
     CHECK(has("location")); // macOS: location is its own `unsupported` row on every collection
 #endif
 }
+
+#if defined(__APPLE__)
+TEST_CASE("privacy_permissions: the real macOS dispatch derives its typed status from the "
+          "rows it actually emitted, and it is NEVER the old UNAVAILABLE/macos:planned "
+          "placeholder result. None of the row-shape checks above read "
+          "result_status/completeness/provenance at all, so a regression that quietly "
+          "reverted collect_macos_permissions to the PLANNED placeholder (or hard-coded a "
+          "status) would leave every other test in this file green (code-review "
+          "Functional-axis finding, round 1).",
+          "[privacy_permissions][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) return;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor(), "permissions");
+    // `state == "denied"` on the wire is NOT the same signal `select_status`'s `any_denied()`
+    // acts on: it also covers an ordinary decoded "this app's grant is denied" row (a normal,
+    // non-failure result -- see PermissionRow::read_denied's own doc comment), and
+    // `read_denied` itself never reaches the wire. So PERMISSION_DENIED can't be derived from
+    // captured rows alone without a real, deliberately-refused TCC.db on this host (covered
+    // instead by the TU-inclusion fixtures in test_privacy_permissions_macos_internals.cpp,
+    // which control file permissions directly). `unreadable`, in contrast, IS unambiguous --
+    // it is never used for a decoded value -- so it alone proves the CONSTRAINED/OK boundary.
+    bool any_unreadable = false;
+    for (const auto& row : rows_of(result.captured)) {
+        std::size_t start = 0;
+        for (int i = 0; i < 4; ++i) start = row.find('|', start) + 1;
+        const auto state = row.substr(start, row.find('|', start) - start);
+        if (state == "unreadable") any_unreadable = true;
+    }
+    CHECK(result.result_status != YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_provenance != "macos:planned");
+    if (result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED) {
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    } else if (any_unreadable) {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    } else {
+        CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    }
+}
+#endif
 
 #if defined(_WIN32)
 TEST_CASE("privacy_permissions: the Windows PLANNED leg's placeholder row and typed status are "

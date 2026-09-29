@@ -832,10 +832,10 @@ implementation is.
 | vuln_scan | inventory | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
 | vuln_scan | inventory | macos | supported | 3 | popen(system_profiler/brew) | - |
 | vuln_scan | inventory | windows | supported | 1 | win32_registry | - |
-| wifi | list_networks | linux | constrained | 2 | nmcli via the argv runner (built without libsystemd) | reads NetworkManager's cached AccessPoints and does not itself initiate a scan (falls through to nmcli, which rescans, when NM reports no finished scan); then falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. Not yet exercised against a real Wi-Fi radio |
+| wifi | list_networks | linux | constrained | 1 | NetworkManager D-Bus (sd-bus) | reads NetworkManager's cached AccessPoints and does not itself initiate a scan (falls through to nmcli, which rescans, when NM reports no finished scan); then falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. Not yet exercised against a real Wi-Fi radio |
 | wifi | list_networks | macos | constrained | 2 | airport -s / system_profiler via argv runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
 | wifi | list_networks | windows | supported | 1 | WlanGetAvailableNetworkList | - |
-| wifi | connected | linux | constrained | 2 | nmcli via the argv runner (built without libsystemd) | reports the device interface (e.g. wlan0) in the connection column rather than the NetworkManager profile name; falls back to nmcli via the argv runner (rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real Wi-Fi radio |
+| wifi | connected | linux | constrained | 1 | NetworkManager D-Bus (sd-bus) | reports the device interface (e.g. wlan0) in the connection column rather than the NetworkManager profile name; falls back to nmcli via the argv runner (rung 2), then an iwconfig ESSID/Signal blob. Not yet exercised against a real Wi-Fi radio |
 | wifi | connected | macos | constrained | 1 | CoreWLAN | Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon |
 | wifi | connected | windows | supported | 1 | WlanQueryInterface | - |
 | windows_optional_features | list | linux | unsupported | - | - | Windows-only: DISM has no Linux/macOS equivalent |

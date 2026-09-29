@@ -209,6 +209,20 @@ std::optional<FdSnapshot> snapshot_fd(int fd) {
 
 /// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat never
 /// blocks, so a planted FIFO is reported, not opened.
+///
+/// Test-coverage gap, stated rather than assumed away (code-review Functional-axis finding,
+/// round 1): the `errno != ENOENT && errno != ENOTDIR` branch (a refused sidecar lstat reported
+/// as "present", the conservative direction) has no direct test. It is not reachable by
+/// chmod'ing the sidecar file itself -- lstat()'s only permission check is search (x) access on
+/// the PARENT directory, never anything on the target file's own mode bits, and the parent here
+/// is the same directory the main TCC.db lstat (earlier in read_tcc_source) already succeeded
+/// against, so restricting it would break that earlier, already-tested step instead. A genuine
+/// non-ENOENT/ENOTDIR errno (EACCES from a restricted intermediate component, ELOOP from an
+/// actual symlink cycle in an earlier path segment, ENAMETOOLONG) would need a path shape this
+/// function does not construct on its own. Every OTHER lstat outcome this function can reach
+/// (present, ENOENT/ENOTDIR-absent, and every "present" node type including a planted FIFO) IS
+/// covered -- see the internals test suite's "anything that is not one quiescent rollback-mode
+/// SQLite file..." case.
 bool sidecar_present(const std::string& path) {
     for (const auto suffix : macos::kSidecarSuffixes) {
         struct stat st{};
@@ -338,6 +352,23 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 /// user or the whole walk are reported as rows (never silence); the returned names are sorted
 /// for stable output. The fd and the DIR* are RAII-owned on every path, including an exception
 /// out of the walk callback.
+///
+/// Test-coverage gap, stated rather than assumed away (code-review Functional-axis finding,
+/// round 1): `users:fdopendir_errno_<n>`, `<user>:home_stat_errno_<n>` and `users:readdir_error`
+/// have no direct test. Each names a real POSIX failure mode (fdopendir()/fstatat()/readdir()
+/// returning an error on an already-successfully-opened directory), but none is practically
+/// reachable from a unit test without a fault-injection seam this function does not have --
+/// unlike `open_readonly`'s deadline or `read_all_sources`' budgets, `users_dir` is the only
+/// injected parameter here, and none of these three failures can be forced through it
+/// deterministically (they need resource exhaustion or a race, not a path). `users:truncated`
+/// (the `kMaxUserHomes` cap) is real and reachable but not covered either, for a different
+/// reason: `kMaxUserHomes` is a compile-time constant, not injected, so proving the cap would
+/// mean actually creating 4097 real directories per test run -- expensive, against this repo's
+/// test-efficiency discipline, for a single edge case. `classify_read_errno`-shaped classifiers
+/// elsewhere in this file ARE unit-tested in isolation; what is untested here is only whether
+/// these three specific syscalls, on this specific already-open directory, can actually fail
+/// this way in practice -- a lower-value case than the source-open path, which IS forceable
+/// (chmod 000 -- see the internals test suite) and IS covered.
 std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                               yuzu::shared::ConstraintAccumulator& acc,
                                               const std::string& users_dir = std::string{kUsersDir}) {

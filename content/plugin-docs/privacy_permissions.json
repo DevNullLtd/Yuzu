@@ -330,6 +330,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
     ],
     "changelog": [
+      "changelog.d/2026-09-29-privacy_permissions-macos-leg.added.md",
       "changelog.d/5064-privacy_permissions.added.md"
     ],
     "definitions": [

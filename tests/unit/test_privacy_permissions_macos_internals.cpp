@@ -419,6 +419,7 @@ struct Poke {
     std::string path;
     bool bump_counter = false;
     bool create_journal = false;
+    bool replace_path = false; // unlink `path` and create a DIFFERENT file there (TOCTOU probe)
 } g_poke;
 
 void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
@@ -428,6 +429,13 @@ void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
         static_cast<void>(::pwrite(fd.get(), counter, sizeof counter, 24));
     }
     if (g_poke.create_journal) { std::ofstream{g_poke.path + "-journal"} << "x"; }
+    if (g_poke.replace_path) {
+        // A different inode: unlink the path SQLite opened (the original fd, already open
+        // via /dev/fd/N, keeps its own inode alive under POSIX unlink-while-open semantics)
+        // and create a hostile replacement at the same name.
+        ::unlink(g_poke.path.c_str());
+        std::ofstream{g_poke.path} << "not a sqlite database, and not the original bytes";
+    }
     sqlite3_result_int(ctx, 0);
 }
 
@@ -467,6 +475,39 @@ TEST_CASE("privacy_permissions macOS: a change made to the file while it is bein
     g_poke.create_journal = false;
     CHECK(read_source(dir / "unsafe.db").rows.at(0).raw.rfind(
               "evil:tcc_db:prepare_failed:unsafe use of poke_unsafe()", 0) == 0);
+}
+
+TEST_CASE("privacy_permissions macOS: reading stays bound to the descriptor opened at the "
+          "start, never the pathname -- a TOCTOU replace of the file mid-read is invisible to "
+          "the query in progress (SQLite steps through /dev/fd/N, not the path a second time) "
+          "and does not corrupt the file-stamp comparison, since both snapshots come from the "
+          "same fd's fstat(), never a path re-lstat() (code-review Functional-axis finding, "
+          "round 1)",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_toctou_"};
+    const auto dir = scratch_dir(tmp);
+    const auto view = [](const char* call) {
+        return std::string{"CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'a.app' "
+                           "AS client, 0 AS client_type, 2 + "} + call + " AS auth_value;";
+    };
+    make_db(dir / "TCC.db", view("poke()"));
+    const PokeRegistered registered;
+    g_poke = {(dir / "TCC.db").string(), false, false, false};
+
+    g_poke.replace_path = true;
+    const auto result = read_source(dir / "TCC.db");
+    g_poke.replace_path = false;
+
+    // Proof of descriptor binding: the row reflects the ORIGINAL db's content (auth_value 2 =
+    // allowed), never a defect from the replacement text SQLite could not have parsed as SQL
+    // (which would surface as a step/prepare failure, not a clean "allowed" row) -- and the
+    // read is NOT refused as "changed_during_read", because the fd's own inode (the one
+    // fstat() actually observes, both before and after) was never touched; only the path was.
+    CHECK(result.count("camera", PermissionState::allowed) == 1);
+    for (const auto& r : result.rows) {
+        INFO(r.raw);
+        CHECK(r.raw != "evil:tcc_db:changed_during_read");
+    }
 }
 
 TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and homes stop being "
