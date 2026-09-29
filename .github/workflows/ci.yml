@@ -93,8 +93,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS jobs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows job uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -1594,7 +1596,7 @@ jobs:
           # meson in the user site, which C:\Python314's meson then imports,
           # failing the toolchain contract for every job on the box.
           if ! python -c "import yaml" >/dev/null 2>&1; then
-            echo "::error::PyYAML is not importable by the runner's Python. Re-run deploy/windows/Provision-Windows-Runner.ps1 on this runner; CI never installs packages into the shared host Python."
+            echo "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
             exit 1
           fi
 

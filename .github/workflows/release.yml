@@ -525,7 +525,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           python -c "import yaml" 2>$null
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::PyYAML is not importable by the runner's Python. Re-run deploy/windows/Provision-Windows-Runner.ps1 on this runner; CI never installs packages into the shared host Python."
+            Write-Host "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
             exit 1
           }
           meson --version
