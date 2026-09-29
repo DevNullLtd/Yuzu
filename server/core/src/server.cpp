@@ -14769,6 +14769,16 @@ private:
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             // #5047: same belt as the /api/v1/result-sets JSON
+                             // write routes — these fragments are plain HTTP
+                             // endpoints too, not cookie-session-only. The
+                             // SOLE production factory (see its own doc
+                             // comment, auth_routes.hpp) — never re-inline
+                             // this as a local lambda; a second copy is
+                             // exactly how the original clause-5 violation
+                             // this belt exists to prevent could recur
+                             // unreviewed at a 9th call site.
+                             .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),
                              .store = result_set_store_.get(),
                              .metrics = &metrics_,
                          });
@@ -19170,7 +19180,17 @@ private:
             // degrades when its own backing store is absent, the exact same
             // per-route degrade the old `!guaranteed_state_store`/
             // `!baseline_store` guards produced.
-            guardian_api);
+            guardian_api,
+            // #5047: closes the cross-transport MCP-tier bypass on the 4
+            // result-set write routes — the SAME belt `require_permission`
+            // applies to every RBAC-gated route, threaded here because this
+            // family has no `perm_fn` call at all (ownership-only by
+            // design). The SOLE production factory (see its own doc
+            // comment, auth_routes.hpp) — never re-inline this as a local
+            // lambda; a second copy is exactly how the original clause-5
+            // violation this belt exists to prevent could recur unreviewed
+            // at a 9th call site.
+            auth_routes_->gateless_tier_policy_fn());
 
         // -- Register MCP server routes ----------------------------------------
 
