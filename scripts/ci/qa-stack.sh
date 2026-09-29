@@ -17,6 +17,13 @@
 #   qa-stack.sh logs <file>         write all service logs to <file>
 #   qa-stack.sh down                stop and delete the stack and its volumes
 #
+# The gateway's sys.config is taken from the git tag of the version being run
+# (v<version>), not from this checkout: a config naming a module the older
+# gateway image lacks (e.g. the #1422 mgmt peer-pin auth_fun) closes every
+# mgmt-plane connection, and an operator on that release has that release's
+# config on disk. Only the compose file itself comes from this checkout — its
+# images are all pinned by YUZU_VERSION.
+#
 # The dashboard is verified against the stack's own install CA (copied out of
 # the server's cert volume); its HTTPS leaf carries SANs localhost/127.0.0.1.
 # Gateway health (:8081) and metrics (:9568) are plain HTTP and are published
@@ -69,12 +76,28 @@ dk = hashlib.pbkdf2_hmac('sha256', os.environ['QA_PW'].encode(), salt, 100000, d
 print(f"qaadmin:admin:{salt.hex()}:{dk.hex()}")
 PY
   fi
+  write_override
+}
+
+gateway_sys_config() {  # gateway_sys_config VERSION -> $STATE/gateway-sys.config
+  local ver="$1" url
+  url="https://raw.githubusercontent.com/${QA_REPO:-DevNullLtd/Yuzu}/v${ver}/deploy/docker/reference-gateway-sys.config"
+  curl -sSfL --retry 3 -o "$STATE/gateway-sys.config.new" "$url" \
+    || die "could not fetch the v${ver} gateway sys.config ($url)"
+  mv "$STATE/gateway-sys.config.new" "$STATE/gateway-sys.config"
+  log "gateway sys.config: v${ver}"
+}
+
+write_override() {
   cat > "$OVERRIDE" <<EOF
 services:
   server:
     volumes:
       - $STATE/yuzu-server.cfg:/etc/yuzu/yuzu-server.cfg:ro
   gateway:
+    volumes:
+      - $STATE/gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+      - certs:/etc/yuzu/certs:ro
     ports:
       - "127.0.0.1:8081:8081"
       - "127.0.0.1:9568:9568"
@@ -167,6 +190,7 @@ cmd_up() {
   local ver="${1:?version required}"
   prepare
   set_env YUZU_VERSION "$ver"
+  gateway_sys_config "$ver"
   log "starting server + gateway (+postgres) at $ver"
   compose pull -q
   compose up -d server gateway
@@ -183,6 +207,7 @@ cmd_upgrade() {
   local ver="${1:?version required}"
   [[ -f "$ENV_FILE" ]] || die "no stack to upgrade (run 'up' first)"
   set_env YUZU_VERSION "$ver"
+  gateway_sys_config "$ver"
   log "upgrading every service to $ver"
   compose pull -q
   compose up -d
