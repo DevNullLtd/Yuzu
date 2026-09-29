@@ -563,6 +563,20 @@ TEST_CASE("privacy_permissions macOS: a path on a network mount is refused befor
             return row.app_id.rfind("b\\", 0) == 0 && row.state == PermissionState::allowed;
         }));
     }
+    SECTION("a home whose name carries delimiters reaches tokens with them folded") {
+        const auto weird = users / "x,y|z";
+        std::filesystem::create_directories(weird / "Library/Application Support/com.apple.TCC");
+        macos::ReadBounds bounds;
+        bounds.mounts = {{weird.string(), "nfs"}};
+        SourceRead r;
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, (base / "system.db").string(), users.string(), bounds,
+                         output);
+        CHECK(r.has_raw("x/y/z:network_mount"));
+        CHECK(std::none_of(r.rows.begin(), r.rows.end(), [](const auto& row) {
+            return row.raw.find(',') != std::string::npos;
+        }));
+    }
     SECTION("a users directory on a network mount is not opened at all") {
         macos::ReadBounds bounds;
         bounds.mounts = {{users.string(), "nfs"}};
@@ -588,6 +602,12 @@ int fake_fetch_nfs(struct statfs** out, int flags) {
     std::strncpy(table[1].f_fstypename, "nfs", sizeof table[1].f_fstypename - 1);
     *out = table;
     return 2;
+}
+int fake_fetch_null_array(struct statfs** out, int flags) { // count > 0 but nothing to read
+    ++g_fake_fetch_calls;
+    g_fake_fetch_flags = flags;
+    *out = nullptr;
+    return 3;
 }
 int fake_fetch_fails(struct statfs** out, int flags) {
     ++g_fake_fetch_calls;
@@ -628,6 +648,13 @@ TEST_CASE("privacy_permissions macOS: one collection takes exactly one non-block
         CHECK(r.has_raw("a:network_mount"));
         CHECK_FALSE(allowed_for(r, "a"));
         CHECK(allowed_for(r, "b"));
+    }
+    SECTION("a count with no array is the same named failure, never a null dereference") {
+        SourceRead r;
+        run_collection(r.rows, r.acc, (base / "system.db").string(), users.string(),
+                       fake_fetch_null_array);
+        CHECK(r.has_raw("mounts:getmntinfo_failed"));
+        CHECK(allowed_for(r, "a"));
     }
     SECTION("a snapshot that cannot be read is named, and the sources are still read") {
         g_fake_fetch_calls = 0;
@@ -719,10 +746,13 @@ TEST_CASE("privacy_permissions macOS: reading a source leaks no descriptor on an
             std::string{kAccessSchema} + "INSERT INTO access VALUES('kTCCServiceCamera','x.app',0,2);");
     make_db(dir / "schema.db", "CREATE TABLE unrelated(x);");
     { std::ofstream{dir / "junk.db"} << std::string(200, 'j'); }
-    const int before = open_fd_count();
-    for (int i = 0; i < 20; ++i)
+    const auto pass = [&] {
         for (const char* name : {"good.db", "schema.db", "junk.db", "missing.db"})
             static_cast<void>(read_source(dir / name));
+    };
+    pass(); // one-time lazy descriptors (sqlite, locale) are opened here, not counted as a leak
+    const int before = open_fd_count();
+    for (int i = 0; i < 20; ++i) pass();
     CHECK(open_fd_count() == before);
 }
 

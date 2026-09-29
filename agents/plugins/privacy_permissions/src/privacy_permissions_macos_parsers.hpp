@@ -89,8 +89,9 @@ struct SourceFailure {
 }
 
 /// A sqlite3_open_v2 / sqlite3_prepare_v2 failure on a file already opened. SQLITE_AUTH/SQLITE_PERM
-/// are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY when the VFS's own failed syscall (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES --
-/// the SIP/TCC refusal shape, the expected outcome without Full Disk Access; a
+/// are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY when the VFS's own failed syscall
+/// (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES -- the SIP/TCC refusal shape, the
+/// expected outcome without Full Disk Access; a
 /// CANTOPEN for any other reason (ENOENT after a race, EMFILE, ...) is unreadable. Any other code
 /// (SQLITE_NOMEM, SQLITE_IOERR, SQLITE_NOTADB, a schema error) is a real fault that gaining FDA
 /// would not fix -> unreadable. Pass the EXTENDED code (sqlite3_extended_errcode): only its
@@ -302,20 +303,25 @@ inline constexpr std::uint32_t kMinUserHomeUid = 500;
 }
 
 /// A name that reaches a provenance token (comma-joined, logged) must not carry a delimiter or a
-/// control character: `|`, `\` and `,` fold to `/`, controls to a space. The wire row is escaped
-/// separately by format_row.
-///
-/// `tcc_db` for the system database, `<user>:tcc_db` for a per-user one -- the subject every
-/// whole-source failure token from this leg starts with.
+/// control character: `|`, `\` and `,` fold to `/`, controls and the U+2028/2029 line separators to
+/// a space. The wire row is escaped separately by format_row.
 [[nodiscard]] inline std::string token_safe(std::string_view s) {
-    std::string out{s};
-    for (char& c : out) {
-        if (c == '|' || c == '\\' || c == ',') c = '/';
-        else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) c = ' ';
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '|' || c == '\\' || c == ',') out += '/';
+        else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) out += ' ';
+        else if (s.substr(i, 3) == "\xE2\x80\xA8" || s.substr(i, 3) == "\xE2\x80\xA9") {
+            out += ' ';
+            i += 2;
+        } else out += c;
     }
     return out;
 }
 
+/// `tcc_db` for the system database, `<user>:tcc_db` for a per-user one -- the subject every
+/// whole-source failure token from this leg starts with.
 [[nodiscard]] inline std::string tcc_source_key(std::string_view owner) {
     return owner.empty() ? std::string{"tcc_db"} : token_safe(owner) + ":tcc_db";
 }

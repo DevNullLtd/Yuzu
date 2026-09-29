@@ -33,9 +33,9 @@
  *     the open is the first syscall on it. Change detection sees write(2)-style writers (ctime);
  *     an owner holding a MAP_SHARED mapping is not seen -- the owner authors every row anyway.
  *     Schema text, rows per service, value and retained-text size, and time (per source and per
- *     run) are bounded; the time bounds start at the first query and do NOT cover
- *     open/lstat/read syscalls (README caveat 3). SQLite may spill a hostile query's temp data to
- *     $TMPDIR within that budget.
+ *     run) are bounded; the clock starts before the open, but only SQLite's progress handler and
+ *     the loop checks enforce it, so it does NOT interrupt open/read syscalls (README caveat 3).
+ *     SQLite may spill a hostile query's temp data to $TMPDIR within that budget.
  *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
  *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
  *     prompt_undetermined, never guessed.
@@ -207,14 +207,20 @@ std::optional<FdSnapshot> snapshot_fd(int fd) {
     return s;
 }
 
-/// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat does
-/// not open its target, so a planted FIFO is reported, not opened. Called only after `path` opened
-/// (O_NOFOLLOW_ANY), so no component of it is a symlink. Untested gap: the refused-lstat branch
-/// (errno other than ENOENT/ENOTDIR) needs a path shape this function does not construct.
-bool sidecar_present(const std::string& path) {
+/// True when a journal/WAL/shm file sits beside `name` in `dirfd`, or its absence cannot be shown.
+/// fstatat with AT_SYMLINK_NOFOLLOW never opens its target (a planted FIFO is reported, not
+/// opened) and resolves nothing but the one name against a directory descriptor the caller
+/// already holds, so an owner swapping a path component for a symlink into a hung mount cannot
+/// redirect it.
+///
+/// Test-coverage gap, stated rather than assumed away: the `errno != ENOENT && errno != ENOTDIR`
+/// branch (a refused sidecar stat reported as "present", the conservative direction) has no direct
+/// test; every other outcome is covered by the internals "not one quiescent rollback-mode SQLite
+/// file" case.
+bool sidecar_present(int dirfd, const std::string& name) {
     for (const auto suffix : macos::kSidecarSuffixes) {
         struct stat st{};
-        if (::lstat((path + std::string{suffix}).c_str(), &st) == 0 ||
+        if (::fstatat(dirfd, (name + std::string{suffix}).c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 ||
             (errno != ENOENT && errno != ENOTDIR))
             return true;
     }
@@ -307,16 +313,24 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 
     // The open is the FIRST syscall on the path. O_NOFOLLOW_ANY refuses a symlink anywhere in it
     // (ELOOP) without traversing it, so a link into a hung mount is never followed -- an lstat
-    // would follow intermediate links -- and a dangling link reads `unreadable`, not `absent`.
+    // would follow intermediate links -- and a dangling link reads `unreadable`, not `absent`. The
+    // parent directory is opened once and the database and its sidecars are then named relative to
+    // that descriptor: no later syscall re-resolves the path, so it cannot be re-pointed.
+    const auto slash = path.rfind('/');
+    const std::string parent =
+        slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+    const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const auto open_failed = [&](int err) {
+        return fail(err == ENOENT || err == ENOTDIR ? macos::classify_tcc_missing(missing_is_absent)
+                                                    : macos::classify_tcc_open_errno(err));
+    };
+    yuzu::agent::ScopedFd dirfd{::open(
+        parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)};
+    if (!dirfd) return open_failed(errno);
     yuzu::agent::ScopedFd fd{
-        ::open(path.c_str(), O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)};
-    if (!fd) {
-        const int err = errno;
-        if (err == ENOENT || err == ENOTDIR)
-            return fail(macos::classify_tcc_missing(missing_is_absent));
-        return fail(macos::classify_tcc_open_errno(err));
-    }
-    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
+        ::openat(dirfd.get(), name.c_str(), O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)};
+    if (!fd) return open_failed(errno);
+    if (sidecar_present(dirfd.get(), name)) return fail({unreadable, "sidecar_present"});
     const auto first = snapshot_fd(fd.get());
     if (!first) return fail({unreadable, "read_failed"});
     if (const auto f = macos::classify_tcc_file(first->regular, first->stamp.size)) return fail(*f);
@@ -350,7 +364,7 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
     if (!last) return fail({unreadable, "read_failed"});
     if (first->stamp != last->stamp)
         return fail({unreadable, "changed_during_read"});
-    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
+    if (sidecar_present(dirfd.get(), name)) return fail({unreadable, "sidecar_present"});
     macos::append_tcc_source_rows(owner, reads, rows, acc);
 }
 
@@ -360,8 +374,9 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 /// user or the whole walk are reported as rows (never silence); the returned names are sorted
 /// for stable output. The fd and the DIR* are RAII-owned on every path.
 ///
-/// Untested gaps: `users:fdopendir_errno_<n>`, `<user>:home_stat_errno_<n>`, `users:readdir_error`
-/// (no fault-injection seam) and `users:truncated` (`kMaxUserHomes` is not injected).
+/// Untested gaps: `users:fdopendir_errno_<n>`, `<user>:home_stat_errno_<n>`,
+/// `<user>:home_vanished` and `users:readdir_error` (no fault-injection seam) and
+/// `users:truncated` (`kMaxUserHomes` is not injected).
 std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                               yuzu::shared::ConstraintAccumulator& acc,
                                               const std::string& users_dir = std::string{kUsersDir},

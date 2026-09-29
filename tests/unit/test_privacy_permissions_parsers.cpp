@@ -757,10 +757,10 @@ TEST_CASE("macos::tcc_source_failed_row: absent carries no token; denied/unreada
     CHECK_FALSE(acc.any_failure());
 
     const auto denied = macos::tcc_source_failed_row(
-        "bob", {macos::SourceOutcome::denied, "access_denied"}, acc);
+        "bob", {macos::SourceOutcome::denied, "open_failed:errno_1"}, acc);
     CHECK(denied.state == PermissionState::denied);
     CHECK(denied.read_denied);
-    CHECK(denied.raw == "bob:tcc_db:access_denied");
+    CHECK(denied.raw == "bob:tcc_db:open_failed:errno_1");
 
     const auto sys = macos::tcc_source_failed_row(
         {}, {macos::SourceOutcome::unreadable, "open_failed:disk I/O error"}, acc);
@@ -777,7 +777,7 @@ TEST_CASE("macos::token_safe and tcc_source_key: a name in a provenance token ca
     CHECK(macos::tcc_source_key({}) == "tcc_db");
     CHECK(macos::tcc_source_key("bob") == "bob:tcc_db");
     // A home named to forge a second token cannot: the comma is folded.
-    CHECK(macos::tcc_source_key("x,evil:tcc_db:access_denied") == "x/evil:tcc_db:access_denied:tcc_db");
+    CHECK(macos::tcc_source_key("x,evil:tcc_db:open_failed:errno_1") == "x/evil:tcc_db:open_failed:errno_1:tcc_db");
 }
 
 TEST_CASE("macos::sort_grants: client order, ties broken by auth_value (NULL first), so the wire "
@@ -791,4 +791,11 @@ TEST_CASE("macos::sort_grants: client order, ties broken by auth_value (NULL fir
     CHECK(g[1].auth_value == 0);
     CHECK(g[2].auth_value == 3);
     CHECK(g[3].client == "b");
+}
+
+TEST_CASE("macos::OutputBudget::charge allocates (format_row), so it must not be noexcept",
+          "[privacy_permissions][macos_parsers]") {
+    macos::OutputBudget b;
+    static_assert(!noexcept(b.charge(std::span<const PermissionRow>{})));
+    CHECK(b.bytes == 0);
 }
