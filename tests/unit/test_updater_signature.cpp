@@ -461,13 +461,10 @@ class BlockingCheckService final : public apb::AgentService::Service {
 TEST_CASE("ActiveRpcCtxGuard cancels an RPC published after stop was requested",
           "[updater][stop][2182]") {
     BlockingCheckService svc;
-    int port = 0;
     grpc::ServerBuilder builder;
-    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
     builder.RegisterService(&svc);
     auto server = builder.BuildAndStart();
     REQUIRE(server != nullptr);
-    REQUIRE(port != 0);
 
     // Owned by the detached thread so a regression fails the bound, not the destructor.
     struct State {
@@ -478,8 +475,7 @@ TEST_CASE("ActiveRpcCtxGuard cancels an RPC published after stop was requested",
         std::unique_ptr<apb::AgentService::Stub> stub;
     };
     auto st = std::make_shared<State>();
-    st->stub = apb::AgentService::NewStub(grpc::CreateChannel(
-        "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+    st->stub = apb::AgentService::NewStub(server->InProcessChannel(grpc::ChannelArguments()));
     auto fut = st->code.get_future();
     std::thread([st] {
         grpc::ClientContext ctx;
