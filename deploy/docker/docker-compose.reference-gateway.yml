@@ -120,6 +120,10 @@ services:
       # /etc/yuzu/certs/default-ca.pem (mounted below). No --no-tls.
       - "--cert-dir=/var/lib/yuzu-agent/certs"   # persists its issued leaf
       - "--data-dir=/var/lib/yuzu-agent"
+      # This `command:` replaces the image's CMD, so restate its plugin dir:
+      # without it the agent looks beside its binary, loads 0 plugins, and
+      # answers every command "No plugin found".
+      - "--plugin-dir=/usr/lib/yuzu/plugins"
       - "--enrollment-token=${YUZU_ENROLL_TOKEN:?set YUZU_ENROLL_TOKEN to an enrollment token}"
     volumes:
       - certs:/etc/yuzu/certs:ro
