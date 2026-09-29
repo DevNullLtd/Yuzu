@@ -268,7 +268,7 @@ TEST_CASE("percent_decoded: exactly two hex digits decode, anything else stays a
     CHECK(ust::percent_decoded("%4%41") == "%4A");
     for (const char* literal : {"", "%", "a%", "%4", "%zz", "%4g", "%g4", "%+1", "%-1", "% 1", "%0x"})
         CHECK(ust::percent_decoded(literal) == literal);
-    // The encoded value is decoded before the trust word is read, and a percent-encoded KEY is not.
+    // The encoded value is decoded before the trust word is read (the percent-encoded KEY case is above).
     const auto r = ust::parse_apt_one_line("deb [trusted=%79es] http://a.example/ s main\n"
                                            "deb [trusted=%-1es] http://b.example/ s main\n");
     REQUIRE(r.sources.size() == 2);
