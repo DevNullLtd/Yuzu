@@ -3165,22 +3165,31 @@ public:
         // log-only on failure at every REST/MCP call site — a sustained
         // pool/query degrade on either had no Prometheus signal, only an
         // spdlog::error line. `op` names which call failed, `surface` which
-        // family of handler hit it. Bounded: 2 ops x 2 surfaces = 4 series,
-        // pre-seeded below so absent() stays meaningful (same closed-label-set
-        // convention as yuzu_exec_correlation_read_degrade_total above). A
-        // sustained mark_cancelled failure specifically can leave an
-        // execution row stranded at status='running' forever (#4982) — see
-        // the stuck-row sweep this issue also adds for the recovery side.
+        // family of handler hit it. Pre-seeded below so absent() stays
+        // meaningful (same closed-label-set convention as
+        // yuzu_exec_correlation_read_degrade_total above). A sustained
+        // mark_cancelled failure specifically can leave an execution row
+        // stranded at status='running' forever (#4982) — see the stuck-row
+        // sweep this issue also adds for the recovery side.
+        //
+        // #4982 fix round 2 (Fix 5): the identical swallowed-failure pattern
+        // also existed, uninstrumented, at the equivalent call sites in
+        // workflow_routes.cpp, schedule_runner.cpp and
+        // command_outbox_delivery.cpp — three more dispatch/redispatch
+        // surfaces than the original REST/MCP pair. `surface` widens to 5
+        // values (rest|mcp|workflow|schedule|outbox); 2 ops x 5 surfaces = 10
+        // series.
         metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
-                          "failed (pool exhaustion or a failed statement) at a REST or MCP "
-                          "dispatch call site, by op (set_agents_targeted|mark_cancelled) and "
-                          "surface (rest|mcp). No retry is attempted inline — retrying in an "
-                          "already-degraded-store request handler risks doubling request "
-                          "latency for no reliability gain.",
+                          "failed (pool exhaustion or a failed statement) at a dispatch call "
+                          "site, by op (set_agents_targeted|mark_cancelled) and surface "
+                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline — "
+                          "retrying in an already-degraded-store request handler/background "
+                          "worker risks doubling request latency or delaying the next tick for "
+                          "no reliability gain.",
                           "counter");
         for (auto op : {"set_agents_targeted", "mark_cancelled"})
-            for (auto surface : {"rest", "mcp"})
+            for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
                 metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                                  {{"op", op}, {"surface", surface}});
         // #4982 Part B — the recovery side of the counter above:

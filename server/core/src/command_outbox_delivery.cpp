@@ -158,8 +158,20 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // it did not own.
         auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "authority_denied");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            if (d_.execution_tracker && !c.execution_id.empty() &&
+                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
+                              "execution_id={} occurrence='{}' after authority_denied",
+                              c.execution_id, c.occurrence_id);
+                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
+                // no observable signal — count it alongside the log line,
+                // matching Part A's REST/MCP instrumentation pattern.
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                        .increment();
+            }
             audit(c, "denied", "authority_denied_at_delivery");
         }
         return;
@@ -203,8 +215,18 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_depth_exceeded");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            if (d_.execution_tracker && !c.execution_id.empty() &&
+                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
+                              "execution_id={} occurrence='{}' after payload_depth_exceeded",
+                              c.execution_id, c.occurrence_id);
+                // #4982 fix round 2 (Fix 5)
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                        .increment();
+            }
             audit(c, "failure", "payload_depth_exceeded");
         }
         return;
@@ -225,8 +247,18 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_decode_failed");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            if (d_.execution_tracker && !c.execution_id.empty() &&
+                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
+                              "execution_id={} occurrence='{}' after payload_decode_failed",
+                              c.execution_id, c.occurrence_id);
+                // #4982 fix round 2 (Fix 5)
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                        .increment();
+            }
             audit(c, "failure", "payload_decode_failed");
         }
         return;
@@ -322,10 +354,45 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    delivered SLI is not inflated by no-agent misses (C-1).
     if (d_.execution_tracker && !c.execution_id.empty()) {
         if (outcome.sent > 0) {
-            if (!d_.execution_tracker->set_agents_targeted(c.execution_id, outcome.sent))
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            if (!d_.execution_tracker->set_agents_targeted(c.execution_id, outcome.sent)) {
+                spdlog::error("command_outbox_delivery: set_agents_targeted failed for "
+                              "execution_id={} occurrence='{}' — falling back to cancel",
+                              c.execution_id, c.occurrence_id);
+                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
+                // no observable signal — count it alongside the log line,
+                // matching Part A's REST/MCP instrumentation pattern.
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", "set_agents_targeted"}, {"surface", "outbox"}})
+                        .increment();
+                if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+                    spdlog::error("command_outbox_delivery: mark_cancelled failed for "
+                                  "execution_id={} occurrence='{}' after set_agents_targeted "
+                                  "also failed — row remains 'running'",
+                                  c.execution_id, c.occurrence_id);
+                    // #4982 fix round 2 (Fix 5): this is the sharpest of the five
+                    // swallowed sites — a DOUBLE bookkeeping failure with
+                    // previously neither a log nor a metric at all.
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                     {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                            .increment();
+                }
+            }
         } else {
-            (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
+                              "execution_id={} occurrence='{}' (sent==0) — row remains 'running'",
+                              c.execution_id, c.occurrence_id);
+                // #4982 fix round 2 (Fix 5)
+                if (d_.metrics)
+                    d_.metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                        .increment();
+            }
         }
     }
     if (outcome.sent > 0) {

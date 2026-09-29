@@ -13,8 +13,10 @@
 
 #include "command_outbox_delivery.hpp"
 #include "command_outbox_store.hpp"
+#include "execution_tracker.hpp"
 #include "leader_elector.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -80,6 +82,7 @@ public:
     DeliveryPg& operator=(const DeliveryPg&) = delete;
 
     CommandOutboxStore& store() { return *store_; }
+    const std::string& dsn() const { return db_->dsn(); }
     LeaderElector& elector() { return *elector_; }
     std::int64_t epoch() const { return epoch_; }
     static std::string lock() { return kServerBackgroundLeaderLock; }
@@ -395,4 +398,91 @@ TEST_CASE("CommandOutboxDelivery[pg]: does nothing when this replica is not lead
     loop.tick();
     CHECK(probe.calls == 0);
     CHECK(fx.raw_state("occ-nolead") == "pending"); // left for the true leader
+}
+
+// #4982 fix round 2 (Fix 5): the identical swallowed-mark_cancelled-failure
+// pattern this issue's own metric was built to observe (REST/MCP, Part A)
+// also existed, uninstrumented, at this file's five call sites — none of
+// them wired an ExecutionTracker in this file's own tests above (every
+// `make_delivery` call leaves `d.execution_tracker` null, so those tests
+// never reach the code this fix touches). This test wires a REAL
+// ExecutionTracker (a second PgPool over the SAME already-migrated database,
+// with a short lock_timeout_ms so a forced lock contention fails fast rather
+// than hangs — the established technique from
+// test_rest_result_sets_async.cpp's own #4982 tests) and forces the
+// "authority_denied" branch's mark_cancelled to genuinely FAIL by locking
+// execution_tracker.executions before ticking.
+TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
+          "authority-denied delivery is now observable via "
+          "yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=outbox} "
+          "(#4982 fix round 2, Fix 5)",
+          "[command_outbox][pg][delivery][4982]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{
+        {.conninfo = fx.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    auto req = fx.req("occ-deny-metric", "cmd-deny-metric");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // Lock the executions row's table from a raw connection BEFORE ticking —
+    // the authority_denied branch never calls dispatch_fn, so there is no
+    // mid-flow hook to lock from; locking up front is equivalent here since
+    // mark_failed (a different schema, command_outbox_store) is unaffected.
+    yuzu::server::pg::PgConn locker{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    yuzu::MetricsRegistry metrics;
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.metrics = &metrics;
+    d.dispatch_fn = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&, const DispatchCaller&, const std::string&) {
+        return ConfinedDispatchOutcome{};
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return false; // deny — the authority_denied branch, no dispatch attempted
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK(fx.raw_state("occ-deny-metric") == "failed"); // mark_failed itself unaffected
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+              .value() == 1.0);
+
+    // The execution row is still 'running' — mark_cancelled genuinely failed.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "running");
 }

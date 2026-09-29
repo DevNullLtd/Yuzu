@@ -1612,6 +1612,65 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
     CHECK(execs[0].status == "cancelled");
 }
 
+// #4982 fix round 2 (Fix 5): the identical swallowed-mark_cancelled-failure
+// pattern this issue's own metric was built to observe (REST/MCP, Part A)
+// also existed, uninstrumented, at this route's own three call sites. This
+// test is the sibling above's own scenario (sent=0 from the dispatch stub)
+// but ALSO forces the mark_cancelled UPDATE itself to genuinely FAIL — a
+// short lock_timeout_ms on the harness's own pool plus a raw LOCK TABLE from
+// a second connection, matching test_rest_result_sets_async.cpp's established
+// #4982 technique — and asserts the new
+// yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=workflow}
+// series increments.
+TEST_CASE("instruction execute: mark_cancelled failing on a sent=0 dispatch is now "
+          "observable via yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,"
+          "surface=workflow} (#4982 fix round 2, Fix 5)",
+          "[pg][workflow][executions][4982]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    ExecHarness h(pool);
+    h.make_def("def-FAIL-METRIC", "FM");
+
+    // Lock the table from WITHIN cmd_dispatch (dispatch_side_effect fires
+    // synchronously there, per its own doc comment above) -- AFTER the route's
+    // own create_execution has already committed the pre-created row, and
+    // BEFORE the post-dispatch mark_cancelled this test targets. Locking any
+    // earlier (before the POST) would also fail create_execution itself,
+    // leaving execution_id empty and mark_cancelled never attempted.
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.dispatch_side_effect = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    auto res = h.sink.Post("/api/instructions/def-FAIL-METRIC/execute",
+                           R"({"params":{},"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503); // unchanged -- mark_cancelled's own failure is silent to the caller
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+              .value() == 1.0);
+
+    // The orphan row is still 'running' -- mark_cancelled genuinely failed,
+    // not merely was skipped (distinguishes this from the sibling test above).
+    ExecutionQuery q;
+    q.definition_id = "def-FAIL-METRIC";
+    auto execs = h.tracker->query_executions(q);
+    REQUIRE(execs.size() == 1);
+    CHECK(execs[0].status == "running");
+}
+
 // #3424/#3511 Gate 8 round-4 (quality-engineer): the sibling above only
 // exercises the generic catch-all zero-reach branch (stub defaults). These
 // three pin the other branches of the same 4-way split, matching the
