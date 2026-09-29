@@ -128,9 +128,14 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "clock-guarded + pg_try_advisory_xact_lock"},
     {"execution_tracker.reap_stuck_running_executions", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + pg_advisory_xact_lock (#4982 Part B); the actual mutation "
-     "(mark_cancelled) is its own guarded UPDATE (status NOT IN (...)), so a racing "
-     "replica's redundant cancel attempt is a safe no-op, never a double-cancel"},
+     "clock-guarded + pg_try_advisory_xact_lock, all-but-holder skip (#4982 fix round 2 — was "
+     "a BLOCKING pg_advisory_xact_lock in Part B; the candidate select, would-wipe check, and "
+     "the atomic cancel UPDATE now all sit inside the SAME lock-held transaction, so a "
+     "blocking lock would stall a losing replica's whole maintenance tick, matching this "
+     "thread's reap_event_outbox sibling). The mutation is a single atomic "
+     "UPDATE ... RETURNING id re-checking the FULL candidate predicate at cancel time (not "
+     "just a terminal-status guard), so the claim+mutate sequence is genuinely single-writer "
+     "and the row cap is an honest per-pass bound, never fleet-wide-exceedable"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
     {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,

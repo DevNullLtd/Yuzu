@@ -2889,6 +2889,7 @@ public:
 
     ExecutionTracker& tracker() { return *tracker_; }
     pg::PgPool& pool() { return *pool_; }
+    const std::string& dsn() const { return db_->dsn(); }
 
 private:
     std::optional<yuzu::test::PostgresTestDb> db_;
@@ -2926,6 +2927,37 @@ void insert_outbox_row(pg::PgPool& pool, const std::string& occurrence_id,
         std::vector<std::string>{occurrence_id, occurrence_id + "-cmd", execution_id, state});
     REQUIRE(res.status() == PGRES_COMMAND_OK);
 }
+
+// #4982 fix round 2 — TOCTOU test helper. Poll `pg_stat_activity` for a
+// backend GENUINELY blocked on a Postgres row lock, rather than a blind
+// `sleep_for` + assume-timing "prove a thread has started" (CLAUDE.md forbids
+// sleep_for+assume-timing synchronization for correctness — unit-test-
+// conventions.md / #1871 shared-runner collision risk). Copied from
+// test_rbac_store.cpp's `poll_for_blocked_backend_pid` (its own doc comment
+// there has the full 5+ minute live-PG debugging trace of why this MUST run
+// on its own ad-hoc connection, never the lock holder's) — same simpler-than-
+// a-shared-header precedent this file's own `parse_reap_i64` duplication
+// already accepts.
+int poll_for_blocked_backend_pid(const std::string& dsn, int own_pid, int max_attempts = 100) {
+    pg::PgConn probe{PQconnectdb(dsn.c_str())};
+    if (PQstatus(probe.get()) != CONNECTION_OK) {
+        UNSCOPED_INFO("poll_for_blocked_backend_pid: probe connection failed, distinct from "
+                      "'no lock wait observed within the bound'");
+        return 0;
+    }
+    for (int i = 0; i < max_attempts; ++i) {
+        pg::PgResult r = pg::exec_params(probe.get(),
+                                         "SELECT pid FROM pg_stat_activity WHERE datname = "
+                                         "current_database() AND wait_event_type = 'Lock' "
+                                         "AND pid <> $1",
+                                         std::vector<std::string>{std::to_string(own_pid)});
+        if (r.ok() && PQntuples(r.get()) == 1)
+            return std::atoi(PQgetvalue(r.get(), 0, 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return 0;
+}
+
 } // namespace
 
 TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
@@ -3161,4 +3193,194 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines on a "
     auto exec = env.tracker().get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "running"); // declined outright — clock anomaly
+}
+
+// ── #4982 fix round 2 ────────────────────────────────────────────────────────
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions atomic-cancel "
+          "recheck excludes a row that receives a genuine concurrent dispatch "
+          "between the candidate SELECT and the atomic UPDATE (Fix 2/3 TOCTOU "
+          "close)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600); // matches the candidate predicate
+
+    // Connection A: open a transaction that sets agents_targeted on the
+    // candidate row and holds it UNCOMMITTED — simulating a genuine
+    // concurrent dispatch landing on this exact row, racing the reap pass's
+    // own atomic cancel UPDATE.
+    auto lease_a = env.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "UPDATE execution_tracker.executions SET agents_targeted = 3 "
+                            "WHERE id = $1",
+                            std::vector<std::string>{*id})
+                .ok());
+
+    // Background thread: the reap pass. Its candidate SELECT (READ COMMITTED,
+    // no row lock) runs BEFORE connection A commits, so it sees the
+    // pre-commit agents_targeted=0 and includes this row as a candidate; its
+    // subsequent atomic cancel UPDATE then needs the SAME row's lock, held by
+    // connection A above, and BLOCKS.
+    std::optional<std::expected<StuckExecutionReapOutcome, std::string>> outcome;
+    std::thread reap_thread([&] { outcome = env.tracker().reap_stuck_running_executions(); });
+    // Non-owning join-on-scope-exit guard (test_rbac_store.cpp's own shape):
+    // a REQUIRE failing between thread construction and the explicit join()
+    // below would otherwise leave a joinable std::thread across unwind
+    // (std::terminate). The guard's destructor no-ops once the explicit
+    // join() below has already run.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{reap_thread};
+
+    // Poll for the reap thread's backend genuinely blocked on connection A's
+    // held row lock (never a blind sleep_for).
+    REQUIRE(poll_for_blocked_backend_pid(env.dsn(), lease_a_pid) != 0);
+
+    // Commit connection A's transaction — the concurrent dispatch is now
+    // durable. The blocked reap UPDATE unblocks, re-evaluates its WHERE
+    // clause against the newly-committed row (Postgres EvalPlanQual), sees
+    // agents_targeted=3, and excludes it from RETURNING.
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+    reap_thread.join();
+
+    REQUIRE(outcome.has_value());
+    REQUIRE(outcome->has_value());
+    CHECK((*outcome)->cancelled == 0);
+    CHECK((*outcome)->not_cancelled == 1);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running"); // untouched — the concurrent dispatch won the race
+    CHECK(exec->agents_targeted == 3);
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions recovers on a "
+          "REPEATED same-direction forward-skew anomaly (Fix 1 wedge recovery)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Freeze the anchor 200000s (~55h) in the past — forward-skew, well past
+    // the 24h implausibility bound.
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint - 200000)::text WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    // Second pass: FIRST occurrence of this anomaly — declines once and arms
+    // the wedge-recovery marker (stuck_exec_reap_declined).
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+
+    // A genuinely stuck row created between the decline and the recovery
+    // pass — proves the third pass actually ran the ordinary capped sweep,
+    // not just cleared the anomaly flag.
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    // Third pass: the SAME (anchor, direction) anomaly persisted across a
+    // full decline pass — recovers, re-anchors to the current reading, and
+    // runs the sweep as an ordinary pass rather than declining a second time.
+    auto third = env.tracker().reap_stuck_running_executions();
+    REQUIRE(third.has_value());
+    CHECK_FALSE(third->clock_anomaly);
+    CHECK(third->cancelled == 1);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "
+          "on a DIFFERENT-direction anomaly at the same frozen anchor (Fix 1 "
+          "negative case — direction-keyed, not anchor-value-alone)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Directly construct the exact scenario: a prior pass declined on a
+    // BACKWARD-skew anomaly at some anchor A (arming
+    // stuck_exec_reap_declined = "A:backward"), and the CURRENT anchor is
+    // frozen at that SAME value A but now the current pass sees a FORWARD
+    // skew against it (a fresh, unrelated anomaly, not the one the marker
+    // was armed against).
+    std::int64_t anchor_a = 0;
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        // Push the anchor far enough into the past that `now_s - anchor_a`
+        // exceeds the 24h forward-skew bound on the NEXT pass.
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint - 300000)::text WHERE key = 'stuck_exec_reap_anchor' "
+            "RETURNING value::bigint",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        anchor_a = std::atoll(PQgetvalue(res.get(), 0, 0));
+
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+            "('stuck_exec_reap_declined', $1) ON CONFLICT (key) DO UPDATE SET value = "
+            "EXCLUDED.value",
+            std::vector<std::string>{std::to_string(anchor_a) + ":backward"});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    // This pass sees a FORWARD skew against anchor_a — the marker matches on
+    // ANCHOR VALUE but its recorded direction is "backward", not "forward",
+    // so it must NOT recover; it declines once more and re-arms the marker
+    // against (anchor_a, forward).
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running"); // still declined — not a free recovery
+
+    // Confirm the marker was re-armed against the NEW direction.
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM execution_tracker.reap_meta WHERE key = "
+            "'stuck_exec_reap_declined'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == std::to_string(anchor_a) + ":forward");
+    }
 }

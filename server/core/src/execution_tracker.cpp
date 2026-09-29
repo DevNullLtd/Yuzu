@@ -2684,6 +2684,76 @@ constexpr std::int64_t kStuckExecMaxPlausibleSkewSecs = 24 * 3600;
 // the population it is measured against.
 constexpr std::int64_t kStuckExecWouldWipeFloor = 20;
 constexpr double kStuckExecWouldWipeRatio = 0.5;
+
+// #4982 fix round 2 (Fix 1) — wedge recovery. Without this, once `now_s -
+// anchor > kStuckExecMaxPlausibleSkewSecs` the primary anchor is frozen
+// forever (a decline never advances it — see below), so `now_s - anchor`
+// only GROWS on every later pass and the sweep declines PERMANENTLY after
+// any routine >24h gap (a weekend, a DR failover, extended maintenance) with
+// no recovery path short of an operator hand-editing `reap_meta`. This is
+// the identical defect class `docs/clock-guarded-retention.md`'s
+// `GatewayRouteStore::reap_stale_routes` entry diagnosed and fixed (PR
+// #4299) — see that entry in full before touching this mechanism again.
+//
+// The fix here is DELIBERATELY simpler than that store's: persist the
+// declined anchor VALUE and its anomaly DIRECTION (forward|backward) as
+// `stuck_exec_reap_declined`. A REPEAT anomaly at the exact SAME (anchor,
+// direction) — proof the gap PERSISTED across a full decline pass, not just
+// one bad reading — re-anchors to the CURRENT now_s and proceeds as an
+// ordinary pass (still fully would-wipe-and-cap-guarded, so a genuine
+// backlog drains gradually across passes rather than being trusted all at
+// once). A DIFFERENT-direction anomaly at that same frozen anchor, or the
+// very first occurrence of any anomaly, still declines and arms/re-arms the
+// marker against its OWN (anchor, direction) — mirroring GatewayRouteStore's
+// own "direction-keyed, not anchor-value-alone" fix (its round-2 defect: a
+// value-only match let an unrelated different-direction anomaly free-ride a
+// frozen anchor and recover against a corrupted reading).
+//
+// DELIBERATELY OMITTED: GatewayRouteStore's third marker field,
+// `first_now_ms` (the reading the anomaly was FIRST observed at), which
+// bounds recovery to a real-time-plausible PERSISTENCE INTERVAL rather than
+// a bare (anchor, direction) match — without it, an ε-later second-replica
+// pass reading the SAME frozen marker recovers with zero persistence
+// evidence (that store's own round-4 fix). That gap is real in general, but
+// judged SAFE to omit for THIS sweep specifically: a too-eager recovery here
+// can only feed a still-corrupted `now_s` into the SAME would-wipe ratio
+// guard and the SAME unconditional per-pass cap this sweep already carries
+// — a spuriously-huge cutoff makes candidates a LARGE fraction of all
+// running executions (the would-wipe guard's own job) rather than a
+// targeted, silent mass-cancel, and even below the would-wipe floor the
+// blast radius is capped at kStuckExecReapCap atomically-rechecked rows,
+// each individually re-verified against LIVE state at cancel time (Fix
+// 2/3, below) — never a bare cutoff-matched DELETE/UPDATE the way
+// GatewayRouteStore's route-tombstone sweep is. GatewayRouteStore has
+// neither safety net for its own sweeps, which is why ITS omission of this
+// field was genuinely unsafe. If a future change ever removes either safety
+// net here, this omission must be re-examined against the same reasoning
+// GatewayRouteStore's own entry in docs/clock-guarded-retention.md records.
+struct StuckExecDeclinedMarker {
+    std::int64_t anchor{0};
+    std::string direction; ///< "forward" | "backward"
+};
+
+// Parses "<anchor>:<direction>" — exactly one colon, direction one of the two
+// literal tokens, anchor a valid non-negative `parse_reap_i64`. Any other
+// shape (absent row, garbled value, an unrecognised direction, a negative or
+// unparseable anchor half) is treated as "no prior decline" — always safe,
+// since every call site re-arms in this same format and declines once more
+// rather than granting an unearned recovery (mirrors
+// gateway_route_reap_rules.hpp's `parse_declined_marker` mixed-version-safe
+// contract, at this sweep's own simpler two-field width).
+std::optional<StuckExecDeclinedMarker> parse_stuck_exec_declined_marker(const std::string& val) {
+    const auto colon = val.find(':');
+    if (colon == std::string::npos || val.find(':', colon + 1) != std::string::npos)
+        return std::nullopt; // zero or 2+ colons — not this sweep's own format
+    const std::string direction = val.substr(colon + 1);
+    if (direction != "forward" && direction != "backward")
+        return std::nullopt;
+    auto anchor = parse_reap_i64(val.substr(0, colon));
+    if (!anchor || *anchor < 0)
+        return std::nullopt;
+    return StuckExecDeclinedMarker{*anchor, direction};
+}
 } // namespace
 
 std::expected<StuckExecutionReapOutcome, std::string>
@@ -2694,16 +2764,36 @@ ExecutionTracker::reap_stuck_running_executions() {
     bool clock_anomaly = false;
     bool would_wipe = false;
     std::vector<std::string> candidate_ids;
+    std::vector<std::string> confirmed_ids; // #4982 fix round 2: RETURNING-confirmed cancels
+    bool should_publish = false;
+    nlohmann::json payload;
+    payload["status"] = "cancelled";
     std::int64_t now_s = 0;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        if (pg::exec_params(
-                c, "SELECT pg_advisory_xact_lock(hashtext('execution_tracker:stuck_exec_reap'))",
-                std::vector<std::string>{})
-                .status() != PGRES_TUPLES_OK) {
+        // #4982 fix round 2 (Fix 2/3): NON-BLOCKING lock — was a blocking
+        // pg_advisory_xact_lock before this fix. The redesign below moves the
+        // ENTIRE claim+mutate sequence (candidate select, would-wipe check,
+        // and the atomic cancel UPDATE) inside THIS ONE transaction, so a
+        // blocking lock here would now stall a losing replica's WHOLE
+        // maintenance tick (session reap, the clock-integrity monitor, every
+        // other pass sharing result_set_maint_thread_) for as long as the
+        // holder's full pass takes, not just a lock probe — exactly the
+        // reasoning this file's own reap_event_outbox sibling already uses
+        // for the same tick-sharing reason (see its own comment above). A
+        // skipped pass costs nothing: this sweep's own candidates are, by
+        // construction, already at least kStuckExecWindowSecs stuck, so
+        // losing one ~15-minute tick to another replica is invisible against
+        // that window.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_try_advisory_xact_lock(hashtext('execution_tracker:stuck_exec_reap'))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK || PQntuples(lk.get()) == 0) {
             err = "stuck-exec reap advisory lock failed";
             return false;
         }
+        if (col_str(lk.get(), 0, 0) != "t")
+            return true; // another replica is sweeping this tick — skip (no candidates touched)
         {
             pg::PgResult nr = pg::exec_params(
                 c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
@@ -2746,36 +2836,117 @@ ExecutionTracker::reap_stuck_running_executions() {
         // Overflow-safe forward-skew comparison — same reasoning as the two
         // siblings above (subtract, never add, on already-sanitised
         // non-negative operands).
-        if (has_anchor && now_s >= anchor && now_s - anchor > kStuckExecMaxPlausibleSkewSecs) {
-            spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: now_s {} "
-                         "implausibly ahead of anchor {}",
-                         now_s, anchor);
-            clock_anomaly = true;
-            return true; // decline, anchor unchanged
-        }
-        if (has_anchor && now_s < anchor) {
-            spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: now_s {} is "
-                         "behind anchor {} (backward clock movement or a poisoned anchor) — not "
-                         "acting under a rewound clock",
-                         now_s, anchor);
-            clock_anomaly = true;
-            return true;
-        }
+        const bool forward_skew =
+            has_anchor && now_s >= anchor && now_s - anchor > kStuckExecMaxPlausibleSkewSecs;
+        const bool backward_skew = has_anchor && now_s < anchor;
 
-        // Clock accepted — advance the anchor now, regardless of the
-        // would-wipe verdict computed below: the anchor's sole job is to
-        // detect a BAD CLOCK, which this reading is not. A would-wipe decline
-        // is an orthogonal, population-based decision about whether to ACT,
-        // not a statement about the clock.
-        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
-        pg::PgResult ur = pg::exec_params(
-            c,
-            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
-            "('stuck_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            std::vector<std::string>{std::to_string(new_anchor)});
-        if (ur.status() != PGRES_COMMAND_OK) {
-            err = "stuck-exec reap anchor update failed";
-            return false;
+        if (forward_skew || backward_skew) {
+            const std::string direction = forward_skew ? "forward" : "backward";
+
+            // #4982 fix round 2 (Fix 1): has this EXACT anomaly (same frozen
+            // anchor, same direction) already declined a full prior pass? If
+            // so, the gap PERSISTED (not just one bad reading) — recover. See
+            // the wedge-recovery design comment above StuckExecDeclinedMarker.
+            pg::PgResult mr = pg::exec_params(
+                c,
+                "SELECT value FROM execution_tracker.reap_meta WHERE key = "
+                "'stuck_exec_reap_declined'",
+                std::vector<std::string>{});
+            if (mr.status() != PGRES_TUPLES_OK) {
+                err = "stuck-exec reap declined-marker read failed";
+                return false;
+            }
+            std::optional<StuckExecDeclinedMarker> declined;
+            if (PQntuples(mr.get()) > 0)
+                declined = parse_stuck_exec_declined_marker(col_str(mr.get(), 0, 0));
+
+            if (declined && declined->anchor == anchor && declined->direction == direction) {
+                // RECOVER: clear the marker and re-anchor UNCONDITIONALLY to
+                // now_s (never max(anchor, now_s), which would leave a
+                // forward-skew-poisoned anchor stuck forever) — then fall
+                // through to the ordinary would-wipe/candidate/cancel logic
+                // below using this now_s, exactly like any accepted pass.
+                spdlog::warn(
+                    "ExecutionTracker::reap_stuck_running_executions recovering: a {}-skew "
+                    "anomaly persisted across a full decline pass (anchor={}, now_s={}) — "
+                    "treating as genuine elapsed time and running this pass now",
+                    direction, anchor, now_s);
+                pg::PgResult dr = pg::exec_params(
+                    c,
+                    "DELETE FROM execution_tracker.reap_meta WHERE key = "
+                    "'stuck_exec_reap_declined'",
+                    std::vector<std::string>{});
+                if (dr.status() != PGRES_COMMAND_OK) {
+                    err = "stuck-exec reap declined-marker clear failed";
+                    return false;
+                }
+                pg::PgResult ur = pg::exec_params(
+                    c,
+                    "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                    "('stuck_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = "
+                    "EXCLUDED.value",
+                    std::vector<std::string>{std::to_string(now_s)});
+                if (ur.status() != PGRES_COMMAND_OK) {
+                    err = "stuck-exec reap anchor update failed";
+                    return false;
+                }
+                // fall through to the would-wipe/candidate logic below —
+                // deliberately NOT a `return true` here.
+            } else {
+                // Decline-once: a DIFFERENT-direction anomaly at this frozen
+                // anchor, or the first occurrence of any anomaly. Arm/re-arm
+                // the marker against THIS pass's own (anchor, direction) and
+                // leave the primary anchor untouched (a decline never
+                // advances it, so an identical repeat presents the same
+                // frozen pair next pass).
+                spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: now_s {} "
+                             "implausible against anchor {} ({}-skew)",
+                             now_s, anchor, direction);
+                clock_anomaly = true;
+                pg::PgResult ar2 = pg::exec_params(
+                    c,
+                    "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                    "('stuck_exec_reap_declined', $1) ON CONFLICT (key) DO UPDATE SET value = "
+                    "EXCLUDED.value",
+                    std::vector<std::string>{std::to_string(anchor) + ":" + direction});
+                if (ar2.status() != PGRES_COMMAND_OK) {
+                    err = "stuck-exec reap declined-marker arm failed";
+                    return false;
+                }
+                return true; // decline, anchor unchanged
+            }
+        } else {
+            // Clean pass (no skew): advance the anchor as before, and clear
+            // any stale declined-marker an EARLIER, now-superseded anomaly
+            // left armed — every accepted pass clears it, so a later,
+            // unrelated anomaly is judged fresh rather than free-riding a
+            // stale recovery identity (matches GatewayRouteStore's "every
+            // lock-holding pass that commits writes the marker" rule, at
+            // this sweep's own simpler two-outcome width: clear or arm).
+            pg::PgResult dr = pg::exec_params(
+                c,
+                "DELETE FROM execution_tracker.reap_meta WHERE key = 'stuck_exec_reap_declined'",
+                std::vector<std::string>{});
+            if (dr.status() != PGRES_COMMAND_OK) {
+                err = "stuck-exec reap declined-marker clear failed";
+                return false;
+            }
+            // Clock accepted — advance the anchor now, regardless of the
+            // would-wipe verdict computed below: the anchor's sole job is to
+            // detect a BAD CLOCK, which this reading is not. A would-wipe
+            // decline is an orthogonal, population-based decision about
+            // whether to ACT, not a statement about the clock.
+            const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
+            pg::PgResult ur = pg::exec_params(
+                c,
+                "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                "('stuck_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = "
+                "EXCLUDED.value",
+                std::vector<std::string>{std::to_string(new_anchor)});
+            if (ur.status() != PGRES_COMMAND_OK) {
+                err = "stuck-exec reap anchor update failed";
+                return false;
+            }
         }
 
         // RAW total running population — deliberately NOT outbox-filtered
@@ -2856,34 +3027,124 @@ ExecutionTracker::reap_stuck_running_executions() {
         candidate_ids.reserve(static_cast<std::size_t>(rows));
         for (int i = 0; i < rows; ++i)
             candidate_ids.push_back(col_str(ids.get(), i, 0));
+        if (candidate_ids.empty())
+            return true; // candidate_count>0 above raced down to 0 in-transaction; nothing to do
+
+        // #4982 fix round 2 (Fix 2/3): the ATOMIC cancel. The former design
+        // selected candidates HERE, inside the lock, then cancelled each one
+        // via a separate mark_cancelled() call AFTER this transaction
+        // committed and the lock released — a window in which (a) a
+        // candidate could receive a genuine dispatch (agents_targeted set >
+        // 0) between the select and the cancel, which mark_cancelled's own
+        // guard (status NOT IN (terminal)) does not check for, force-
+        // cancelling a live, still-executing command with no kill RPC ever
+        // sent; and (b) two replicas could each acquire the lock in
+        // sequence, each select an overlapping candidate set (since neither
+        // had yet mutated anything while holding it), and both proceed to
+        // cancel — exceeding the declared cap fleet-wide per cadence and
+        // breaching this sweep's ReplicaSafe/single-writer classification in
+        // background_jobs.hpp.
+        //
+        // The fix: re-check the FULL candidate predicate (not just
+        // mark_cancelled's terminal-status guard) in ONE atomic UPDATE, in
+        // THIS SAME lock-held transaction. `RETURNING id` reports exactly
+        // which rows actually transitioned — a row that no longer matches
+        // (dispatched in the interim, its outbox entry went pending, or
+        // anything else changed) is silently excluded, which is CORRECT: it
+        // was never eligible at the moment of the actual mutation, only at
+        // the moment of an earlier, now-stale SELECT. Under Postgres READ
+        // COMMITTED, a concurrent writer that commits a change to one of
+        // these rows before this UPDATE reaches it is seen fresh by this
+        // statement; one that is still in-flight blocks this UPDATE on the
+        // row lock and is re-checked via EvalPlanQual the instant it
+        // commits — so nothing can slip through the gap either way. This
+        // also makes the pass genuinely single-writer: a second replica
+        // cannot begin its own pass (the advisory lock above) until this
+        // ENTIRE claim+mutate sequence commits, so the row cap is an honest
+        // per-pass bound, never fleet-wide-exceedable.
+        std::vector<std::string_view> sv(candidate_ids.begin(), candidate_ids.end());
+        pg::PgResult upd = pg::exec_params(
+            c,
+            "UPDATE execution_tracker.executions SET status = 'cancelled', completed_at = $1 "
+            "WHERE id = ANY($2::text[]) AND status = 'running' AND agents_targeted = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
+            "                WHERE execution_id = executions.id AND state = 'pending') "
+            "RETURNING id",
+            std::vector<std::string>{std::to_string(now_epoch()), pg::to_text_array(sv)});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            err = "stuck-exec reap atomic cancel failed";
+            return false;
+        }
+        const int confirmed_rows = PQntuples(upd.get());
+        confirmed_ids.reserve(static_cast<std::size_t>(confirmed_rows));
+        for (int i = 0; i < confirmed_rows; ++i)
+            confirmed_ids.push_back(col_str(upd.get(), i, 0));
+
+        // Durable event append, ONE per confirmed row, in THIS SAME
+        // transaction — matches mark_cancelled's own coupling (ADR-2002 §5
+        // invariant 1: the state write and its event commit atomically). If
+        // ANY append fails, the WHOLE transaction rolls back — nothing this
+        // pass cancels commits without its paired event — rather than leave
+        // some rows durably cancelled with no event; this pass is simply
+        // retried in full next tick, since nothing here is durable yet.
+        for (const auto& id : confirmed_ids) {
+            if (!append_event_outbox(c, id, "execution-completed", payload.dump(),
+                                     /*is_terminal=*/true, replica_id_)) {
+                err = "stuck-exec reap event-outbox append failed for execution_id=" + id;
+                return false;
+            }
+        }
+        if (event_bus_ && !confirmed_ids.empty())
+            should_publish = true;
         return true;
-    });
+    }); // transaction committed / lease released here — publish below runs lease-free.
     if (!ok)
         return std::unexpected(err.empty() ? "stuck-exec reap failed" : err);
 
     StuckExecutionReapOutcome out;
     out.clock_anomaly = clock_anomaly;
     out.would_wipe = would_wipe;
+    out.cancelled = static_cast<int>(confirmed_ids.size());
+    out.not_cancelled = static_cast<int>(candidate_ids.size() - confirmed_ids.size());
 
-    // The actual cancellation happens OUTSIDE the guard transaction above,
-    // through the SAME mark_cancelled() every other terminal transition in
-    // this file uses — its own guarded UPDATE (status NOT IN (...)) and
-    // execution-completed event-publish shape, so a candidate that already
-    // transitioned between the SELECT above and this call (a genuine terminal
-    // response arriving, or a race lost to another replica) is a safe, silent
-    // no-op here, never a double-cancel.
-    for (const auto& id : candidate_ids) {
-        if (mark_cancelled(id, "system:stuck_exec_reap")) {
-            ++out.cancelled;
-        } else {
-            ++out.not_cancelled;
-            spdlog::warn("ExecutionTracker::reap_stuck_running_executions: mark_cancelled did "
-                         "not transition execution id={} (already terminal, raced by another "
-                         "replica, or the write itself failed — see mark_cancelled's own error "
-                         "log for the latter) — remains 'running' if still live, retried next "
-                         "pass",
-                         id);
+    // #4982 fix round 2 (Fix 6): a bounded per-pass log naming exactly which
+    // execution_ids were cancelled — bounded by the SAME kStuckExecReapCap
+    // that bounds confirmed_ids, so no unbounded log-volume risk.
+    if (!confirmed_ids.empty()) {
+        std::string joined;
+        for (std::size_t i = 0; i < confirmed_ids.size(); ++i) {
+            if (i)
+                joined += ", ";
+            joined += confirmed_ids[i];
         }
+        spdlog::info("ExecutionTracker::reap_stuck_running_executions: cancelled {} stuck "
+                     "execution(s) this pass: {}",
+                     confirmed_ids.size(), joined);
+    }
+    if (out.not_cancelled > 0) {
+        std::string joined;
+        for (const auto& id : candidate_ids) {
+            if (std::find(confirmed_ids.begin(), confirmed_ids.end(), id) ==
+                confirmed_ids.end()) {
+                if (!joined.empty())
+                    joined += ", ";
+                joined += id;
+            }
+        }
+        spdlog::warn("ExecutionTracker::reap_stuck_running_executions: {} candidate(s) selected "
+                     "this pass were NOT cancelled — the atomic recheck found they no longer "
+                     "matched at cancel time (a genuine dispatch landed, the outbox went "
+                     "pending, or the row otherwise transitioned): {} — retried next pass if "
+                     "still genuinely stuck",
+                     out.not_cancelled, joined);
+    }
+
+    // Snapshot-and-release (mark_cancelled's own shape): publish OUTSIDE the
+    // transaction, lease-free, once per confirmed id, with the SAME event
+    // shape mark_cancelled's own cancel path publishes.
+    if (should_publish) {
+        for (const auto& id : confirmed_ids)
+            event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
     return out;
 }

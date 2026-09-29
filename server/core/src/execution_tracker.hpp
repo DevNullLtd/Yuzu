@@ -198,23 +198,40 @@ struct EventOutboxReapOutcome {
     bool clock_anomaly{false};
 };
 
-/// #4982 Part B. Outcome of one `reap_stuck_running_executions` pass. Unlike
+/// #4982 Part B (fix round 2, #4982 continued). Outcome of one
+/// `reap_stuck_running_executions` pass. Unlike
 /// `CommandExecutionReapOutcome`/`EventOutboxReapOutcome` above (which DELETE
 /// rows from a regenerable observability table), this sweep MUTATES live
-/// execution rows via `mark_cancelled` — so its outcome carries an extra
+/// execution rows via a single atomic `UPDATE ... RETURNING id` (fix round 2
+/// — see the recorded reasoning at `reap_stuck_running_executions`'s
+/// definition; the pass used to select candidates under the advisory lock
+/// and cancel each one via a separate post-commit `mark_cancelled` call,
+/// which left a TOCTOU window and made the per-pass cap fleet-wide
+/// exceedable under a second replica) — so its outcome carries an extra
 /// `would_wipe` decline signal (clock-guarded-retention part 1, ADOPTED for
 /// this sweep; see the recorded reasoning at `reap_stuck_running_executions`'s
 /// definition for why this sweep adopts it while its two DELETE-based
 /// siblings above deliberately do not), and it splits `cancelled` from
-/// `not_cancelled` because `mark_cancelled`'s own return value cannot
-/// distinguish "already terminal / raced by another replica" (a harmless
-/// no-op) from "the write itself failed" (mark_cancelled already
-/// `spdlog::error`s that case on its own).
+/// `not_cancelled` because the atomic UPDATE's `RETURNING` set can exclude a
+/// selected candidate that no longer matched the FULL predicate at the
+/// instant it actually ran (a genuine dispatch landed, its outbox entry went
+/// `pending`, or the row otherwise left `running` — see `not_cancelled`'s own
+/// doc below).
 struct StuckExecutionReapOutcome {
-    int cancelled{0};          ///< executions actually transitioned to 'cancelled' this pass.
-    int not_cancelled{0};      ///< candidates that did NOT transition (already terminal, raced
-                               ///< by another replica, or mark_cancelled's own write failed).
-    bool clock_anomaly{false}; ///< pass declined outright: implausible now()/anchor reading.
+    int cancelled{0};     ///< executions actually transitioned to 'cancelled' this pass — the
+                          ///< RETURNING-confirmed set of the atomic cancel UPDATE (fix round 2).
+    int not_cancelled{0}; ///< candidates the pass selected but the atomic UPDATE's own
+                          ///< full-predicate recheck excluded at mutation time: a genuine
+                          ///< dispatch landed (agents_targeted > 0), its outbox entry went
+                          ///< 'pending', or the row otherwise left 'running' — all in the
+                          ///< interval between the candidate SELECT and the atomic UPDATE,
+                          ///< which (fix round 2) now sit inside the SAME transaction, so this
+                          ///< is a single-statement-boundary window, never the cross-replica
+                          ///< race this field used to also have to cover.
+    bool clock_anomaly{false}; ///< pass declined outright: implausible now()/anchor reading, or
+                               ///< a repeat anomaly that has not yet earned this sweep's
+                               ///< (anchor, direction) wedge-recovery match (fix round 2, Fix 1
+                               ///< — see `reap_stuck_running_executions`'s definition).
     bool would_wipe{false};    ///< pass declined to ACT: candidates were an implausibly large
                                ///< fraction of all currently-running executions.
 };
