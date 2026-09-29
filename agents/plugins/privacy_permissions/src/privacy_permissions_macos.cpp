@@ -15,7 +15,7 @@
  *     directly under /Users, not followed through a symlink, owned by uid >= 500, the directory
  *     name as the user name (no Open Directory call).
  * A per-user db that does not exist is `absent` for that user; a refusal (EPERM/EACCES on the
- * lstat or the open, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed
+ * open, SQLITE_AUTH/PERM, or SQLITE_CANTOPEN whose underlying syscall failed
  * EPERM/EACCES on a file that IS there) is `denied`; anything else -- including a failed
  * `PRAGMA query_only` or query bind -- is `unreadable` with a `<source>:<cause>` token
  * (macos_parsers.hpp decides; this file only reads).
@@ -29,9 +29,13 @@
  *   - A per-user db is hostile input (its user owns it). It is REFUSED, never guessed, when it is
  *     not a regular file of plausible size, not SQLite, WAL-mode, has a -journal/-wal/-shm beside
  *     it, or changes while read (an immutable read ignores exactly that state): so a concurrent
- *     tccd commit reads `unreadable`. O_NOFOLLOW_ANY refuses a symlink anywhere in the path.
+ *     tccd commit reads `unreadable`. O_NOFOLLOW_ANY refuses a symlink anywhere in the path, and
+ *     the open is the first syscall on it. Change detection sees write(2)-style writers (ctime);
+ *     an owner holding a MAP_SHARED mapping is not seen -- the owner authors every row anyway.
  *     Schema text, rows per service, value and retained-text size, and time (per source and per
- *     run) are bounded.
+ *     run) are bounded; the time bounds start at the first query and do NOT cover
+ *     open/lstat/read syscalls (README caveat 3). SQLite may spill a hostile query's temp data to
+ *     $TMPDIR within that budget.
  *   - The `access` schema and `auth_value` mapping (0=denied/2=allowed/3=limited) are the
  *     commonly-documented shape, proven on macOS 26.6.2 only; any other value is
  *     prompt_undetermined, never guessed.
@@ -111,16 +115,16 @@ struct Deadline {
 
 /// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle. The text can
 /// echo hostile schema identifiers, so it is cut, scrubbed and stripped of control characters and
-/// line separators (U+2028/2029). `|` and `\` become `/` here, once: this text is also a
-/// provenance token, so it must be delimiter-free before format_row's own escape ever runs (a
-/// second escape would only mangle it).
+/// line separators (U+2028/2029). `|`, `\` and `,` become `/` here, once: this text is also a
+/// comma-joined provenance token, so it must be delimiter-free before format_row's own escape
+/// ever runs (a second escape would only mangle it).
 std::string sqlite_errmsg(sqlite3* db) {
     if (!db) return "no_handle";
     auto msg = sanitize_utf8(std::string_view{sqlite3_errmsg(db)}.substr(0, 200));
     for (std::size_t i = 0; i < msg.size(); ++i) {
         const auto c = static_cast<unsigned char>(msg[i]);
         if (c < 0x20 || c == 0x7F) msg[i] = ' ';
-        else if (c == '|' || c == '\\') msg[i] = '/';
+        else if (c == '|' || c == '\\' || c == ',') msg[i] = '/';
         else if (msg.compare(i, 3, "\xE2\x80\xA8") == 0 || msg.compare(i, 3, "\xE2\x80\xA9") == 0)
             msg.replace(i, 3, " ");
     }
@@ -203,8 +207,9 @@ std::optional<FdSnapshot> snapshot_fd(int fd) {
     return s;
 }
 
-/// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat never
-/// blocks, so a planted FIFO is reported, not opened. Untested gap: the refused-lstat branch
+/// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat does
+/// not open its target, so a planted FIFO is reported, not opened. Called only after `path` opened
+/// (O_NOFOLLOW_ANY), so no component of it is a symlink. Untested gap: the refused-lstat branch
 /// (errno other than ENOENT/ENOTDIR) needs a path shape this function does not construct.
 bool sidecar_present(const std::string& path) {
     for (const auto suffix : macos::kSidecarSuffixes) {
@@ -249,12 +254,24 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
                 read.cut = macos::kCutRowCap;
                 break;
             }
+            const bool client_null = sqlite3_column_type(stmt, 1) == SQLITE_NULL;
             const auto* client = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            if (!client_null && client == nullptr) { // sqlite ran out of memory: not a NULL client
+                read.step_failed = true;
+                break;
+            }
             std::optional<std::int64_t> auth_value;
             if (sqlite3_column_type(stmt, 2) == SQLITE_INTEGER)
                 auth_value = sqlite3_column_int64(stmt, 2);
             // Scrubbed here so both output budgets count the bytes that reach the wire.
-            auto text = sanitize_utf8(client ? client : "-");
+            // The whole column, by length: an embedded NUL must not truncate a client to its prefix
+            // (`a\0x` and `a\0y` would collapse), and a NUL never reaches a row.
+            std::string raw_text =
+                client_null ? "-"
+                            : std::string(client, static_cast<std::size_t>(
+                                                      sqlite3_column_bytes(stmt, 1)));
+            std::replace(raw_text.begin(), raw_text.end(), '\0', '?');
+            auto text = sanitize_utf8(raw_text);
             if (retained + text.size() > macos::kMaxSourceBytes) {
                 read.cut = macos::kCutByteCap;
                 break;
@@ -283,19 +300,23 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
     };
     constexpr auto unreadable = macos::SourceOutcome::unreadable;
     // Before ANY syscall on the path: a network-backed mount is never touched.
-    if (macos::path_under_network_mount(path, bounds.mounts)) return fail({unreadable, "network_mount"});
-    struct stat st{};
-    const int lstat_errno = (::lstat(path.c_str(), &st) == 0) ? 0 : errno;
-    const bool regular = lstat_errno == 0 && S_ISREG(st.st_mode);
-    if (const auto f = macos::classify_tcc_presence(lstat_errno, regular, missing_is_absent))
-        return fail(*f);
+    if (macos::path_under_network_mount(path, bounds.mounts))
+        return fail({unreadable, "network_mount"});
     const auto now = std::chrono::steady_clock::now();
     if (now >= bounds.run_end) return fail({unreadable, std::string{macos::kCutTimeout}});
-    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
 
+    // The open is the FIRST syscall on the path. O_NOFOLLOW_ANY refuses a symlink anywhere in it
+    // (ELOOP) without traversing it, so a link into a hung mount is never followed -- an lstat
+    // would follow intermediate links -- and a dangling link reads `unreadable`, not `absent`.
     yuzu::agent::ScopedFd fd{
         ::open(path.c_str(), O_RDONLY | O_NOFOLLOW_ANY | O_NONBLOCK | O_CLOEXEC)};
-    if (!fd) return fail(macos::classify_tcc_open_errno(errno));
+    if (!fd) {
+        const int err = errno;
+        if (err == ENOENT || err == ENOTDIR)
+            return fail(macos::classify_tcc_missing(missing_is_absent));
+        return fail(macos::classify_tcc_open_errno(err));
+    }
+    if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
     const auto first = snapshot_fd(fd.get());
     if (!first) return fail({unreadable, "read_failed"});
     if (const auto f = macos::classify_tcc_file(first->regular, first->stamp.size)) return fail(*f);
@@ -350,7 +371,8 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
         rows.push_back(failure_row("macos", "-", "-", false, "users:network_mount", acc));
         return names;
     }
-    yuzu::agent::ScopedFd fd{::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+    yuzu::agent::ScopedFd fd{
+        ::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
     if (!fd) {
         const int err = errno;
         rows.push_back(failure_row("macos", "-", "-", err == EPERM || err == EACCES,
@@ -365,22 +387,26 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
         return names; // `fd` still owns the descriptor and closes it
     }
     static_cast<void>(fd.release()); // the DIR* adopted the fd; closedir() closes it
-    const auto walk = yuzu::shared::walk_dir_capped(dir.get(), kMaxUserHomes, [&](const struct dirent* e) {
+    const auto walk = yuzu::shared::walk_dir_capped(dir.get(), kMaxUserHomes,
+                                                    [&](const struct dirent* e) {
         const std::string name{e->d_name};
         if (!macos::home_name_eligible(name)) return true;
         // A home that is itself a network mount point: even the fstatat below would block on it.
         if (macos::path_under_network_mount(users_dir + "/" + name, mounts)) {
             rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-", false,
-                                       name + ":network_mount", acc));
+                                       macos::token_safe(name) + ":network_mount", acc));
             return true;
         }
         struct stat st{};
         if (::fstatat(::dirfd(dir.get()), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int err = errno;
-            if (err != ENOENT) // vanished between readdir and fstatat: nothing lost
-                rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-",
-                                           err == EPERM || err == EACCES,
-                                           name + ":home_stat_errno_" + std::to_string(err), acc));
+            // A home that vanished between readdir and fstatat (renamed or removed under us) is
+            // named, not dropped: a user missing from an OK/FULL run is a silent coverage loss.
+            const std::string cause = err == ENOENT ? "home_vanished"
+                                                    : "home_stat_errno_" + std::to_string(err);
+            rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-",
+                                       err == EPERM || err == EACCES,
+                                       macos::token_safe(name) + ":" + cause, acc));
             return true;
         }
         if (macos::is_user_home_entry(name, S_ISDIR(st.st_mode),
@@ -388,7 +414,8 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
             names.push_back(name);
         return true;
     });
-    if (walk.truncated) rows.push_back(failure_row("macos", "-", "-", false, "users:truncated", acc));
+    if (walk.truncated)
+        rows.push_back(failure_row("macos", "-", "-", false, "users:truncated", acc));
     if (walk.enumeration_error)
         rows.push_back(failure_row("macos", "-", "-", false, "users:readdir_error", acc));
     std::sort(names.begin(), names.end());
@@ -409,12 +436,13 @@ std::vector<macos::MountEntry> snapshot_mounts(std::vector<PermissionRow>& rows,
     std::vector<macos::MountEntry> out;
     struct statfs* raw = nullptr;
     const int n = fetch(&raw, MNT_NOWAIT);
-    const std::unique_ptr<struct statfs, decltype(&std::free)> mnt{raw, &std::free};
-    if (n <= 0) {
+    const std::unique_ptr<struct statfs, decltype(&::free)> mnt{raw, &::free};
+    if (n <= 0 || raw == nullptr) {
         rows.push_back(failure_row("macos", "-", "-", false, "mounts:getmntinfo_failed", acc));
         return out;
     }
-    for (int i = 0; i < n; ++i) out.push_back({mnt.get()[i].f_mntonname, mnt.get()[i].f_fstypename});
+    for (int i = 0; i < n; ++i)
+        out.push_back({mnt.get()[i].f_mntonname, mnt.get()[i].f_fstypename});
     return out;
 }
 

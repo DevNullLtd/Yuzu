@@ -21,9 +21,12 @@
  * run `plugin_doc_gen.py --stamp`), the yaml header comment and `platforms` column, the README
  * (How it works, the mermaid diagram, Privileges, Result status, Sample, Caveats),
  * docs/agent-privilege-model.md's row, the capability matrix row and counts, the
- * capability-map cell, the changelog fragment, and
- * test_privacy_permissions_local_dispatcher.cpp's PLANNED-placeholder pin test (currently
- * `#if defined(_WIN32)` only, having lost its macOS arm when that leg landed).
+ * capability-map cell, the changelog fragment, the SOC2 doc's privacy_permissions row
+ * (docs/enterprise-readiness-soc2-first-customer.md), the plugin's row in
+ * .claude/routed-concerns-software-estate.md, the header comment of privacy_permissions_plugin.cpp,
+ * the tests/meson.build comment, and test_privacy_permissions_local_dispatcher.cpp's
+ * PLANNED-placeholder pin test (currently `#if defined(_WIN32)` only, having lost its macOS arm
+ * when that leg landed).
  */
 #pragma once
 

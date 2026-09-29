@@ -532,7 +532,7 @@ agent_test_exe = executable(
     'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (Linux + macOS leg; Windows follows in its own PR's test file)
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
-    'unit/test_privacy_permissions_macos_internals.cpp',  # macOS-leg PR: TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
+    'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b

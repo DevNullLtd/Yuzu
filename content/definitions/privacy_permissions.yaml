@@ -43,7 +43,7 @@ metadata:
     `denied` row whose `raw` names the refusal, never collapsed into `absent`. Every category
     gets a row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields
     are Windows-only (epoch-milliseconds; "-" elsewhere). Reads one machine per request and is
-    off until enabled: macOS is expected to read `denied` until the agent has Full Disk Access,
+    off until enabled: macOS is expected to read `denied` until the agent has Full Disk Access (per-user rows are what that user's own TCC.db records, not what tccd enforces; homes outside /Users or on a network mount are not read),
     Windows is planned and reports `unsupported`/UNAVAILABLE with a `windows:planned` token until
     its leg ships in a follow-up PR, and Linux reports only the agent's own session, normally
     `unavailable` under the shipped service.

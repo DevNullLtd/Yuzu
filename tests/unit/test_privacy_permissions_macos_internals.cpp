@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <fcntl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -44,25 +45,14 @@
 // Direct source inclusion, macOS-only, mirroring autoruns_macos.cpp's
 // YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY seam (see that file's own banner, and
 // YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY's definition comment in
-// privacy_permissions_macos.cpp): `open_readonly`, `read_tcc_source` and `read_all_sources` have
+// privacy_permissions_macos.cpp): `open_readonly`, `read_tcc_source`, `run_collection` and friends have
 // internal (anonymous-namespace) linkage, so there is no header seam to reach them through
 // otherwise. This TU never statically links the real plugin either way
 // (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
 // runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
 // symbol conflict.
-// Excluding collect_macos_permissions leaves enumerate_user_homes with no caller in THIS
-// compilation of the TU -- real, used call sites in the actual (non-test) build of this same
-// file. -Wunused-function is non-fatal project-wide but is silenced narrowly here, scoped to just
-// the include.
 #define YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY 1
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#endif
 #include "../../agents/plugins/privacy_permissions/src/privacy_permissions_macos.cpp"
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
 #undef YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 namespace yuzu::privacy_permissions {
@@ -133,8 +123,9 @@ TEST_CASE("privacy_permissions macOS: open_readonly on a genuinely unopenable pa
 TEST_CASE("privacy_permissions macOS: read_tcc_source on a MISSING per-user db is one absent "
           "row with no token; a missing SYSTEM db is unreadable, never absent",
           "[privacy_permissions][macos][internals]") {
-    const std::string missing =
-        yuzu::test::unique_temp_path("yuzu_test_pp_missing_").string() + "/TCC.db";
+    yuzu::test::TempDir tmp{"yuzu_test_pp_missing_"};
+    // Canonical: O_NOFOLLOW_ANY refuses the /var -> /private/var symlink before it can report ENOENT.
+    const std::string missing = (scratch_dir(tmp) / "no_such_dir" / "TCC.db").string();
 
     yuzu::shared::ConstraintAccumulator user_acc;
     std::vector<PermissionRow> user_rows;
@@ -334,17 +325,6 @@ TEST_CASE("privacy_permissions macOS: a spent run or source budget is a named ti
     const StmtPtr stmt{raw};
     CHECK(sqlite3_step(stmt.get()) == SQLITE_INTERRUPT);
     CHECK(deadline.fired);
-
-    // A query that never yields a row is cut by the handler mid-step, not reported as a failure.
-    make_db(db.parent_path() / "spin.db",
-            "CREATE VIEW access AS WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) "
-            "SELECT 'kTCCServiceCamera' AS service, 'x' AS client, 0 AS client_type, 2 AS "
-            "auth_value FROM n WHERE i < 0;");
-    macos::ReadBounds brief;
-    brief.source_budget = std::chrono::milliseconds{20};
-    const auto spin = read_source(db.parent_path() / "spin.db", brief);
-    CHECK(spin.has_raw("evil:tcc_db:camera:timeout"));
-    CHECK_FALSE(spin.has_raw("evil:tcc_db:camera:query_step_failed"));
 }
 
 TEST_CASE("privacy_permissions macOS: the bounded schema and untrusted-database posture still "
@@ -423,6 +403,7 @@ struct Poke {
     bool create_journal = false;
     bool replace_path = false; // unlink `path` and create a DIFFERENT file there (TOCTOU probe)
     bool rewrite_keep_mtime = false; // same-size in-place write, then restore mtime (ctime probe)
+    Deadline* expire = nullptr;      // set `fired` from inside the running query (timeout probe)
 } g_poke;
 
 void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
@@ -451,6 +432,7 @@ void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
         const struct timespec times[2] = {{0, UTIME_OMIT}, before.st_mtimespec};
         ::futimens(fd.get(), times);
     }
+    if (g_poke.expire) g_poke.expire->fired = true;
     sqlite3_result_int(ctx, 0);
 }
 
@@ -492,11 +474,9 @@ TEST_CASE("privacy_permissions macOS: a change made to the file while it is bein
               "evil:tcc_db:prepare_failed:unsafe use of poke_unsafe()", 0) == 0);
 }
 
-TEST_CASE("privacy_permissions macOS: reading stays bound to the descriptor opened at the "
-          "start, never the pathname -- a mid-read replace of the file is never parsed (SQLite "
-          "steps through /dev/fd/N, not the path a second time) and the replaced inode is refused "
-          "as changed_during_read (both snapshots come from the same fd's fstat(), never a path "
-          "re-lstat())",
+TEST_CASE("privacy_permissions macOS: replacing the file mid-read is refused as "
+          "changed_during_read and the replacement is never parsed (the unlink moves the open "
+          "inode's ctime; both snapshots come from the same fd's fstat(), never a path re-lstat())",
           "[privacy_permissions][macos][internals]") {
     yuzu::test::TempDir tmp{"yuzu_test_pp_toctou_"};
     const auto dir = scratch_dir(tmp);
@@ -512,11 +492,11 @@ TEST_CASE("privacy_permissions macOS: reading stays bound to the descriptor open
     const auto result = read_source(dir / "TCC.db");
     g_poke.replace_path = false;
 
-    // Proof of descriptor binding: SQLite kept reading the ORIGINAL inode through /dev/fd/N, so
-    // the replacement text ("not a sqlite database ...") is never parsed -- no prepare/step/
-    // not_sqlite failure. The unlink itself does move the original inode's ctime, so the
-    // read is refused as changed_during_read (a replaced file is a changed file); the one row is
-    // that refusal, never a row built from the replacement.
+    // The unlink moves the original inode's ctime, so the read is refused as changed_during_read
+    // (a replaced file is a changed file). The one row is that refusal: nothing was built from the
+    // replacement text ("not a sqlite database ..."), which would surface as not_sqlite or a
+    // prepare/step failure. (That SQLite reads the inode it opened, not the path, is a property of
+    // its open at sqlite3_open_v2, which precedes this poke -- not observable from here.)
     REQUIRE(result.rows.size() == 1);
     CHECK(result.rows[0].raw == "evil:tcc_db:changed_during_read");
     CHECK_FALSE(result.has_raw("evil:tcc_db:not_sqlite"));
@@ -662,6 +642,125 @@ TEST_CASE("privacy_permissions macOS: one collection takes exactly one non-block
     }
 }
 
+int open_fd_count() {
+    int n = 0;
+    for (int fd = 0; fd < 256; ++fd)
+        if (::fcntl(fd, F_GETFD) != -1) ++n;
+    return n;
+}
+
+TEST_CASE("privacy_permissions macOS: a NULL auth_value and a failing step are named failures, "
+          "never a fabricated denied or a clean absent",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_nullstep_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "null.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'a.app' AS client, 0 AS "
+            "client_type, NULL AS auth_value;");
+    const auto nul = read_source(dir / "null.db");
+    CHECK(nul.has_raw("evil:tcc_db:camera:auth_value_unreadable"));
+    CHECK(nul.count("camera", PermissionState::denied) == 0);
+    CHECK(nul.count("camera", PermissionState::allowed) == 0);
+
+    // abs(INT64_MIN) is an integer overflow the engine raises AT STEP time, on a row.
+    make_db(dir / "step.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceMicrophone' AS service, 'x' AS client, 0 AS "
+            "client_type, abs(-9223372036854775807-1) AS auth_value;");
+    const auto step = read_source(dir / "step.db");
+    CHECK(step.has_raw("evil:tcc_db:microphone:query_step_failed"));
+    CHECK(step.count("microphone", PermissionState::absent) == 0);
+    CHECK(step.acc.any_failure());
+}
+
+TEST_CASE("privacy_permissions macOS: a client with an embedded NUL is kept whole, not truncated "
+          "to its prefix, and no NUL reaches a row",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_nul_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "TCC.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, CAST(x'610078' AS TEXT) "
+            "AS client, 0 AS client_type, 2 AS auth_value UNION ALL SELECT 'kTCCServiceCamera', "
+            "CAST(x'610079' AS TEXT), 0, 2;");
+    const auto r = read_source(dir / "TCC.db");
+    REQUIRE(r.count("camera", PermissionState::allowed) == 2);
+    std::vector<std::string> ids;
+    for (const auto& row : r.rows)
+        if (row.category == "camera" && row.state == PermissionState::allowed)
+            ids.push_back(row.app_id);
+    CHECK(ids == std::vector<std::string>{"evil\\a?x", "evil\\a?y"});
+}
+
+TEST_CASE("privacy_permissions macOS: the open is the first syscall on the path -- a symlinked or "
+          "dangling intermediate component is refused, never followed and never `absent`",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_dangling_"};
+    const auto base = scratch_dir(tmp);
+    std::filesystem::create_directory_symlink(base / "does_not_exist", base / "Library");
+    SourceRead r;
+    read_tcc_source("alice", (base / "Library" / "TCC.db").string(), /*missing_is_absent=*/true,
+                    r.rows, r.acc);
+    REQUIRE(r.rows.size() == 1);
+    CHECK(r.rows[0].raw == "alice:tcc_db:open_failed:symlink"); // ELOOP, not ENOENT -> not absent
+    CHECK(r.rows[0].state == PermissionState::unreadable);
+
+    // A plain file where a directory is expected is a genuinely missing db.
+    { std::ofstream{base / "file"}; }
+    SourceRead f;
+    read_tcc_source("alice", (base / "file" / "TCC.db").string(), true, f.rows, f.acc);
+    REQUIRE(f.rows.size() == 1);
+    CHECK(f.rows[0].state == PermissionState::absent);
+}
+
+TEST_CASE("privacy_permissions macOS: reading a source leaks no descriptor on any outcome",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_fdleak_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "good.db",
+            std::string{kAccessSchema} + "INSERT INTO access VALUES('kTCCServiceCamera','x.app',0,2);");
+    make_db(dir / "schema.db", "CREATE TABLE unrelated(x);");
+    { std::ofstream{dir / "junk.db"} << std::string(200, 'j'); }
+    const int before = open_fd_count();
+    for (int i = 0; i < 20; ++i)
+        for (const char* name : {"good.db", "schema.db", "junk.db", "missing.db"})
+            static_cast<void>(read_source(dir / name));
+    CHECK(open_fd_count() == before);
+}
+
+TEST_CASE("privacy_permissions macOS: a source whose deadline fires DURING the query is cut as a "
+          "timeout, deterministically -- never a step failure and never a hang",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_midstep_"};
+    const auto dir = scratch_dir(tmp);
+    // Finite (a regression that loses the progress handler ends in DONE, not a hang); poke() runs
+    // on every row and expires the deadline from inside the running query.
+    make_db(dir / "mid.db",
+            "CREATE VIEW access AS WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n "
+            "LIMIT 30000000) SELECT 'kTCCServiceCamera' AS service, 'x' AS client, 0 AS "
+            "client_type, 2 AS auth_value FROM n WHERE poke() = 1;");
+    const PokeRegistered registered;
+    g_poke = {};
+    Deadline deadline{std::chrono::steady_clock::now() + std::chrono::hours{1}};
+    g_poke.expire = &deadline;
+
+    auto opened = open_readonly((dir / "mid.db").string(), &deadline);
+    REQUIRE(opened.has_value());
+    const DbPtr db = std::move(*opened);
+    sqlite3_stmt* raw = nullptr;
+    REQUIRE(sqlite3_prepare_v2(db.get(),
+                               "SELECT service, client, auth_value FROM access WHERE service = ?",
+                               -1, &raw, nullptr) == SQLITE_OK);
+    const StmtPtr stmt{raw};
+    const auto reads = read_services(stmt.get(), deadline, macos::kMaxRowsPerService);
+    g_poke = {};
+
+    REQUIRE(reads.size() == macos::kTccServices.size());
+    CHECK(deadline.fired);
+    CHECK(reads[0].cut == macos::kCutTimeout);
+    CHECK_FALSE(reads[0].step_failed);
+    CHECK(reads[0].grants.empty());
+    CHECK(reads[1].cut == macos::kCutTimeout); // the rest see the fired deadline at the loop top
+}
+
 TEST_CASE("privacy_permissions macOS: a delimiter or backslash in a sqlite diagnostic is folded once, "
           "not escaped twice",
           "[privacy_permissions][macos][internals]") {
@@ -669,9 +768,10 @@ TEST_CASE("privacy_permissions macOS: a delimiter or backslash in a sqlite diagn
     const auto dir = scratch_dir(tmp);
     make_db(dir / "pipe.db",
             "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'c' AS client, 0 AS "
-            "client_type, 2 AS auth_value FROM \"a|b\\c\";");
+            "client_type, 2 AS auth_value FROM \"a|b\\c,d\";");
     const auto r = read_source(dir / "pipe.db");
-    CHECK(r.rows.at(0).raw == "evil:tcc_db:prepare_failed:no such table: main.a/b/c");
+    CHECK(r.rows.at(0).raw == "evil:tcc_db:prepare_failed:no such table: main.a/b/c/d");
+    CHECK(r.rows.at(0).raw.find(',') == std::string::npos); // a comma would forge a second token
     CHECK(r.rows.at(0).raw.find('|') == std::string::npos);
     CHECK(r.rows.at(0).raw.find('\\') == std::string::npos);
 }

@@ -79,8 +79,8 @@ TEST_CASE("privacy_permissions: descriptor pins the single action per OS",
     REQUIRE(d->action_descriptor_count == 1);
     const auto& a = d->action_descriptors[0];
     CHECK(std::string_view{a.action} == "permissions");
-    // The whole point of this PR: macOS moves from PLANNED to a real, CONSTRAINED rung-1
-    // leg; Windows stays PLANNED until its own PR lands. A descriptor regression back to
+    // macOS is a real, CONSTRAINED rung-1 leg; Windows stays PLANNED until its own leg lands.
+    // A descriptor regression back to
     // PLANNED (or an accidental Windows promotion) would otherwise pass every other test
     // in this file, since none of them read the descriptor's support level.
     CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
@@ -156,7 +156,7 @@ TEST_CASE("privacy_permissions: no category is silently omitted -- each of the f
 
 #if defined(__APPLE__)
 TEST_CASE("privacy_permissions: the real macOS dispatch derives its typed status from the "
-          "rows it actually emitted, and it is NEVER the old UNAVAILABLE/macos:planned "
+          "rows it actually emitted, and it is never the UNAVAILABLE/macos:planned "
           "placeholder result. None of the row-shape checks above read "
           "result_status/completeness/provenance at all, so a regression that quietly "
           "reverted collect_macos_permissions to the PLANNED placeholder (or hard-coded a "

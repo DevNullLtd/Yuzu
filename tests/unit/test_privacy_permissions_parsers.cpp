@@ -498,30 +498,21 @@ TEST_CASE("macos::decode_auth_value: 0 denied, 2/3 allowed, other prompt_undeter
     CHECK(macos::decode_auth_value(-2) == PermissionState::prompt_undetermined);
 }
 
-TEST_CASE("macos::classify_tcc_presence: a missing per-user db is absent, a missing system db "
-          "is unreadable, a refused lstat is denied, a non-regular file is refused",
+TEST_CASE("macos::classify_tcc_missing: a missing per-user db is absent, a missing system db is "
+          "unreadable",
           "[privacy_permissions][macos_parsers]") {
-    CHECK_FALSE(macos::classify_tcc_presence(0, true, true).has_value());
-    const auto user_missing = macos::classify_tcc_presence(ENOENT, false, true);
-    REQUIRE(user_missing);
-    CHECK(user_missing->outcome == macos::SourceOutcome::absent);
-    CHECK(user_missing->cause.empty());
-    const auto sys_missing = macos::classify_tcc_presence(ENOENT, false, false);
-    REQUIRE(sys_missing);
-    CHECK(sys_missing->outcome == macos::SourceOutcome::unreadable);
-    CHECK(sys_missing->cause == "missing");
-    for (const int e : {EPERM, EACCES}) {
-        const auto d = macos::classify_tcc_presence(e, false, true);
-        REQUIRE(d);
-        CHECK(d->outcome == macos::SourceOutcome::denied);
-    }
-    const auto link = macos::classify_tcc_presence(0, false, true);
-    REQUIRE(link);
-    CHECK(link->outcome == macos::SourceOutcome::unreadable);
-    CHECK(link->cause == "not_regular");
-    const auto io = macos::classify_tcc_presence(EIO, false, true);
-    REQUIRE(io);
-    CHECK(io->cause == "lstat_errno_" + std::to_string(EIO));
+    const auto user_missing = macos::classify_tcc_missing(true);
+    CHECK(user_missing.outcome == macos::SourceOutcome::absent);
+    CHECK(user_missing.cause.empty());
+    const auto sys_missing = macos::classify_tcc_missing(false);
+    CHECK(sys_missing.outcome == macos::SourceOutcome::unreadable);
+    CHECK(sys_missing.cause == "missing");
+    // Every other failure of the first open goes through the errno classifier: a refusal is
+    // denied, a symlink anywhere in the path (ELOOP) is refused, anything else is unreadable.
+    for (const int e : {EPERM, EACCES})
+        CHECK(macos::classify_tcc_open_errno(e).outcome == macos::SourceOutcome::denied);
+    CHECK(macos::classify_tcc_open_errno(ELOOP).cause == "open_failed:symlink");
+    CHECK(macos::classify_tcc_open_errno(EIO).outcome == macos::SourceOutcome::unreadable);
 }
 
 TEST_CASE("macos::classify_tcc_sqlite_rc: AUTH/PERM denied; CANTOPEN denied only when the VFS "
@@ -670,12 +661,26 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
     CHECK_FALSE(refused("/Users/dave/Library")); // a local mount is never a reason
     CHECK_FALSE(refused("/Library/Application Support/com.apple.TCC/TCC.db"));
     CHECK_FALSE(macos::path_under_network_mount("/Users/alice", {}));
+    // The shapes the kernel really reports: a mount the system creates on the firmlinked volume
+    // (autofs's /home, captured on macOS 26.6.2) carries the /System/Volumes/Data prefix.
+    const std::vector<macos::MountEntry> real{{"/", "apfs"},
+                                              {"/System/Volumes/Data", "apfs"},
+                                              {"/System/Volumes/Data/home", "autofs"},
+                                              {"/System/Volumes/Data/Users/carol", "smbfs"}};
+    CHECK(macos::path_under_network_mount("/home/dave/Library", real));
+    CHECK(macos::path_under_network_mount("/Users/carol/Library/x", real));
+    CHECK(macos::path_under_network_mount("/System/Volumes/Data/home/dave", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/carolyn/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/alex/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/homework", real));
     // A network root covers every path.
     CHECK(macos::path_under_network_mount("/Users/x", std::vector<macos::MountEntry>{{"/", "nfs"}}));
     CHECK(macos::is_network_mount_fstype("nfs"));
     CHECK(macos::is_network_mount_fstype("smbfs"));
     CHECK(macos::is_network_mount_fstype("webdav"));
     CHECK(macos::is_network_mount_fstype("afpfs"));
+    CHECK(macos::is_network_mount_fstype("macfuse"));
+    CHECK(macos::is_network_mount_fstype("osxfuse"));
     CHECK_FALSE(macos::is_network_mount_fstype("apfs"));
     CHECK_FALSE(macos::is_network_mount_fstype("devfs"));
 }
@@ -762,4 +767,28 @@ TEST_CASE("macos::tcc_source_failed_row: absent carries no token; denied/unreada
     CHECK(sys.app_id == "-");
     CHECK(sys.state == PermissionState::unreadable);
     CHECK(sys.raw == "tcc_db:open_failed:disk I/O error");
+}
+
+TEST_CASE("macos::token_safe and tcc_source_key: a name in a provenance token carries no delimiter "
+          "or control character",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::token_safe("alice") == "alice");
+    CHECK(macos::token_safe("a,b|c\\d\ne\x7f") == "a/b/c/d e ");
+    CHECK(macos::tcc_source_key({}) == "tcc_db");
+    CHECK(macos::tcc_source_key("bob") == "bob:tcc_db");
+    // A home named to forge a second token cannot: the comma is folded.
+    CHECK(macos::tcc_source_key("x,evil:tcc_db:access_denied") == "x/evil:tcc_db:access_denied:tcc_db");
+}
+
+TEST_CASE("macos::sort_grants: client order, ties broken by auth_value (NULL first), so the wire "
+          "order is a total order",
+          "[privacy_permissions][macos_parsers]") {
+    std::vector<macos::TccGrant> g{{"b", 2}, {"a", 3}, {"a", std::nullopt}, {"a", 0}};
+    macos::sort_grants(g);
+    REQUIRE(g.size() == 4);
+    CHECK(g[0].client == "a");
+    CHECK_FALSE(g[0].auth_value.has_value());
+    CHECK(g[1].auth_value == 0);
+    CHECK(g[2].auth_value == 3);
+    CHECK(g[3].client == "b");
 }

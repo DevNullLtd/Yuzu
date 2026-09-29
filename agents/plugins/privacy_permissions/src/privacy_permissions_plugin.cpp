@@ -63,13 +63,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* macos_leg   = */
      {YUZU_SUPPORT_CONSTRAINED, 1,
       "TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI (no lock, "
-      "no -journal/-wal/-shm ever opened or created; a WAL-mode, journal-bearing or changing "
-      "file is refused, never read): the system /Library/Application Support/"
+      "no -journal/-wal/-shm ever opened or created; a WAL-mode or journal-bearing file is "
+      "refused, and a file that changes during the read is discarded): the system /Library/Application Support/"
       "com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user "
       "Library/Application Support/com.apple.TCC/TCC.db",
       "every TCC.db is TCC-protected: without Full Disk Access each read is denied; camera and "
-      "microphone grants normally live in the per-user dbs; location is unsupported (locationd, "
-      "outside TCC)"},
+      "microphone grants normally live in the per-user dbs; per-user rows report what that user's "
+      "own TCC.db records, not what tccd enforces; homes outside /Users or on a network mount "
+      "are not read; location is unsupported (locationd, outside TCC)"},
      /* windows_leg = */
      {YUZU_SUPPORT_PLANNED, 1,
       "HKLM ProfileList enumeration, then each real profile's "

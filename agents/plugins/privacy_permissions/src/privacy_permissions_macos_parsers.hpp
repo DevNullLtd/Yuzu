@@ -24,6 +24,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
@@ -76,31 +77,19 @@ struct SourceFailure {
     std::string cause; // empty for `absent` (no token -- not a failure)
 };
 
-/// The lstat() pre-check on a TCC.db path, run BEFORE the open so a missing file is told apart
-/// from a refused one. `lstat_errno` is 0 on success. nullopt = a regular file is there, go
-/// ahead and open it.
-/// `missing_is_absent`: a per-user TCC.db that does not exist is an honest "this user has no
-/// TCC records" (absent); the SYSTEM TCC.db is always present on a supported macOS, so its
-/// absence is `unreadable`, never absent. A symlink or other non-regular final component is
-/// refused as `unreadable` (the open itself uses O_NOFOLLOW_ANY).
-[[nodiscard]] inline std::optional<SourceFailure>
-classify_tcc_presence(int lstat_errno, bool is_regular_file, bool missing_is_absent) {
-    if (lstat_errno == 0) {
-        if (is_regular_file) return std::nullopt;
-        return SourceFailure{SourceOutcome::unreadable, "not_regular"};
-    }
-    if (lstat_errno == ENOENT || lstat_errno == ENOTDIR) {
-        if (missing_is_absent) return SourceFailure{SourceOutcome::absent, {}};
-        return SourceFailure{SourceOutcome::unreadable, "missing"};
-    }
-    if (lstat_errno == EPERM || lstat_errno == EACCES)
-        return SourceFailure{SourceOutcome::denied, "access_denied"};
-    return SourceFailure{SourceOutcome::unreadable, "lstat_errno_" + std::to_string(lstat_errno)};
+/// An open(2) of a TCC.db path that failed ENOENT/ENOTDIR. A per-user TCC.db that does not exist is
+/// an honest "this user has no TCC records" (`absent`); the SYSTEM TCC.db is always present on a
+/// supported macOS, so its absence is `unreadable`, never absent. Every other open failure goes
+/// through classify_tcc_open_errno (the open is the FIRST syscall on the path: O_NOFOLLOW_ANY
+/// refuses a symlink anywhere in it without traversing it, so a link into a hung mount is never
+/// followed the way an lstat would).
+[[nodiscard]] inline SourceFailure classify_tcc_missing(bool missing_is_absent) {
+    if (missing_is_absent) return SourceFailure{SourceOutcome::absent, {}};
+    return SourceFailure{SourceOutcome::unreadable, "missing"};
 }
 
-/// A sqlite3_open_v2 / sqlite3_prepare_v2 failure on a file the lstat pre-check already saw
-/// as present. SQLITE_AUTH/SQLITE_PERM are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY
-/// when the VFS's own failed syscall (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES --
+/// A sqlite3_open_v2 / sqlite3_prepare_v2 failure on a file already opened. SQLITE_AUTH/SQLITE_PERM
+/// are refusals -> denied. SQLITE_CANTOPEN is a refusal ONLY when the VFS's own failed syscall (`sys_errno`, from sqlite3_system_errno) was EPERM/EACCES --
 /// the SIP/TCC refusal shape, the expected outcome without Full Disk Access; a
 /// CANTOPEN for any other reason (ENOENT after a race, EMFILE, ...) is unreadable. Any other code
 /// (SQLITE_NOMEM, SQLITE_IOERR, SQLITE_NOTADB, a schema error) is a real fault that gaining FDA
@@ -130,7 +119,9 @@ enum class SqliteStage { open, query_only, prepare };
     const SourceOutcome outcome = stage == SqliteStage::query_only
                                       ? SourceOutcome::unreadable
                                       : classify_tcc_sqlite_rc(rc, sys_errno);
-    return {outcome, std::string{prefix}.append(errmsg)};
+    std::string cause{prefix};
+    cause.append(errmsg);
+    return {outcome, std::move(cause)};
 }
 
 // ── bounded, immutable read of one source ───────────────────────────────
@@ -147,16 +138,25 @@ inline constexpr std::chrono::milliseconds kRunBudget{10'000};
 inline constexpr std::chrono::milliseconds kSourceBudget{500};
 
 /// One mounted filesystem, from a single non-blocking mount-table snapshot taken at the start of
-/// the run (getmntinfo(MNT_NOWAIT): the kernel's cached table, never a call into a wedged server).
+/// the run (getmntinfo_r_np(MNT_NOWAIT): the kernel's cached table into a caller-owned array,
+/// never a call into a wedged server).
 struct MountEntry {
     std::string mount_point;
     std::string fstype;
 };
 
-/// The shared deny-list plus the two macOS client names it lacks (`webdav`, `afpfs`).
+/// The shared deny-list plus the macOS client names it lacks: `webdav`, `afpfs` and the macFUSE
+/// FUSE-over-anything family (`macfuse`, `osxfuse`) -- a user-run FUSE daemon serving a home can
+/// hang exactly like a dead server.
 [[nodiscard]] inline bool is_network_mount_fstype(std::string_view fstype) noexcept {
-    return yuzu::shared::is_network_fstype(fstype) || fstype == "webdav" || fstype == "afpfs";
+    return yuzu::shared::is_network_fstype(fstype) || fstype == "webdav" || fstype == "afpfs" ||
+           fstype == "macfuse" || fstype == "osxfuse";
 }
+
+/// A mount under the firmlinked read-write volume that the system creates itself (autofs's `/home`)
+/// is listed with this prefix (`/System/Volumes/Data/home`); a mount a user makes is listed under
+/// the path it was made at. Both spellings are matched.
+inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
 
 /// True when `path`, or any directory on the way to it, is a network-backed mount point: an
 /// lstat/open/read under one pins a worker of the agent's shared command pool until the server
@@ -165,11 +165,16 @@ struct MountEntry {
 /// and is not seen -- the disclosed limit shared with runtimes and filesystem_posture.
 [[nodiscard]] inline bool path_under_network_mount(std::string_view path,
                                                    std::span<const MountEntry> mounts) {
+    const auto covers = [&](std::string_view mp) {
+        return mp == "/" || path == mp ||
+               (path.size() > mp.size() && path.starts_with(mp) && path[mp.size()] == '/');
+    };
     return std::any_of(mounts.begin(), mounts.end(), [&](const MountEntry& m) {
+        if (!is_network_mount_fstype(m.fstype)) return false;
         const std::string_view mp = m.mount_point;
-        const bool covers = mp == "/" || path == mp ||
-                            (path.size() > mp.size() && path.starts_with(mp) && path[mp.size()] == '/');
-        return covers && is_network_mount_fstype(m.fstype);
+        if (covers(mp)) return true;
+        return mp.size() > kDataVolume.size() && mp.starts_with(kDataVolume) &&
+               mp[kDataVolume.size()] == '/' && covers(mp.substr(kDataVolume.size()));
     });
 }
 
@@ -199,7 +204,7 @@ struct OutputBudget {
     std::size_t bytes = 0;
 
     [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
-    void charge(std::span<const PermissionRow> rows) noexcept {
+    void charge(std::span<const PermissionRow> rows) { // allocates (format_row): not noexcept
         for (const auto& r : rows) bytes += format_row(r).size() + 1; // +1: the row separator
     }
 };
@@ -209,12 +214,16 @@ struct OutputBudget {
 [[nodiscard]] inline std::string immutable_uri(std::string_view path) {
     std::string out{"file:"};
     for (const char c : path)
-        out.append(c == '%' ? "%25" : c == '?' ? "%3F" : c == '#' ? "%23" : std::string_view{&c, 1});
-    return out += "?immutable=1";
+        out.append(c == '%'   ? "%25"
+                   : c == '?' ? "%3F"
+                   : c == '#' ? "%23"
+                              : std::string_view{&c, 1});
+    out += "?immutable=1";
+    return out;
 }
 
-/// A failed open(2) of a file the lstat pre-check saw as present: EPERM/EACCES is the TCC/SIP
-/// refusal (denied); ELOOP is O_NOFOLLOW_ANY refusing a symlink anywhere in the path.
+/// A failed open(2) other than ENOENT/ENOTDIR: EPERM/EACCES is the TCC/SIP refusal (denied); ELOOP
+/// is O_NOFOLLOW_ANY refusing a symlink anywhere in the path.
 [[nodiscard]] inline SourceFailure classify_tcc_open_errno(int err) {
     if (err == ELOOP) return {SourceOutcome::unreadable, "open_failed:symlink"};
     return {err == EPERM || err == EACCES ? SourceOutcome::denied : SourceOutcome::unreadable,
@@ -261,8 +270,11 @@ struct FileStamp {
     std::int64_t mtime_sec = 0;
     std::int64_t mtime_nsec = 0;
     std::uint32_t change_counter = 0;
-    // ctime moves on every content write and an unprivileged writer cannot restore it (there is
-    // no utimes for ctime), so a same-size, mtime-restoring in-place write still changes the stamp.
+    // ctime moves on a write(2)/pwrite and an unprivileged writer cannot restore it (there is no
+    // utimes for ctime), so a same-size, mtime-restoring in-place write still changes the stamp.
+    // NOT detected: stores through a MAP_SHARED mapping the owner holds, which move neither time
+    // until munmap -- the owner already authors every row, so this adds no forgery (README
+    // caveat 3).
     std::int64_t ctime_sec = 0;
     std::int64_t ctime_nsec = 0;
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
@@ -289,10 +301,23 @@ inline constexpr std::uint32_t kMinUserHomeUid = 500;
     return home_name_eligible(name) && is_directory && uid >= kMinUserHomeUid;
 }
 
+/// A name that reaches a provenance token (comma-joined, logged) must not carry a delimiter or a
+/// control character: `|`, `\` and `,` fold to `/`, controls to a space. The wire row is escaped
+/// separately by format_row.
+///
 /// `tcc_db` for the system database, `<user>:tcc_db` for a per-user one -- the subject every
 /// whole-source failure token from this leg starts with.
+[[nodiscard]] inline std::string token_safe(std::string_view s) {
+    std::string out{s};
+    for (char& c : out) {
+        if (c == '|' || c == '\\' || c == ',') c = '/';
+        else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) c = ' ';
+    }
+    return out;
+}
+
 [[nodiscard]] inline std::string tcc_source_key(std::string_view owner) {
-    return owner.empty() ? std::string{"tcc_db"} : std::string{owner} + ":tcc_db";
+    return owner.empty() ? std::string{"tcc_db"} : token_safe(owner) + ":tcc_db";
 }
 
 [[nodiscard]] inline std::string tcc_row_app_id(std::string_view owner, std::string_view client) {
@@ -319,10 +344,11 @@ struct TccGrant {
 };
 
 /// Deterministic row order (the query has no ORDER BY: on a hostile view it would sort every row
-/// before returning the first, defeating the row cap).
+/// before returning the first, defeating the row cap): client, then auth_value.
 inline void sort_grants(std::vector<TccGrant>& grants) {
-    std::stable_sort(grants.begin(), grants.end(),
-                     [](const TccGrant& a, const TccGrant& b) { return a.client < b.client; });
+    std::stable_sort(grants.begin(), grants.end(), [](const TccGrant& a, const TccGrant& b) {
+        return a.client != b.client ? a.client < b.client : a.auth_value < b.auth_value;
+    });
 }
 
 /// One mapped TCC service's query result from one source.
