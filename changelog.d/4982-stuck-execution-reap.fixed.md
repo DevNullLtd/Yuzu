@@ -15,4 +15,13 @@
   mass-cancelling live work on the strength of what is more likely a systemic bug. New metric
   `yuzu_exec_tracker_stuck_reap_total{outcome}` (cancelled\|not_cancelled\|would_wipe\|
   clock_anomaly\|degraded), and a new `execution_tracker.reap_stuck_running_executions` row in
-  the WS-10 background-job classification table (`ReplicaSafe`).
+  the WS-10 background-job classification table (`ReplicaSafe`). Full seven-part
+  clock-guarded-retention record: `docs/clock-guarded-retention.md`'s own entry for this sweep.
+  **Fix round 2** (post-adversarial-review, still pre-release): the sweep no longer wedges
+  permanently after a >24h clock gap — a repeated same-direction anomaly now recovers and
+  drains gradually instead of declining forever (see the doc entry above); the candidate select
+  and the cancel are now ONE atomic `UPDATE ... RETURNING id` inside the same lock-held
+  transaction (closing a TOCTOU window against a genuinely-dispatched row and making the
+  500-row cap an honest per-pass bound under a second replica); the advisory lock is now
+  try-and-skip rather than blocking; and a bounded per-pass log now names the cancelled
+  `execution_id`s.

@@ -388,6 +388,77 @@ Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a
 regenerable observability aid, not compliance evidence, so a from-boot skewed clock deleting a batch
 of already-consumed mappings is an acceptable worst case.
 
+### `ExecutionTracker::reap_stuck_running_executions` (#4982 Part B, fix round 2)
+
+Diverges from this file's two DELETE-based siblings immediately above in kind, not just detail: this
+sweep **MUTATES** live `execution_tracker.executions` rows (cancels a `running`/`agents_targeted=0`
+row past a 30-minute window, excluding anything with a still-`pending` `command_outbox_store.outbox`
+entry) rather than deleting from a regenerable observability table, so its part-1/part-4 choices
+invert theirs:
+
+1. **Would-wipe IS ADOPTED** (unlike `reap_command_execution_mappings`/`reap_event_outbox` above,
+   which decline it). Their tables drain to 100% expiry as ROUTINE behaviour, so a would-wipe verdict
+   there cannot separate a true positive from ordinary drain. This sweep's candidates are the
+   opposite: a healthy fleet's running executions resolve `agents_targeted>0` within seconds, so
+   candidates should always be a SMALL minority of the running population — a pass whose candidates
+   are a LARGE fraction (`kStuckExecWouldWipeRatio = 0.5`, floored at `kStuckExecWouldWipeFloor = 20`
+   total running executions below which the ratio is too noisy to mean anything) is evidence of a
+   systemic bookkeeping bug (e.g. a broad regression in a synchronous dispatch call site's own
+   `set_agents_targeted` call), not a genuine backlog, and acting on it risks mass-cancelling live
+   work.
+4. **Fact-set anomaly dedup IS ADOPTED, at a DELIBERATELY simpler width than `GatewayRouteStore`'s.**
+   The original Part B implementation carved this part out entirely (matching the DELETE-based
+   siblings) — and wedged PERMANENTLY after any routine >24h clock gap (a weekend, a DR failover,
+   extended maintenance) as a result: a decline never advances the primary `stuck_exec_reap_anchor`,
+   so `now_s - anchor` only GROWS on every later pass with no recovery path short of an operator
+   hand-editing `reap_meta`. This is the identical defect class `GatewayRouteStore::reap_stale_routes`
+   above was fixed for (PR #4299). The fix round 2 correction adds a SECOND persisted marker,
+   `stuck_exec_reap_declined = "<anchor>:<direction>"` (direction ∈ forward|backward) — a REPEAT
+   anomaly at the exact SAME (anchor, direction) as a marker armed by a full prior decline pass
+   re-anchors to the CURRENT `now_s` UNCONDITIONALLY and runs the ordinary would-wipe/candidate/cancel
+   logic for that pass (a genuine backlog then drains gradually across passes under the same cap,
+   never trusted all at once); a DIFFERENT-direction anomaly at that frozen anchor, or the very first
+   occurrence of any anomaly, still declines and arms/re-arms the marker against its own (anchor,
+   direction) — mirroring GatewayRouteStore's own direction-keyed fix (a value-only match let an
+   unrelated different-direction anomaly free-ride a frozen anchor and recover against a corrupted
+   reading, that store's round-2 external-review defect).
+
+   **Part-6 recovery mechanism (the doc's own "record which way you went" philosophy, applied to a
+   SECOND question this row's own history raised — not just the missing-anchor one below).**
+   DELIBERATELY OMITTED here: GatewayRouteStore's third marker field, `first_now_ms` (the reading an
+   anomaly was FIRST observed at), which bounds recovery to a real-time-plausible PERSISTENCE INTERVAL
+   rather than a bare (anchor, direction) match — without it, an ε-later second-replica pass reading
+   the SAME frozen marker recovers with zero persistence evidence (that store's own round-4 fix). This
+   gap is real in general but judged SAFE to omit for THIS sweep specifically: a too-eager recovery
+   here can only feed a still-corrupted `now_s` into the SAME would-wipe ratio guard and the SAME
+   unconditional per-pass cap (`kStuckExecReapCap = 500`) this sweep already carries for every
+   accepted pass — a spuriously-huge cutoff makes candidates a LARGE fraction of all running
+   executions (would-wipe's own job to catch) rather than a targeted, silent mass-cancel, and even
+   below the would-wipe floor the blast radius is capped at 500 ATOMICALLY-rechecked rows, each
+   individually re-verified against LIVE state at cancel time (the fix round 2 TOCTOU close, below) —
+   never a bare cutoff-matched DELETE/UPDATE the way GatewayRouteStore's own route-tombstone sweep is.
+   GatewayRouteStore has neither safety net for its own sweeps, which is why ITS omission of this
+   field was genuinely unsafe. If a future change ever removes either safety net here, this omission
+   must be re-examined against the same reasoning GatewayRouteStore's own entry above records.
+
+**Claim+mutate atomicity (fix round 2, not a clock-guard part but load-bearing for the SINGLE-WRITER
+rule above).** The original Part B design selected candidates under the advisory lock, then cancelled
+each one via a separate post-commit `mark_cancelled()` call after the lock released — a TOCTOU window
+in which a candidate could receive a genuine dispatch between the select and the cancel (force-
+cancelling a live, still-executing command), and a window in which two replicas could each acquire the
+lock in sequence and both select overlapping candidates, exceeding the declared cap fleet-wide per
+cadence. Fix round 2 moves the ENTIRE claim+mutate sequence — candidate select, would-wipe check, and
+a single atomic `UPDATE ... RETURNING id` re-checking the FULL candidate predicate (not just a
+terminal-status guard) — inside the SAME lock-held transaction, and switches the advisory lock itself
+from blocking to `pg_try_advisory_xact_lock` (all-but-holder skip, matching this store's
+`reap_event_outbox` sibling and `GatewayRouteStore`'s own idiom) so a losing replica's maintenance tick
+is never stalled waiting on it.
+
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a dispatch that is
+genuinely still stuck survives to the next pass regardless of whether this one's cutoff arithmetic
+used a fresh or a from-boot-skewed clock, so acting on the first pass against an unverified clock is
+an acceptable worst case, bounded by the same would-wipe/cap guards as any other pass.
+
 ### `guardian_lifecycle_journal.cpp`
 
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do
