@@ -11,9 +11,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
 #include <string>
+#include <thread>
 
 using namespace yuzu::agent;
 namespace fs = std::filesystem;
@@ -198,4 +202,37 @@ TEST_CASE("Updater constructs without error", "[updater][construct]") {
 
     // Verify stop works without prior start
     updater.stop();
+}
+
+// ── Stop unblocks the update loop (#2182) ───────────────────────────────────
+
+TEST_CASE("Updater::stop ends run_check_loop mid-interval", "[updater][stop][2182]") {
+    UpdateConfig config;
+    auto updater = std::make_shared<Updater>(config, "agent-2182", "0.1.0", "linux", "x86_64",
+                                             current_executable_path());
+
+    // A null stub makes check_and_apply fail fast ("null gRPC stub"), so the loop
+    // goes straight to its inter-check wait, here an hour long. The thread is
+    // detached and owns the Updater so a regression fails the bound below instead
+    // of hanging the suite at a std::thread destructor.
+    auto done = std::make_shared<std::promise<bool>>();
+    auto fut = done->get_future();
+    std::thread([updater, done] {
+        done->set_value(updater->run_check_loop(nullptr, std::chrono::hours{1}));
+    }).detach();
+
+    // Let the loop reach its wait, then stop as run()'s reconnect teardown does.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    updater->stop();
+
+    REQUIRE(fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    CHECK_FALSE(fut.get()); // stopped, no update applied
+}
+
+TEST_CASE("Updater::run_check_loop returns at once when already stopped",
+          "[updater][stop][2182]") {
+    UpdateConfig config;
+    Updater updater(config, "agent-2182", "0.1.0", "linux", "x86_64", current_executable_path());
+    updater.stop();
+    CHECK_FALSE(updater.run_check_loop(nullptr, std::chrono::hours{1}));
 }

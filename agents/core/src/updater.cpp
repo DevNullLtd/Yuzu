@@ -333,8 +333,29 @@ Updater::Updater(UpdateConfig config, std::string agent_id, std::string current_
       current_version_{std::move(current_version)}, os_{std::move(os)}, arch_{std::move(arch)},
       exe_path_{std::move(exe_path)} {}
 
+bool Updater::run_check_loop(void* stub, std::chrono::seconds interval) {
+    while (!stop_requested_.load(std::memory_order_acquire)) {
+        auto result = check_and_apply(stub);
+        if (result.has_value() && result.value())
+            return true;
+        if (!result.has_value())
+            spdlog::warn("OTA update check failed: {}", result.error().message);
+        // Wait out the interval on the stop state so stop() wakes us immediately.
+        std::unique_lock lk(stop_mu_);
+        stop_cv_.wait_for(lk, interval,
+                          [this] { return stop_requested_.load(std::memory_order_acquire); });
+    }
+    return false;
+}
+
 void Updater::stop() noexcept {
-    stop_requested_.store(true, std::memory_order_release);
+    {
+        // Store under stop_mu_ so a waiter between its predicate check and its block
+        // cannot miss the notify. Released before the TryCancel below (never both locks).
+        std::lock_guard lk(stop_mu_);
+        stop_requested_.store(true, std::memory_order_release);
+    }
+    stop_cv_.notify_all();
     // Unblock an in-flight OTA RPC. The stop flag alone is only observed
     // BETWEEN download chunks (and not at all during a stalled CheckForUpdate),
     // so a sick-but-not-dead server that withholds a chunk would otherwise park

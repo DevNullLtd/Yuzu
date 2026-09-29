@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <expected>
 #include <filesystem>
 #include <mutex>
@@ -98,9 +99,19 @@ public:
     /// On startup: if .old exists and current binary seems broken, roll back.
     [[nodiscard]] bool rollback_if_needed();
 
+    /// The OTA update-thread body: check_and_apply(), then wait `interval` for stop(),
+    /// repeated until stop() or an applied update. The wait is on THIS object's stop
+    /// state (condition variable notified by stop()), so stop() ends the loop promptly
+    /// even mid-interval; the caller's join() returns without waiting out the interval
+    /// (#2182). Returns true if an update was applied (process should restart).
+    [[nodiscard]] bool run_check_loop(void* stub, std::chrono::seconds interval);
+
+    /// Latches: a stopped Updater never runs again (run() builds a fresh one per connection).
     void stop() noexcept;
 
 private:
+    std::mutex stop_mu_; // guards the stop_requested_ store vs. the wait in run_check_loop
+    std::condition_variable stop_cv_;
     UpdateConfig config_;
     std::string agent_id_;
     std::string current_version_;

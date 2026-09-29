@@ -2118,24 +2118,11 @@ public:
                                                   updater = updater()]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
-                        while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater->check_and_apply(raw_stub);
-                            if (result.has_value() && result.value()) {
-                                spdlog::info("OTA update applied - agent will restart");
-                                stop();
-                                return;
-                            }
-                            if (!result.has_value()) {
-                                spdlog::warn("OTA update check failed: {}", result.error().message);
-                            }
-                            // Sleep in small increments so we can respond to stop quickly
-                            auto remaining = cfg_.update_check_interval;
-                            while (remaining.count() > 0 &&
-                                   !stop_requested_.load(std::memory_order_acquire)) {
-                                auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-                                std::this_thread::sleep_for(sleep_time);
-                                remaining -= sleep_time;
-                            }
+                        // Waits on the UPDATER's stop state, not AgentImpl::stop_requested_:
+                        // the reconnect teardown calls only Updater::stop() (#2182).
+                        if (updater->run_check_loop(raw_stub, cfg_.update_check_interval)) {
+                            spdlog::info("OTA update applied - agent will restart");
+                            stop();
                         }
                     });
                 }
