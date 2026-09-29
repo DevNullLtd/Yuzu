@@ -1647,7 +1647,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | firmware_posture | Y | Y | Y | Security |
 | platform_security | Y | Y | Y | Security |
 | browser_inventory | - | Y | - | Security |
-| local_security_policy | - | Y | Y | Security |
+| local_security_policy | Y | Y | Y | Security |
 | privacy_permissions | - | Y | - | Security |
 | system_hardening | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |

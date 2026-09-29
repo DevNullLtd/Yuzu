@@ -4,34 +4,17 @@
  * CFPropertyList bridge). Every decision lives in local_security_policy_parsers.hpp.
  * Each collect_* is defined by exactly one leg TU; a read returns 0, degradation is the status.
  *
- * Linux and macOS ship in this PR. Windows (secedit) and the `sudoers` action are PLANNED,
- * follow as their own PR -- until then `execute()` reports both as the honest planned state
- * inline (no collect_windows_policy leg exists in this PR at all; see plugin.cpp), same
- * "report planned, never claim an empty success" property as browser_policy's
- * mark_result_planned (browser_policy_legs.hpp) -- the one PLANNED-leg precedent actually
- * present in this tree; privacy_permissions (#5064) also ships the same pattern and now
- * lives in this repo at agents/plugins/privacy_permissions/.
- * The portable TU already builds a `local_security_policy.dll` on Windows even in this PR, and
- * deploy/packaging/windows/yuzu-agent.iss now installs it (adversarial-review finding: an
- * installed Windows agent previously could not reach even the planned-state row, since the
- * installer's per-DLL Sources list had no entry for this plugin at all).
+ * All three legs and all four actions are real: Linux and macOS read files (macOS also
+ * pwpolicy), Windows decodes `secedit /export` (local_security_policy_win.cpp), and `sudoers`
+ * reads /etc/sudoers and /etc/sudoers.d on Linux and macOS (Windows has no sudoers: it reports
+ * `unsupported`). Every leg reports degradation as the status, never an empty success.
  *
- * WHEN THE WINDOWS LEG LANDS: add local_security_policy_win.cpp back to meson.build's
- * files() list and the advapi32 dependency branch, add collect_windows_policy's declaration
- * back here, restore plugin.cpp's #if defined(_WIN32) dispatch to call it, flip the three
- * actions' windows_leg descriptors off YUZU_SUPPORT_PLANNED, then grep the tree for
- * "planned" and "follows as its own PR" and update every hit.
- *
- * WHEN THE SUDOERS ACTION LANDS: restore local_security_policy_parsers.hpp's sudoers block
- * (lines 310-845 of the pre-split file: detail::SudoersLexer, parse_sudoers,
- * sudoers_dir_entry_ignored), format_sudoers_row, and detail::sudoers_file; replace
- * collect_file_policy's `case LocalPolicyAction::Sudoers:` stub with the real body; restore
- * the 4th kActionDescriptors entry and the `execute()` guard that currently treats Sudoers
- * as unregistered; add the 4th plugin_action_catalogue_local_security_policy.hpp row; restore
- * the sudoers-specific test cases in test_local_security_policy_parsers.cpp; re-derive
- * EXPECTED_TOTAL_ROWS; restore a 7-field branch to Tally::truncation_marker() in
- * local_security_policy_parsers.hpp (removed in this PR since only the 4-field kv shape is
- * reachable here -- see that function's own doc comment).
+ * Sites that still name a leg's support level and must be revisited if one changes: the per-OS
+ * descriptors in local_security_policy_plugin.cpp (support level, mechanism, fallback; the
+ * leg-hash changes, so run `plugin_doc_gen.py --stamp`), the yaml `platforms` column and row
+ * descriptions, the README (How it works, Privileges, Result status, Sample, Caveats),
+ * docs/agent-privilege-model.md's row, the capability matrix row, the capability-map cell, the
+ * .claude/routed-concerns-security-posture.md row, and the capability catalogue header.
  */
 #pragma once
 
@@ -89,9 +72,8 @@ inline RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
 
 int collect_linux_policy(yuzu::CommandContext& ctx, std::string_view action);
 int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action);
-// collect_windows_policy is PLANNED, follows as its own PR (see this header's banner) -- no
-// declaration here yet; plugin.cpp's Windows branch reports the planned state inline instead
-// of calling a leg, so nothing needs to link against it in this PR.
+int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
+                           std::string_view data_dir);
 
 /// Writes the rows and the one status every leg reports (PERMISSION_DENIED only
 /// when nothing existing was readable -- see select_status). `action_prefix` is

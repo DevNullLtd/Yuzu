@@ -1,14 +1,18 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-24 · euid 501 · leg-hash 32441fb0dddd
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0fe9f183d5a9
 == action=password_policy
 password_policy|policy_content|policyAttributePassword matches '.{4,}+'|pwpolicy:com.apple.defaultpasswordpolicy.fde
 password_policy|minimum_length|4|pwpolicy:com.apple.defaultpasswordpolicy.fde
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
 
 == action=lockout_policy
 lockout_policy|policies|none|pwpolicy
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
 
 == action=audit_policy
 audit_policy|source_state|absent|/etc/security/audit_control
-[result_status] OK / FULL /
+[result_status] OK / FULL / 
+
+== action=sudoers
+sudoers|/etc/sudoers|unreadable|-|-|-|permission_denied
+[result_status] PERMISSION_DENIED / PARTIAL / /etc/sudoers:permission_denied
 

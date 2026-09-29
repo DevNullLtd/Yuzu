@@ -1,14 +1,8 @@
 /**
  * test_local_security_policy_parsers.cpp -- pure tests for the local_security_policy
- * plugin's PAM/login.defs/auditd parsers and pwpolicy row mapping. Runs on every OS:
+ * plugin's PAM/login.defs/auditd parsers, the sudoers lexer, the secedit export decode and row
+ * mapping, the Windows scratch-sweep decisions and the pwpolicy row mapping. Runs on every OS:
  * nothing here touches the filesystem, the registry or a process.
- *
- * The sudoers lexer and Windows scratch-sweep decisions are PLANNED, follow as their own PR
- * (see local_security_policy_legs.hpp's banner) -- their tests are not in this file; PR4
- * restores them. The secedit export's UTF-16LE decode and case-insensitive INI mapping
- * (decode_utf16le_bom / CaseInsensitiveLess / parse_inf_sections) have no caller yet either,
- * but ARE tested below -- they're pure and OS-independent, so there's no reason to ship them
- * untested ahead of PR4 (adversarial-review finding).
  *
  * No REAL CAPTURE fixtures here (unlike app_control/autoruns/runtimes): this plugin's
  * inputs are host-specific system files (a live pwpolicy plist) that vary machine to
@@ -22,6 +16,7 @@
 
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_parsers.hpp"
 
+#include "../../agents/plugins/local_security_policy/src/local_security_policy_scratch_sweep.hpp"
 #if defined(__APPLE__)
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_legs.hpp"
 #endif
@@ -814,3 +809,359 @@ TEST_CASE("local_security_policy pwpolicy_plist_to_items: a non-dictionary root 
 }
 #endif // defined(__APPLE__)
 
+TEST_CASE("local_security_policy sudoers: correctly-spelled aliases are their own kind",
+          "[local_security_policy][parsers][sudoers]") {
+    for (const auto& [kw, name] :
+         {std::pair{std::string{"User_Alias"}, std::string{"ADMINS"}},
+          std::pair{std::string{"Host_Alias"}, std::string{"WEBSERVERS"}},
+          std::pair{std::string{"Runas_Alias"}, std::string{"OP"}},
+          std::pair{std::string{"Cmnd_Alias"}, std::string{"SHELLS"}}}) {
+        const auto rows = parse_sudoers(kw + " " + name + " = /bin/sh\n");
+        INFO("keyword: " << kw);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].kind == "alias");
+        CHECK(rows[0].subject == kw + ":" + name);
+        CHECK(rows[0].commands == "/bin/sh");
+    }
+}
+
+// Regression for #4997 finding 2: `Cmd_Alias` (sudo-legal alternate spelling of
+// `Cmnd_Alias`) was NOT in the alias-keyword set, so this line fell through to
+// parse_user_spec and was silently accepted as an ordinary user grant for a
+// fictitious principal "Cmd_Alias" on host "SHELLS" -- under a clean OK/FULL result,
+// no failure token anywhere.
+TEST_CASE("local_security_policy sudoers: Cmd_Alias is recognised, never a fictitious grant",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows = parse_sudoers("Cmd_Alias SHELLS = /bin/sh\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].kind == "alias");
+    CHECK(rows[0].subject == "Cmd_Alias:SHELLS");
+    CHECK(rows[0].commands == "/bin/sh");
+    CHECK_FALSE(rows[0].kind == "user_spec"); // the bug this closes
+    CHECK_FALSE(rows[0].subject == "Cmd_Alias@SHELLS");
+}
+
+TEST_CASE("local_security_policy sudoers: Defaults, includes, comments",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows = parse_sudoers(
+        "Defaults env_reset\n"
+        "Defaults:alice !authenticate\n"
+        "#include /etc/sudoers.extra\n"
+        "@includedir /etc/sudoers.d\n"
+        "# a whole-line comment, never a row\n"
+        // A trailing `#1000` (a digit follows the '#') is a uid reference, not a
+        // comment -- so it is lexed as its own trailing word, which the user_spec
+        // grammar has no place for after the command list; the whole line is
+        // unmodelled, but with the `#1000` text kept, never swallowed as a comment.
+        "alice ALL = /bin/ls #1000\n");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[0].kind == "defaults");
+    CHECK(rows[0].subject == "-");
+    CHECK(rows[0].commands == "env_reset");
+    CHECK(rows[1].kind == "defaults");
+    CHECK(rows[1].subject == "user:alice");
+    CHECK(rows[1].commands == "!authenticate");
+    CHECK(rows[2].kind == "include");
+    CHECK(rows[2].commands == "/etc/sudoers.extra");
+    CHECK(rows[3].kind == "includedir");
+    CHECK(rows[3].commands == "/etc/sudoers.d");
+    CHECK(rows[4].kind == "unmodelled");
+    CHECK(rows[4].commands.find("#1000") != std::string::npos); // kept, not treated as a comment
+}
+
+// Regression for #4997 finding 3: command_args's break set wrongly included `=`
+// (correct only for command()'s own PATH-name scan just above it), truncating a
+// legal `--flag=value` sudoers command argument at the `=`.
+TEST_CASE("local_security_policy sudoers: command_args keeps '=' in an argument",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows =
+        parse_sudoers("deploy ALL=(root) NOPASSWD: /usr/bin/rsync --rsync-path=x\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].kind == "user_spec");
+    CHECK(rows[0].subject == "deploy@ALL");
+    CHECK(rows[0].runas == "root");
+    CHECK(rows[0].nopasswd == "true");
+    CHECK(rows[0].commands == "/usr/bin/rsync --rsync-path=x"); // NOT cut at '='
+
+    // A VAR=value environment-style argument survives the same way.
+    const auto env_rows = parse_sudoers("alice ALL = /usr/bin/make VAR=value target\n");
+    REQUIRE(env_rows.size() == 1);
+    CHECK(env_rows[0].commands == "/usr/bin/make VAR=value target");
+}
+
+TEST_CASE("local_security_policy sudoers: NOPASSWD/PASSWD clause splitting, runas carry-over",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows = parse_sudoers("alice ALL = (root) NOPASSWD: /bin/ls, PASSWD: /bin/cat\n");
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].subject == "alice@ALL");
+    CHECK(rows[0].runas == "root");
+    CHECK(rows[0].nopasswd == "true");
+    CHECK(rows[0].commands == "/bin/ls");
+    CHECK(rows[1].subject == "alice@ALL");
+    CHECK(rows[1].runas == "root"); // carried across the same clause
+    CHECK(rows[1].nopasswd == "false");
+    CHECK(rows[1].commands == "/bin/cat");
+
+    // Same NOPASSWD state, several commands: one entry, comma-joined.
+    const auto same = parse_sudoers("bob ALL = NOPASSWD: /bin/ls, /bin/cat\n");
+    REQUIRE(same.size() == 1);
+    CHECK(same[0].commands == "/bin/ls, /bin/cat");
+
+    // Two Host_List clauses on one line (colon-separated) are two independent entries.
+    const auto multi = parse_sudoers("carol HOST1 = /bin/ls : HOST2 = /bin/cat\n");
+    REQUIRE(multi.size() == 2);
+    CHECK(multi[0].subject == "carol@HOST1");
+    CHECK(multi[1].subject == "carol@HOST2");
+}
+
+// Regression for #4997 finding 2 (the fail-safe half): a grammatically malformed
+// grant that still carries an undecoded NOPASSWD:/PASSWD: tag is reported `unmodelled`
+// with the tag intact in its text -- the caller (sudoers_file) must treat this as a
+// failure, never a silent `false`.
+TEST_CASE("local_security_policy sudoers: an undecoded NOPASSWD tag is unmodelled, tag intact",
+          "[local_security_policy][parsers][sudoers]") {
+    // No command follows the tag -- ungrammatical, so parse_user_spec returns nullopt
+    // and the NOPASSWD: tag (already lexed into the statement text) survives verbatim.
+    const auto rows = parse_sudoers("alice ALL = NOPASSWD:\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].kind == "unmodelled");
+    CHECK(rows[0].commands.find("NOPASSWD:") != std::string::npos);
+    CHECK(detail::has_passwd_tag(rows[0].commands));
+}
+
+TEST_CASE("local_security_policy sudoers: has_passwd_tag word-boundary and spacing",
+          "[local_security_policy][parsers][sudoers]") {
+    CHECK(detail::has_passwd_tag("NOPASSWD:"));
+    CHECK(detail::has_passwd_tag("PASSWD:"));
+    CHECK(detail::has_passwd_tag("NOPASSWD  :")); // blanks before the colon still count
+    CHECK_FALSE(detail::has_passwd_tag("MYNOPASSWD:")); // part of a longer identifier
+    CHECK_FALSE(detail::has_passwd_tag("/bin/ls"));
+    CHECK_FALSE(detail::has_passwd_tag(""));
+}
+
+TEST_CASE("local_security_policy sudoers: quoted strings, IPv6 hosts, digests, negation",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows = parse_sudoers(
+        R"(alice ::1 = CWD="/tmp:x" sha256:abcd1234 !!/bin/ls)"
+        "\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].subject == "alice@::1"); // an IPv6 host, colon kept intact
+    CHECK(rows[0].commands.find(R"(CWD="/tmp:x")") != std::string::npos); // quoted value untouched
+    CHECK(rows[0].commands.find("sha256:abcd1234") != std::string::npos);
+    CHECK(rows[0].commands.find("/bin/ls") != std::string::npos); // even '!' count cancels out
+}
+
+TEST_CASE("local_security_policy sudoers.d: name filtering", "[local_security_policy][parsers][sudoers]") {
+    CHECK_FALSE(sudoers_dir_entry_ignored("readable"));
+    CHECK(sudoers_dir_entry_ignored("webadmins.rpmnew"));
+    CHECK(sudoers_dir_entry_ignored("backup~"));
+    CHECK_FALSE(sudoers_dir_entry_ignored(""));
+}
+
+// ── errno classification / status selection ───────────────────────────────────────
+
+TEST_CASE("local_security_policy collect_file_policy: sudoers end to end, undecoded tag is CONSTRAINED",
+          "[local_security_policy][parsers]") {
+    auto rd = reader_from({{"/etc/sudoers", "alice ALL = NOPASSWD:\n"}});
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, empty_dir());
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("/etc/sudoers:undecoded_passwd_tag") != std::string::npos);
+    bool saw_unmodelled = false;
+    for (const auto& r : c.rows)
+        if (r.rfind("sudoers|/etc/sudoers|unmodelled|", 0) == 0) saw_unmodelled = true;
+    CHECK(saw_unmodelled);
+}
+
+TEST_CASE("local_security_policy collect_file_policy: sudoers.d name filtering and per-file reads",
+          "[local_security_policy][parsers]") {
+    auto rd = reader_from({{"/etc/sudoers", "alice ALL = /bin/ls\n"},
+                           {"/etc/sudoers.d/readable", "bob ALL = /bin/cat\n"}});
+    const auto dl = [](const std::string& path) -> DirList {
+        if (path == "/etc/sudoers.d")
+            return {0, {"backup~", "readable", "webadmins.rpmnew"}, false};
+        return {};
+    };
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, dl);
+    CHECK(c.status == PolicyStatus::Ok);
+    int ignored = 0, real = 0;
+    for (const auto& r : c.rows) {
+        if (r.find("|ignored|") != std::string::npos) ++ignored;
+        if (r.rfind("sudoers|/etc/sudoers.d/readable|user_spec|", 0) == 0) ++real;
+    }
+    CHECK(ignored == 2); // backup~ (trailing '~') and webadmins.rpmnew (a '.')
+    CHECK(real == 1);
+}
+
+TEST_CASE("local_security_policy secedit: audit setting bitmask", "[local_security_policy][parsers][secedit]") {
+    CHECK(secedit_audit_setting("0") == "none");
+    CHECK(secedit_audit_setting("1") == "success");
+    CHECK(secedit_audit_setting("2") == "failure");
+    CHECK(secedit_audit_setting("3") == "success_failure");
+    CHECK(secedit_audit_setting("9") == "unmodelled:9");
+}
+
+TEST_CASE("local_security_policy secedit: export completeness requires the signed final [Version]",
+          "[local_security_policy][parsers][secedit]") {
+    const std::string full =
+        "[System Access]\nMinimumPasswordLength = 8\n"
+        "[Event Audit]\nAuditSystemEvents = 3\n"
+        "[Version]\nsignature=\"$CHICAGO$\"\nRevision=1\n";
+    CHECK(secedit_export_complete(full));
+    // Case-insensitive section/key names -- the INF rule.
+    const std::string lower =
+        "[system access]\nminimumpasswordlength = 8\n"
+        "[event audit]\n"
+        "[version]\nSIGNATURE=\"$CHICAGO$\"\n";
+    CHECK(secedit_export_complete(lower));
+    CHECK_FALSE(secedit_export_complete("[System Access]\n[Version]\nsignature=\"$CHICAGO$\"\n")); // no Event Audit
+    CHECK_FALSE(secedit_export_complete(full + "[Extra]\nx=1\n")); // Version not the FINAL section
+    CHECK_FALSE(secedit_export_complete("[System Access]\n[Event Audit]\n[Version]\n")); // unsigned
+    CHECK_FALSE(secedit_export_complete(""));
+}
+
+TEST_CASE("local_security_policy secedit_policy_rows: audit, password, lockout, unsupported",
+          "[local_security_policy][parsers][secedit]") {
+    const auto sections = parse_inf_sections(
+        "[System Access]\nMinimumPasswordLength = 14\nLockoutBadCount = 0\n"
+        "[Event Audit]\nAuditSystemEvents = 3\nAuditLogonEvents = 1\n");
+    const auto pw = secedit_policy_rows("password_policy", sections);
+    CHECK(pw.failure_token.empty());
+    bool saw_len = false, saw_absent_history = false;
+    for (const auto& r : pw.rows) {
+        if (r == "password_policy|MinimumPasswordLength|14|secedit") saw_len = true;
+        if (r == "password_policy|PasswordHistorySize|absent|secedit") saw_absent_history = true;
+    }
+    CHECK(saw_len);
+    CHECK(saw_absent_history); // a key the export doesn't carry reads the modal "absent"
+
+    const auto lock = secedit_policy_rows("lockout_policy", sections);
+    bool saw_zero = false;
+    for (const auto& r : lock.rows)
+        if (r == "lockout_policy|LockoutBadCount|0|secedit") saw_zero = true;
+    CHECK(saw_zero);
+
+    const auto audit = secedit_policy_rows("audit_policy", sections);
+    CHECK(audit.rows == std::vector<std::string>{"audit_policy|AuditLogonEvents|success|secedit",
+                                                  "audit_policy|AuditSystemEvents|success_failure|secedit"});
+
+    const auto unsup = secedit_policy_rows("sudoers", sections);
+    CHECK(unsup.failure_token == "secedit:unsupported_action");
+    CHECK(unsup.rows.empty());
+
+    const auto missing = secedit_policy_rows("audit_policy", InfSections{});
+    CHECK(missing.failure_token == "secedit:section_missing_event_audit");
+}
+
+// Regression for #4997 finding 4: the per-key row lookup used a plain
+// std::map<std::string,...> ordered/looked-up by exact bytes, so a present but
+// differently-cased section or key silently read as the modal "absent" under a
+// clean OK/FULL result.
+TEST_CASE("local_security_policy secedit: case-insensitive section/key lookup",
+          "[local_security_policy][parsers][secedit]") {
+    const auto sections = parse_inf_sections("[system access]\nminimumpasswordlength = 14\n");
+    const auto pw = secedit_policy_rows("password_policy", sections);
+    CHECK(pw.failure_token.empty());
+    bool saw_len = false;
+    for (const auto& r : pw.rows) {
+        CHECK(r != "password_policy|MinimumPasswordLength|absent|secedit"); // the bug this closes
+        if (r == "password_policy|MinimumPasswordLength|14|secedit") saw_len = true;
+    }
+    CHECK(saw_len);
+}
+
+TEST_CASE("local_security_policy sweep: scratch directory name validation",
+          "[local_security_policy][parsers][sweep]") {
+    CHECK(is_scratch_dir_name("local_security_policy-0123456789abcdef0123456789ABCDEF"));
+    CHECK_FALSE(is_scratch_dir_name("local_security_policy-tooshort"));
+    CHECK_FALSE(is_scratch_dir_name("local_security_policy-0123456789abcdef0123456789abcdeg")); // 'g' not hex
+    CHECK_FALSE(is_scratch_dir_name("other_plugin-0123456789abcdef0123456789abcdef"));
+    CHECK_FALSE(is_scratch_dir_name("local_security_policy-"));
+    CHECK_FALSE(is_scratch_dir_name(""));
+}
+
+TEST_CASE("local_security_policy sweep: staleness is strict, exact equality is fresh",
+          "[local_security_policy][parsers][sweep]") {
+    CHECK_FALSE(is_stale(1000, 1000 + 3600, 3600));       // exactly the threshold: fresh
+    CHECK(is_stale(1000, 1000 + 3601, 3600));             // one second past: stale
+    CHECK_FALSE(is_stale(1000, 500, 3600));               // a future-dated mtime (clock skew): fresh
+}
+
+TEST_CASE("local_security_policy sweep: candidate classification covers all four states",
+          "[local_security_policy][parsers][sweep]") {
+    const std::string name = "local_security_policy-0123456789abcdef0123456789abcdef";
+    CHECK(classify_sweep_candidate("not_a_match", true, 0, 4000, 3600) == SweepCandidate::NotCandidate);
+    CHECK(classify_sweep_candidate(name, false, 0, 4000, 3600) == SweepCandidate::NotCandidate); // not a directory
+    CHECK(classify_sweep_candidate(name, true, std::nullopt, 4000, 3600) == SweepCandidate::NoMtime);
+    CHECK(classify_sweep_candidate(name, true, 3999, 4000, 3600) == SweepCandidate::Fresh);
+    CHECK(classify_sweep_candidate(name, true, 0, 3601, 3600) == SweepCandidate::Stale);
+}
+
+TEST_CASE("local_security_policy sweep: ownership gate and log-worthiness",
+          "[local_security_policy][parsers][sweep]") {
+    CHECK(sweep_may_remove(true));
+    CHECK_FALSE(sweep_may_remove(false));
+
+    CHECK_FALSE(sweep_worth_logging({})); // an all-zero steady-state pass says nothing
+    ScratchSweepResult removed_one;
+    removed_one.removed = 1;
+    CHECK(sweep_worth_logging(removed_one));
+    ScratchSweepResult failed_one;
+    failed_one.failed = 1;
+    CHECK(sweep_worth_logging(failed_one));
+    ScratchSweepResult foreign;
+    foreign.skipped_not_ours = 1;
+    CHECK(sweep_worth_logging(foreign));
+    ScratchSweepResult deferred;
+    deferred.deferred = 1;
+    CHECK(sweep_worth_logging(deferred));
+    ScratchSweepResult fresh_only;
+    fresh_only.skipped_fresh = 3; // fresh candidates alone are not worth a log line
+    CHECK_FALSE(sweep_worth_logging(fresh_only));
+
+    ScratchSweepResult r;
+    r.removed = 2;
+    r.failed = 1;
+    r.skipped_fresh = 3;
+    r.skipped_not_ours = 1;
+    r.deferred = 1;
+    CHECK(format_sweep_summary(r) ==
+          "scratch_sweep: removed 2 failed 1 fresh 3 not_ours 1 deferred 1");
+}
+
+TEST_CASE("local_security_policy sweep: secedit run/read classification",
+          "[local_security_policy][parsers][sweep]") {
+    CHECK(classify_export_run(RunEnd::SpawnError, 0) == "secedit:spawn_error");
+    CHECK(classify_export_run(RunEnd::Deadline, 0) == "secedit:deadline");
+    CHECK(classify_export_run(RunEnd::Cancelled, 0) == "secedit:cancelled");
+    CHECK(classify_export_run(RunEnd::Signaled, 0) == "secedit:signaled");
+    CHECK(classify_export_run(RunEnd::Other, 0) == "secedit:unexpected_termination");
+    CHECK(classify_export_run(RunEnd::Exited, 0).empty());
+    CHECK(classify_export_run(RunEnd::Exited, 1) == "secedit:exit_1");
+
+    const auto denied = classify_export_read_error(kWin32AccessDenied);
+    CHECK(denied.permission_denied);
+    CHECK(denied.token == "secedit:access_denied");
+    for (const auto err : {kWin32FileNotFound, kWin32PathNotFound}) {
+        const auto missing = classify_export_read_error(err);
+        CHECK_FALSE(missing.permission_denied);
+        CHECK(missing.token == "secedit:output_missing");
+    }
+    const auto other = classify_export_read_error(1234);
+    CHECK_FALSE(other.permission_denied);
+    CHECK(other.token == "secedit:read_1234");
+
+    CHECK_FALSE(classify_export_object(false, 100).has_value()); // usable
+    REQUIRE(classify_export_object(true, 100).has_value());
+    CHECK(classify_export_object(true, 100)->token == "secedit:output_not_regular");
+    REQUIRE(classify_export_object(false, kExportMaxBytes + 1).has_value());
+    CHECK(classify_export_object(false, kExportMaxBytes + 1)->token == "secedit:output_oversized");
+
+    CHECK(classify_export_read_length(100, 100).empty());
+    CHECK(classify_export_read_length(100, 50) == "secedit:output_short_read");
+
+    CHECK(classify_decoded_export(std::nullopt) == "secedit:decode_failed");
+    CHECK(classify_decoded_export(std::optional<std::string>{""}) == "secedit:decode_failed");
+    CHECK(classify_decoded_export(std::optional<std::string>{std::string("a\0b", 3)}) ==
+          "secedit:embedded_nul");
+    CHECK(classify_decoded_export(std::optional<std::string>{"clean text"}).empty());
+}

@@ -3,10 +3,9 @@
  * or clock. Every decision (errno class, status, row shape) is a function here; the
  * leg TUs only read bytes and hand them in.
  *
- * Linux and macOS legs (password_policy, lockout_policy, audit_policy) ship in this PR.
- * The Windows leg and the `sudoers` action are PLANNED, follow as their own PR -- see
- * local_security_policy_legs.hpp's banner. Nothing in this file emits the `sudoers|...`
- * 7-field row or the Windows 2-field diagnostic row today.
+ * All four actions (password_policy, lockout_policy, audit_policy, sudoers) and all three
+ * legs (Linux, macOS, Windows) read today. `sudoers` emits the 7-field row below; the Windows
+ * leg decodes a secedit export here and returns the 2-field diagnostic row on its own faults.
  *
  * Rows (fields through safe_output_field):
  *   <action>|<key>|<value>|<source>          password_policy, lockout_policy, audit_policy
@@ -102,14 +101,12 @@ inline std::optional<std::string> decode_utf16le_bom(std::span<const std::uint8_
 }
 
 /// Case-insensitive `std::map` ordering/lookup for INI section and key names (the INF
-/// rule), restored from the pre-split secedit implementation this PR does not ship:
-/// `secedit_export_complete` and `secedit_policy_rows` (PLANNED, follow with the Windows
-/// leg in their own PR -- see this file's "WHEN THE SUDOERS ACTION LANDS" banner) will
-/// compare section/key names case-insensitively; a plain `std::map<std::string,...>`
+/// rule): `secedit_export_complete` and `secedit_policy_rows` compare section/key names
+/// case-insensitively; a plain `std::map<std::string,...>`
 /// orders and looks up by exact bytes, so a differently-cased section or key that passed
 /// the completeness check would be invisible to the row lookups -- a present setting
 /// silently reading as the legitimate modal value `absent` (#4997, the defect this type
-/// exists to prevent once its callers land). `is_transparent` lets `.find()` take a
+/// exists to prevent). `is_transparent` lets `.find()` take a
 /// `std::string_view` literal directly. Values keep whatever casing the export file used
 /// -- only lookup/ordering are case-insensitive.
 struct CaseInsensitiveLess {
@@ -129,8 +126,7 @@ struct CaseInsensitiveLess {
 /// before the first section are ignored; a repeated key keeps the last value
 /// (case-insensitively -- see CaseInsensitiveLess -- so `MinimumPasswordLength` and a
 /// later `minimumpasswordlength` in the same section are the same key). std::map, not
-/// unordered: the PLANNED `secedit_policy_rows` (see CaseInsensitiveLess's comment) will
-/// iterate `[Event Audit]` directly once it lands, so the key order IS meant to become the
+/// unordered: `secedit_policy_rows` iterates `[Event Audit]` directly, so the key order IS the
 /// audit_policy row order on the wire.
 using InfSections =
     std::map<std::string, std::map<std::string, std::string, CaseInsensitiveLess>, CaseInsensitiveLess>;
@@ -312,6 +308,543 @@ inline std::string audit_enabled_token(std::string_view v) {
     return "unmodelled:" + std::string{v}; // escaped once, by the row formatter
 }
 
+// ---- sudoers ------------------------------------------------------------------------
+
+struct SudoersEntry {
+    std::string kind, subject, runas, nopasswd, commands;
+};
+
+namespace detail {
+
+/// One sudoers token over SudoersStatement::text[b, e). `kind` is the character itself
+/// for `( ) , = : ! >`, else 'w' a word (name, alias, keyword, %group, +netgroup, #uid,
+/// IP address), 's' a double-quoted string, 'c' a command (a path, regex or sudoedit with
+/// its arguments), 't' a tag with its colon, 'd' a digest spec, 'x' text sudo rejects.
+struct SudoersToken {
+    char kind;
+    std::size_t b, e;
+};
+
+/// One statement: comments cut, each line continuation replaced by one blank (by nothing
+/// inside a quoted string, as sudo joins it) and every other blank run by one blank.
+struct SudoersStatement {
+    std::string text;
+    std::vector<SudoersToken> toks;
+};
+
+inline constexpr std::string_view kSudoersTags[] = {
+    "NOPASSWD", "PASSWD", "NOEXEC", "EXEC", "INTERCEPT", "NOINTERCEPT", "SETENV", "NOSETENV",
+    "LOG_OUTPUT", "NOLOG_OUTPUT", "LOG_INPUT", "NOLOG_INPUT", "MAIL", "NOMAIL", "FOLLOW",
+    "NOFOLLOW"};
+inline constexpr std::string_view kSudoersOptions[] = {
+    "CWD", "CHROOT", "TIMEOUT", "NOTBEFORE", "NOTAFTER", "ROLE", "TYPE", "APPARMOR_PROFILE",
+    "PRIVS", "LIMITPRIVS"};
+
+/// sudoers(5) lexing in ONE linear pass, following sudo 1.9.16's toke.l rather than
+/// approximating it -- each ad-hoc scan it replaces reported a passwordless grant as
+/// `nopasswd=false` for some legal line. The rules that decide a statement's shape:
+///  - `#` starts a comment unless followed by a digit (`#1000`, a uid) or inside double
+///    quotes, glued to a token or not (`/bin/ls#note` is `/bin/ls` then a comment). A
+///    comment runs to the end of the physical line and ENDS the statement: a `\` before
+///    or inside it never continues onto the next line. `#include` is a directive only in
+///    column 0.
+///  - `\`, optional blanks, newline continues the statement, except glued to a word as
+///    `\ ` (an escaped blank, as sudo's WORD) -- and `\ # x` is an escaped blank, then a
+///    comment, so it does not continue either.
+///  - A command (`/path`, `^regex$`, `sudoedit`) takes arguments up to an unescaped
+///    `#`, `:`, `,` or `=`; a double quote there is literal. Elsewhere `"..."` is one
+///    token (`CWD="/x y:z"`) with `\"` inside it, and `\` escapes the next character.
+///  - `NAME:` with a tag name (blanks allowed before the colon) is one tag token, a
+///    `sha224`..`sha512` digest with its colon and digest is one token, and an IPv6
+///    literal (`2001:db8::1`, `::1`) is one word -- so no colon inside any of them is
+///    ever a separator.
+class SudoersLexer {
+public:
+    explicit SudoersLexer(std::string_view src) : s_{src} {}
+
+    std::vector<SudoersStatement> run() {
+        while (i_ < s_.size()) step();
+        end_statement();
+        return std::move(out_);
+    }
+
+private:
+    std::string_view s_;
+    std::size_t i_ = 0, bol_ = 0;
+    SudoersStatement st_;
+    std::vector<SudoersStatement> out_;
+    bool blank_ = false, defaults_ = false, want_value_ = false, bad_ = false;
+    static constexpr std::size_t npos = std::string_view::npos;
+
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+    static bool xdigit(char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }
+    [[nodiscard]] char at(std::size_t k) const { return k < s_.size() ? s_[k] : '\0'; }
+    [[nodiscard]] std::size_t newline_len(std::size_t k) const {
+        return at(k) == '\n' ? 1 : (at(k) == '\r' && at(k + 1) == '\n' ? 2 : 0);
+    }
+    /// Index just past a line continuation (`\`, blanks, newline) starting at k, or 0.
+    [[nodiscard]] std::size_t continuation(std::size_t k) const {
+        if (at(k) != '\\') return 0;
+        for (++k; at(k) == ' ' || at(k) == '\t'; ++k) {}
+        const std::size_t nl = newline_len(k);
+        return nl != 0 ? k + nl : 0;
+    }
+    std::size_t mark() {
+        if (blank_ && !st_.text.empty()) st_.text += ' ';
+        blank_ = false;
+        return st_.text.size();
+    }
+    void put(char c) {
+        mark();
+        st_.text += c;
+    }
+    void emit(char kind, std::size_t b) { st_.toks.push_back({kind, b, st_.text.size()}); }
+    void end_statement() {
+        if (!st_.text.empty()) out_.push_back(std::move(st_));
+        st_ = {};
+        blank_ = defaults_ = want_value_ = false;
+    }
+
+    void step() {
+        const char c = s_[i_];
+        if (const std::size_t nl = newline_len(i_)) {
+            i_ = bol_ = i_ + nl;
+            return end_statement();
+        }
+        if (c == ' ' || c == '\t' || c == '\r') {
+            blank_ = true;
+            ++i_;
+            return;
+        }
+        if (const std::size_t next = continuation(i_)) {
+            blank_ = true;
+            i_ = bol_ = next;
+            return;
+        }
+        const bool uid = digit(at(i_ + 1)) || (at(i_ + 1) == '-' && digit(at(i_ + 2)));
+        if (c == '#' && !uid) {
+            if (i_ == bol_ && st_.toks.empty() && include_directive()) return;
+            while (i_ < s_.size() && newline_len(i_) == 0) ++i_; // a comment
+            return;
+        }
+        const std::size_t b = mark();
+        if (c == '"') return quoted(b);
+        if (!defaults_ && !want_value_ && (c == '/' || c == '^')) return command(b);
+        if (const std::size_t n = ipv6_len()) {
+            copy(n);
+            want_value_ = false;
+            return emit('w', b);
+        }
+        if (c == '!') {
+            std::size_t n = 0;
+            for (; at(i_) == '!'; ++n) copy(1);
+            if (n % 2 == 1) emit('!', b); // an even run cancels out, as in sudo
+            return;
+        }
+        if (std::string_view{"(),=:>"}.find(c) != npos) {
+            copy(1);
+            return emit(c, b);
+        }
+        for (const auto name : kSudoersTags) {
+            if (!s_.substr(i_).starts_with(name)) continue;
+            std::size_t k = i_ + name.size();
+            while (at(k) == ' ' || at(k) == '\t') ++k;
+            if (at(k) != ':') continue;
+            st_.text.append(name);
+            st_.text += ':';
+            i_ = k + 1;
+            return emit('t', b);
+        }
+        word(b);
+    }
+
+    void copy(std::size_t n) {
+        for (std::size_t k = 0; k < n; ++k) put(s_[i_ + k]);
+        i_ += n;
+    }
+
+    bool include_directive() {
+        for (const std::string_view d : {"#includedir", "#include"}) {
+            const char after = at(i_ + d.size());
+            if (!s_.substr(i_).starts_with(d) || (after != ' ' && after != '\t')) continue;
+            const std::size_t b = mark();
+            copy(d.size());
+            emit('w', b);
+            include_path();
+            return true;
+        }
+        return false;
+    }
+
+    /// The path after an include directive (toke.l GOTINC): quoted, or non-space text.
+    void include_path() {
+        while (at(i_) == ' ' || at(i_) == '\t') {
+            blank_ = true;
+            ++i_;
+        }
+        const std::size_t b = mark();
+        if (at(i_) == '"') return quoted(b);
+        while (i_ < s_.size() && std::isspace(static_cast<unsigned char>(s_[i_])) == 0)
+            copy(s_[i_] == '\\' && (at(i_ + 1) == ' ' || at(i_ + 1) == '\t') ? 2 : 1);
+        if (st_.text.size() > b) emit('w', b);
+    }
+
+    void quoted(std::size_t b) {
+        copy(1);
+        for (;;) {
+            if (i_ >= s_.size() || newline_len(i_) != 0) return emit('x', b); // unterminated
+            if (const std::size_t next = continuation(i_)) {
+                for (i_ = bol_ = next; at(i_) == ' ' || at(i_) == '\t';) ++i_;
+                continue;
+            }
+            const char ch = s_[i_];
+            copy(ch == '\\' && at(i_ + 1) == '"' ? 2 : 1);
+            if (ch == '"') break;
+        }
+        want_value_ = false;
+        emit('s', b);
+    }
+
+    /// Length of an IPv6 literal at i_ (toke.l IPV6ADDR, with an optional /prefix), or 0.
+    [[nodiscard]] std::size_t ipv6_len() const {
+        const auto hex = [this](std::size_t k) {
+            std::size_t n = 0;
+            while (n < 4 && xdigit(at(k + n))) ++n;
+            return n;
+        };
+        std::size_t k = i_, groups = 0;
+        for (; groups < 7 && at(k + hex(k)) == ':'; ++groups) k += hex(k) + 1;
+        if (groups < 2) return 0;
+        k += hex(k);
+        while (digit(at(k)) || at(k) == '.') ++k; // an embedded IPv4 tail
+        if (at(k) == '/')
+            for (++k; xdigit(at(k)) || at(k) == ':' || at(k) == '.';) ++k;
+        return k - i_;
+    }
+
+    void word(std::size_t b) {
+        if (at(i_) == '%') copy(at(i_ + 1) == ':' ? 2 : 1);
+        if (at(i_) == '#') { // #uid, %#gid
+            copy(at(i_ + 1) == '-' ? 2 : 1);
+            while (digit(at(i_))) copy(1);
+        } else {
+            while (i_ < s_.size()) {
+                const char ch = s_[i_];
+                if (ch == '\\') {
+                    const char n = at(i_ + 1);
+                    if (i_ + 1 >= s_.size() || n == '\n' || n == '\r' || (n == '\t' && !defaults_))
+                        break;
+                    copy(2);
+                } else if (std::string_view{"#>!=:,() \t\r\n\""}.find(ch) == npos) {
+                    copy(1);
+                } else {
+                    break;
+                }
+            }
+        }
+        if (st_.text.size() == b) { // nothing sudo lexes starts here
+            copy(1);
+            return emit('x', b);
+        }
+        const std::string w = st_.text.substr(b);
+        if (w == "sudoedit" && !defaults_ && !want_value_) return command_args(b);
+        if (w == "sha224" || w == "sha256" || w == "sha384" || w == "sha512") {
+            std::size_t k = i_;
+            while (at(k) == ' ' || at(k) == '\t') ++k;
+            std::size_t d = k + 1;
+            while (at(d) == ' ' || at(d) == '\t') ++d;
+            const std::size_t d0 = d;
+            const auto digest_char = [](char ch) {
+                return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '+' || ch == '/' ||
+                       ch == '=';
+            };
+            while (digest_char(at(d))) ++d;
+            if (at(k) == ':' && d > d0) {
+                st_.text += ':';
+                i_ = d0;
+                copy(d - d0);
+                return emit('d', b);
+            }
+        }
+        if (st_.toks.empty() && w.starts_with("Defaults") && (w.size() == 8 || w[8] == '@'))
+            defaults_ = true;
+        emit('w', b);
+        if (w == "@include" || w == "@includedir") include_path();
+        want_value_ = w == "CWD" || w == "CHROOT"; // toke.l EXPECTPATH: the value is no command
+    }
+
+    void command(std::size_t b) {
+        if (s_[i_] == '/') {
+            while (i_ < s_.size()) {
+                const char ch = s_[i_];
+                if (ch == '\\' && i_ + 1 < s_.size() &&
+                    std::string_view{",:= \t#"}.find(s_[i_ + 1]) != npos)
+                    copy(2);
+                else if (std::string_view{",:=\\ \t\r\n#"}.find(ch) == npos)
+                    copy(1);
+                else
+                    break;
+            }
+            if (st_.text.back() == '/') return emit('c', b); // a directory takes no arguments
+            return command_args(b);
+        }
+        // toke.l REGEX is the LONGEST match: it ends at the last `$` before an unescaped
+        // `#`, an unescaped `$` or the line end.
+        std::size_t end = 0, k = i_ + 1;
+        for (; k < s_.size() && newline_len(k) == 0; ++k) {
+            const bool escaped = s_[k - 1] == '\\';
+            if (s_[k] == '#' && !escaped) break;
+            if (s_[k] == '$') {
+                end = k + 1;
+                if (!escaped) break;
+            }
+        }
+        if (end == 0) { // unterminated: consumed whole, so no later `^` rescans it
+            copy(k - i_);
+            return emit('x', b);
+        }
+        copy(end - i_);
+        command_args(b);
+    }
+
+    /// toke.l GOTCMND: arguments run to an unescaped `#`, `:`, `,` or the line end. `=` is
+    /// an ordinary argument character here (env assignments, `--flag=value`) -- it is NOT
+    /// in this break set, unlike command()'s own PATH-name scan just above, where `=` DOES
+    /// end the token per toke.l's PATH rule and must stay excluded there. Including it here
+    /// too used to cut a legal `NOPASSWD: /usr/bin/rsync --rsync-path=x` at the `=`,
+    /// misreporting it `unmodelled` (#4997; loud via the undecoded_passwd_tag fail-safe,
+    /// since the raw NOPASSWD: text survives -- not silent, but still wrong).
+    void command_args(std::size_t b) {
+        bad_ = false;
+        bool have_arg = false;
+        while (i_ < s_.size() && newline_len(i_) == 0) {
+            const char ch = s_[i_];
+            if (std::string_view{"#:,"}.find(ch) != npos) break;
+            if (ch == ' ' || ch == '\t' || ch == '\r') {
+                blank_ = true;
+                ++i_;
+            } else if (const std::size_t next = continuation(i_)) {
+                blank_ = true;
+                i_ = bol_ = next;
+            } else if (ch == '^' && !have_arg) {
+                arg_regex();
+                break;
+            } else if (ch == '\\') {
+                const bool known = i_ + 1 < s_.size() &&
+                    std::string_view{":\\,= \t#*?[]!^"}.find(s_[i_ + 1]) != npos;
+                bad_ = bad_ || !known;
+                copy(known ? 2 : 1);
+                have_arg = true;
+            } else {
+                copy(1);
+                have_arg = true;
+            }
+        }
+        emit(bad_ ? 'x' : 'c', b);
+    }
+
+    /// toke.l GOTREGEX: a first argument `^...$` may hold blanks, commas and colons; it
+    /// ends the command. `#` or a line end inside it is an error.
+    void arg_regex() {
+        copy(1);
+        while (i_ < s_.size() && newline_len(i_) == 0 && s_[i_] != '#') {
+            if (const std::size_t next = continuation(i_)) {
+                i_ = bol_ = next;
+                continue;
+            }
+            const char ch = s_[i_];
+            copy(ch == '\\' && i_ + 1 < s_.size() && newline_len(i_ + 1) == 0 ? 2 : 1);
+            if (ch == '$') return;
+        }
+        bad_ = true;
+    }
+};
+
+inline bool is_option_name(std::string_view w) {
+    return std::find(std::begin(kSudoersOptions), std::end(kSudoersOptions), w) !=
+           std::end(kSudoersOptions);
+}
+
+/// True when `s` still carries an unescaped `NOPASSWD:` / `PASSWD:` tag (blanks
+/// allowed before the colon). A decoded tag is removed from the row's text, so
+/// one found here was NOT decoded into the `nopasswd` column.
+inline bool has_passwd_tag(std::string_view s) {
+    for (std::size_t at = 0; (at = s.find("PASSWD", at)) != std::string_view::npos; ++at) {
+        const std::size_t b = at >= 2 && s.substr(at - 2, 2) == "NO" ? at - 2 : at;
+        if (b > 0 && (std::isalnum(static_cast<unsigned char>(s[b - 1])) || s[b - 1] == '_'))
+            continue;
+        std::size_t e = at + 6;
+        while (e < s.size() && (s[e] == ' ' || s[e] == '\t')) ++e;
+        if (e < s.size() && s[e] == ':') return true;
+    }
+    return false;
+}
+
+/// One lexed user spec, parsed by the sudoers(5) grammar:
+/// `User_List Host_List = Cmnd_Spec_List (: Host_List = Cmnd_Spec_List)*`, each
+/// Cmnd_Spec `[(Runas)] Option_Spec* Tag_Spec* Digest_Spec* !* Cmnd`. One entry per
+/// contiguous (runas, NOPASSWD) run of each Host_List clause; runas and tags carry
+/// across one clause's Cmnd_Specs, never into the next clause. Every tag other than
+/// NOPASSWD:/PASSWD: is kept in the command text as `TAG: `, every Option_Spec verbatim.
+/// nullopt when the tokens do not follow the grammar.
+///
+/// WHAT `nopasswd` GUARANTEES: the clause colon is a token, so a `:` inside a quoted
+/// Option_Spec value, an IPv6 host, a digest, a runas group or an escape never splits a
+/// clause. Defence in depth: a NOPASSWD:/PASSWD: tag that still survives into any field
+/// makes the whole line nullopt -- parse_sudoers reports it `unmodelled` and the collector
+/// adds `<file>:undecoded_passwd_tag` (CONSTRAINED). Known limits: this is sudo 1.9.16's
+/// lexing (checked against it differentially); the column is the tag alone (a Defaults
+/// `!authenticate` also removes the password prompt); aliases and includes are not
+/// resolved; and a line sudo itself rejects is reported best-effort.
+/// Output bounds for one user spec. Every clause repeats the User_List in its
+/// subject, so a single grammar-legal 256 KiB line could otherwise expand into
+/// gigabytes of rows (a 128 KiB User_List times ~18K ':'-joined clauses). A
+/// User_List or Host_List longer than kMaxSudoersListBytes, or a line yielding
+/// more than kMaxSudoersLineEntries entries, is not decoded: the caller reports
+/// the line once as `unmodelled` with its raw text, and a NOPASSWD:/PASSWD: tag in
+/// it still trips the undecoded_passwd_tag failure. Output per line stays O(line).
+inline constexpr std::size_t kMaxSudoersListBytes = 4096;
+inline constexpr std::size_t kMaxSudoersLineEntries = 4096;
+
+inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersStatement& st) {
+    const auto& t = st.toks;
+    const std::string_view text = st.text;
+    std::size_t k = 0;
+    const auto is = [&](char kind) { return k < t.size() && t[k].kind == kind; };
+    const auto span = [&](std::size_t b, std::size_t e) {
+        return std::string{text.substr(b, e - b)};
+    };
+    // User_List / Host_List: item (',' item)*, item = '!'* word-or-string; verbatim text.
+    const auto member_list = [&]() -> std::optional<std::string> {
+        const std::size_t first = k;
+        for (;;) {
+            while (is('!')) ++k;
+            if (!is('w') && !is('s')) return std::nullopt;
+            ++k;
+            if (!is(',')) return span(t[first].b, t[k - 1].e);
+            ++k;
+        }
+    };
+    const auto users = member_list();
+    if (!users || users->size() > kMaxSudoersListBytes) return std::nullopt;
+    std::vector<SudoersEntry> out;
+    for (;;) {
+        const auto host = member_list();
+        if (!host || !is('=') || host->size() > kMaxSudoersListBytes ||
+            out.size() >= kMaxSudoersLineEntries)
+            return std::nullopt;
+        ++k;
+        const std::string subject = *users + "@" + *host;
+        std::string runas = "-", nopasswd = "false";
+        std::vector<std::string> run;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            std::string cmds;
+            for (const auto& c : run) cmds += (cmds.empty() ? "" : ", ") + c;
+            out.push_back({"user_spec", subject, runas, nopasswd, std::move(cmds)});
+            run.clear();
+        };
+        for (;;) {
+            std::string next_runas = runas, next_nopw = nopasswd, kept;
+            if (is('(')) {
+                const std::size_t open = k++;
+                while (is('w') || is('s') || is(',') || is(':') || is('!')) ++k;
+                if (!is(')')) return std::nullopt;
+                next_runas = std::string{trim_ws(text.substr(t[open].e, t[k].b - t[open].e))};
+                ++k;
+            }
+            for (;;) { // Option_Spec and Tag_Spec, accepted in any order
+                if (is('t')) {
+                    const auto name = text.substr(t[k].b, t[k].e - t[k].b - 1);
+                    if (name == "NOPASSWD") next_nopw = "true";
+                    else if (name == "PASSWD") next_nopw = "false";
+                    else kept.append(name).append(": ");
+                    ++k;
+                } else if (is('w') && k + 2 < t.size() && t[k + 1].kind == '=' &&
+                           (t[k + 2].kind == 'w' || t[k + 2].kind == 's') &&
+                           is_option_name(text.substr(t[k].b, t[k].e - t[k].b))) {
+                    kept.append(span(t[k].b, t[k + 2].e)).append(" ");
+                    k += 3;
+                } else {
+                    break;
+                }
+            }
+            const std::size_t cmd_b = k < t.size() ? t[k].b : text.size();
+            while (is('d')) {
+                ++k;
+                if (is(',') && k + 1 < t.size() && t[k + 1].kind == 'd') ++k;
+            }
+            while (is('!')) ++k;
+            if (!is('c') && !is('w')) return std::nullopt;
+            const std::size_t cmd_e = t[k++].e;
+            if (next_runas != runas || next_nopw != nopasswd) flush();
+            runas = std::move(next_runas);
+            nopasswd = std::move(next_nopw);
+            run.push_back(kept + span(cmd_b, cmd_e));
+            if (!is(',')) break;
+            ++k;
+        }
+        flush();
+        if (k == t.size()) break;
+        if (!is(':')) return std::nullopt;
+        ++k;
+    }
+    for (const auto& e : out)
+        if (has_passwd_tag(e.subject) || has_passwd_tag(e.runas) || has_passwd_tag(e.commands))
+            return std::nullopt;
+    return out;
+}
+
+} // namespace detail
+
+/// Parses one sudoers file. `#include`/`#includedir`/`@include*` are listed
+/// (kind include/includedir), never followed; any other statement that is not a
+/// Defaults / *_Alias / user spec is kind `unmodelled` with the statement text in
+/// `commands` -- never dropped. An `unmodelled` line that still carries a
+/// NOPASSWD:/PASSWD: tag is the collector's `undecoded_passwd_tag` failure.
+inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
+    std::vector<SudoersEntry> out;
+    for (const auto& st : detail::SudoersLexer{text}.run()) {
+        const std::string_view line = st.text;
+        const auto word = line.substr(0, line.find_first_of(" \t"));
+        const auto rest = trim_ws(line.substr(word.size()));
+        if (word == "#include" || word == "@include")
+            out.push_back({"include", "-", "-", "-", std::string{rest}});
+        else if (word == "#includedir" || word == "@includedir")
+            out.push_back({"includedir", "-", "-", "-", std::string{rest}});
+        else if (word.substr(0, 8) == "Defaults" &&
+                 (word.size() == 8 || std::string_view{":@!>"}.find(word[8]) != std::string_view::npos)) {
+            std::string scope = "-"; // Defaults:user / @host / !cmnd / >runas
+            if (word.size() > 8) {
+                const auto k = std::string_view{":@!>"}.find(word[8]);
+                scope = std::string{std::array{"user:", "host:", "cmnd:", "runas:"}[k]} + std::string{word.substr(9)};
+            }
+            out.push_back({"defaults", scope, "-", "-", std::string{rest}});
+        } else if (
+            // `Cmd_Alias` is a sudo-legal synonym for `Cmnd_Alias` (toke.l's alias rule
+            // matches `(Host|Cmnd|Cmd|User|Runas)_Alias`) -- omitting it let a line like
+            // `Cmd_Alias SHELLS = /bin/sh` fall through to parse_user_spec below and
+            // silently invent a user_spec row for a fictitious principal "Cmd_Alias" on
+            // host "SHELLS", under a clean OK/FULL result with no failure token (#4997).
+            word == "User_Alias" || word == "Runas_Alias" || word == "Host_Alias" ||
+            word == "Cmnd_Alias" || word == "Cmd_Alias") {
+            const auto eq = rest.find('=');
+            out.push_back({"alias", std::string{word} + ":" + std::string{trim_ws(rest.substr(0, eq))},
+                           "-", "-", eq == std::string_view::npos ? "" : std::string{trim_ws(rest.substr(eq + 1))}});
+        } else if (auto spec = detail::parse_user_spec(st)) {
+            for (auto& e : *spec) out.push_back(std::move(e));
+        } else {
+            out.push_back({"unmodelled", "-", "-", "-", std::string{line}});
+        }
+    }
+    return out;
+}
+
+/// sudo skips /etc/sudoers.d names containing '.' or ending in '~'.
+inline bool sudoers_dir_entry_ignored(std::string_view name) {
+    return name.find('.') != std::string_view::npos || (!name.empty() && name.back() == '~');
+}
+
 // ---- errno classification and status (one function for every leg) --------------------
 
 inline constexpr int kReadOversized = -1;
@@ -383,6 +916,10 @@ inline std::string format_kv_row(std::string_view action, std::string_view key,
     return join_row(action, {key, value.empty() ? std::string_view{"present"} : value, source});
 }
 
+inline std::string format_sudoers_row(std::string_view file, const SudoersEntry& e) {
+    return join_row("sudoers", {file, e.kind, e.subject, e.runas, e.nopasswd, e.commands});
+}
+
 // ---- file-source collector (Linux and macOS file legs; reader injected) --------------------
 
 struct FileRead {
@@ -444,10 +981,9 @@ struct Tally {
     /// reservation the cap silently drops the row announcing the cap, so the
     /// output ended on an ordinary row indistinguishable from a complete dump --
     /// the one place a non-OK status was not paired with a row saying why.
-    /// `marker_prefix` is the action's row prefix; the marker is always the 4-field
-    /// kv shape in this PR (the Sudoers action, whose row is 7 fields, is PLANNED and
-    /// follows as its own PR -- see local_security_policy_legs.hpp's "when the sudoers
-    /// action lands" note, which must restore a 7-field marker branch here alongside it).
+    /// `marker_prefix` is the action's row prefix; `marker_fields` makes the
+    /// marker match the action's own field count (4 for the kv actions, 7 for
+    /// sudoers), so the truncation notice never breaks the wire shape.
     void row(std::string r) {
         if (rows.size() + 1 >= kMaxRows) {
             if (!capped) {
@@ -461,8 +997,12 @@ struct Tally {
     }
 
     std::string marker_prefix{"local_security_policy"};
+    std::size_t marker_fields{4};
     [[nodiscard]] std::string truncation_marker() const {
-        return format_kv_row(marker_prefix, "source_state", "unreadable:row_cap", marker_prefix);
+        return marker_fields == 7
+                   ? format_sudoers_row("-", {"unreadable", "-", "-", "-", "row_cap"})
+                   : format_kv_row(marker_prefix, "source_state", "unreadable:row_cap",
+                                   marker_prefix);
     }
     /// Records a failed (non-absent) read.
     void failure(const ReadOutcome& o, std::string_view src) {
@@ -546,24 +1086,35 @@ inline void pam_sources(const FileReader& rd, Tally& t, std::string_view action,
     }
 }
 
-// detail::sudoers_file is PLANNED, follows as its own PR (see local_security_policy_legs.hpp's
-// "when the sudoers action lands" note) -- it called parse_sudoers/format_sudoers_row/
-// SudoersEntry, all of which are absent from this PR's copy of the file.
+inline void sudoers_file(const FileReader& rd, Tally& t, const std::string& path) {
+    auto text = read_source(rd, t, path, [&](const auto& st) {
+        t.row(format_sudoers_row(path, {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
+    });
+    if (!text) return;
+    for (const auto& e : parse_sudoers(*text)) {
+        t.row(format_sudoers_row(path, e));
+        // The fail-safe half of parse_user_spec: a NOPASSWD:/PASSWD: tag the parser could
+        // not decode is an unmodelled row AND a failure, never a quiet `false`.
+        if (e.kind == "unmodelled" && has_passwd_tag(e.commands)) {
+            ++t.failed;
+            t.acc.add_failure(path + ":undecoded_passwd_tag");
+        }
+    }
+}
 
 } // namespace detail
 
 /// Collects the rows + status for a file-backed action. `Macos` password/lockout
 /// come from pwpolicy, not files, and are not handled here.
 inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action,
-                                     const FileReader& rd,
-                                     [[maybe_unused]] const DirLister& ls) {
-    // `ls` is unused in this PR: its only caller was the Sudoers case (sudoers.d
-    // enumeration), PLANNED and stubbed above. Kept in the signature so linux.cpp/macos.cpp's
-    // call sites need no change; PR4 restores its use.
+                                     const FileReader& rd, const DirLister& ls) {
     detail::Tally t;
     const auto prefix = action_row_prefix(action);
+    // Shape the row-cap truncation marker like the action's own rows (sudoers is
+    // 7 fields, the rest 4), so the notice can never break the wire contract.
     t.marker_prefix = std::string{prefix};
-    // FAIL CLOSED, not open. Every arm below is unreachable today -- execute()
+    t.marker_fields = action == LocalPolicyAction::Sudoers ? 7u : 4u;
+    // FAIL CLOSED, not open. Both arms below are unreachable today -- execute()
     // rejects Unknown before any leg runs, and the macOS leg routes Password and
     // Lockout to pwpolicy before calling here -- but returning an empty Collected
     // would be status OK with zero rows, which apply_collected reports as a green
@@ -571,11 +1122,7 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
     // Password/Lockout arms read Linux paths and never consult `flavor`, so this
     // is also what stops a relaxed macOS early return quietly reading
     // /etc/login.defs on a Mac.)
-    //
-    // Sudoers is PLANNED, follows as its own PR (see local_security_policy_legs.hpp's "when
-    // the sudoers action lands" note) -- refused here, same as Unknown, rather than reaching
-    // the switch below, whose Sudoers case is a stub.
-    if (action == LocalPolicyAction::Unknown || action == LocalPolicyAction::Sudoers ||
+    if (action == LocalPolicyAction::Unknown ||
         (flavor == FileFlavor::Macos &&
          (action == LocalPolicyAction::Password || action == LocalPolicyAction::Lockout)))
         return {{}, PolicyStatus::Constrained, "unsupported_action"};
@@ -620,12 +1167,135 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
         t.row(format_kv_row(prefix, "enabled", c.enabled ? audit_enabled_token(*c.enabled) : "unset", path));
         break;
     }
-    case LocalPolicyAction::Sudoers:
-        break; // refused above (PLANNED, follows as its own PR); the switch stays exhaustive
+    case LocalPolicyAction::Sudoers: {
+        detail::sudoers_file(rd, t, "/etc/sudoers");
+        const auto d = ls("/etc/sudoers.d");
+        if (d.err != 0) {
+            const auto st = t.state_of(classify_read_errno(d.err), "sudoers.d");
+            t.row(format_sudoers_row("/etc/sudoers.d", {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
+            break;
+        }
+        // Pair the failure with its row, like every other failure site in this
+        // function. Counting one WITHOUT a row is what would let collect_file_policy
+        // return a non-OK status with zero rows, and apply_collected's fallback would
+        // then write its 4-field `<action>|status|...` shape into this action's
+        // 7-field contract. It also puts the truncation on the wire instead of only
+        // in the status reason. `unreadable` is already a declared sudoers kind.
+        if (d.truncated) {
+            t.acc.add_failure("sudoers.d:truncated");
+            ++t.failed;
+            t.row(format_sudoers_row("/etc/sudoers.d", {"unreadable", "-", "-", "-", "truncated"}));
+        }
+        for (const auto& n : d.names) {
+            const std::string path = "/etc/sudoers.d/" + n;
+            if (sudoers_dir_entry_ignored(n))
+                t.row(format_sudoers_row(path, {"ignored", "-", "-", "-", "name_ignored_by_sudo"}));
+            else
+                detail::sudoers_file(rd, t, path);
+        }
+        break;
+    }
     case LocalPolicyAction::Unknown: break; // refused above; the switch stays exhaustive
     }
     return {std::move(t.rows), select_status(t.readable, t.denied, t.failed + (t.capped ? 1 : 0)),
             t.acc.reason()};
+}
+
+// ---- Windows secedit export -> rows (the Windows leg only reads and decodes the bytes) --------
+
+struct SeceditRows {
+    std::vector<std::string> rows;
+    std::string failure_token; // non-empty -> CONSTRAINED; rows must not be trusted
+};
+
+inline constexpr std::string_view kSeceditPasswordKeys[] = {
+    "MinimumPasswordAge", "MaximumPasswordAge", "MinimumPasswordLength",
+    "PasswordComplexity", "PasswordHistorySize", "ClearTextPassword"};
+inline constexpr std::string_view kSeceditLockoutKeys[] = {"LockoutBadCount", "ResetLockoutCount",
+                                                           "LockoutDuration"};
+
+/// [Event Audit] values are the AUDIT_* bitmask: 0 none, 1 success, 2 failure, 3 both;
+/// anything else is the named `unmodelled:` state, never dropped and never "no data".
+inline std::string secedit_audit_setting(std::string_view raw) {
+    raw = trim_ws(raw);
+    if (raw == "0") return "none";
+    if (raw == "1") return "success";
+    if (raw == "2") return "failure";
+    if (raw == "3") return "success_failure";
+    return "unmodelled:" + std::string{raw};
+}
+
+/// True only for a WHOLE export. `absent` is a real modal value (LockoutDuration when
+/// LockoutBadCount=0), so a truncated file that exits 0 would otherwise report the keys it
+/// lost as absent under OK. Measured on the-rig (Windows 11 Pro 10.0.26200, LocalSystem,
+/// exit 0, 12828 bytes UTF-16LE, BOM FF FE): the sections run `[System Access]`,
+/// `[Event Audit]`, `[Registry Values]`, `[Version]`, with `[Version]` LAST carrying
+/// `signature="$CHICAGO$"` and `Revision=1`. Complete = both policy sections present and
+/// the final section `[Version]` with that signature; anything else is
+/// `secedit:export_incomplete`. Section/key names compare case-insensitively (INF rule).
+inline bool secedit_export_complete(std::string_view text) {
+    const auto ieq = [](std::string_view a, std::string_view b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+                   return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+               });
+    };
+    bool system_access = false, event_audit = false, signed_version = false;
+    std::string_view last;
+    for (auto raw : split_lines(text)) {
+        const auto line = trim_ws(raw);
+        if (!line.empty() && line.front() == '[' && line.back() == ']') {
+            last = trim_ws(line.substr(1, line.size() - 2));
+            system_access = system_access || ieq(last, "System Access");
+            event_audit = event_audit || ieq(last, "Event Audit");
+            signed_version = false; // only the FINAL section's signature counts
+        } else if (const auto eq = line.find('='); ieq(last, "Version") && eq != std::string_view::npos &&
+                   ieq(trim_ws(line.substr(0, eq)), "signature")) {
+            signed_version = ieq(trim_ws(line.substr(eq + 1)), "\"$CHICAGO$\"");
+        }
+    }
+    return system_access && event_audit && ieq(last, "Version") && signed_version;
+}
+
+/// `<action>|<key>|<value>|secedit` rows (audit: every [Event Audit] category). A key the
+/// export does not carry is the row value `absent` (a modal state, no token); a missing
+/// required section means the export is not the shape we read -- a failure token, never an
+/// empty success. The leg refuses a NUL anywhere in the export first
+/// (classify_decoded_export); a reported key or value holding one is still
+/// `secedit:embedded_nul` here, so this mapper is safe on its own.
+inline SeceditRows secedit_policy_rows(std::string_view action, const InfSections& sections) {
+    SeceditRows out;
+    const auto which = parse_local_policy_action(action);
+    if (which == LocalPolicyAction::Unknown || which == LocalPolicyAction::Sudoers) {
+        out.failure_token = "secedit:unsupported_action";
+        return out;
+    }
+    const bool audit = which == LocalPolicyAction::Audit;
+    const auto sec = sections.find(audit ? "Event Audit" : "System Access");
+    if (sec == sections.end() || sec->second.empty()) {
+        out.failure_token = audit ? "secedit:section_missing_event_audit"
+                                  : "secedit:section_missing_system_access";
+        return out;
+    }
+    const auto prefix = action_row_prefix(which);
+    const auto nul = [&out](std::string_view k, std::string_view v) {
+        if (k.find('\0') == std::string_view::npos && v.find('\0') == std::string_view::npos) return false;
+        out = {{}, "secedit:embedded_nul"};
+        return true;
+    };
+    if (audit) {
+        for (const auto& [k, v] : sec->second) {
+            if (nul(k, v)) return out;
+            out.rows.push_back(format_kv_row(prefix, k, secedit_audit_setting(v), "secedit"));
+        }
+        return out;
+    }
+    for (const auto key : which == LocalPolicyAction::Lockout ? std::span<const std::string_view>{kSeceditLockoutKeys}
+                                                              : std::span<const std::string_view>{kSeceditPasswordKeys}) {
+        const auto it = sec->second.find(std::string{key});
+        if (it != sec->second.end() && nul(key, it->second)) return out;
+        out.rows.push_back(format_kv_row(prefix, key, it == sec->second.end() ? "absent" : it->second, "secedit"));
+    }
+    return out;
 }
 
 // ---- macOS pwpolicy ------------------------------------------------------------------------

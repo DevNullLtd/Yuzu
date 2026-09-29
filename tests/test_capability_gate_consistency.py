@@ -150,14 +150,12 @@ FRAGMENT_FILES = [
 # landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); dev's own
 # browser_policy (+1) landed on top of that: 222 + 1 = 223. This branch's own
 # dev merged privacy_permissions (+1) on top of the 223 baseline: dev is now at 224.
-# This branch's own local_security_policy (+3: password_policy/lockout_policy/
-# audit_policy -- sudoers is PLANNED, follows as its own PR, not counted here) lands on
-# top of dev's CURRENT 224 (not the pre-merge 223): 224 + 3 = 227. Verified directly by
-# running parse_fragment_gate_rows over FRAGMENT_FILES with both plugins' fragments
-# present, not by hand arithmetic -- see the merge-arithmetic trap this comment exists
-# to name (adding this branch's own delta to a stale baseline undercounts by the other
-# side's own delta).
-EXPECTED_TOTAL_ROWS = 227
+# local_security_policy's own three rows (password_policy/lockout_policy/audit_policy) landed
+# on top of dev's 224: 224 + 3 = 227. Its `sudoers` action (+1, Medium risk tier) is the 228th:
+# 227 + 1 = 228. Verified directly by running parse_fragment_gate_rows over FRAGMENT_FILES,
+# not by hand arithmetic -- see the merge-arithmetic trap this comment exists to name (adding
+# a branch's own delta to a stale baseline undercounts by the other side's own delta).
+EXPECTED_TOTAL_ROWS = 228
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
