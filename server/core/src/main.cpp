@@ -14,6 +14,7 @@
 #include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
+#include "rbac_store.hpp" // fresh-start Administrator bootstrap (RbacStore::provision_first_admin)
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
 #include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
@@ -1361,11 +1362,14 @@ int main(int argc, char* argv[]) {
     //
     // main.cpp DOES still need its own short-lived AuthDB here, for two
     // reasons that both run BEFORE Server::create() exists to ask:
-    //   1. Fresh-start admin seeding (below) — auth.users is empty on a
+    //   1. Fresh-start admin bootstrap (below) — auth.users is empty on a
     //      brand-new Postgres database, so the config-file admin (loaded
-    //      into auth_mgr above) must be persisted once via
-    //      seed_admin_if_empty(), which is TOCTOU-free against a second
-    //      server instance racing first boot.
+    //      into auth_mgr above) must be persisted once, atomically with its
+    //      Administrator RBAC grant, via RbacStore::provision_first_admin()
+    //      (TOCTOU-free against a second server instance racing first
+    //      boot); AuthDB::seed_admin_if_empty() is NOT called here at all
+    //      (a redundant second no-op call was removed — see its own header
+    //      comment for why it stays exported regardless).
     //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
     //      --auth-mode=sso-only break-glass validation, all of which run
     //      (and may exit) before Server::create() is ever called.
@@ -1445,11 +1449,22 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Fresh-start seed (ADR-0006 cutover): seed the configured admin
-        // (loaded into auth_mgr above via load_config()/first_run_setup())
-        // iff auth.users is genuinely empty. A seed ERROR is FATAL — never
-        // warning-only (a boot that silently fails to seed leaves an
-        // operator locked out of a brand-new deployment with no diagnosis).
+        // Fresh-start bootstrap (RBAC-safe-by-default + ADR-0006 cutover):
+        // provision the configured admin's account, and a durable fleet-wide
+        // Administrator grant, iff auth.users is genuinely empty (a
+        // brand-new Postgres database), via `RbacStore::provision_first_admin`
+        // (`WHERE NOT EXISTS (SELECT 1 FROM auth.users)`, so it can only ever
+        // fire once — the account+grant land in ONE transaction so a crash
+        // between the two can never strand an account with no grant, and
+        // every later boot then sees a non-empty table and cleanly no-ops).
+        // `AuthDB::seed_admin_if_empty` is NOT called here — it would be a
+        // redundant second no-op by the time this runs (it stays exported
+        // for its own tests and API completeness; see its header doc
+        // comment). A bootstrap failure is FATAL — never warning-only (a
+        // boot that silently fails to provision leaves an operator locked
+        // out of a brand-new deployment with no diagnosis — and once RBAC
+        // defaults to enabled, with no route left able to authorize the fix
+        // either).
         const auto cfg_users = auth_mgr.list_users();
         const yuzu::server::auth::UserEntry* seed_user = nullptr;
         for (const auto& u : cfg_users) {
@@ -1459,31 +1474,148 @@ int main(int argc, char* argv[]) {
             }
         }
         if (!seed_user && !cfg_users.empty()) {
-            seed_user = &cfg_users.front();
+            // A non-admin-role config entry must never be silently promoted
+            // to Administrator (this used to fall back to cfg_users.front()
+            // and provision whatever the first entry was). The interactive
+            // first_run_setup flow (auth.cpp) always creates the admin
+            // account with Role::admin explicitly, so this is reachable
+            // only via a hand-edited config file — but it must still fail
+            // loudly here, not silently provision the wrong identity as the
+            // fleet's first Administrator.
+            //
+            // Deliberately unconditional — this refusal fires on EVERY boot
+            // that reaches this shape, including a database that already
+            // has admins and where nothing would actually be provisioned
+            // (seed_user's only use is passing an identity to
+            // provision_first_admin below, which no-ops harmlessly on a
+            // non-empty auth.users regardless). Gating the refusal on
+            // auth.users emptiness would need a new read before this point;
+            // kept simple and fail-loud instead — an operator who hand-edits
+            // config to remove the admin-role entry (e.g. moving fully to
+            // SSO) gets a clear, immediately recoverable boot error rather
+            // than a config file that quietly stops doing what it used to
+            // do. SEE docs/user-manual/server-admin.md "Upgrade Notes" for
+            // the operator-facing version of this paragraph — this fires on
+            // an EXISTING deployment's next restart too, not only first
+            // boot, if its config carries this shape.
+            spdlog::error(
+                "Fatal: the loaded config lists {} local user(s) but none has role=admin; "
+                "refusing to provision a non-admin account as Administrator. Fix: either mark "
+                "one config entry role=admin, or (if this fleet is SSO-only) remove all local "
+                "user entries from the config so this check is skipped entirely.",
+                cfg_users.size());
+            return EXIT_FAILURE;
         }
         if (seed_user != nullptr) {
-            auto seeded = auth_db->seed_admin_if_empty(seed_user->username, seed_user->hash_hex,
-                                                        seed_user->salt_hex);
-            if (!seeded) {
+            // Short-lived, scoped to this block only — never referenced
+            // again below, so a plain local destructs it (default dtor, no
+            // background thread) well before auth_pg_pool.reset() further
+            // down; no explicit teardown needed. Constructing a second,
+            // independent RbacStore/PgPool pairing here is safe for the
+            // same reason the comment above auth_pg_pool.emplace() gives for
+            // AuthDB: schema migration and default-seeding are idempotent —
+            // ServerImpl's own RbacStore, built moments later against the
+            // same database, just re-verifies an already-migrated schema.
+            yuzu::server::RbacStore bootstrap_rbac_store(*auth_pg_pool);
+            if (!bootstrap_rbac_store.is_open()) {
                 spdlog::error(
-                    "Fatal: failed to seed the admin user into the Postgres auth store "
-                    "(error={}) — refusing to start rather than boot into an unusable auth "
-                    "store.",
-                    static_cast<int>(seeded.error()));
+                    "Fatal: failed to open the Postgres RBAC store for the fresh-start "
+                    "Administrator bootstrap — refusing to start rather than boot into an "
+                    "unusable authorization substrate.");
                 return EXIT_FAILURE;
             }
-            if (*seeded) {
+
+            // Audit pre-flight (compliance Gate 6 finding, governance round
+            // 2026-09-28): mirrors --mfa-reset/--break-glass-arm's own
+            // "audit is MANDATORY" posture (main.cpp's open_one_shot_audit,
+            // above) — verify the audit store is WRITABLE *before* minting
+            // the fleet's single most privileged account, so a durable
+            // record of this event is never silently impossible. This is
+            // the ONE case where log-and-continue (used below, after the
+            // mutation commits) would be wrong: WHERE NOT EXISTS guarantees
+            // provision_first_admin never gets a second chance to try, so an
+            // audit-store outage at exactly this boot would otherwise
+            // PERMANENTLY forfeit the evidence row for the one event that
+            // most needs one.
+            //
+            // Known residual, deliberately not chased further here (Gate 5
+            // chaos finding): if the account+grant commit succeeds
+            // server-side but the client never observes the COMMIT ack
+            // (network fault between PG processing COMMIT and the reply),
+            // provision_first_admin returns ok=false and this whole block
+            // never reaches the post-write audit call below — yet the
+            // mutation is live. A restart then sees a non-empty table and
+            // cleanly no-ops, so the account+grant are safe, but that one
+            // narrow window can still lose the audit row despite the
+            // pre-flight passing. Accepted: closing it needs either a
+            // same-transaction audit write (AuditStore::log() always
+            // self-acquires its own lease, no connection-scoped write API
+            // exists to fold into provision_first_admin's transaction) or a
+            // durable pre-commit marker, both disproportionate to this
+            // narrow, self-healing-for-the-mutation residual.
+            auto audit = open_one_shot_audit(
+                *auth_pg_pool, cfg.audit_retention_days, "fresh-start bootstrap",
+                "provision the fleet's first Administrator",
+                " Check --postgres-dsn reachability and retry.");
+            if (!audit)
+                return EXIT_FAILURE;
+
+            auto provisioned = bootstrap_rbac_store.provision_first_admin(
+                seed_user->username, seed_user->hash_hex, seed_user->salt_hex);
+            if (!provisioned) {
+                spdlog::error(
+                    "Fatal: failed to provision the first Administrator grant into the "
+                    "Postgres RBAC store (error={}) — refusing to start rather than boot into "
+                    "an unusable authorization substrate.",
+                    provisioned.error());
+                return EXIT_FAILURE;
+            }
+            if (*provisioned) {
                 spdlog::warn(
-                    "AUTH DATA RESET ON POSTGRES CUTOVER — admin user '{}' was re-seeded into "
-                    "the Postgres auth store because it was empty. Any prior local accounts, "
-                    "roles, and MFA enrollments (from a legacy auth.db / a different Postgres "
-                    "database) are GONE. This warning is logged once, only when a seed actually "
-                    "occurs.",
+                    "RBAC BOOTSTRAP — admin user '{}' was provisioned into the Postgres auth "
+                    "store (it was empty) and granted a durable fleet-wide Administrator role. "
+                    "This warning is logged once, only when a fresh-start provision actually "
+                    "occurs. If this database previously held a legacy SQLite auth.db or a "
+                    "different Postgres database's auth data, that prior data is NOT migrated "
+                    "and is gone — see docs/auth-architecture.md \"fresh-start cutover\" if that "
+                    "applies to this deployment.",
                     seed_user->username);
                 // Threaded into ServerImpl via Config (metrics_ doesn't exist
                 // yet at this point — Server::create() hasn't run) — see
                 // Config::auth_fresh_start_seeded doc comment.
                 cfg.auth_fresh_start_seeded = true;
+
+                const std::string os_user = resolve_os_principal();
+                yuzu::server::AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.principal_role = "system";
+                ev.action = "rbac.bootstrap.first_admin";
+                ev.target_type = "User";
+                ev.target_id = seed_user->username;
+                ev.result = "success";
+                ev.detail = std::format(
+                    "reason=fresh_install_bootstrap account+Administrator grant provisioned "
+                    "atomically at boot (os_identity={})",
+                    os_user);
+                if (!audit->log(ev)) {
+                    // The pre-flight passed but the write itself failed
+                    // (e.g. disk filled between the check and the write) —
+                    // a narrow TOCTOU, not the ack-loss residual documented
+                    // above. The mutation already committed and is
+                    // non-retriable (WHERE NOT EXISTS), so failing boot here
+                    // would strand an otherwise-healthy install for no
+                    // benefit — log-and-continue, loudly, distinctly (no
+                    // Prometheus counter exists this early in boot to carry
+                    // this signal — the log line IS the only one).
+                    spdlog::error(
+                        "RBAC BOOTSTRAP: admin '{}' was provisioned but the audit row failed to "
+                        "persist — record this bootstrap event manually in your change-"
+                        "management system NOW.",
+                        seed_user->username);
+                }
             }
         }
     }

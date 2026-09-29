@@ -3407,6 +3407,27 @@ static const ToolDef kTools[] = {
      "Requires SoftwareDeployment:Execute.",
      R"j({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Deployment id from list_software_deployments"}},"required":["id"]})j",
      R"j({"type":"object","properties":{"cancelled":{"const":true},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["cancelled"]})j"},
+
+    // Fleet-wide RBAC role assignment listing — MCP twin of GET
+    // /api/v1/rbac/roles/assignments, reusing the SAME
+    // RbacStore::list_all_principal_roles_checked() bulk read
+    // build_access_review() (access_review_model.cpp) already uses for the
+    // SOC 2 CC6.2 grant-table export. Gated on the SAME dedicated
+    // AccessReview:Read securable that store method was built for (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role above, which
+    // mint/revoke standing authority — a stronger decision than reading the
+    // grant table). Appended at the VERY END of kTools[] per the standing
+    // governance note above (KEK rotation tools) — minimizes rebase conflict
+    // with any concurrent PR inserting tools earlier in this array.
+    {"list_rbac_role_assignments",
+     "List every current RBAC role assignment fleet-wide: every "
+     "(principal_type, principal_id, role_name) grant row on record, across "
+     "all three principal types (user/group/engine), in one bulk read — the "
+     "grant table itself, not a per-roster-member derivation. Read-only. "
+     "Mirrors GET /api/v1/rbac/roles/assignments. Self-audited as "
+     "rbac.assignments.list. Requires AccessReview:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"assignments":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["principal_type","principal_id","role_name"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","assignments"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -3926,6 +3947,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_access_review", {"AccessReview", "Read"}},
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
+    // Fleet-wide RBAC role assignment listing — SAME dedicated
+    // AccessReview:Read securable as the access-review family above (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role, which mint/
+    // revoke standing authority rather than read the grant table).
+    {"list_rbac_role_assignments", {"AccessReview", "Read"}},
     // KEK rotation (#2395 track C) — parity with the REST twins'
     // Security:Write (rotate/rewrap) and Security:Read (status) gates.
     {"rotate_kek", {"Security", "Write"}},
@@ -4531,6 +4557,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
     {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
     {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
+    {"list_rbac_role_assignments",
+     {ToolEffect::ReadOnly, true, "List fleet-wide RBAC role assignments"}},
     {"get_kek_status", {ToolEffect::ReadOnly, true, "Get KEK rotation status"}},
 
     // ── Mutating tools (effect Additive/Destructive) ──────────────────────────
@@ -24839,6 +24867,54 @@ McpServer::HandlerFn McpServer::build_handler(
                                                "", "count=" + std::to_string(rows_res->size()));
                 JObj payload;
                 payload.add("count", static_cast<int64_t>(rows_res->size())).raw("campaigns", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_rbac_role_assignments") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    mcp_audit("failure", "rbac store unavailable");
+                    res.set_content(a4_error(kInternalError, "rbac store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto grants_res = rbac_store->list_all_principal_roles_checked();
+                if (!grants_res) {
+                    mcp_audit("failure", grants_res.error());
+                    (void)audit_fn(req, "rbac.assignments.list", "failure", "AccessReview", "",
+                                   grants_res.error());
+                    res.set_content(a4_error(kInternalError, grants_res.error(),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& g : *grants_res) {
+                    arr.add(JObj()
+                                .add("principal_type", g.principal_type)
+                                .add("principal_id", g.principal_id)
+                                .add("role_name", g.role_name));
+                }
+                const bool audit_ok = audit_fn(req, "rbac.assignments.list", "success", "AccessReview",
+                                               "", "count=" + std::to_string(grants_res->size()));
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(grants_res->size()))
+                    .raw("assignments", arr.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success");

@@ -3161,11 +3161,17 @@ public:
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
-        // once, iff `seed_admin_if_empty` actually seeded the sole admin row
-        // (an empty `auth.users` table) — a no-op (table already populated,
-        // the common case on every restart) leaves this at 0. No labels: the
-        // event is binary and rare enough that a plain counter (0 forever, or
-        // 1 after the one genuine fresh-start boot) is the whole signal.
+        // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
+        // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
+        // Administrator bootstrap, and the SOLE production seeder now —
+        // `seed_admin_if_empty` has no production caller; see
+        // `Config::auth_fresh_start_seeded`'s doc comment) — true iff the
+        // sole admin row was actually inserted
+        // into a genuinely-empty `auth.users` table this boot. A no-op
+        // (table already populated, the common case on every restart)
+        // leaves this at 0. No labels: the event is binary and rare enough
+        // that a plain counter (0 forever, or 1 after the one genuine
+        // fresh-start boot) is the whole signal.
         metrics_.describe("yuzu_auth_fresh_start_reset_total",
                           "1 iff this boot seeded the sole admin user into an empty auth.users "
                           "table (fresh-start), 0 otherwise",

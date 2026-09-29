@@ -26,7 +26,12 @@ This is **caller-inclusive and deliberately stricter than a bare fleet-wide "at 
 
 Recommended order for a fresh install:
 
-1. `POST /api/v1/rbac/roles/Administrator/assignments` for yourself (`{"principal_type":"user","principal_id":"<your username>"}`) — see "Fleet-Wide Role Assignment" below.
+1. On a genuinely fresh install, the config-file admin already holds the fleet-wide
+   `Administrator` grant from boot (`RbacStore::provision_first_admin`) — this step is a no-op for
+   that account and only matters for an UPGRADED/pre-existing database whose current operators
+   don't already hold it. `POST /api/v1/rbac/roles/Administrator/assignments` for yourself
+   (`{"principal_type":"user","principal_id":"<your username>"}`) — see "Fleet-Wide Role
+   Assignment" below.
 2. Grant management-group roles to every operator who needs device visibility (see the callout immediately below) — RBAC-on applies role-scoped visibility immediately, and a user with no management-group role sees no agents.
 3. `PUT /api/v1/rbac/enforcement {"enabled": true}`.
 
@@ -220,7 +225,7 @@ admitted; the floor never overrides a live RBAC grant.)
 
 | Securable:Operation | Surface |
 |---|---|
-| `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*` |
+| `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*`, and the lighter-weight live grant-table listing `GET /api/v1/rbac/roles/assignments` (+ MCP `list_rbac_role_assignments`) — same securable, same sensitivity class, not a management-group-confined view |
 | `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
 | `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
 | `Enrollment:Read` (#4031) | Auto-approve enrollment rules and pending-agent visibility, `GET /api/v1/enrollment/auto-approve-rules` and `GET /api/v1/enrollment/pending-agents` |
@@ -676,6 +681,7 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 6 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
 | `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
 | `PUT` | `/api/v1/rbac/enforcement` | Enable or disable RBAC enforcement fleet-wide (A1) | Implemented |
+| `GET` | `/api/v1/rbac/roles/assignments` | Fleet-wide "who currently holds which role" — the complete grant table, gated `AccessReview:Read` (see the securable table below) | Implemented |
 
 ## Planned Features
 
