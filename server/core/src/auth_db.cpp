@@ -156,6 +156,14 @@ constexpr const char* kSeedAdminLockSql =
     // Postgres major versions — two mixed-version first-boot processes could
     // otherwise compute different locks and both seed). `1` in the shared
     // `2037545589` yuzu namespace (the migration runner's global lock uses `0`).
+    //
+    // Duplicated byte-for-byte in `rbac_admin_authority_owner.cpp`'s
+    // anonymous-namespace `kProvisionFirstAdminLockSql` (no shared header
+    // exists between the two TUs) — the two MUST stay equal, or
+    // `RbacStore::provision_first_admin` and `AuthDB::seed_admin_if_empty`
+    // stop serializing against each other on a shared first boot. Changing
+    // this literal without updating that copy silently reopens the race
+    // both comments describe.
     "SELECT pg_advisory_xact_lock(2037545589, 1)";
 
 // ── Schema ────────────────────────────────────────────────────────────────
