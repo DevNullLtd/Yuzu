@@ -481,6 +481,45 @@ std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path&
         return std::nullopt;
     return sqlite3_column_int64(stmt.get(), 0);
 }
+
+// WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg import
+// (system principal, like the other boot-time posture rows). One row per file
+// kind that did something noteworthy: `imported` (result=success),
+// `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
+// or `error` (result=failure). `absent` / `already_imported` are the steady
+// state and deliberately write no row. Shared by the normal successful-boot
+// drain AND the fatal-import one-shot write (PR #5107 review, Should-fix) —
+// EXTEND this, never fork a second copy of the event shape.
+void write_enrollment_import_audit_rows(
+    yuzu::server::AuditStore& audit_store,
+    const std::vector<yuzu::server::enrollment_import::KindReport>& reports) {
+    using yuzu::server::enrollment_import::Outcome;
+    for (const auto& r : reports) {
+        if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
+            continue;
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "system";
+        ev.principal_role = "system";
+        ev.action = "enrollment.import";
+        ev.target_type = "Enrollment";
+        ev.target_id = r.kind;
+        ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
+                    " imported=" + std::to_string(r.counts.imported) +
+                    " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
+                    " skipped_garbled=" + std::to_string(r.parse.garbled) +
+                    " recovered_colon=" + std::to_string(r.parse.recovered) +
+                    " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
+                    " renamed=" + (r.renamed ? "true" : "false") +
+                    (r.detail.empty() ? "" : " reason=" + r.detail);
+        ev.result = r.outcome == Outcome::imported
+                        ? "success"
+                        : (r.outcome == Outcome::fingerprint_mismatch ? "warning" : "failure");
+        (void)audit_store.log(ev);
+    }
+}
 } // namespace
 } // namespace yuzu::server
 
@@ -4753,19 +4792,38 @@ public:
                         // not import or rename). A missing file is a no-op; a PG
                         // error with a file present refuses to start (like the
                         // first-boot admin seed): a half-known enrollment set is
-                        // worse than no boot. The reports are kept so the audit
-                        // events can be emitted once audit_store_ exists.
+                        // worse than no boot. On a normal boot the reports are
+                        // kept and drained into the audit store once it's built
+                        // below (audit_store_ isn't constructed yet at this point
+                        // in the boot sequence).
                         auto imported = enrollment_import::run_legacy_enrollment_import(
                             *auth_db_,
                             enrollment_import::Locations{cfg_.data_dir,
                                                          cfg_.auth_config_path.parent_path()},
                             &metrics_);
-                        enrollment_import_reports_ = std::move(imported.reports);
                         if (imported.fatal) {
                             spdlog::error("[PG] Refusing to start: the one-time legacy enrollment "
                                           ".cfg import failed with a file present (see the "
                                           "[enrollment-import] lines above)");
                             startup_failed_ = true;
+                            // The refusal above means `audit_store_` (below) is
+                            // never constructed on THIS boot, and a later boot's
+                            // reports are a fresh, unrelated import attempt — so
+                            // the documented enrollment.import failure row
+                            // (docs/observability-conventions.md) would otherwise
+                            // never be written for the failure that actually
+                            // caused this refusal (PR #5107 review, Should-fix).
+                            // A one-shot AuditStore over the same still-open
+                            // pg_pool_ writes it here, best-effort (a dead audit
+                            // store is exactly the kind of failure this row would
+                            // have described anyway; the loud spdlog::error above
+                            // is the primary signal either way).
+                            AuditStore one_shot_audit(*pg_pool_, cfg_.audit_retention_days);
+                            if (one_shot_audit.is_open())
+                                write_enrollment_import_audit_rows(one_shot_audit,
+                                                                   imported.reports);
+                        } else {
+                            enrollment_import_reports_ = std::move(imported.reports);
                         }
                     }
                 }
@@ -5320,40 +5378,14 @@ public:
             }
 
             // WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg
-            // import (system principal, like the other boot-time posture rows). One row
-            // per file kind that did something noteworthy: `imported` (result=success),
-            // `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
-            // or `error` (result=failure - the server is refusing to start, so this only
-            // lands if a later boot gets that far). `absent` / `already_imported` are
-            // the steady state and deliberately write no row.
+            // import (system principal, like the other boot-time posture rows).
+            // Shared with the fatal-import one-shot write above
+            // (write_enrollment_import_audit_rows) — a `startup_failed_` boot
+            // never reaches here (audit_store_ isn't built), which is exactly
+            // why that path writes its own row via a throwaway AuditStore
+            // instead of relying on this drain.
             if (audit_store_ && audit_store_->is_open()) {
-                for (const auto& r : enrollment_import_reports_) {
-                    using enrollment_import::Outcome;
-                    if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
-                        continue;
-                    AuditEvent ev;
-                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-                    ev.principal = "system";
-                    ev.principal_role = "system";
-                    ev.action = "enrollment.import";
-                    ev.target_type = "Enrollment";
-                    ev.target_id = r.kind;
-                    ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
-                                " imported=" + std::to_string(r.counts.imported) +
-                                " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
-                                " skipped_garbled=" + std::to_string(r.parse.garbled) +
-                                " recovered_colon=" + std::to_string(r.parse.recovered) +
-                                " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
-                                " renamed=" + (r.renamed ? "true" : "false") +
-                                (r.detail.empty() ? "" : " reason=" + r.detail);
-                    ev.result = r.outcome == Outcome::imported
-                                    ? "success"
-                                    : (r.outcome == Outcome::fingerprint_mismatch ? "warning"
-                                                                                   : "failure");
-                    (void)audit_store_->log(ev);
-                }
+                write_enrollment_import_audit_rows(*audit_store_, enrollment_import_reports_);
                 enrollment_import_reports_.clear();
             }
 

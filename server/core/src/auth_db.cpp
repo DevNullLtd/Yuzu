@@ -2717,6 +2717,27 @@ AuthDB::import_legacy_pending(std::string_view marker_key, std::string_view fing
         impl_->pool, kWriteTimeout, marker_key, fingerprint, imported_by,
         [&](PGconn* conn, enrollment_import::ImportCounts& counts) -> bool {
             for (const auto& p : rows) {
+                // The single agent_id_ok/pending_fields_ok chokepoint (extend
+                // it, never add per-call-site escaping) — a legacy row skipped
+                // this on the normal runtime write path (PR #5107 review,
+                // Minor): a comma or control byte in a pre-6.2 file's agent_id
+                // would otherwise land verbatim and later corrupt/forge a
+                // comma-joined bulk audit detail or a plain-string log line.
+                // Folded into `failed` (no new counter for a Minor-severity,
+                // effectively-unreachable-in-practice case — a hand-edited or
+                // corrupted legacy file, not real agent-generated ids).
+                // Only the free-text fields pending_fields_ok actually reads
+                // are populated — requested_at/status are irrelevant to this
+                // validation-only, never-persisted struct.
+                auth::PendingAgent candidate{.agent_id = p.agent_id,
+                                             .hostname = p.hostname,
+                                             .os = p.os,
+                                             .arch = p.arch,
+                                             .agent_version = p.agent_version};
+                if (!pending_fields_ok(candidate)) {
+                    ++counts.failed;
+                    continue;
+                }
                 pg::PgResult ins = pg::exec_params(
                     conn,
                     "INSERT INTO auth.pending_agents (agent_id, hostname, os, arch, "
