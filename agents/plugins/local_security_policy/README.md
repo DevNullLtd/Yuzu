@@ -92,7 +92,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `audit_policy` `constrained` | Windows, Linux, macOS | `audit_policy` | Fixed row tag, always the action name. Three cases write a two-field constrained\|<reason> row instead, whose second field is the reason: the Windows planned-state placeholder (constrained\|windows:planned), an unsupported OS (constrained\|unsupported_os), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
+| `row_kind` | string | `audit_policy` `constrained` | Windows, Linux, macOS | `audit_policy` | Fixed row tag, always the action name. Two cases write a two-field constrained\|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
 | `key` | string | - | Windows, Linux, macOS | `watch_rules` | Setting name: rules, watch_rules, syscall_rules, unmodelled_lines, control_lines or enabled (Linux), an audit_control key (macOS), an [Event Audit] category name (Windows -- one row per category the export carries; a category the export omits has no row), or source_state when the source is absent or unreadable (and on the row-cap marker). |
 | `value` | string | - | Windows, Linux, macOS | `12` | The setting value: a count (Linux -- rules is the RULE count, equal to watch_rules + syscall_rules + unmodelled_lines; control_lines counts the lines that configure auditd rather than add a rule, exactly -D, -b, -f, -r, -i, -c, -e, --backlog_wait_time and --loginuid-immutable), the audit_control value (macOS), none/success/failure/success_failure or unmodelled:<raw> (Windows), or, for the Linux enabled row, enabled/disabled/immutable for -e 1/0/2, unset with no -e line, or unmodelled:<raw> for any other -e value. For source_state, absent or unreadable:<reason> (unreadable:row_cap on the row-cap marker). |
 | `source` | string | - | Windows, Linux, macOS | `/etc/audit/audit.rules` | Where the row was read: /etc/audit/audit.rules (Linux), /etc/security/audit_control (macOS) or secedit (Windows). The row-cap marker carries audit_policy. |
@@ -101,7 +101,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `lockout_policy` `constrained` | Windows, Linux, macOS | `lockout_policy` | Fixed row tag, always the action name. Three cases write a two-field constrained\|<reason> row instead, whose second field is the reason: the Windows planned-state placeholder (constrained\|windows:planned), an unsupported OS (constrained\|unsupported_os), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
+| `row_kind` | string | `lockout_policy` `constrained` | Windows, Linux, macOS | `lockout_policy` | Fixed row tag, always the action name. Two cases write a two-field constrained\|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
 | `key` | string | - | Windows, Linux, macOS | `LOGIN_RETRIES` | Setting name: a login.defs / faillock.conf key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable (also a macOS pwpolicy item not in the documented plist shape, and the row-cap marker), or status when a non-OK outcome produced no rows at all (only a failed macOS pwpolicy run). |
 | `value` | string | - | Windows, Linux, macOS | `5` | The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today. |
 | `source` | string | - | Windows, Linux, macOS | `/etc/login.defs` | Where the row was read: a file path, or /etc/pam.d when every PAM file of the action is absent (Linux); pwpolicy:<policy identifier>, pwpolicy:<category> when the policy has no identifier, or pwpolicy (macOS); secedit (Windows). The row-cap marker carries the action name. On a status row this field carries the failure reason token instead, not a source. |
@@ -110,7 +110,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `row_kind` | string | `password_policy` `constrained` | Windows, Linux, macOS | `password_policy` | Fixed row tag, always the action name. Three cases write a two-field constrained\|<reason> row instead, whose second field is the reason: the Windows planned-state placeholder (constrained\|windows:planned), an unsupported OS (constrained\|unsupported_os), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
+| `row_kind` | string | `password_policy` `constrained` | Windows, Linux, macOS | `password_policy` | Fixed row tag, always the action name. Two cases write a two-field constrained\|<reason> row instead, whose second field is the reason: every Windows-leg failure (scratch directory, secedit run or export), and an exception contained on any OS (constrained\|internal_error). Linux and macOS read failures stay in this four-field shape as source_state or status rows. |
 | `key` | string | - | Windows, Linux, macOS | `PASS_MAX_DAYS` | Setting name: a login.defs / pwquality key or a pam.<type>.<module> stack line (Linux), a pwpolicy item (macOS: policy_content, minimum_length, a policyAttribute* name, unmodelled_category, unmodelled_parameter, policies), a secedit key (Windows), source_state when a whole source is absent or unreadable (also a macOS pwpolicy item not in the documented plist shape, and the row-cap marker), or status when a non-OK outcome produced no rows at all (only a failed macOS pwpolicy run). |
 | `value` | string | - | Windows, Linux, macOS | `99999` | The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today. |
 | `source` | string | - | Windows, Linux, macOS | `/etc/login.defs` | Where the row was read: a file path, or /etc/pam.d when every PAM file of the action is absent (Linux); pwpolicy:<policy identifier>, pwpolicy:<category> when the policy has no identifier, or pwpolicy (macOS); secedit (Windows). The row-cap marker carries the action name. On a status row this field carries the failure reason token instead, not a source. |
@@ -151,7 +151,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated) · leg-hash 0fe9f183d5a9
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-29 · LocalSystem (elevated) · leg-hash 0fe9f183d5a9
 
 ```
 == action=password_policy
@@ -187,7 +187,7 @@ sudoers|-|unsupported|-|-|-|windows_has_no_sudoers
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-24 · euid 501 · leg-hash 0fe9f183d5a9
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0fe9f183d5a9
 
 ```
 == action=password_policy
@@ -208,7 +208,7 @@ sudoers|/etc/sudoers|unreadable|-|-|-|permission_denied
 [result_status] PERMISSION_DENIED / PARTIAL / /etc/sudoers:permission_denied
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 0fe9f183d5a9
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-29 · euid 0 · leg-hash 0fe9f183d5a9
 
 ```
 == action=password_policy
@@ -216,29 +216,17 @@ password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
 password_policy|PASS_MIN_DAYS|0|/etc/login.defs
 password_policy|PASS_WARN_AGE|7|/etc/login.defs
 password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
-password_policy|minlen|14|/etc/security/pwquality.conf
-password_policy|dcredit|-1|/etc/security/pwquality.conf
-password_policy|ucredit|-1|/etc/security/pwquality.conf
-password_policy|lcredit|-1|/etc/security/pwquality.conf
-password_policy|ocredit|-1|/etc/security/pwquality.conf
-password_policy|pam.password.pam_pwquality.so|requisite retry=3|/etc/pam.d/common-password
-password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure use_authtok try_first_pass yescrypt|/etc/pam.d/common-password
+password_policy|source_state|absent|/etc/security/pwquality.conf
+password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
 [result_status] OK / FULL
 
 == action=lockout_policy
 lockout_policy|LOGIN_RETRIES|5|/etc/login.defs
 lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs
-lockout_policy|deny|5|/etc/security/faillock.conf
-lockout_policy|unlock_time|900|/etc/security/faillock.conf
 [result_status] OK / FULL
 
 == action=audit_policy
-audit_policy|rules|10|/etc/audit/audit.rules
-audit_policy|watch_rules|6|/etc/audit/audit.rules
-audit_policy|syscall_rules|4|/etc/audit/audit.rules
-audit_policy|unmodelled_lines|0|/etc/audit/audit.rules
-audit_policy|control_lines|5|/etc/audit/audit.rules
-audit_policy|enabled|immutable|/etc/audit/audit.rules
+audit_policy|source_state|absent|/etc/audit/audit.rules
 [result_status] OK / FULL
 
 == action=sudoers
@@ -249,12 +237,6 @@ sudoers|/etc/sudoers|defaults|-|-|-|use_pty
 sudoers|/etc/sudoers|user_spec|root@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|user_spec|%sudo@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|includedir|-|-|-|/etc/sudoers.d
-sudoers|/etc/sudoers.d/90-hardened|defaults|-|-|-|use_pty
-sudoers|/etc/sudoers.d/90-hardened|defaults|user:bob|-|-|!authenticate
-sudoers|/etc/sudoers.d/90-hardened|user_spec|alice@ALL|root|true|CWD=/tmp /bin/ls
-sudoers|/etc/sudoers.d/90-hardened|user_spec|carol@ALL|root|true|TIMEOUT=5m /usr/bin/id
-sudoers|/etc/sudoers.d/90-hardened|user_spec|dave@web1|root|false|/bin/df
-… 12 of 17 rows shown
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
@@ -275,5 +257,5 @@ sudoers|/etc/sudoers.d/90-hardened|user_spec|dave@web1|root|false|/bin/df
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp`
 - Tests: `tests/unit/test_local_security_policy_local_dispatcher.cpp` · `tests/unit/test_local_security_policy_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/5069-local_security_policy.added.md`
+- Changelog: `changelog.d/2026-09-29-local_security_policy-windows-sudoers.added.md` · `changelog.d/5069-local_security_policy.added.md`
 <!-- END GENERATED -->

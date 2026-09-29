@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-24 · LocalSystem (elevated) · leg-hash 0fe9f183d5a9
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-29 · LocalSystem (elevated) · leg-hash 0fe9f183d5a9
 == action=password_policy
 password_policy|MinimumPasswordAge|0|secedit
 password_policy|MaximumPasswordAge|42|secedit
