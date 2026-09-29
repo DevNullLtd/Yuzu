@@ -46,19 +46,15 @@ int run_macos(yuzu::CommandContext& ctx);
 /// the absence of rows.
 inline void report_sources(yuzu::CommandContext& ctx, const std::vector<std::string>& rows,
                            const yuzu::shared::ConstraintAccumulator& acc) {
-    if (acc.any_failure()) {
-        const std::string reason = acc.reason();
-        ctx.write_output(format_status_row(StatusState::constrained, reason));
-        for (const auto& r : rows)
-            ctx.write_output(r);
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              reason);
-        return;
-    }
-    ctx.write_output(format_status_row(StatusState::supported, {}));
+    const bool degraded = acc.any_failure();
+    const std::string reason = degraded ? acc.reason() : std::string{};
+    ctx.write_output(format_status_row(degraded ? StatusState::constrained : StatusState::supported,
+                                       reason));
     for (const auto& r : rows)
         ctx.write_output(r);
-    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    ctx.set_result_status(degraded ? YUZU_RESULT_STATUS_CONSTRAINED : YUZU_RESULT_STATUS_OK,
+                          degraded ? YUZU_RESULT_COMPLETENESS_PARTIAL : YUZU_RESULT_COMPLETENESS_FULL,
+                          reason);
 }
 
 /// A leg that reads nothing reports ONE exact `unsupported` status row and an

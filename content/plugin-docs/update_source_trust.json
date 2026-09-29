@@ -73,7 +73,7 @@
     {
       "columns": [
         {
-          "description": "Row shape discriminator (field 0). Values: status, apt_source, apt_keyring. The rpm_repo, macos_swu and wsus shapes are documented in the field descriptions below for the planned rpm/dnf, macOS and Windows legs and are not emitted today.",
+          "description": "Row shape discriminator (field 0). Values: status, apt_source, apt_keyring.",
           "example": "apt_source",
           "name": "row_kind",
           "platforms": [
@@ -89,7 +89,7 @@
           ]
         },
         {
-          "description": "status: the literal \"sources\". apt_source: the logical absolute path of the source file. apt_keyring: the keyring file path. Planned, not emitted today: rpm_repo: the logical absolute path of the .repo file. macos_swu: scope, local or managed.",
+          "description": "status: the literal \"sources\". apt_source: the logical absolute path of the source file. apt_keyring: the keyring file path.",
           "example": "/etc/apt/sources.list.d/debian.sources",
           "name": "field_1",
           "platforms": [
@@ -101,7 +101,7 @@
           "values": null
         },
         {
-          "description": "status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, and a leg that threw report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings). Planned, not emitted today: rpm_repo: repo id. macos_swu: catalog URL, \"-\" when the plist sets none, or unmodelled for a value of the wrong type.",
+          "description": "status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, and a leg that threw report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings).",
           "example": "deb822",
           "name": "field_2",
           "platforms": [
@@ -113,7 +113,7 @@
           "values": null
         },
         {
-          "description": "status: reason token(s) for a constrained or unsupported read, \"-\" when complete; a token has the form <os>:<source>:<detail> (linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries) or <os>:<state> (windows:planned on Windows, macos:planned on macOS). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled). Planned, not emitted today: rpm_repo: repository name. macos_swu: auto_check.",
+          "description": "status: reason token(s) for a constrained or unsupported read, \"-\" when complete; a token has the form <os>:<source>:<detail> (linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries) or <os>:<state> (windows:planned on Windows, macos:planned on macOS). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled).",
           "example": "deb",
           "name": "field_3",
           "platforms": [
@@ -125,7 +125,7 @@
           "values": null
         },
         {
-          "description": "apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Planned, not emitted today: rpm_repo: enabled. macos_swu: auto_download. Not used by status.",
+          "description": "apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Not used by status.",
           "example": "https://deb.debian.org/debian",
           "name": "field_4",
           "platforms": [
@@ -136,7 +136,7 @@
           "values": null
         },
         {
-          "description": "apt_source: suites, space-separated when several. Planned, not emitted today: rpm_repo: gpgcheck (yes, no, unset, unmodelled; unset means the .repo file does not say, not that the effective value is off). macos_swu: auto_install_macos.",
+          "description": "apt_source: suites, space-separated when several.",
           "example": "bookworm",
           "name": "field_5",
           "platforms": [
@@ -147,7 +147,7 @@
           "values": null
         },
         {
-          "description": "apt_source: components. Planned, not emitted today: rpm_repo: repo_gpgcheck. macos_swu: config_data_install.",
+          "description": "apt_source: components.",
           "example": "main",
           "name": "field_6",
           "platforms": [
@@ -158,7 +158,7 @@
           "values": null
         },
         {
-          "description": "apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), the literal unmodelled when a one-line signed-by uses += or -=, or \"-\" when absent (apt then uses its global trusted keyrings). Planned, not emitted today: rpm_repo: gpgkey URL(s). macos_swu: critical_update_install.",
+          "description": "apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), the literal unmodelled when a one-line signed-by uses += or -=, or \"-\" when absent (apt then uses its global trusted keyrings).",
           "example": "/usr/share/keyrings/debian-archive-keyring.gpg",
           "name": "field_7",
           "platforms": [
@@ -169,7 +169,7 @@
           "values": null
         },
         {
-          "description": "apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source; only the apt boolean words are recognised and any other value is unmodelled; unset means the source does not say, not that signatures are enforced). Planned, not emitted today: rpm_repo: baseurl. macos_swu: allow_prerelease.",
+          "description": "apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source; only the apt boolean words are recognised and any other value is unmodelled; unset means the source does not say, not that signatures are enforced).",
           "example": "unset",
           "name": "field_8",
           "platforms": [
@@ -180,7 +180,7 @@
           "values": null
         },
         {
-          "description": "apt_source: allow_insecure (yes, no, unset, unmodelled; read from the one-line [allow-insecure=...] option only: apt ignores it in deb822, so it is unset there). Planned, not emitted today: rpm_repo: mirror (mirrorlist or metalink) URL.",
+          "description": "apt_source: allow_insecure (yes, no, unset, unmodelled; read from the one-line [allow-insecure=...] option only: apt ignores it in deb822, so it is unset there).",
           "example": "unset",
           "name": "field_9",
           "platforms": [
@@ -190,7 +190,7 @@
           "values": null
         },
         {
-          "description": "apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled). Planned, not emitted today: rpm_repo: sslverify (yes, no, unset, unmodelled).",
+          "description": "apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled).",
           "example": "yes",
           "name": "field_10",
           "platforms": [

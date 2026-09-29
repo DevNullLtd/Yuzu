@@ -86,6 +86,7 @@
 
 #include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
+#include <wire_utf8.hpp>
 #include <yuzu/agent/scoped_fd.hpp>
 
 #include <dirent.h>
@@ -341,7 +342,7 @@ inline bool add_keyring_file(const std::filesystem::path& root, const std::strin
         return true;
     // The row's path field is scrubbed by format_apt_keyring_row; the name only
     // needs the constraint (a keyring name is not filtered by the walk).
-    if (count_invalid_wire_bytes(logical) != 0)
+    if (yuzu::shared::count_invalid_wire_bytes(logical) != 0)
         pio::note_failure(acc, kAptKeyringPrefix, "invalid_bytes");
     rows.push_back(format_apt_keyring_row(logical, scope, sniff_keyring(head), size));
     return within_output_budget(rows, acc, kAptKeyringPrefix);

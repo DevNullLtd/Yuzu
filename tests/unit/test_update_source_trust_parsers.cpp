@@ -402,24 +402,8 @@ TEST_CASE("apt_dir_name_ok is apt's own file-name rule for its *.d directories",
         CHECK_FALSE(ust::apt_dir_name_ok(bad));
 }
 
-TEST_CASE("scrub_wire_bytes and field: NUL and non-UTF-8 never reach the wire",
+TEST_CASE("field: NUL and non-UTF-8 never reach the wire",
           "[update_source_trust][parsers][wire]") {
-    std::string ok = "plain caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80";
-    CHECK(ust::scrub_wire_bytes(ok) == 0); // 2-, 3- and 4-byte scalars survive
-    CHECK(ok == "plain caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80");
-    // NUL, a lone 0xFF, an overlong NUL (C0 80), a surrogate (ED A0 80), a code
-    // point above U+10FFFF (F4 90 ...), a stray continuation byte and a truncated
-    // sequence are each replaced byte by byte.
-    for (std::string_view bad : {std::string_view("a\0b", 3), std::string_view("a\xff" "b"),
-                                 std::string_view("a\xc0\x80" "b"), std::string_view("a\xed\xa0\x80" "b"),
-                                 std::string_view("a\xf4\x90\x80\x80" "b"), std::string_view("a\x80" "b"),
-                                 std::string_view("a\xe2\x82")}) {
-        std::string t{bad};
-        CHECK(ust::scrub_wire_bytes(t) > 0);
-        CHECK(t.find('\0') == std::string::npos);
-        CHECK(t.front() == 'a');
-        CHECK(t.size() == bad.size()); // replaced in place: the row keeps its shape
-    }
     // MUTATION: a field() that only escapes leaves the NUL, and the host's strlen
     // then cuts the row (a 7-of-11-field apt_source row that still says `supported`).
     CHECK(ust::field(std::string_view("a\0b", 3)) == "a?b");
@@ -433,33 +417,6 @@ TEST_CASE("scrub_wire_bytes and field: NUL and non-UTF-8 never reach the wire",
     REQUIRE(fields.size() == 11);
     CHECK(fields[4] == "http://a.example/x?y");
     CHECK(fields[8] == "yes"); // the trust columns behind the NUL survive
-}
-
-TEST_CASE("scrub_wire_bytes accepts exactly RFC 3629 (boundaries of every lead-byte range)",
-          "[update_source_trust][parsers][wire]") {
-    // The sole guard for a response the receiver would reject whole: each boundary of
-    // the table, valid and one step past it. MUTATION: any loosened lead range or
-    // continuation check flips one of these.
-    for (std::string_view ok : {std::string_view("\xc2\x80"), std::string_view("\xdf\xbf"),
-                                std::string_view("\xe0\xa0\x80"), std::string_view("\xed\x9f\xbf"),
-                                std::string_view("\xef\xbf\xbd"), std::string_view("\xf0\x90\x80\x80"),
-                                std::string_view("\xf4\x8f\xbf\xbf")}) {
-        std::string t{ok};
-        CHECK(ust::scrub_wire_bytes(t) == 0);
-        CHECK(t == ok);
-    }
-    for (std::string_view bad : {std::string_view("\xc1\xbf"), std::string_view("\xe0\x9f\xbf"),
-                                 std::string_view("\xf0\x8f\xbf\xbf"), std::string_view("\xf5\x80\x80\x80"),
-                                 std::string_view("\xe2\x28\xa1"), std::string_view("\xf1\x28\x80\x80"),
-                                 std::string_view("\xf0\x9f\x28\x8c"), std::string_view("\xc3\x28"),
-                                 std::string_view("\xc3\xc3"), std::string_view("\xe2\x82\xe2"),
-                                 std::string_view("\xf0\x9f\x98"), std::string_view("\xc3")}) {
-        std::string t{bad};
-        CHECK(ust::scrub_wire_bytes(t) > 0);
-        CHECK(ust::count_invalid_wire_bytes(bad) > 0);
-        for (const char c : t)
-            CHECK(static_cast<unsigned char>(c) < 0x80);
-    }
 }
 
 TEST_CASE("parse_apt_one_line: '#' inside [...] is not a comment, a stray ']' is a plain character, allow-insecure follows trusted",

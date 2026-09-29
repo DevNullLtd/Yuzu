@@ -54,10 +54,12 @@
  */
 #pragma once
 
+#include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -234,20 +236,13 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
 /// (apt does the same before reading signed-by/trusted/allow-insecure). A '%'
 /// that is not followed by two hex digits stays as written.
 [[nodiscard]] inline std::string percent_decoded(std::string_view s) {
-    const auto hex = [](char c) -> int {
-        if (c >= '0' && c <= '9')
-            return c - '0';
-        if (c >= 'a' && c <= 'f')
-            return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F')
-            return c - 'A' + 10;
-        return -1;
-    };
     std::string out;
     out.reserve(s.size());
     for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '%' && i + 2 < s.size() && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
-            out += static_cast<char>(hex(s[i + 1]) * 16 + hex(s[i + 2]));
+        unsigned byte = 0;
+        if (s[i] == '%' && i + 2 < s.size() &&
+            std::from_chars(s.data() + i + 1, s.data() + i + 3, byte, 16).ptr == s.data() + i + 3) {
+            out += static_cast<char>(byte);
             i += 2;
         } else {
             out += s[i];
@@ -334,70 +329,6 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return out;
 }
 
-/// Length of the well-formed UTF-8 scalar starting at s[i] (1-4), or 0 when the
-/// byte there is NUL or does not start one (stray continuation byte, overlong
-/// form, surrogate, above U+10FFFF, truncated sequence).
-[[nodiscard]] inline std::size_t utf8_scalar_len(std::string_view s, std::size_t i) noexcept {
-    const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
-    const auto cont = [&](std::size_t k) { return k < s.size() && (at(k) & 0xC0u) == 0x80u; };
-    const unsigned c = at(i);
-    if (c == 0)
-        return 0;
-    if (c < 0x80)
-        return 1;
-    if (c >= 0xC2 && c <= 0xDF)
-        return cont(i + 1) ? 2 : 0;
-    if (c >= 0xE0 && c <= 0xEF) {
-        if (!cont(i + 1) || !cont(i + 2))
-            return 0;
-        if ((c == 0xE0 && at(i + 1) < 0xA0) || (c == 0xED && at(i + 1) >= 0xA0))
-            return 0; // overlong / UTF-16 surrogate
-        return 3;
-    }
-    if (c >= 0xF0 && c <= 0xF4) {
-        if (!cont(i + 1) || !cont(i + 2) || !cont(i + 3))
-            return 0;
-        if ((c == 0xF0 && at(i + 1) < 0x90) || (c == 0xF4 && at(i + 1) >= 0x90))
-            return 0; // overlong / above U+10FFFF
-        return 4;
-    }
-    return 0;
-}
-
-/// How many bytes scrub_wire_bytes would replace in `s`, without changing it.
-[[nodiscard]] inline std::size_t count_invalid_wire_bytes(std::string_view s) noexcept {
-    std::size_t bad = 0;
-    for (std::size_t i = 0; i < s.size();) {
-        const std::size_t n = utf8_scalar_len(s, i);
-        if (n == 0) {
-            ++bad;
-            ++i;
-        } else {
-            i += n;
-        }
-    }
-    return bad;
-}
-
-/// Replaces every byte that may not reach the wire -- NUL (the plugin ABI
-/// carries C strings, so a NUL cuts the row) and anything outside well-formed
-/// UTF-8 (the ABI is UTF-8; an invalid byte makes the whole response
-/// unparseable downstream) -- with '?'. Returns how many bytes were replaced.
-inline std::size_t scrub_wire_bytes(std::string& s) {
-    std::size_t replaced = 0;
-    for (std::size_t i = 0; i < s.size();) {
-        const std::size_t n = utf8_scalar_len(s, i);
-        if (n == 0) {
-            s[i] = '?';
-            ++replaced;
-            ++i;
-        } else {
-            i += n;
-        }
-    }
-    return replaced;
-}
-
 /// One wire field: "-" when empty, otherwise the untrusted text scrubbed of
 /// bytes that cannot cross the plugin ABI (scrub_wire_bytes) and escaped for the
 /// shared server decoder (safe_output_field; lossy on backslash by design).
@@ -405,13 +336,13 @@ inline std::size_t scrub_wire_bytes(std::string& s) {
     if (v.empty())
         return "-";
     std::string s{v};
-    scrub_wire_bytes(s);
+    yuzu::shared::scrub_wire_bytes(s);
     return yuzu::util::safe_output_field(s);
 }
 
 [[nodiscard]] inline std::string url_field(std::string_view v) {
     std::string s = redact_url_userinfo(v);
-    if (scrub_wire_bytes(s) != 0)
+    if (yuzu::shared::scrub_wire_bytes(s) != 0)
         s = redact_after_last_at(s);
     return field(s);
 }
@@ -787,6 +718,7 @@ struct AptParseResult {
                                                     std::string_view text,
                                                     std::vector<std::string>& rows,
                                                     std::size_t* altered = nullptr) {
+    using yuzu::shared::count_invalid_wire_bytes;
     const AptParseResult parsed =
         fmt == AptFormat::deb822 ? parse_apt_deb822(text) : parse_apt_one_line(text);
     for (const auto& s : parsed.sources) {
