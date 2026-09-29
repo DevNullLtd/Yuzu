@@ -83,7 +83,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import closing_refs  # noqa: E402  (the single parser -- see module docstring)
 
-REPO = "Tr3kkR/Yuzu"
+REPO = "DevNullLtd/Yuzu"
 TARGET_BRANCH = "dev"
 PER_PR_CAP = 6  # A1 par.5: observed max on 360 merged dev PRs is 6; >6 is anomalous
 MUTATION_SLEEP_S = 2

@@ -269,7 +269,7 @@ ${c.tlsMode === 'plaintext'
   y += `configs:\n`;
   y += `  # ── Server RBAC config ──\n`;
   y += `  # NOTE: RBAC is enabled but may not enforce in all Yuzu versions.\n`;
-  y += `  # See: https://github.com/Tr3kkR/Yuzu/issues/388\n`;
+  y += `  # See: https://github.com/DevNullLtd/Yuzu/issues/388\n`;
   y += `  server-cfg:\n`;
   y += `    content: |\n`;
   y += `      # ${c.adminUser} / <the password you entered> — PBKDF2-HMAC-SHA256, 100k iters.\n`;

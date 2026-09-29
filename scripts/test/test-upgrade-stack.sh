@@ -129,7 +129,7 @@ fi
 # pipeline still runs on a fresh clone without gh configured.
 if [[ -z "$OLD_VERSION" ]]; then
     if command -v gh >/dev/null 2>&1; then
-        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-Tr3kkR/Yuzu}/releases/latest" \
+        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-DevNullLtd/Yuzu}/releases/latest" \
                       --jq '.tag_name' 2>/dev/null | sed 's/^v//') || resolved=""
     fi
     if [[ -n "${resolved:-}" ]]; then

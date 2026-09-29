@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""closing_refs.py -- THE closing-keyword parser for Tr3kkR/Yuzu (ADR-3001 A1 par.12).
+"""closing_refs.py -- THE closing-keyword parser for DevNullLtd/Yuzu (ADR-3001 A1 par.12).
 
 Single implementation, imported by close_linked_issues.py (workflow, backfill,
 undo, leak scan) and by tests/test_close_automation.py. There is deliberately
@@ -39,7 +39,7 @@ import json
 import re
 import sys
 
-DEFAULT_REPO = "Tr3kkR/Yuzu"
+DEFAULT_REPO = "DevNullLtd/Yuzu"
 
 # Issue numbers: no leading zero, 1..9,999,999. GitHub renders #0 as text.
 _NUM = r"(?P<num>[1-9][0-9]{0,6})"
@@ -214,9 +214,9 @@ _SELFTEST = [
     ("closes #1, #2 and #3", [1, 2, 3]),  # the chain superset
     ("Fixes: #77", [77]),
     ("Resolved GH-9", [9]),
-    ("Closes Tr3kkR/Yuzu#520, #630.", [520, 630]),
+    ("Closes DevNullLtd/Yuzu#520, #630.", [520, 630]),
     ("Closes other/repo#5", []),  # cross-repo: never act
-    ("Closes https://github.com/Tr3kkR/Yuzu/issues/42", [42]),
+    ("Closes https://github.com/DevNullLtd/Yuzu/issues/42", [42]),
     # PR #1711, the canonical negative -- emphasis-wrapped negation:
     ("Hardening for the read surface (#1634, **partial** -- does **not** close #1634).", []),
     ("This does not fix #12, but closes #13", [13]),

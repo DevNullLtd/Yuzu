@@ -36,7 +36,7 @@ import close_linked_issues as cli  # noqa: E402
 # 1. Parser corpus: (name, body fragment, expected same-repo closing numbers)
 
 PARSER_CORPUS = [
-    # -- real bodies (verbatim fragments from merged Tr3kkR/Yuzu PRs) --------
+    # -- real bodies (verbatim fragments from merged DevNullLtd/Yuzu PRs) --------
     ("PR #1711 negated (MANDATORY negative)",
      "Hardening for the response/execution read surface (#1634, **partial** — does **not** close #1634).",
      []),
@@ -58,8 +58,8 @@ PARSER_CORPUS = [
     ("chain with and", "fixes #1, #2 and #3", [1, 2, 3]),
     ("colon form", "Resolves: #41", [41]),
     ("GH- form", "closed GH-77", [77]),
-    ("URL form", "Fixes https://github.com/Tr3kkR/Yuzu/issues/612", [612]),
-    ("same-repo qualified", "Closes Tr3kkR/Yuzu#99", [99]),
+    ("URL form", "Fixes https://github.com/DevNullLtd/Yuzu/issues/612", [612]),
+    ("same-repo qualified", "Closes DevNullLtd/Yuzu#99", [99]),
     ("cross-repo excluded", "Closes octo/kit#5 and fixes other/repo#6", []),
     ("newline between keyword and ref", "Closes\n#61", [61]),
     ("negation stops at contrast", "This does not fix #12, but closes #13", [13]),
@@ -398,8 +398,8 @@ def run_snapshot_and_misc_tests(failures):
     if key not in cli.capskip_title(123, 7):
         failures.append("capskip: search key must be a substring of the generated title")
 
-    for bad in ("", "https://github.com/Tr3kkR/Yuzu/issues/2139",
-                "https://github.com/Tr3kkR/Yuzu/issues/2139#issuecomment-notanumber"):
+    for bad in ("", "https://github.com/DevNullLtd/Yuzu/issues/2139",
+                "https://github.com/DevNullLtd/Yuzu/issues/2139#issuecomment-notanumber"):
         if cli.verify_approval_url(bad):
             failures.append(f"approval-url: {bad!r} must be rejected")
 

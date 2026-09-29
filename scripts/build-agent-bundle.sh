@@ -43,7 +43,7 @@ IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0
 
 REPO_SLUG="$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$|\1|')"
-[ -n "$REPO_SLUG" ] || REPO_SLUG="Tr3kkR/Yuzu"
+[ -n "$REPO_SLUG" ] || REPO_SLUG="DevNullLtd/Yuzu"
 
 derive_owner() {
   printf '%s' "$REPO_SLUG" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]'

@@ -199,7 +199,7 @@ class MainTests(unittest.TestCase):
                 {
                     "GITHUB_OUTPUT": str(self.output),
                     "GITHUB_EVENT_NAME": "pull_request",
-                    "GITHUB_REPOSITORY": "Tr3kkR/Yuzu",
+                    "GITHUB_REPOSITORY": "DevNullLtd/Yuzu",
                     "GITHUB_HEAD_REPOSITORY": "contributor/Yuzu",
                 },
                 clear=True,
