@@ -81,7 +81,7 @@ grep -q 'checkout_ref=' "$TMP/validate.sh" || { echo "extracted body does not lo
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-if [ "$#" -eq 2 ] && [ "$1" = "api" ] && [[ "$2" =~ ^repos/Tr3kkR/Yuzu/pulls/[1-9][0-9]*$ ]]; then
+if [ "$#" -eq 2 ] && [ "$1" = "api" ] && [[ "$2" =~ ^repos/DevNullLtd/Yuzu/pulls/[1-9][0-9]*$ ]]; then
   : > "$STUB_MARKER"
   # STUB_ACTUAL_HEAD_SHA overrides what the "live" PR head is, independent of
   # STUB_HEAD_SHA (the approved SHA passed in) -- unset, it defaults to the
@@ -106,7 +106,7 @@ run_validate() { # run_validate <event> <github_ref> <github_sha> <approved_sha>
     export PATH="$TMP/bin:$PATH" \
            GITHUB_OUTPUT="$TMP/out" GH_EVENT_NAME="$1" GITHUB_REF="$2" GITHUB_SHA="$3" \
            APPROVED_SHA="$4" GH_BASE_SHA="$5" \
-           REPOSITORY="Tr3kkR/Yuzu" PR_NUMBER="${RV_PR_NUMBER:-}" TRUSTED_GATE="${RV_TRUSTED_GATE:-}" \
+           REPOSITORY="DevNullLtd/Yuzu" PR_NUMBER="${RV_PR_NUMBER:-}" TRUSTED_GATE="${RV_TRUSTED_GATE:-}" \
            GH_TOKEN="" STUB_MARKER="$TMP/gh-called" STUB_HEAD_SHA="$4" STUB_BASE_SHA="$5" \
            STUB_ACTUAL_HEAD_SHA="${RV_STUB_ACTUAL_HEAD_SHA:-}"
     bash "$TMP/validate.sh" >"$TMP/stdout" 2>"$TMP/stderr"
@@ -181,7 +181,7 @@ if command -v jq >/dev/null 2>&1; then
     check "$ref: checkout_sha is the approved sha"  "$APPROVED"   "$(out_of checkout_sha)"
     check "$ref: trusted_execution is true"         "true"        "$(out_of trusted_execution)"
     check "$ref: base_sha is the PR base"           "$SHA_BASE"   "$(out_of base_sha)"
-    check "$ref: checkout_repository is the base repo" "Tr3kkR/Yuzu" "$(out_of checkout_repository)"
+    check "$ref: checkout_repository is the base repo" "DevNullLtd/Yuzu" "$(out_of checkout_repository)"
   done
 
   echo "-- workflow_call, PR head moved between approval and dispatch: refused, nothing pinned --"

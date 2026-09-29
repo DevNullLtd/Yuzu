@@ -200,7 +200,7 @@ def _print_auth_instructions(stderr: str) -> None:
     print("To enable, create a PAT and store it as a repo secret:")
     print("  1. github.com → Settings → Developer settings → Personal access tokens")
     print("     → Fine-grained tokens → Generate new token")
-    print("  2. Repository access = Tr3kkR/Yuzu only")
+    print("  2. Repository access = DevNullLtd/Yuzu only")
     print("  3. Permissions: 'Administration' = Read-only")
     print("  4. gh secret set RUNNER_INVENTORY_TOKEN --body <token>")
     print()
@@ -252,7 +252,7 @@ def query_runners() -> QueryResult:
     for attempt in range(MAX_QUERY_ATTEMPTS):
         try:
             result = subprocess.run(
-                ["gh", "api", "/repos/Tr3kkR/Yuzu/actions/runners"],
+                ["gh", "api", "/repos/DevNullLtd/Yuzu/actions/runners"],
                 capture_output=True,
                 text=True,
                 check=False,

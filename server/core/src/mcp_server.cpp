@@ -968,19 +968,20 @@ static const ToolDef kTools[] = {
      R"j(]})j"},
 
     {"preview_scope_targets",
-     "Show which agents match a scope expression. Confined by management group (ADR-0017): a "
-     "caller admitted through a management-group grant sees matched_agents/matched_count "
-     "narrowed to only their own visible devices, never the whole fleet. NOTE: tag:<key> atoms "
-     "resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls "
-     "back to a connected agent's own live self-reported value when the store has no row for "
-     "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
-     "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". NOTE: "
-     "from_result_set:<id> and props.* atoms are NOT resolved by this preview (only "
-     "os/arch/hostname/agent_version/tag:* are) - an expression using from_result_set: always "
-     "previews as matched_count:0 here even though a real dispatch resolves it correctly; do "
-     "not rely on this tool for such an expression (tracked #4307). REST v1 twin: POST "
-     "/api/v1/scope/preview.",
+     "Show which agents match a scope expression. Runs the SAME evaluation ladder a real "
+     "dispatch uses (owner-check gate included, #4981) - tag:<key>, props.<key>, and "
+     "from_result_set:<id> atoms all resolve identically to a real dispatch, not just "
+     "os/arch/hostname/agent_version/tag:* as before. Confined by management group (ADR-0017): "
+     "a caller admitted through a management-group grant sees matched_agents/matched_count "
+     "narrowed to only their own visible devices, never the whole fleet - the ladder itself "
+     "evaluates fleet-wide, then this confinement is intersected in afterward. tag:<key> atoms "
+     "resolve IDENTICALLY to a real dispatch: the persistent tag store first, falling back to a "
+     "locally-connected agent's own live self-reported value only when the store has no row for "
+     "that agent - a presence-only cross-replica agent has no live session to fall back to, so "
+     "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
+     "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
+     "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
+     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -8446,6 +8447,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 q.name_filter = param_str(args, "name");
                 const auto limit_opt = param_int_strict(args, "limit", q.limit);
                 if (!limit_opt) {
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams, "limit must be a JSON integer"),
                         "application/json");
@@ -8463,7 +8465,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("list_product_packs",
                                                             packs_result.error()),
-                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
+                                {}, /*retry_after_ms=*/transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -8507,7 +8509,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("get_product_pack",
                                                             pack_result.error()),
-                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
+                                {}, /*retry_after_ms=*/transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -11464,38 +11466,103 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Narrow the candidate set to the caller's admitted scope
-                // BEFORE the preview builder runs — the unfiltered snapshot
-                // (get_agents()) is the SAME source list_agents' own agents_fn
-                // and GET /api/v1/devices use; gate.scope is the sole filter,
-                // mirroring GET /api/v1/devices' own in_scope-filter-then-render.
-                const auto& all_agents = get_agents();
-                nlohmann::json visible_agents = nlohmann::json::array();
-                for (const auto& a : all_agents) {
-                    if (authz::in_scope(gate.scope, a.value("agent_id", "")))
-                        visible_agents.push_back(a);
+                // Checked AFTER the cheap input-shape validation above
+                // (mirrors GET /api/v1/events' own ordering — a malformed
+                // request is rejected before any backend-unavailable check).
+                if (!scope_evaluate_fn_) {
+                    spdlog::error("preview_scope_targets: scope_evaluate_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
                 }
-                // #2146 Batch B2: delegates to the shared preview_scope_targets()
-                // builder (scope_preview.hpp) so this tool and its new REST v1
+                // #4981 PR-2: delegates to the shared preview_scope_targets()
+                // builder (scope_preview.hpp) so this tool and its REST v1
                 // twin (POST /api/v1/scope/preview) cannot silently diverge in
-                // which agents match (api-twin-recipe.md Rule 1).
-                auto outcome =
-                    yuzu::server::preview_scope_targets(expression, visible_agents, tag_store);
+                // which agents match (api-twin-recipe.md Rule 1). Runs the
+                // SAME evaluation ladder a real dispatch uses (owner-check
+                // gate included) — gate.scope is applied AFTER the ladder's
+                // unfiltered fleet-wide evaluation, mirroring
+                // GET /api/v1/devices' own in_scope-filter-then-render.
+                auto outcome = yuzu::server::preview_scope_targets(
+                    expression, session->username, gate.scope, result_set_store_,
+                    scope_evaluate_fn_);
                 switch (outcome.kind) {
                 case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
                     res.set_content(error_response(id, kInvalidParams, outcome.detail),
                                     "application/json");
                     return;
-                case yuzu::server::ScopePreviewOutcome::Kind::kTagStoreDegraded:
-                    // Target = the expression being previewed — every sibling
-                    // failure audit here carries a target (governance cons-F2).
+                case yuzu::server::ScopePreviewOutcome::Kind::kEvaluationAborted: {
+                    if (outcome.detail == "owner_check_failed") {
+                        // Existence-oracle-safe, mirrors rs_load_owned's own
+                        // 404 body: a non-owner is indistinguishable from an
+                        // absent set. One row PER failing ref — a compound
+                        // expression can name more than one.
+                        for (const auto& ref : outcome.failing_refs)
+                            (void)audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
+                                           "not found or not owned");
+                        mcp_audit("failure", expression);
+                        // #4981 fix-round finding: was a bare error_response(...) with
+                        // no `data` object at all -- no correlation_id, no
+                        // retry_after_ms (not even null). Routed through the same
+                        // a4_error lambda the sibling db_degraded/principal_unresolved
+                        // arm below uses, so this permanent (non-retryable — the
+                        // referenced set doesn't exist or isn't owned by this
+                        // caller) failure carries a full A4 envelope too, per
+                        // agentic-first-principle.md A4.
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "RESULT_SET_NOT_FOUND: result set not found"),
+                            "application/json");
+                        return;
+                    }
+                    // db_degraded / principal_unresolved / presence_degraded /
+                    // unresolvable — never silently rendered as "0 matches"
+                    // (that would under-report the scope's real blast
+                    // radius). Target = the expression being previewed —
+                    // every sibling failure audit here carries a target
+                    // (governance cons-F2).
+                    //
+                    // #4981 adversarial-review finding 4: `principal_unresolved`
+                    // (no dispatching principal) and `unresolvable` (a
+                    // required store not wired — a configuration error) are
+                    // PERMANENT per scope_eval_error.hpp's own doc comments on
+                    // those two Kind values — a retry cannot fix either, so
+                    // they must NOT carry the same `retry_after_ms` hint as a
+                    // genuine transient degrade (`db_degraded`/
+                    // `presence_degraded`). Matches REST's identical split on
+                    // this same route and `approval_store_read_error_body`'s
+                    // (mcp_approval_error.hpp) precedent for
+                    // `list_pending_approvals`: the permanent arm omits
+                    // `retry_after_ms` entirely so `a4_error`'s default (-1 ->
+                    // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
-                    res.set_content(
-                        a4_error(kInternalError, "Tag store unavailable",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
+                    // #4981 fix-round finding: was a raw string comparison against
+                    // outcome.detail, which cannot warn if a future 6th
+                    // ScopeEvalError::Kind value lands unclassified. Routed
+                    // through the shared, exhaustive scope_abort_is_permanent()
+                    // classifier (scope_eval_error.hpp) instead — see that
+                    // function's doc comment for why OwnerCheckFailed never
+                    // actually reaches here (handled above).
+                    const bool permanent = outcome.abort_kind &&
+                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
+                    if (permanent) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "this is a permanent condition and will NOT clear on "
+                                     "retry; escalate to an operator"),
+                            "application/json");
+                    } else {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    }
                     return;
+                }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
                     mcp_audit("success", expression);
                     res.set_content(
@@ -15065,6 +15132,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string os = param_str(args, "os", "all");
                 auto model = dex_api_->catalogue_group(name, os, window);
                 if (!model) {
+                    // retry-hint-exempt: unknown signal family name, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams, "no such signal family: " + name),
                         "application/json");
@@ -15171,6 +15239,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the scope gate already allowed.
                 auto obs = dex_api_->observation(agent_id, event_id);
                 if (!obs) {
+                    // retry-hint-exempt: oracle-closed by design (not-found and a
+                    // foreign/guessed event_id share this same body) — the dex_api_
+                    // null check above already handles genuine store unavailability
                     res.set_content(error_response(id, kInvalidParams, "observation not found"),
                                     "application/json");
                     return;
@@ -19453,10 +19524,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     const int rpc_code =
                         (no_root || bad_csr || weak_key || bad_validity) ? kInvalidParams
                                                                           : kInternalError;
+                    const bool retryable = rpc_code == kInternalError;
                     res.set_content(
-                        error_response(id, rpc_code, msg,
-                                       audit_ok ? std::string_view{}
-                                                : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(rpc_code, msg, retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 audit_ok),
                         "application/json");
                     return;
                 }
@@ -19921,6 +19993,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto key = param_str(args, "key");
                 auto pk = plugin_config::parse_plugin_key(plugin, key);
                 if (!pk) {
+                    // retry-hint-exempt: invalid plugin/key format, not a store fault
                     res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
                                     "application/json");
                     return;
@@ -20044,6 +20117,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto key = param_str(args, "key");
                 auto pk = plugin_config::parse_plugin_key(plugin, key);
                 if (!pk) {
+                    // retry-hint-exempt: invalid plugin/key format, not a store fault
                     res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
                                     "application/json");
                     return;
@@ -20235,7 +20309,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                                  ? std::string_view("retry once the server reports "
                                                                     "ready")
                                                  : std::string_view{},
-                                             retryable ? mcp::kMcpStoreFaultShortRetryMs : -1),
+                                             /*retry_after_ms=*/retryable
+                                                 ? mcp::kMcpStoreFaultShortRetryMs
+                                                 : -1),
                                     "application/json");
                     return;
                 }
@@ -22015,6 +22091,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "engine_principal.role.assigned", "denied",
                                    "EnginePrincipal", principal_id,
                                    role_name + ": " + result.error());
+                    // retry-hint-exempt: business-rule rejection (validate_assignment), not a store fault
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
                                     "application/json");
                     return;
@@ -22084,7 +22161,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
-                    res.set_content(error_response(id, kInternalError, result.error()),
+                    res.set_content(a4_error(kInternalError, result.error(), {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -22931,10 +23009,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok = audit_fn(req, "engine_principal.create", "failure",
                                                           "EnginePrincipal", principal_id,
                                                           created.error());
+                    const int code = mcp_error_for_store_msg(created.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(created.error()), created.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, created.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -23279,10 +23360,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.mint", "failure", "EnginePrincipal",
                                 principal_id, minted.error());
+                    const int code = mcp_error_for_store_msg(minted.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(minted.error()), minted.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, minted.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -23359,6 +23443,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // 30.0, or "30"). REST 400s this; so does the tool's own
                     // declared integer schema. Silently defaulting to 7 gave
                     // the caller a window they did not ask for.
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "overlap_days must be a JSON integer (days)"),
@@ -23396,10 +23481,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.rotate", "failure",
                                 "EnginePrincipal", principal_id, rotated.error());
+                    const int code = mcp_error_for_store_msg(rotated.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(rotated.error()), rotated.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, rotated.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -23655,6 +23743,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // 30.0, or "30"). REST 400s this; so does the tool's own
                     // declared integer schema. Silently defaulting to 7 gave
                     // the caller a window they did not ask for.
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "overlap_days must be a JSON integer (days)"),
@@ -23716,10 +23805,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) {
                     const bool denied_audit_ok = audit_fn(req, "api_token.rotate", "failure",
                                                           "ApiToken", token_id, result.error());
+                    const int code = mcp_error_for_store_msg(result.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(result.error()), result.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, result.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     mcp_audit("failure", result.error());
                     return;
@@ -23959,11 +24051,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                     const bool denied_audit_ok = audit_fn(req, "api_token.confirm", "failure",
                                                           "ApiToken", token_id, confirmed.error());
+                    const int code = mcp_error_for_store_msg(confirmed.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
-                                       confirmed.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, confirmed.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     mcp_audit("failure", confirmed.error());
                     return;
@@ -24723,12 +24817,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview", "",
                                 open_res.error());
                     mcp_audit("failure", open_res.error());
+                    const int code = mcp_error_for_access_review_msg(open_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(open_res.error()),
-                                       open_res.error(),
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, open_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -24855,9 +24950,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto view_res = access_review_store->get_campaign(campaign_id);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
+                    const int code = mcp_error_for_access_review_msg(view_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(view_res.error()),
-                                       view_res.error()),
+                        a4_error(code, view_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -25029,12 +25127,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn(req, "access_review.closed", "failure", "AccessReview", campaign_id,
                                 close_res.error());
                     mcp_audit("failure", close_res.error());
+                    const int code = mcp_error_for_access_review_msg(close_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(close_res.error()),
-                                       close_res.error(),
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, close_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }

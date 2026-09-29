@@ -44,7 +44,7 @@
 
 services:
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.10.0}
     restart: "no"
     environment:
       # Postgres substrate DSN (ADR-0006, #1318). Inert on the old-release

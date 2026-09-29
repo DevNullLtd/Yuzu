@@ -65,7 +65,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management server
  Enterprise endpoint management platform — server component.
 EOF
@@ -121,7 +121,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management agent
  Enterprise endpoint management platform — agent component.
 EOF
