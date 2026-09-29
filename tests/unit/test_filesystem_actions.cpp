@@ -50,7 +50,12 @@ namespace {
 // jobs on the same shared-identity box (one shared %TEMP%) can no longer see
 // each other's files — under the old fixed paths, one job's fixture dtor
 // deleted the other job's live file mid-test (#1883). The base is created
-// once and recursively removed at process exit by yuzu::test::TempDir.
+// once. NOTE (#3507): it is NOT removed at process exit any more. TempDir's
+// only cleanup is its destructor, and the Catch2 main hard_exit()s after
+// Session::run() on Windows and macOS, which skips static destruction - so
+// this base leaks one directory per run under $TMPDIR/%TEMP% on those two
+// platforms. Bounded (macOS purges unaccessed temp entries after ~3 days) and
+// tracked; the durable fix is a testRunEnded listener, not a destructor.
 const fs::path& fsaction_base() {
     static yuzu::test::TempDir base{"yuzu_test_fsaction-"};
     static const bool created = [] {

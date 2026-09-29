@@ -84,10 +84,20 @@
 // docs/windows-build.md's standing rule, and windows-asan's toolchain is
 // confirmed cl.exe) — extending this guard to macOS, which is Apple Clang,
 // makes it load-bearing: a bare !defined(__SANITIZE_ADDRESS__) would NOT
-// exclude a macOS ASan build and would TerminateProcess before the leak
-// reporter ran, reintroducing on macOS exactly the hole the windows-asan
-// carve-out above exists to prevent. Hence YUZU_TEST_ASAN below, which ORs
-// both conventions. This is not a new, untested pattern: the identical
+// exclude a macOS ASan build, and the guard would then hard_exit (::_exit on
+// POSIX, not TerminateProcess - see hard_exit.hpp) before any static/global
+// destructor ran, reintroducing on macOS exactly the hole the windows-asan
+// carve-out above exists to prevent. The durable loss there is the
+// teardown-UAF WINDOW, not primarily the leak report. Hence YUZU_TEST_ASAN
+// below, which ORs both conventions.
+//
+// TSan is excluded on the same reasoning and by the same shape: the sanitizer
+// built to SEE a detached-worker-vs-teardown race is exactly the one that must
+// be allowed to reach teardown. (Apple's TSan runtime interposes _exit, so its
+// report and exit status survive hard_exit - the window does not, which is the
+// part that matters.) UBSan needs no exclusion: it reports inline and runs no
+// finalizer. The YUZU_TEST_TSAN macro this guard reads is the pre-existing one
+// defined below for the libpq suppressions hook. This is not a new, untested pattern: the identical
 // cross-toolchain sanitizer-detect need already lives in this exact
 // codebase at tests/unit/test_helpers.hpp's kSpinScale and
 // agents/core/include/yuzu/agent/guardian_engine.hpp's
@@ -188,7 +198,8 @@ int main(int argc, char* argv[]) {
                  result);
     std::fflush(stderr);
     std::fflush(stdout);
-#if (defined(_WIN32) || defined(__APPLE__)) && !defined(YUZU_TEST_ASAN)
+#if (defined(_WIN32) || defined(__APPLE__)) && !defined(YUZU_TEST_ASAN) && \
+    !defined(YUZU_TEST_TSAN)
     yuzu::agent::hard_exit(result); // see the #3507 AC1 comment above
 #endif
     return result;
