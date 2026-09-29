@@ -235,5 +235,4 @@ error|missing required parameter: name
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md` · `changelog.d/4513-macos-services-malformed-capture-constrained.fixed.md`
 <!-- END GENERATED -->

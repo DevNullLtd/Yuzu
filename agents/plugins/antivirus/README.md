@@ -211,5 +211,4 @@ unsupported|av_exclusions is Windows-only
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_antivirus_local_dispatcher.cpp` · `tests/unit/test_antivirus_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260716-macos-antivirus-xprotect.fixed.md` · `changelog.d/20260818-wave3-antivirus-av-exclusions.added.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md`
 <!-- END GENERATED -->

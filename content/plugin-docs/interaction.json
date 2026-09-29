@@ -1014,10 +1014,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/20260716-macos-interaction-not-reachable.fixed.md",
-      "changelog.d/20260818-wave2-interaction-native-argv.changed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/interaction.yaml"
     ],
