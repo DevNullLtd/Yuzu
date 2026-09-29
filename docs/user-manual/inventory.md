@@ -173,11 +173,15 @@ cadences.
 The data lands in the Postgres schema **`software_inventory_store`**:
 
 - `installed_software(agent_id, name, version, publisher, install_date, kind,
-  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version)`
+  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version,
+  install_location, uninstall_string, package_id, source, install_id)`
   — one row per installed package per device. Every column except `agent_id`
   and `name` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
-  agent's next full resend.
+  agent's next full resend. Rows from agents that do not yet emit the extended
+  tail carry `''` in `install_location`, `uninstall_string`, `package_id` and
+  `source`; `install_id` (a row id, reassigned on each full report) is always
+  populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied

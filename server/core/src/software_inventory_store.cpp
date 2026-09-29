@@ -763,7 +763,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     if (!q.q.empty()) {
         // One bind reused across the four columns (software_catalog's idiom). `%`/`_`
         // in q act as wildcards, exactly like name_filter there.
-        // ponytail: four seq-scan ILIKEs — fine to ~50k rows; add a pg_trgm GIN
+        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows; add a pg_trgm GIN
         // (CREATE EXTENSION is an operator decision) when the fleet passes that.
         const std::string ph = "$" + std::to_string(++p);
         sql += " AND (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +

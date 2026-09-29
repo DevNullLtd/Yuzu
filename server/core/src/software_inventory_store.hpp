@@ -142,7 +142,7 @@ struct CatalogRollupMeta {
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
     std::string name;     ///< exact software-name filter ("" = all names)
-    /// Page size. Silently clamped to kFleetQueryRowCap (100000) by the store, so a
+    /// Page size. Silently clamped to kFleetQueryRowCap by the store, so a
     /// short page is NOT proof of exhaustion: page until an EMPTY page.
     int limit{1000};
     std::string q;         ///< case-insensitive substring over name|publisher|ecosystem|source
