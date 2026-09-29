@@ -6,6 +6,7 @@
  */
 
 #include "execution_tracker.hpp"
+#include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -20,6 +21,8 @@
 #include <atomic>
 #include <chrono>
 #include <latch>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2847,4 +2850,315 @@ TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic 
     auto exec = tracker.get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "running");
+}
+
+// ── #4982 Part B: reap_stuck_running_executions ──────────────────────────────
+//
+// The candidate query is a cross-schema NOT EXISTS against
+// command_outbox_store.outbox, so these tests need BOTH schemas migrated into
+// the SAME ephemeral database — the shared execution_tracker_pg_template above
+// migrates execution_tracker alone, so this uses its own dedicated template +
+// fixture, mirroring test_command_outbox_delivery.cpp's local
+// DeliveryPg/delivery_tpl shape.
+
+namespace {
+yuzu::test::PgTestTemplate stuck_exec_tpl{"stuckexecreap", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ExecutionTracker et{pool};
+    if (!et.is_open())
+        throw std::runtime_error("stuck-exec template: execution_tracker failed to migrate");
+    yuzu::server::CommandOutboxStore cos{pool};
+    if (!cos.is_open())
+        throw std::runtime_error("stuck-exec template: command_outbox_store failed to migrate");
+}};
+
+class StuckExecPg {
+public:
+    StuckExecPg() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr)
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        db_.emplace(stuck_exec_tpl);
+        REQUIRE(db_->available());
+        pool_.emplace(pg::PgPool::Options{.conninfo = db_->dsn(), .size = 4});
+        REQUIRE(pool_->valid());
+        tracker_ = std::make_unique<ExecutionTracker>(*pool_);
+        REQUIRE(tracker_->is_open());
+    }
+    StuckExecPg(const StuckExecPg&) = delete;
+    StuckExecPg& operator=(const StuckExecPg&) = delete;
+
+    ExecutionTracker& tracker() { return *tracker_; }
+    pg::PgPool& pool() { return *pool_; }
+
+private:
+    std::optional<yuzu::test::PostgresTestDb> db_;
+    std::optional<pg::PgPool> pool_;
+    std::unique_ptr<ExecutionTracker> tracker_;
+};
+
+// Directly backdates an execution's dispatched_at (test-only path — the
+// public API has no "backdate" hook by design — mirrors how the
+// reap_command_execution_mappings tests above poke created_at directly).
+void backdate_dispatched_at(pg::PgPool& pool, const std::string& id, std::int64_t seconds_ago) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.executions SET dispatched_at = dispatched_at - $1 WHERE id = $2",
+        std::vector<std::string>{std::to_string(seconds_ago), id});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+
+// Inserts a minimal command_outbox_store.outbox row referencing execution_id
+// in the given state — a direct INSERT rather than going through
+// CommandOutboxStore's fenced claim_and_enqueue (which needs a real
+// LeaderElector epoch these tests have no use for); same test-only-path
+// precedent as backdate_dispatched_at above.
+void insert_outbox_row(pg::PgPool& pool, const std::string& occurrence_id,
+                       const std::string& execution_id, const std::string& state) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO command_outbox_store.outbox "
+        "(occurrence_id, command_id, source, plugin, action, execution_id, state) "
+        "VALUES ($1, $2, 'test', 'test-plugin', 'test-action', $3, $4)",
+        std::vector<std::string>{occurrence_id, occurrence_id + "-cmd", execution_id, state});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+} // namespace
+
+TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
+          "reap_stuck_running_executions without crashing",
+          "[execution_tracker]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+    auto out = closed.reap_stuck_running_executions();
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error() == "execution tracker not open");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions cancels an old "
+          "running/agents_targeted=0 row with no outbox involvement at all",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600); // 1h old, past the 30m window
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 1);
+    CHECK(out->not_cancelled == 0);
+    CHECK_FALSE(out->clock_anomaly);
+    CHECK_FALSE(out->would_wipe);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+
+    // Event-publish shape matches mark_cancelled's own (the sweep calls it
+    // directly for the actual mutation).
+    auto rows = fetch_outbox(env.pool(), *id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].event_type == "execution-completed");
+    CHECK(rows[0].is_terminal);
+    CHECK(rows[0].data.find("cancelled") != std::string::npos);
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions leaves a RECENT "
+          "running/agents_targeted=0 row alone (inside the window)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution()); // dispatched_at = now
+    REQUIRE(id.has_value());
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 0);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions leaves an old row "
+          "alone once agents_targeted is set (not actually stuck)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(env.tracker().set_agents_targeted(*id, 3));
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 0);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions excludes a row "
+          "with a PENDING outbox entry (#4982 escalation — still legitimately "
+          "retried by command_outbox_delivery, not a bookkeeping failure)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+    insert_outbox_row(env.pool(), "occ-pending-1", *id, "pending");
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 0);
+    CHECK_FALSE(out->would_wipe);
+    CHECK_FALSE(out->clock_anomaly);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running"); // untouched — still legitimately in flight
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions still cancels a "
+          "row once its outbox entry reached a TERMINAL state — the exclusion "
+          "is scoped to state='pending' only",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+    insert_outbox_row(env.pool(), "occ-sent-1", *id, "sent");
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 1);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines to act "
+          "(would-wipe) when most running executions look stuck",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    // 25 total running executions (>= the 20-row floor); 20 of them old and
+    // agents_targeted=0 (80% > the 50% ratio) — the systemic-bug shape, not a
+    // genuine backlog.
+    std::vector<std::string> stuck_ids;
+    for (int i = 0; i < 20; ++i) {
+        auto id = env.tracker().create_execution(make_execution());
+        REQUIRE(id.has_value());
+        backdate_dispatched_at(env.pool(), *id, 3600);
+        stuck_ids.push_back(*id);
+    }
+    for (int i = 0; i < 5; ++i) {
+        auto id = env.tracker().create_execution(make_execution());
+        REQUIRE(id.has_value());
+        REQUIRE(env.tracker().set_agents_targeted(*id, 1));
+    }
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->would_wipe);
+    CHECK(out->cancelled == 0);
+    CHECK_FALSE(out->clock_anomaly);
+
+    for (const auto& id : stuck_ids) {
+        auto exec = env.tracker().get_execution(id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running"); // declined — nothing acted on this pass
+    }
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions proceeds below the "
+          "would-wipe floor even at a 100% candidate ratio",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    // 3 total running executions, all 3 old & stuck: 100% ratio, but under the
+    // floor (kStuckExecWouldWipeFloor=20) — too small a population for the
+    // ratio to mean anything, so this proceeds instead of declining.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 3; ++i) {
+        auto id = env.tracker().create_execution(make_execution());
+        REQUIRE(id.has_value());
+        backdate_dispatched_at(env.pool(), *id, 3600);
+        ids.push_back(*id);
+    }
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->would_wipe);
+    CHECK(out->cancelled == 3);
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines on an "
+          "implausibly-forward anchor gap (forward-skew decline)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint - 200000)::text WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running"); // declined outright — clock anomaly
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines on a "
+          "backward-stepped clock (backward-anomaly decline)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint + 200000)::text WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running"); // declined outright — clock anomaly
 }

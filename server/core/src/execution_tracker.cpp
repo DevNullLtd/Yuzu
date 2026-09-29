@@ -2623,6 +2623,271 @@ std::expected<EventOutboxReapOutcome, std::string> ExecutionTracker::reap_event_
     return EventOutboxReapOutcome{deleted, clock_anomaly};
 }
 
+// ---------------------------------------------------------------------------
+// #4982 Part B: the stuck-running-execution sweep
+// ---------------------------------------------------------------------------
+
+namespace {
+// Substrate-tuned to `executions` — NOT copied from kCmdExecutionReapWindowSecs/
+// kEventOutboxReapWindowSecs above (clock-guarded-retention part 1's "never
+// copy the numbers" rule: those two size a DELETE window for a regenerable
+// observability table; this sizes how long a MUTATING cancel waits before
+// acting on live state). A synchronous REST/MCP dispatch resolves
+// agents_targeted (or cancels) within the SAME request — normal completion is
+// sub-second — so 30 minutes is generous headroom over any realistic
+// in-request latency (pool contention, a slow scope resolve) while still
+// surfacing a genuinely wedged row within the hour, not after a day. A
+// schedule_runner/command_outbox_delivery-originated execution that is
+// legitimately still being retried past this window is excluded up front by
+// the outbox NOT EXISTS clause below, regardless of age, so this window only
+// has to be sized for the synchronous path this sweep actually targets.
+constexpr std::int64_t kStuckExecWindowSecs = 30 * 60;
+constexpr int kStuckExecReapCap = 500;
+// Same reasoning as kMaxPlausibleSkewSecs/kEventOutboxMaxPlausibleSkewSecs
+// above: real margin over THIS sweep's own nominal cadence
+// (kStuckExecReapEveryNTicks, server.cpp, ~15 minutes), not merely equal to
+// it. 24h is a ~96x margin over that cadence — comfortably absorbing ordinary
+// scheduler jitter while still catching a genuinely wrong clock (a jump of
+// days, not minutes).
+constexpr std::int64_t kStuckExecMaxPlausibleSkewSecs = 24 * 3600;
+
+// Would-wipe (clock-guarded-retention part 1) is ADOPTED here — UNLIKE this
+// file's two DELETE-based siblings above, which deliberately decline it
+// because their tables drain to 100% expiry as ROUTINE behaviour (every
+// mapping/event is consumed or ages out on schedule, so a would-wipe verdict
+// there cannot separate a true positive from ordinary drain). This sweep is
+// the opposite kind of pass: its action CANCELS live, still-referenced
+// execution rows — a mutation of authoritative state, not a drain of a
+// regenerable aid — and a healthy fleet's running executions resolve
+// agents_targeted>0 within seconds, so candidates should always be a SMALL
+// minority of the running population. A pass whose candidates are a LARGE
+// fraction of all currently-running executions is evidence of a systemic bug
+// (e.g. a broad regression in a synchronous dispatch call site's own
+// set_agents_targeted call), not a genuine backlog of stuck rows, and acting
+// on that evidence risks mass-cancelling live work.
+//
+// Floor (20 total running executions): below it, a single legitimate stuck
+// row is already a large fraction of a small population by arithmetic alone
+// (1 of 3 = 33%) — the ratio is too noisy to mean anything at this scale, and
+// the blast radius of proceeding anyway is at most a handful of rows, so
+// proceeding is the safer default below the floor.
+//
+// Ratio (50%): cancelling a MINORITY of currently-running executions on the
+// strength of this already-narrowly-scoped candidate query (status + age +
+// outbox-exclusion) is this sweep's ordinary job; cancelling a MAJORITY is the
+// "something broke fleet-wide" signal part 1 exists to catch.
+//
+// The denominator is the RAW total running count — deliberately NOT itself
+// outbox-filtered — so a broadly-broken set_agents_targeted bug on the
+// SYNCHRONOUS dispatch path (which never touches the outbox at all) still
+// trips this guard; the outbox exclusion only narrows the CANDIDATE set, not
+// the population it is measured against.
+constexpr std::int64_t kStuckExecWouldWipeFloor = 20;
+constexpr double kStuckExecWouldWipeRatio = 0.5;
+} // namespace
+
+std::expected<StuckExecutionReapOutcome, std::string>
+ExecutionTracker::reap_stuck_running_executions() {
+    if (!open_)
+        return std::unexpected("execution tracker not open");
+
+    bool clock_anomaly = false;
+    bool would_wipe = false;
+    std::vector<std::string> candidate_ids;
+    std::int64_t now_s = 0;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        if (pg::exec_params(
+                c, "SELECT pg_advisory_xact_lock(hashtext('execution_tracker:stuck_exec_reap'))",
+                std::vector<std::string>{})
+                .status() != PGRES_TUPLES_OK) {
+            err = "stuck-exec reap advisory lock failed";
+            return false;
+        }
+        {
+            pg::PgResult nr = pg::exec_params(
+                c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "stuck-exec reap now() read failed";
+                return false;
+            }
+            // SANITISE the reading (clock-guarded-retention part 3): unparseable
+            // or negative is an ANOMALY, never a quiet fallback.
+            auto parsed_now = parse_reap_i64(col_str(nr.get(), 0, 0));
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: "
+                             "unparseable or negative now() reading '{}'",
+                             col_str(nr.get(), 0, 0));
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            now_s = *parsed_now;
+        }
+        pg::PgResult ar = pg::exec_params(
+            c, "SELECT value FROM execution_tracker.reap_meta WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        if (ar.status() != PGRES_TUPLES_OK) {
+            err = "stuck-exec reap anchor read failed";
+            return false;
+        }
+        const bool has_anchor = PQntuples(ar.get()) > 0;
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            auto parsed_anchor = parse_reap_i64(col_str(ar.get(), 0, 0));
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: "
+                             "unparseable or negative persisted anchor '{}'",
+                             col_str(ar.get(), 0, 0));
+                clock_anomaly = true;
+                return true;
+            }
+            anchor = *parsed_anchor;
+        }
+        // Overflow-safe forward-skew comparison — same reasoning as the two
+        // siblings above (subtract, never add, on already-sanitised
+        // non-negative operands).
+        if (has_anchor && now_s >= anchor && now_s - anchor > kStuckExecMaxPlausibleSkewSecs) {
+            spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: now_s {} "
+                         "implausibly ahead of anchor {}",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true; // decline, anchor unchanged
+        }
+        if (has_anchor && now_s < anchor) {
+            spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: now_s {} is "
+                         "behind anchor {} (backward clock movement or a poisoned anchor) — not "
+                         "acting under a rewound clock",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true;
+        }
+
+        // Clock accepted — advance the anchor now, regardless of the
+        // would-wipe verdict computed below: the anchor's sole job is to
+        // detect a BAD CLOCK, which this reading is not. A would-wipe decline
+        // is an orthogonal, population-based decision about whether to ACT,
+        // not a statement about the clock.
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
+        pg::PgResult ur = pg::exec_params(
+            c,
+            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+            "('stuck_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(new_anchor)});
+        if (ur.status() != PGRES_COMMAND_OK) {
+            err = "stuck-exec reap anchor update failed";
+            return false;
+        }
+
+        // RAW total running population — deliberately NOT outbox-filtered
+        // (see kStuckExecWouldWipeRatio's doc comment above): the would-wipe
+        // guard must also catch a broadly-broken set_agents_targeted bug on
+        // the SYNCHRONOUS dispatch path, which never touches the outbox at
+        // all.
+        pg::PgResult tr = pg::exec_params(
+            c, "SELECT count(*) FROM execution_tracker.executions WHERE status = 'running'",
+            std::vector<std::string>{});
+        if (tr.status() != PGRES_TUPLES_OK || PQntuples(tr.get()) == 0) {
+            err = "stuck-exec reap total-running read failed";
+            return false;
+        }
+        const std::int64_t total_running = to_i64(col(tr.get(), 0, 0));
+
+        // Candidate population (uncapped COUNT, to decide would-wipe before
+        // ever selecting rows to act on). The outbox NOT EXISTS clause
+        // excludes any execution_id the delivery loop is still actively
+        // retrying — command_outbox_store.outbox's `state` CHECK constraint
+        // is `IN ('pending','sent','failed')` and its delivery loop
+        // (command_outbox_delivery.cpp) never introduces a fourth transient/
+        // claimed state: a row stays 'pending' for its whole in-tick
+        // processing and only ever leaves it via mark_sent/mark_failed, or is
+        // rescheduled back to 'pending' with backoff. 'pending' is therefore
+        // the sole "still owned by the delivery loop" value. This is a
+        // cross-schema reference to a sibling store's table — normal in this
+        // codebase (many stores already reference each other this way), and
+        // safe here because CommandOutboxStore's own construction is
+        // fail-closed at boot (server.cpp refuses to start if its schema
+        // migration fails), so the schema is guaranteed present whenever this
+        // sweep runs. A query failure against it (permissions, a dropped
+        // schema, any other fault) flows through the SAME degrade path as
+        // every other query failure in this transaction — no special case.
+        const std::string cutoff = std::to_string(now_s - kStuckExecWindowSecs);
+        pg::PgResult cr = pg::exec_params(
+            c,
+            "SELECT count(*) FROM execution_tracker.executions "
+            "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
+            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
+            "                WHERE execution_id = executions.id AND state = 'pending')",
+            std::vector<std::string>{cutoff});
+        if (cr.status() != PGRES_TUPLES_OK || PQntuples(cr.get()) == 0) {
+            err = "stuck-exec reap candidate-count read failed";
+            return false;
+        }
+        const std::int64_t candidate_count = to_i64(col(cr.get(), 0, 0));
+
+        if (candidate_count == 0)
+            return true; // nothing to do this pass
+
+        if (total_running >= kStuckExecWouldWipeFloor &&
+            static_cast<double>(candidate_count) / static_cast<double>(total_running) >
+                kStuckExecWouldWipeRatio) {
+            spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined to act: {} of "
+                         "{} running executions ({:.0f}%) look stuck — likely a systemic "
+                         "bookkeeping bug, not a genuine backlog; declining to mass-cancel",
+                         candidate_count, total_running,
+                         100.0 * static_cast<double>(candidate_count) /
+                             static_cast<double>(total_running));
+            would_wipe = true;
+            return true; // decline to act; anchor already advanced above
+        }
+
+        pg::PgResult ids = pg::exec_params(
+            c,
+            "SELECT id FROM execution_tracker.executions "
+            "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
+            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
+            "                WHERE execution_id = executions.id AND state = 'pending') "
+            "ORDER BY dispatched_at ASC LIMIT $2::bigint",
+            std::vector<std::string>{cutoff, std::to_string(kStuckExecReapCap)});
+        if (ids.status() != PGRES_TUPLES_OK) {
+            err = "stuck-exec reap candidate-select failed";
+            return false;
+        }
+        const int rows = PQntuples(ids.get());
+        candidate_ids.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i)
+            candidate_ids.push_back(col_str(ids.get(), i, 0));
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "stuck-exec reap failed" : err);
+
+    StuckExecutionReapOutcome out;
+    out.clock_anomaly = clock_anomaly;
+    out.would_wipe = would_wipe;
+
+    // The actual cancellation happens OUTSIDE the guard transaction above,
+    // through the SAME mark_cancelled() every other terminal transition in
+    // this file uses — its own guarded UPDATE (status NOT IN (...)) and
+    // execution-completed event-publish shape, so a candidate that already
+    // transitioned between the SELECT above and this call (a genuine terminal
+    // response arriving, or a race lost to another replica) is a safe, silent
+    // no-op here, never a double-cancel.
+    for (const auto& id : candidate_ids) {
+        if (mark_cancelled(id, "system:stuck_exec_reap")) {
+            ++out.cancelled;
+        } else {
+            ++out.not_cancelled;
+            spdlog::warn("ExecutionTracker::reap_stuck_running_executions: mark_cancelled did "
+                         "not transition execution id={} (already terminal, raced by another "
+                         "replica, or the write itself failed — see mark_cancelled's own error "
+                         "log for the latter) — remains 'running' if still live, retried next "
+                         "pass",
+                         id);
+        }
+    }
+    return out;
+}
+
 // HA WS-2a-2 (ADR-2002 §5): the cross-replica delivery poll. Reference: the
 // enterprise-architect design review 2026-09-02 (verdict ENDORSE/SOUND) + the
 // ID-ORDERING CONTRACT on append_event_outbox above.

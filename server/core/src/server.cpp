@@ -3183,6 +3183,32 @@ public:
             for (auto surface : {"rest", "mcp"})
                 metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                                  {{"op", op}, {"surface", surface}});
+        // #4982 Part B — the recovery side of the counter above:
+        // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
+        // execution row permanently wedged at status='running',
+        // agents_targeted=0. outcome="cancelled" counts by the number of rows
+        // actually transitioned this pass; outcome="not_cancelled" counts
+        // candidates the pass selected but mark_cancelled did not transition
+        // (already terminal, raced by another replica, or the write itself
+        // failed — see that call's own spdlog::error for the latter);
+        // outcome="clock_anomaly"/"would_wipe" each count once per pass
+        // DECLINED for that reason (an implausible now()/anchor reading, or
+        // candidates being an implausibly large fraction of all running
+        // executions — likely a systemic bug, not a genuine backlog);
+        // outcome="degraded" counts a pass that failed outright (pool/query
+        // degradation). Bounded 5-value closed set, pre-seeded below so
+        // absent() stays meaningful (same convention as the gateway-route
+        // reap outcome family).
+        metrics_.describe("yuzu_exec_tracker_stuck_reap_total",
+                          "reap_stuck_running_executions() pass outcomes (#4982 Part B), by "
+                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded). "
+                          "cancelled/not_cancelled increment by the per-row count for an accepted "
+                          "pass; would_wipe/clock_anomaly/degraded increment once per declined/"
+                          "failed pass.",
+                          "counter");
+        for (const char* outcome :
+            {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly", "degraded"})
+            metrics_.counter("yuzu_exec_tracker_stuck_reap_total", {{"outcome", outcome}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
         // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
@@ -15940,6 +15966,16 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // #4982 Part B: the stuck-running-execution sweep. Tighter than
+                // the 60m correlation-table cadence above — this recovers a
+                // CORRECTNESS bug (an execution wedged at status='running'
+                // forever), not routine hygiene on an opaque-id table, so a
+                // ~15m cadence (matching the session-reap cadence) surfaces a
+                // genuinely wedged row reasonably promptly without hammering
+                // the pool for what should be a rare event. See
+                // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
+                // PlausibleSkewSecs for how this cadence sizes those constants.
+                constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -16194,6 +16230,45 @@ private:
                                         .increment();
                             } else {
                                 metrics_.counter("yuzu_exec_correlation_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2e2) #4982 Part B: the stuck-running-execution sweep —
+                        // recovers an execution row permanently wedged at
+                        // status='running', agents_targeted=0 (see
+                        // ExecutionTracker::reap_stuck_running_executions's own
+                        // doc comment for the full false-positive-avoidance
+                        // reasoning: the outbox-pending exclusion, the
+                        // would-wipe ratio gate, and the clock-guard shape).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kStuckExecReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_stuck_running_executions()) {
+                                if (reaped->cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "cancelled"}})
+                                        .increment(static_cast<double>(reaped->cancelled));
+                                if (reaped->not_cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "not_cancelled"}})
+                                        .increment(static_cast<double>(reaped->not_cancelled));
+                                if (reaped->would_wipe)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "would_wipe"}})
+                                        .increment();
+                                if (reaped->clock_anomaly)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "clock_anomaly"}})
+                                        .increment();
+                            } else {
+                                spdlog::warn("stuck-execution reap failed: {}", reaped.error());
+                                metrics_
+                                    .counter("yuzu_exec_tracker_stuck_reap_total",
+                                             {{"outcome", "degraded"}})
                                     .increment();
                             }
                         }

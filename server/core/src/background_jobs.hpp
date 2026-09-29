@@ -92,10 +92,11 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (44 passes). Verified against the source sweep
+/// The exhaustive inventory (45 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
-/// `gateway_route_store.reap_stale_routes`, 2026-09-11, and the HA WS-8 addition
-/// of `pg_reachability_probe.tick`, 2026-09-24); keep the count
+/// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
+/// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
+/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -125,6 +126,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "authority. Runs on the single replica today; the class gates a 2nd replica on the fix"},
     {"execution_tracker.reap_event_outbox", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock"},
+    {"execution_tracker.reap_stuck_running_executions", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + pg_advisory_xact_lock (#4982 Part B); the actual mutation "
+     "(mark_cancelled) is its own guarded UPDATE (status NOT IN (...)), so a racing "
+     "replica's redundant cancel attempt is a safe no-op, never a double-cancel"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
     {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,

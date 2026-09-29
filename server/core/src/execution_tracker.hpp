@@ -198,6 +198,27 @@ struct EventOutboxReapOutcome {
     bool clock_anomaly{false};
 };
 
+/// #4982 Part B. Outcome of one `reap_stuck_running_executions` pass. Unlike
+/// `CommandExecutionReapOutcome`/`EventOutboxReapOutcome` above (which DELETE
+/// rows from a regenerable observability table), this sweep MUTATES live
+/// execution rows via `mark_cancelled` — so its outcome carries an extra
+/// `would_wipe` decline signal (clock-guarded-retention part 1, ADOPTED for
+/// this sweep; see the recorded reasoning at `reap_stuck_running_executions`'s
+/// definition for why this sweep adopts it while its two DELETE-based
+/// siblings above deliberately do not), and it splits `cancelled` from
+/// `not_cancelled` because `mark_cancelled`'s own return value cannot
+/// distinguish "already terminal / raced by another replica" (a harmless
+/// no-op) from "the write itself failed" (mark_cancelled already
+/// `spdlog::error`s that case on its own).
+struct StuckExecutionReapOutcome {
+    int cancelled{0};          ///< executions actually transitioned to 'cancelled' this pass.
+    int not_cancelled{0};      ///< candidates that did NOT transition (already terminal, raced
+                               ///< by another replica, or mark_cancelled's own write failed).
+    bool clock_anomaly{false}; ///< pass declined outright: implausible now()/anchor reading.
+    bool would_wipe{false};    ///< pass declined to ACT: candidates were an implausibly large
+                               ///< fraction of all currently-running executions.
+};
+
 /// #2146 A2-R1 governance re-review (blocking): `get_children_checked`'s
 /// underlying query was unbounded (no LIMIT at all), unlike its sibling
 /// `ScheduleEngine::query_schedules_checked` (`schedule_engine.hpp`'s
@@ -710,6 +731,63 @@ public:
     /// horizon, so the window is re-read next pass (a duplicate, never a gap;
     /// ADR-2002 §5 is at-least-once). The caller counts a degrade metric.
     [[nodiscard]] std::expected<int, std::string> poll_event_outbox_once();
+
+    /// #4982 Part B — recovers an execution row permanently wedged at
+    /// `status='running'`, `agents_targeted=0`: Part 1
+    /// (`yuzu_exec_tracker_bookkeeping_failed_total`) now COUNTS a failed
+    /// `set_agents_targeted`/`mark_cancelled` bookkeeping write at every
+    /// REST/MCP dispatch call site, but cannot itself repair the row the
+    /// failure leaves behind — the request that hit it has already been
+    /// answered by the time anyone notices.
+    ///
+    /// THE FALSE-POSITIVE THIS SWEEP MUST NOT ACT ON (escalation, #4982
+    /// review): a `ScheduleRunner`/`CommandOutboxDelivery`-originated
+    /// execution legitimately sits at `running`/`agents_targeted=0` for the
+    /// FULL DURATION of a `containment_unreadable`/`route_unreadable`
+    /// degrade — `CommandOutboxDelivery::deliver` reschedules that occurrence
+    /// indefinitely, with NO cap (`command_outbox_delivery.cpp` step 5). The
+    /// candidate query excludes every `execution_id` with a STILL-PENDING
+    /// `command_outbox_store.outbox` row up front (`state='pending'` is
+    /// confirmed — against that store's own schema CHECK constraint and its
+    /// delivery loop's state machine — to be the ONLY "still owned by the
+    /// delivery loop" state; there is no separate in-flight/claimed state to
+    /// also exclude). Once the outbox gives up (`state` moves to
+    /// `'failed'`/`'sent'`) or never touched the row at all (the ORIGINAL
+    /// #4982 bug — a synchronous REST/MCP dispatch whose OWN `mark_cancelled`
+    /// call itself failed), the row is fair game.
+    ///
+    /// Clock-guarded-retention shape mirrors `reap_command_execution_mappings`
+    /// exactly for the anchor/anomaly half (advisory lock as its own
+    /// statement, one in-SQL DB `now()` read, persisted+sanitised `reap_meta`
+    /// anchor keyed `stuck_exec_reap_anchor`, forward/backward-anomaly
+    /// decline, unconditional per-pass cap) and DECLINES part 4 the same way
+    /// (no fact-set anomaly dedup — a decline is `spdlog::warn`'d and
+    /// surfaced via the caller's metric, not deduped by fact identity). Part
+    /// 6 (missing-anchor) is PROCEED, the same answer as its siblings — a
+    /// cold sweep with no anomaly history is still protected against mass
+    /// action by the would-wipe ratio gate below, independent of anchor
+    /// state.
+    ///
+    /// UNLIKE both siblings, this sweep ADOPTS part 1's would-wipe probe: see
+    /// the recorded reasoning at the constants' definition in
+    /// execution_tracker.cpp for why (in short — this pass MUTATES live,
+    /// still-referenced execution state rather than draining a regenerable
+    /// observability aid, and a healthy fleet's candidate fraction should
+    /// always be small, unlike a table that legitimately drains to 100%
+    /// expiry as routine behaviour). The would-wipe denominator is the RAW
+    /// total running-execution count, NOT itself outbox-filtered, so a
+    /// broadly-broken `set_agents_targeted` call site on the SYNCHRONOUS
+    /// dispatch path (which never touches the outbox at all) still trips it.
+    ///
+    /// The actual cancellation happens through the SAME `mark_cancelled` every
+    /// other terminal transition in this file uses, called once per selected
+    /// candidate AFTER the guard transaction commits — its own guarded UPDATE
+    /// (`status NOT IN (...)`) and execution-completed event-publish shape,
+    /// so a candidate that already transitioned between the SELECT and this
+    /// call (a genuine terminal response, or a race with another replica) is
+    /// a safe, silent no-op, never a double-cancel.
+    [[nodiscard]] std::expected<StuckExecutionReapOutcome, std::string>
+    reap_stuck_running_executions();
 
     /// Whether the store is usable (schema migrated). False after a failed
     /// migration — feeds the `/readyz` probe so a broken execution-history
