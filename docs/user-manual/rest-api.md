@@ -9701,24 +9701,45 @@ legacy unversioned twin exists (`POST /api/scope/estimate` below is a
 *different* capability: a matched/total **count** only, for the workflow
 builder's own confined `scope_fn`). Both this route and `preview_scope_targets`
 call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
-matched-agent set cannot drift between transports. A `tag:<key>` atom in the
-expression resolves from the persistent tag store **only** — unlike a real
-dispatch, which also falls back to a connected agent's own live self-report —
-see [Tag source precedence](../asset-tagging-guide.md). **`from_result_set:<id>`
-and `props.*` atoms are not resolved by this preview** - the resolver only
-populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
-(including `from_result_set:`, this feature's own headline scope-walking
-primitive) is treated as unset and never matches, silently returning
-`matched_count: 0` for a composed expression that uses one - a genuine
-dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
-rely on this preview for an expression containing `from_result_set:` or
-`props.`; tracked in `#4307`.
+matched-agent set cannot drift between transports.
+
+**#4981: this route now runs the SAME evaluation ladder a real dispatch uses**
+(`resolve_scope_targets`, `dispatch_scope_ladder.hpp`) — alias resolution,
+owner-check gate, parse, then registry evaluation, each step fail-closed.
+`tag:<key>`, `props.<key>`, and `from_result_set:<id>` atoms all resolve
+identically to a real dispatch; this closes the pre-#4981 fleet-wide
+over-disclosure bug where `from_result_set:`/`props.*` were silently
+unresolved (always "" — unset) and a `NOT`-negated reference to either
+matched the WHOLE FLEET regardless of the referenced set's real membership.
+The ladder's own evaluation runs unfiltered against the whole fleet; the
+caller's confinement (see **Permission** below) is intersected in
+AFTERWARD, mirroring how a real dispatch intersects against the operator's
+`Execution:Execute` visible set before sending.
+
+A `tag:<key>` atom in the expression now resolves **identically** to a real
+dispatch (#4981): the persistent tag store first, falling back to a
+locally-connected agent's own live self-report only when the store has no
+row for that agent — a presence-only cross-replica agent has no live
+session to fall back to, so it still resolves store-only for such agents,
+same as real dispatch. See
+[Tag source precedence](../asset-tagging-guide.md). `POST /api/scope/estimate`
+below also resolves `from_result_set:` against the owner, but a failed
+owner-check there degrades to "zero members" rather than aborting the whole
+evaluation like this route's ladder does — a separate, still-open fail-open
+gap, tracked `#5003`, not fixed by `#4981`.
 
 **Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the
 syntax-only validate route above, so a management-group-confined caller's
 `matched_agents`/`matched_count` are narrowed to their own visible devices
-before the preview builder runs, never the whole fleet.
+after the ladder evaluates, never the whole fleet. **A service-scoped API
+token is denied outright (403)** before the fleet-read gate or the
+evaluation ladder ever run — same cross-service-reach reasoning as `POST
+/api/v1/result-sets/from-inventory-query` (#4980): a `from_result_set:<id>`/
+`props.<key>` atom resolves against the *minting operator's* identity
+(`session->username`), not the token's own restricted scope, so admitting
+and merely narrowing the output (what `fleet_read_fn` alone would do) would
+let a service token probe or own-check a result set it never minted.
 
 **Request body:** `{"expression": "..."}`
 
@@ -9743,7 +9764,9 @@ before the preview builder runs, never the whole fleet.
 | Status | Reason |
 |---|---|
 | 400 | `expression` missing/empty, or fails to parse/validate |
-| 503 | The expression references a `tag:<key>` atom and the bulk tag-store preload degraded (`retry_after_ms: 5000`) — never silently under-reports the match set |
+| 403 | Service-scoped API token — denied outright, before the fleet-read gate or evaluation ladder ever run (#4980-class cross-service-reach fix). No `.permission` field in the error body: a service-scoped caller holding `Infrastructure:Read` is still denied, so naming it would be a false self-remediation claim |
+| 404 | A `from_result_set:<id>` atom references a result set that is absent, expired, or not owned by the caller (`RESULT_SET_NOT_FOUND`) — existence-oracle-safe, same body shape as the result-set routes' own `load_owned` 404; a server-side audit row is still written |
+| 503 | Scope evaluation aborted — never silently under-reports the match set. A store preload (tag/props/result-set) failed or the cross-replica presence read failed is TRANSIENT (`db_degraded`/`presence_degraded`, `retry_after_ms: 5000`); no dispatching principal was available or a required store isn't wired is PERMANENT (`principal_unresolved`/`unresolvable`, `retry_after_ms: null` — a retry cannot fix either); the evaluator itself being unwired (misconfiguration) also carries `retry_after_ms: null` |
 
 #### `POST /api/scope/estimate`
 

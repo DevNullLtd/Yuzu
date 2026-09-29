@@ -18868,6 +18868,35 @@ private:
             return exists.has_value() && *exists;
         };
 
+        // #4981 PR-2: the SOLE scope-evaluation closure `POST
+        // /api/v1/scope/preview` and MCP `preview_scope_targets` both bind —
+        // byte-for-byte the same binding shape `command_routes.cpp`'s Scope
+        // arm and `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp)
+        // already use for a real dispatch, so a scope preview now resolves
+        // `tag:`/`props.`/`from_result_set:` atoms identically to a real
+        // dispatch instead of the old bespoke per-agent resolver that never
+        // populated the latter two (#4981's fleet-wide over-disclosure bug —
+        // see scope_preview.hpp's file header). Defined ONCE as a plain `auto`
+        // closure (RestApiV1::ScopeEvaluateFn and McpServer::ScopeEvaluateFn
+        // are independently-declared class-scoped std::function aliases with
+        // the identical signature — this codebase's convention, see
+        // ExecVisibleFn — so the SAME closure converts cleanly into either
+        // one) and passed to both RestApiV1::set_scope_evaluate_fn and
+        // McpServer::set_scope_evaluate_fn below, so REST and MCP cannot
+        // silently diverge in which agents a preview matches.
+        // #4981 PR-3: `touch_referenced_result_sets = false` — a preview is a
+        // read-only dry run; it must resolve `from_result_set:` membership
+        // identically to a real dispatch WITHOUT extending a referenced
+        // owned set's TTL merely for being named in the check (real dispatch,
+        // via command_routes.cpp's Scope arm and wire_and_dispatch_confined,
+        // is unaffected and keeps the touch at its default `true`).
+        auto scope_evaluate_fn = [this](const yuzu::scope::Expression& parsed,
+                                        const std::string& principal) {
+            return registry_.evaluate_scope(parsed, tag_store_.get(), custom_properties_store_.get(),
+                                            result_set_store_.get(), principal,
+                                            /*touch_referenced_result_sets=*/false);
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
         // Both setters MUST run BEFORE register_routes() (captured by value
         // at registration time, not `this`) — see set_engine_principal_store/
@@ -18879,6 +18908,10 @@ private:
             rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
             rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
         }
+        // #4981 PR-2 — see scope_evaluate_fn's own comment above. MUST run
+        // BEFORE register_routes(), same timing contract as the two setters
+        // immediately above.
+        rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -19547,6 +19580,10 @@ private:
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #4981 PR-2 — see scope_evaluate_fn's own comment above (defined
+            // once, shared with rest_api_v1_->set_scope_evaluate_fn above).
+            // MUST run BEFORE register_routes()/build_handler() below.
+            mcp_server_->set_scope_evaluate_fn(scope_evaluate_fn);
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so

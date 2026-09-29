@@ -2976,6 +2976,41 @@ validation before the handler's own logic ever runs. A `rule_id` that violates B
 AND over-length) is reachable by neither REST nor MCP; fall back to a direct database delete
 (`guaranteed_state_store.guaranteed_state_rules`) for that case.
 
+## Behaviour change: `preview_scope_targets` / `scope/preview` now resolve `from_result_set:`/`props.` atoms correctly (#4981)
+
+`POST /api/v1/scope/preview` and MCP `preview_scope_targets` previously evaluated a scope
+expression against a bespoke attribute resolver that only understood
+`ostype`/`arch`/`hostname`/`agent_version`/`tag:<key>` — a `from_result_set:<id>` or
+`props.<key>` atom silently resolved to unset, so the atom's comparison was always false, and
+`NOT from_result_set:<id>` inverted that to match every agent the caller could see regardless
+of the referenced set's real membership. Both surfaces now route through the same
+fail-closed evaluation ladder a real dispatch uses.
+
+**Who this affects:** anyone who has called either surface with an expression containing
+`from_result_set:` or `props.`. If you relied on the old (incorrect) match set for either atom
+kind, re-check any automation built on that response before upgrading — the direction of the
+correction depends on how the atom was used: a negated `NOT from_result_set:<id>` was, in
+practice, matching your whole visible fleet, and the corrected match set will generally be
+narrower and more accurate to what a real dispatch of the same expression would actually
+target; a plain (non-negated) `from_result_set:`/`props.<key>` atom always evaluated false under
+the old resolver, so its match set was previously stuck at 0 and the corrected set will
+generally be broader, now actually populated with real members.
+
+**New error responses a strict client should handle:**
+- **403 (REST only)** — a service-scoped API token calling `POST /api/v1/scope/preview` now gets
+  denied outright, rather than admitted with a silently narrowed match set (closing the same
+  cross-service-reach gap #4980 closed on a sibling result-set route). MCP `preview_scope_targets`
+  is unaffected by this change — it already denied a service-scoped token outright before this
+  release.
+- **404** `RESULT_SET_NOT_FOUND` (REST) / `kInvalidParams` (MCP) — a `from_result_set:<id>`
+  referencing a result set that is absent, expired, or not owned by the caller now aborts,
+  instead of silently matching nothing (or, negated, everything).
+- **503**, with a `retry_after_ms` hint — a degraded backend store or presence read now aborts
+  instead of under- or over-reporting the match set.
+
+A preview call no longer extends a referenced result set's TTL as a side effect — it is now a
+genuine read-only dry run, matching its documented `readOnlyHint: true`.
+
 ## Upgrade Order
 
 Always upgrade in this order:

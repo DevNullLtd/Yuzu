@@ -1252,6 +1252,7 @@ if build_server
       'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',
+      'unit/server/test_scope_preview.cpp', # #4981 PR-2: scope_preview.hpp's ladder-backed rewrite
       'unit/server/test_scope_yaml.cpp',
       'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
