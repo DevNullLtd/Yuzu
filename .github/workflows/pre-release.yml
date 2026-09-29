@@ -17,7 +17,7 @@ permissions:
   packages: read
 
 # NO workflow-level `env: REGISTRY`. It used to be
-# `ghcr.io/${{ github.repository_owner }}`, which renders as `ghcr.io/Tr3kkR` —
+# `ghcr.io/${{ github.repository_owner }}`, which renders as `ghcr.io/DevNullLtd` —
 # Docker rejects uppercase in a repository name outright ("repository name must
 # be lowercase"), so nothing could be pulled. GitHub expressions have no
 # lowercase function, so the owner must be folded in a shell step: the `resolve`
@@ -65,12 +65,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # `github.repository_owner` is `Tr3kkR` — mixed case. Docker rejects
+      # `github.repository_owner` is `DevNullLtd` — mixed case (it was
+      # `Tr3kkR` before the 2026-09-28 org transfer; the owner changed but
+      # the mixed case did not, so this workaround is still load-bearing).
+      # Docker rejects
       # uppercase in a repository name outright ("repository name must be
       # lowercase"), so `ghcr.io/${{ github.repository_owner }}/yuzu-server`
       # cannot be pulled at all. This is not theoretical: the v0.11.0 QA run
       # (24937379958) died with exactly `invalid reference format: repository
-      # name (Tr3kkR/yuzu-server) must be lowercase`. release.yml lowercases the
+      # name (DevNullLtd/yuzu-server) must be lowercase`. release.yml lowercases the
       # owner for this reason; this workflow never did. Every job below that
       # touches an image overrides REGISTRY with this value, and steps that
       # cannot read env (action `with:` inputs, e.g. trivy's image-ref) use the
@@ -163,7 +166,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Override the workflow-level REGISTRY, which carries the mixed-case owner
-    # (`ghcr.io/Tr3kkR`) that Docker refuses to pull. See resolve's "Lowercase
+    # (`ghcr.io/DevNullLtd`) that Docker refuses to pull. See resolve's "Lowercase
     # registry owner".
     env:
       REGISTRY: ${{ needs.resolve.outputs.registry }}
@@ -177,11 +180,11 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo. Falls
           # back to GITHUB_TOKEN for fork PRs without secret access.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Pull release images
@@ -833,11 +836,11 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo. Falls
           # back to GITHUB_TOKEN for fork PRs without secret access.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       # Scope: Trivy is used here ONLY for vulnerability scanning of
@@ -903,11 +906,11 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo. Falls
           # back to GITHUB_TOKEN for fork PRs without secret access.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Start stack
@@ -1066,11 +1069,11 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo. Falls
           # back to GITHUB_TOKEN for fork PRs without secret access.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Start previous release

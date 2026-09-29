@@ -1230,14 +1230,17 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1462,9 +1465,9 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN — see docker-publish for the full rationale.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1668,14 +1671,17 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1896,14 +1902,17 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
