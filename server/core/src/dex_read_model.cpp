@@ -17,6 +17,60 @@ using json = nlohmann::json;
 
 // ── MCP-only gap #1: per-device DEX score ────────────────────────────────────
 
+// `dex_score_from_signals`/`dex_device_score` are declared in
+// `dex_read_builders.hpp` — relocated VERBATIM from the presentation TU
+// `dex_routes.cpp` (ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28),
+// closing the WS-B2 "LINK RESIDUAL" #4579 that header's own doc comment
+// flagged: this core TU (via `build_dex_device_score_model` below) and the
+// presentation TU's own Overview renderer (`dex_device_score` call in
+// `dex_routes.cpp`) were BOTH calling functions defined in `dex_routes.cpp` --
+// invisible to the include-closure seam gate, which only checks headers, not
+// link targets. `dex_routes.cpp`'s own caller is unaffected (ODR-safe
+// relocation, not a duplication; no logic changes).
+
+// The pure scoring formula (#4855 extraction) — everything dex_device_score
+// below did with `device_signals` once it had them, factored out so the ONE
+// checked store read the score builder below performs (closing the #4855 torn
+// read between score + signals) can feed this directly instead of forcing a
+// second read just to get a score.
+int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {
+    double total = 0.0;
+    for (const auto& fw : dex_family_weights()) {
+        const DexSignalGroup* g = nullptr;
+        for (const auto& grp : dex_signal_groups())
+            if (std::string(grp.name) == fw.name) {
+                g = &grp;
+                break;
+            }
+        if (!g)
+            continue;
+        const DexFamilyRollup rr = dex_family_rollup(*g, device_signals);
+        if (rr.benign || rr.events <= 0) // benign reports (boot/uptime) never deduct
+            continue;
+        // Per-device impact: this device's events in the family, gently scaled
+        // (1 event = partial; kCap+ events = full severity). Illustrative cap,
+        // pending calibration (like the perf baseline).
+        constexpr double kCap = 5.0;
+        const double impact = std::min(1.0, static_cast<double>(rr.events) / kCap);
+        total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
+    }
+    return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
+}
+
+int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
+                     const std::string& since) {
+    if (!store)
+        return -1;
+    // #4855: a degraded read must never render as a signal-free, perfectly
+    // healthy device — use the type-distinguishable checked twin and refuse
+    // to score (-1, "unscored") rather than fabricate a 100 from an empty
+    // container indistinguishable from "genuinely no signals".
+    const auto device_signals = store->dex_device_signal_summary_checked(agent_id, since);
+    if (!device_signals)
+        return -1;
+    return dex_score_from_signals(*device_signals);
+}
+
 DexDeviceScoreModel build_dex_device_score_model(GuaranteedStateStore* store,
                                                  const std::string& agent_id,
                                                  const std::string& window,
@@ -238,6 +292,7 @@ std::optional<DexCatalogueGroupModel> build_dex_catalogue_group_model(
     if (m.monitored_count > 0 && n_scoped > 0)
         m.health_score =
             std::clamp(100.0 - dex_family_health_deduction(*grp, signals, n_scoped), 0.0, 100.0);
+    m.benign = dex_family_is_benign(group_name);
     return m;
 }
 
@@ -256,7 +311,8 @@ std::string dex_catalogue_group_json(const DexCatalogueGroupModel& model) {
              {"monitored_count", model.monitored_count},
              {"total_type_count", model.total_type_count},
              {"active_events", model.active_events},
-             {"max_signal_devices", model.max_signal_devices}};
+             {"max_signal_devices", model.max_signal_devices},
+             {"benign", model.benign}}; // additive (ADR-0031 WS-A4 PR-1) -- not in `required`
     out["health_score"] = model.health_score < 0 ? json(nullptr) : json(model.health_score);
     out["types"] = std::move(types);
     return out.dump();
@@ -576,6 +632,9 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
                         ++m.coverage_monitored;
                         break;
                     }
+        // ADR-0031 WS-A4 PR-1: additive -- the coverage tile's "N platform(s)"
+        // caption, same cscope the fragment computes.
+        m.connected_platforms = static_cast<int64_t>(cscope.size());
 
         for (std::size_t i = 0; i < seg_os.size(); ++i) {
             DexOverviewSegment seg;
@@ -608,6 +667,26 @@ DexOverviewModel build_dex_overview_model(GuaranteedStateStore* store, const Dex
     for (const auto& s : signals)
         if (s.count > 0)
             ++m.active_signal_types;
+
+    // ADR-0031 WS-A4 PR-1: additive -- the Explore card's busiest-family
+    // teaser (fragment: "busiest <b>NAME</b>" text, same `signals` var).
+    // Empty/zero when nothing fired in-window, mirroring the fragment's own
+    // `busiest_ev > 0` display guard.
+    {
+        const DexSignalGroup* busiest = nullptr;
+        int64_t busiest_ev = 0;
+        for (const auto& g : dex_signal_groups()) {
+            const auto r = dex_family_rollup(g, signals);
+            if (r.events > busiest_ev) {
+                busiest_ev = r.events;
+                busiest = &g;
+            }
+        }
+        if (busiest && busiest_ev > 0) {
+            m.busiest_family = busiest->name;
+            m.busiest_family_events = busiest_ev;
+        }
+    }
 
     // -- Crashes per day + top lists --
     for (const auto& d : by_day)
@@ -674,6 +753,8 @@ std::string dex_overview_json(const DexOverviewModel& model, bool audit_persiste
              {"unscored", model.unscored}, // #4855: additive field, see DexOverviewModel::unscored
              {"coverage_monitored", model.coverage_monitored},
              {"coverage_total", model.coverage_total},
+             {"connected_platforms", model.connected_platforms}, // additive, ADR-0031 WS-A4 PR-1
+             {"busiest_family_events", model.busiest_family_events}, // additive, ditto
              {"windows_reporting", model.windows_reporting},
              {"total_crashes", model.total_crashes},
              {"devices_impacted", model.devices_impacted},
@@ -684,6 +765,9 @@ std::string dex_overview_json(const DexOverviewModel& model, bool audit_persiste
     out["crashes_per_1k_device_days"] =
         model.crashes_per_1k_device_days < 0 ? json(nullptr) : json(model.crashes_per_1k_device_days);
     out["health_score"] = model.health_score < 0 ? json(nullptr) : json(model.health_score);
+    // additive, ADR-0031 WS-A4 PR-1 -- null when nothing fired in-window,
+    // matching the fragment's own display guard (never an empty string).
+    out["busiest_family"] = model.busiest_family.empty() ? json(nullptr) : json(model.busiest_family);
     out["segments"] = std::move(segments);
     out["crashes_by_day"] = std::move(crashes_by_day);
     out["top_apps"] = std::move(top_apps);
@@ -691,6 +775,115 @@ std::string dex_overview_json(const DexOverviewModel& model, bool audit_persiste
     out["os_table"] = std::move(os_table);
     if (!audit_persisted)
         out["audit_persisted"] = false;
+    return out.dump();
+}
+
+// ── New twin #9: catalogue / family cards (View 1) ───────────────────────────
+
+DexCatalogueModel build_dex_catalogue_model(GuaranteedStateStore* store, const DexFleet& fleet,
+                                            const std::string& os_filter,
+                                            const std::string& window) {
+    DexCatalogueModel m;
+    m.window = window;
+    m.total_types = static_cast<int>(dex_catalogued_type_count());
+
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    m.os = plat.empty() ? "all" : plat;
+    if (!store)
+        return m; // degrade to zero families -- caller's !store_ptr 503 guard is authoritative
+
+    const std::string since = dex_iso_since(dex_window_to_days(window));
+    const auto checked_signals = store->dex_signal_summary_checked(since, plat);
+    // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary
+    // read must never render as a healthy, zero-event catalogue (health
+    // 100) — refuse here, same posture as the per-device score builder's
+    // #4855 guard. `m.families`/`m.uncatalogued` stay empty, matching the
+    // model's own doc comment on `degraded`.
+    if (!checked_signals) {
+        m.degraded = true;
+        return m;
+    }
+    const auto& signals = *checked_signals;
+
+    std::vector<std::string> scope;
+    if (m.os == "all") {
+        for (const auto& o : fleet.connected_os) {
+            auto n = normalize_platform(o);
+            if (std::find(scope.begin(), scope.end(), n) == scope.end())
+                scope.push_back(n);
+        }
+    } else {
+        scope.push_back(m.os);
+    }
+    auto in_scope = [&](const std::string& p) {
+        return std::find(scope.begin(), scope.end(), p) != scope.end();
+    };
+    auto monitored = [&](const std::string& t) {
+        for (const auto& p : dex_obs_platforms(t))
+            if (in_scope(p))
+                return true;
+        return false;
+    };
+
+    const int64_t n_scoped = m.os == "linux"  ? fleet.linux_online
+                             : m.os == "macos" ? fleet.macos_online
+                                                : fleet.windows_online; // "all" or "windows"
+
+    for (const auto& g : dex_signal_groups()) {
+        DexCatalogueFamilyRow row;
+        row.name = g.name;
+        row.total = static_cast<int>(g.types.size());
+        for (const char* t : g.types)
+            if (monitored(t))
+                ++row.monitored;
+        m.monitored_types += row.monitored;
+
+        const auto r = dex_family_rollup(g, signals);
+        row.events = r.events;
+        if (row.monitored > 0 && n_scoped > 0)
+            row.health_score =
+                std::clamp(100.0 - dex_family_health_deduction(g, signals, n_scoped), 0.0, 100.0);
+        if (r.events > 0 && r.top)
+            row.top_obs_type = r.top->obs_type;
+        m.families.push_back(std::move(row));
+    }
+
+    // "Other (uncatalogued)": any obs_type seen on the wire that isn't in any
+    // curated family yet -- same check the fragment does with a nested
+    // dex_signal_groups()/types loop, factored here via dex_family_index.
+    for (const auto& s : signals)
+        if (dex_family_index(s.obs_type) < 0)
+            m.uncatalogued.push_back(s);
+
+    return m;
+}
+
+std::string dex_catalogue_json(const DexCatalogueModel& model) {
+    // Fix 2 (WS-A4 PR-1 fix round, sec-5): mirrors dex_device_score_json's
+    // guard — a degraded model has no honest wire shape to serve; every
+    // caller must translate it into its own surface's degrade response
+    // before ever calling this.
+    assert(!model.degraded && "dex_catalogue_json: caller must handle model.degraded first");
+    json families = json::array();
+    for (const auto& f : model.families) {
+        json fj{{"name", f.name}, {"monitored", f.monitored}, {"total", f.total},
+                {"events", f.events}};
+        fj["health_score"] = f.health_score < 0 ? json(nullptr) : json(f.health_score);
+        fj["top_obs_type"] = f.top_obs_type.empty() ? json(nullptr) : json(f.top_obs_type);
+        families.push_back(std::move(fj));
+    }
+    json uncatalogued = json::array();
+    for (const auto& s : model.uncatalogued)
+        uncatalogued.push_back({{"obs_type", s.obs_type},
+                                {"count", s.count},
+                                {"distinct_devices", s.distinct_devices},
+                                {"last_seen", s.last_seen}});
+    json out{{"os", model.os},
+             {"window", model.window},
+             {"monitored_types", model.monitored_types},
+             {"total_types", model.total_types}};
+    out["families"] = std::move(families);
+    out["uncatalogued"] = std::move(uncatalogued);
     return out.dump();
 }
 

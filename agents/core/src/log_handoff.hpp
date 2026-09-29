@@ -66,12 +66,24 @@
 /// last-message buffer is guarded by a plain std::mutex, NOT a lock-free/single-writer
 /// scheme (that was a specification bug in an earlier draft, caught by the final
 /// review -- verify against ErrorState below, not against a stale comment elsewhere).
-/// STDERR FALLBACK (governance hardening round): the handler now also formats and
-/// writes a rate-limited (1/sec) diagnostic line to stderr, mirroring what spdlog's own
-/// default error handler always did before this one replaced it -- see the handler's
-/// own comment in log_handoff.cpp for the full rationale and its lock-vs-I/O boundary
-/// (the mutex above guards only the in-memory ErrorState fields; the stderr write
-/// itself happens outside it).
+/// STDERR FALLBACK (governance hardening round): the handler also emits a rate-limited
+/// (1/sec) diagnostic line to stderr, mirroring what spdlog's own default error handler
+/// always did before this one replaced it. Since #5023 the write is NEVER made on the
+/// thread that entered the handler: for a sink throw that thread is the async logger's
+/// one worker (spdlog runs the handler inline there), and a write to a blocked stderr is
+/// unbounded. It is made by a short-lived detached thread, at most one write in flight
+/// (ErrorState::emit_in_flight). While one is stuck, or if the thread cannot be created,
+/// that diagnostic is dropped and counted (stderr_emits_dropped()). The write uses no
+/// stdio (a raw write(2) / WriteFile), so a stuck thread holds no FILE lock and cannot
+/// hang a normal exit(). SCOPE: this closes the DIAGNOSTIC's write only. It does not
+/// isolate delivery from a blocked stderr/stdout that is ALSO one of this logger's sinks
+/// (create() adds a stderr sink beside the file sink outside a Windows service, and a
+/// stdout sink when there is no usable log file, i.e. none configured or it could not be
+/// opened; a Windows service derives one when none is configured): that stall is in the
+/// sink's own write, unchanged, exposed by stalled_for() (no shipped code reads it) and
+/// bounded only at shutdown by teardown()'s watchdog. The mutex above guards only the
+/// in-memory ErrorState fields. See the handler's own comment in log_handoff.cpp for the
+/// full rationale.
 ///
 /// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent -- a second SEQUENTIAL
 /// call (or the destructor firing after an explicit call already returned) is a no-op. A second
@@ -466,7 +478,8 @@ struct DrainHandle;
 ///
 /// Separately, they are NOT synchronized against a
 /// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
-/// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
+/// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()/
+/// stderr_emits_dropped()) or against
 /// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
 /// directly, with no lock, while teardown_body() resets them. This is UNREACHABLE in
 /// PR-1 (nothing calls these accessors from a second thread yet) but is a REAL
@@ -579,6 +592,13 @@ public:
     /// throw, or a producer-side formatter/allocation exception, or "pool gone").
     [[nodiscard]] std::uint64_t log_errors_total() const;
 
+    /// Cumulative count of stderr diagnostic lines the handler DROPPED: because an earlier
+    /// write had not yet released the in-flight slot (stderr is blocked, or the slot was
+    /// released a moment after the write returned), or because the emit thread could not be
+    /// created (#5023). Zero in a healthy process. Like log_errors_total(), no production
+    /// consumer reads it yet (see #5024).
+    [[nodiscard]] std::uint64_t stderr_emits_dropped() const;
+
     /// The most recent error message the handler observed, truncated to 256 bytes.
     /// Test/diagnostic accessor -- not surfaced on the heartbeat (PR-3's job, if ever).
     [[nodiscard]] std::string last_log_error_for_test() const;
@@ -609,6 +629,26 @@ public:
     /// into a later, unrelated test. Production callers never set this.
     static void set_construction_fault_for_test(bool fail) noexcept;
 
+    /// The function the handler's detached emit thread calls to write the diagnostic line
+    /// (count, message). Default (nullptr) is the real stderr write.
+    using StderrEmitFn = void (*)(std::uint64_t count, const std::string& message);
+
+    /// Test-only seam (the U11 family, and the no-op EmitSilencer in tests that only
+    /// incidentally trip the handler): replaces the stderr write so a test can make it
+    /// block and assert log delivery continues (#5023). Read once per emit, when the emit
+    /// thread is launched. PROCESS-WIDE and NOT auto-reset (unlike
+    /// set_construction_fault_for_test): the setter must restore nullptr, via a ScopeExit
+    /// declared after the LogHandoff (a blocking stub, which must first be released) or an
+    /// EmitSilencer declared before it (a no-op). Production callers never set this.
+    static void set_stderr_emit_for_test(StderrEmitFn fn) noexcept;
+
+    /// Test-only fault injection (#5023): the next emit-thread LAUNCH ATTEMPT fails as if
+    /// the OS refused the thread (EAGAIN), without real resource exhaustion. Consumed
+    /// (reset to false) only by a launch attempt, so a test whose diagnostic may be
+    /// throttled or dropped before reaching one must clear it itself. Process-wide.
+    /// Production callers never set this.
+    static void set_emit_thread_fault_for_test(bool fail) noexcept;
+
 private:
     struct ErrorState {
         mutable std::mutex mu;
@@ -621,6 +661,15 @@ private:
         // default handler doesn't silently drop an operator-visible signal that
         // existed before this primitive was wired into production (#4666 PR-2).
         std::chrono::steady_clock::time_point last_emit{};
+        // #5023: claimed by the handler just before it launches the detached stderr-emit
+        // thread, released by an RAII permit (the single release site) when that thread's
+        // callable is destroyed after its write returns, or when the launch fails. At most
+        // one emit WRITE is in flight (a finishing thread may briefly overlap its
+        // successor), so a stuck stderr costs one blocked thread, never a growing number.
+        // Atomics, not guarded by `mu`: the emit thread must never take `mu` (it would
+        // re-couple a stuck write to the lock the accessors use).
+        std::atomic<bool> emit_in_flight{false};
+        std::atomic<std::uint64_t> emits_dropped{0};
     };
 
     LogHandoff() = default;
@@ -690,6 +739,8 @@ private:
     std::string log_file_fallback_reason_;
 
     static inline std::atomic<bool> construction_fault_for_test_{false};
+    static inline std::atomic<StderrEmitFn> stderr_emit_for_test_{nullptr};
+    static inline std::atomic<bool> emit_thread_fault_for_test_{false};
 };
 
 /// Pre-abort breadcrumb helper (plan 1.8). See the file banner's own paragraph for the

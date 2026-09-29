@@ -208,9 +208,14 @@ IMPL_TUS = [
     # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
     # dex_device_score → dex_read_builders.hpp). NOTE: this check is INCLUDE-purity
     # (no presentation/httplib header in the TU's include closure), NOT link-purity
-    # — dex_read_model.cpp still CALLS symbols whose definitions live in the
-    # presentation dex_routes.cpp, a core→presentation LINK residual tracked in
-    # #4579 (only meaningful at the WS-B2 physical split; inert in today's monolith).
+    # — dex_read_model.cpp used to still CALL symbols whose definitions lived in
+    # the presentation dex_routes.cpp, a core→presentation LINK residual tracked
+    # in #4579. That residual is now CLOSED (ADR-0031 WS-A4 PR-1 F1 fix,
+    # 2026-09-28: the definitions moved into dex_types.cpp/dex_window.cpp/
+    # dex_read_model.cpp) and enforced by the LINK-level twin this include-purity
+    # check cannot be — scripts/ci/check_core_presentation_link.py, wired as the
+    # meson test() `dex link no presentation symbols` (suite:server) since it
+    # needs compiled objects, unlike this pure source-tree walk.
     "server/core/src/dex_read_model.cpp",
     # dex_app_perf_model.cpp backs the same LocalDexPerfApi (it defines
     # app_perf_fleet_trend/app_perf_group_trend/app_perf_device_summaries +

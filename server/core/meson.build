@@ -503,6 +503,8 @@ yuzu_server_core_lib = static_library(
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_read_model.cpp',
+    'src/dex_types.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure catalogue/health computation, relocated out of dex_routes.cpp
+    'src/dex_window.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure window/OS-filter resolvers, relocated out of dex_routes.cpp
     'src/execution_statistics_model.cpp', # #2146 Batch B3 -- shared REST+MCP builder (Rule 1)
     'src/management_group_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
     'src/api_token_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)

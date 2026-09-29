@@ -2361,3 +2361,92 @@ TEST_CASE("TAR #2573: a stale Wipe entry is erased, not left dangling, when NoAn
     CHECK(declines_of(f.guard, "process_hourly") == 3);
     CHECK(row_count(*f.db, "process_hourly") == 5);
 }
+
+// ── #1654: the enable/disable transition is all-or-nothing ─────────────────────
+//
+// Failures are injected with RAISE(ABORT) triggers (deterministic, in-process),
+// both the INSERT and UPDATE forms so the test does not depend on which UPSERT
+// branch SQLite takes; they hit the same rollback path a real SQLITE_BUSY would.
+
+namespace {
+void install_fault(TarDatabase& db, const char* table, const char* col, const char* val) {
+    REQUIRE(db.execute_sql(std::format("CREATE TRIGGER yuzu_test_fail_i BEFORE INSERT ON {0} "
+                                       "WHEN NEW.{1}='{2}' BEGIN SELECT RAISE(ABORT,'injected'); END",
+                                       table, col, val)));
+    REQUIRE(db.execute_sql(std::format("CREATE TRIGGER yuzu_test_fail_u BEFORE UPDATE ON {0} "
+                                       "WHEN NEW.{1}='{2}' BEGIN SELECT RAISE(ABORT,'injected'); END",
+                                       table, col, val)));
+}
+} // namespace
+
+TEST_CASE("TAR #1654: a failed enabled-flag write rolls back the baseline clear",
+          "[tar][paused_at][issue1654]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_flagfail_"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(db.set_config("process_enabled", "true"));
+
+    install_fault(db, "tar_config", "key", "process_enabled");
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+    // Never "baseline cleared + still enabled": the clear rolled back with it.
+    CHECK_FALSE(db.get_state("process").empty());
+    CHECK(db.get_config("process_enabled", "true") == "true");
+    CHECK(db.get_config("process_paused_at", "0") == "0");
+}
+
+TEST_CASE("TAR #1654: a failed baseline clear leaves the flag untouched (transactional)",
+          "[tar][paused_at][issue1654]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_clearfail_"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(db.set_config("process_enabled", "true"));
+
+    install_fault(db, "tar_state", "collector", "process");
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'735'689'600));
+    CHECK(db.get_config("process_enabled", "true") == "true");
+    CHECK(db.get_config("process_paused_at", "0") == "0");
+}
+
+TEST_CASE("TAR #1654: a failed paused_at write leaves an enable transition unapplied",
+          "[tar][paused_at][issue1654]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_pausefail_"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    REQUIRE(db.set_config("process_enabled", "false"));
+    REQUIRE(db.set_config("process_paused_at", "1735689600"));
+
+    install_fault(db, "tar_config", "key", "process_paused_at");
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+    CHECK(db.get_config("process_enabled", "true") == "false"); // flag did not move
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");
+}
+
+TEST_CASE("TAR #1654: in-function guard rejects unvalidated values and unknown sources",
+          "[tar][paused_at][issue1654]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_guard_"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "maybe", 1'735'689'600));
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "true'; DROP TABLE tar_config;--",
+                                                1'735'689'600));
+    CHECK_FALSE(apply_source_enabled_transition(db, "not_a_source", "true", 1'735'689'600));
+    CHECK(db.get_config("process_enabled", "unset") == "unset");
+    CHECK(db.get_config("not_a_source_enabled", "unset") == "unset");
+}
+
+TEST_CASE("TAR #1567: db_health line format", "[tar][status][issue1567]") {
+    CHECK(format_db_health_line(true, 1700000000) == "db_health|quarantined|1700000000");
+    CHECK(format_db_health_line(false, 0) == "db_health|ok|0");
+    CHECK(format_db_health_line(false, 1700000000) == "db_health|ok|1700000000");
+}

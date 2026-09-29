@@ -102,6 +102,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
 ]
@@ -145,11 +146,12 @@ FRAGMENT_FILES = [
 # EVERY side's new plugin on top of it, never pick one side's total -- and re-derive
 # by RUNNING parse_fragment_gate_rows over FRAGMENT_FILES rather than trusting hand
 # arithmetic, which has drifted before (206, then 203, then repeatedly since). Dev
-# landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); this
-# branch's own browser_policy (+1) lands on top of dev's 222: 222 + 1 = 223. Verified
-# directly against the merged fragment files (not by combining stale totals) before
-# landing -- see the merge commit for the confirming test run.
-EXPECTED_TOTAL_ROWS = 223
+# landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); dev's own
+# browser_policy (+1) landed on top of that: 222 + 1 = 223. This branch's own
+# privacy_permissions (+1) lands on top of dev's 223: 223 + 1 = 224. Verified directly
+# by running parse_fragment_gate_rows over FRAGMENT_FILES with privacy_permissions'
+# fragment added, not by hand arithmetic.
+EXPECTED_TOTAL_ROWS = 224
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

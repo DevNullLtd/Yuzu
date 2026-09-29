@@ -62,9 +62,9 @@
     "capability_id": "get.fragments-dex-catalogue",
     "rest_v1_twin": {
       "method": "GET",
-      "path": "/api/v1/dex/signals"
+      "path": "/api/v1/dex/catalogue"
     },
-    "mcp_twin": "list_dex_signals",
+    "mcp_twin": "get_dex_catalogue",
     "status": "twinned"
   },
   {

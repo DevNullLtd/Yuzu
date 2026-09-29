@@ -80,8 +80,13 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   reaper thread must join before the codec/pool it touches destructs).
 - `server/core/src/main.cpp` — a **second, short-lived** `PgPool`/
   `FileKeyProvider`/`SecretCodec`/`AuthDB` stack, built and torn down before
-  `Server::create()` is ever called, used only for (1) `seed_admin_if_empty`
-  fresh-start seeding and (2) the host-CLI one-shots (`--mfa-reset`,
+  `Server::create()` is ever called, used for (1) `RbacStore::provision_first_admin`
+  fresh-start seeding (atomically inserts the account AND its Administrator
+  RBAC grant; `AuthDB::seed_admin_if_empty` is NOT called in production at
+  all — a redundant second no-op call was removed from `main.cpp`'s
+  fresh-start block; the function stays exported for its own tests — see
+  auth_db.hpp's doc comment) and (2) the
+  host-CLI one-shots (`--mfa-reset`,
   `--break-glass-arm`) and the `--auth-mode=sso-only` break-glass boot
   validation. Constructing two independent `AuthDB` instances against the
   same database in one process is safe (migration + `SecretCodec::init()`
@@ -133,9 +138,15 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 
 - **`yuzu-server.cfg` is a one-shot fresh-start seed, not a live source of
   truth — AND the seed only ever fires when `auth.users` is genuinely
-  empty.** `AuthDB::seed_admin_if_empty` is a single
-  `INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
-  server instance racing first boot. After the first successful seed (or on
+  empty.** `RbacStore::provision_first_admin` is the production seeder (a
+  single `INSERT ... SELECT ... WHERE NOT EXISTS` plus the Administrator
+  grant plus a durable `rbac.bootstrap.first_admin` audit row, one
+  transaction for the account+grant, TOCTOU-free against a second server
+  instance racing first boot); `AuthDB::seed_admin_if_empty` is the same
+  shape for the account alone but is NO LONGER called in production at all
+  (a redundant second no-op call was removed from `main.cpp`'s fresh-start
+  block; the function stays exported for its own tests). After the first
+  successful seed (or on
   any subsequent boot where the table is non-empty), edits to the config
   file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
   create, the role endpoint for role change) is the only live mutation path.

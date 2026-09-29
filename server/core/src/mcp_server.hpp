@@ -684,21 +684,21 @@ public:
     /// dashboard fragments now route through this same seam too.
     void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
 
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
-    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
-    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
-    /// devices/top_devices lists to the caller's management-group scope
-    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
-    /// `/fragments/dex/overview` already do. This is a SECOND, independent
-    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
-    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
-    /// Unset (default-constructed) degrades to "no confinement" (matching the
-    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
-    using DexVisibleFn =
-        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
-    void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+    // #4035 hardening (governance) introduced a bespoke `DexVisibleFn`
+    // resolver for `get_dex_app`/`get_dex_overview`/`get_dex_signal_detail` —
+    // retired (WS-A4 PR-1 fix round, sec-1/sec-2): see
+    // `RestApiV1::DexVisibleFn`'s retirement comment (rest_api_v1.hpp) for
+    // the full rationale — the bare `perm_fn`/`tier_allows` gate in front of
+    // it resolved GLOBAL roles only, so this resolver's confinement was
+    // dormant on every admitted call. Per the WS-A4 PR-1 decision (see the
+    // same rest_api_v1.hpp comment) all three tools REVERTED to base
+    // gating instead of moving onto `fleet_read_fn_`: every value they
+    // return is a fleet-wide aggregate (an ADR-0017 INV-3 concern, not a
+    // per-caller-confinement one), so they gate on the bare
+    // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or with
+    // RBAC off any authenticated non-service/non-engine session) plus the base MCP `ServiceScopeClass`
+    // service-token deny — no per-caller confinement resolver, dormant or
+    // otherwise, on any of the three.
 
     /// ADR-0031 WS-A4 (seventh family): the SAME in-process schedule-read API
     /// seam the REST `GET /api/v1/schedules` handler and the dashboard
@@ -1201,8 +1201,6 @@ private:
     // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
     std::shared_ptr<const DexApi> dex_api_;
     std::shared_ptr<const DexPerfApi> dex_perf_api_;
-    // #4035 hardening (governance) — see set_dex_visible_fn above.
-    DexVisibleFn dex_visible_fn_;
     // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.

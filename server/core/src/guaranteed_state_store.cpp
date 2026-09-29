@@ -1390,10 +1390,15 @@ GuaranteedStateStore::dex_crashes_by_day(const std::string& since) const {
         });
 }
 
-std::vector<DexSignalCount>
-GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::string& platform) const {
+std::optional<std::vector<DexSignalCount>>
+GuaranteedStateStore::dex_signal_summary_checked(const std::string& since,
+                                                 const std::string& platform) const {
+    // Second named exception (WS-A4 PR-1 fix round, sec-5): see this
+    // method's own doc comment (guaranteed_state_store.hpp) — the fleet
+    // catalogue builder must tell "degraded" apart from "genuinely zero
+    // events fleet-wide".
     static DegradeSampler sampler;
-    return dex_read<std::vector<DexSignalCount>>(
+    return dex_read_checked<std::vector<DexSignalCount>>(
         open_, pool_, metrics_, "dex_signal_summary", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<DexSignalCount>> {
             std::string sql =
@@ -1421,6 +1426,11 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::st
             }
             return out;
         });
+}
+
+std::vector<DexSignalCount>
+GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::string& platform) const {
+    return dex_signal_summary_checked(since, platform).value_or(std::vector<DexSignalCount>{});
 }
 
 std::optional<std::vector<DexSignalCount>>

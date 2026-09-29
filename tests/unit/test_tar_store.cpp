@@ -1717,6 +1717,37 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
         }
     }
     CHECK(found_quarantine);
+
+    // #1567: this open knows it quarantined, and the fact is persisted (epoch +
+    // basename only) so it survives a restart and can be published fleet-wide.
+    REQUIRE(db2.quarantined_this_open().has_value());
+    const auto q_epoch = db2.get_config("db_health_last_quarantine_epoch", "");
+    CHECK_FALSE(q_epoch.empty());
+    CHECK(q_epoch.find_first_not_of("0123456789") == std::string::npos);
+    CHECK(q_epoch == std::to_string(*db2.quarantined_this_open()));
+    const auto q_file = db2.get_config("db_health_last_quarantine_file", "");
+    CHECK(q_file.rfind(tmp.filename().string() + ".corrupt-", 0) == 0);
+    CHECK(q_file.find_first_of("/\\") == std::string::npos);
+
+    // A clean re-open of the same path reports no quarantine, but both config
+    // rows persist (tar_config is the durable source of truth).
+    { TarDatabase discard = std::move(db2); }
+    auto clean = TarDatabase::open(tmp);
+    REQUIRE(clean.has_value());
+    CHECK_FALSE(clean->quarantined_this_open().has_value());
+    CHECK(clean->get_config("db_health_last_quarantine_epoch", "") == q_epoch);
+    CHECK(clean->get_config("db_health_last_quarantine_file", "") == q_file);
+    { TarDatabase discard = std::move(*clean); }
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(tmp.filename().string() + ".corrupt-", 0) == 0) {
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+    {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+    }
 }
 
 TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
@@ -2084,4 +2115,173 @@ TEST_CASE("checked_transaction: every statement individually succeeding does not
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("COMMIT failed") != std::string::npos);
     CHECK(row_count(t.db, "fk_child") == 0);
+}
+
+// ── #1654: events + baseline commit atomically ─────────────────────────────────
+//
+// The failure is injected with RAISE(ABORT) triggers (deterministic, in-process,
+// no timing) on tar_state, both the INSERT and the UPDATE form so the test does
+// not depend on which UPSERT branch SQLite takes. It hits the same
+// `rc != SQLITE_DONE -> ROLLBACK` path a real SQLITE_BUSY would.
+
+static void install_state_fault(TarDatabase& db, const std::string& collector) {
+    REQUIRE(db.execute_sql("CREATE TRIGGER yuzu_test_fail_state_i BEFORE INSERT ON tar_state "
+                           "WHEN NEW.collector='" + collector +
+                           "' BEGIN SELECT RAISE(ABORT,'injected'); END"));
+    REQUIRE(db.execute_sql("CREATE TRIGGER yuzu_test_fail_state_u BEFORE UPDATE ON tar_state "
+                           "WHEN NEW.collector='" + collector +
+                           "' BEGIN SELECT RAISE(ABORT,'injected'); END"));
+}
+
+static void drop_state_fault(TarDatabase& db) {
+    REQUIRE(db.execute_sql("DROP TRIGGER yuzu_test_fail_state_i"));
+    REQUIRE(db.execute_sql("DROP TRIGGER yuzu_test_fail_state_u"));
+}
+
+static int64_t count_rows(TarDatabase& db, const std::string& table) {
+    auto r = db.execute_query("SELECT COUNT(*) FROM " + table, 1);
+    REQUIRE(r.has_value());
+    return std::stoll(r->rows[0][0]);
+}
+
+TEST_CASE("TarDatabase: process events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.set_state("process", "baseline-1"));
+
+    ProcessEvent a;
+    a.ts = 1000;
+    a.snapshot_id = 1;
+    a.action = "started";
+    a.pid = 1;
+    a.name = "a.exe";
+    ProcessEvent b = a;
+    b.pid = 2;
+    b.name = "b.exe";
+
+    install_state_fault(t.db, "process");
+    CHECK_FALSE(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    // Nothing durable: no events, baseline unchanged -> the next tick re-diffs the
+    // identical delta instead of double-emitting.
+    CHECK(count_rows(t.db, "process_live") == 0);
+    CHECK(t.db.get_state("process") == "baseline-1");
+
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    CHECK(count_rows(t.db, "process_live") == 2);
+    CHECK(t.db.get_state("process") == "baseline-2");
+}
+
+TEST_CASE("TarDatabase: software + network events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+
+    SoftwareEvent sw;
+    sw.ts = 1000;
+    sw.snapshot_id = 1;
+    sw.action = "installed";
+    sw.name = "app";
+    install_state_fault(t.db, "software");
+    CHECK_FALSE(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_live") == 0);
+    CHECK(t.db.get_state("software").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_live") == 1);
+    CHECK(t.db.get_state("software") == "s2");
+
+    NetworkEvent ne;
+    ne.ts = 1000;
+    ne.snapshot_id = 1;
+    ne.action = "connected";
+    ne.proto = "tcp";
+    install_state_fault(t.db, "network");
+    CHECK_FALSE(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_live") == 0);
+    CHECK(t.db.get_state("network").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_live") == 1);
+    CHECK(t.db.get_state("network") == "n2");
+}
+
+TEST_CASE("TarDatabase: service/user/arp/dns/mapdrive events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+
+    ServiceEvent se; se.ts = 1000; se.snapshot_id = 1; se.action = "started"; se.name = "svc";
+    install_state_fault(t.db, "service");
+    CHECK_FALSE(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 0);
+    CHECK(t.db.get_state("service").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 1);
+    CHECK(t.db.get_state("service") == "b2");
+
+    UserEvent ue; ue.ts = 1000; ue.snapshot_id = 1; ue.action = "login"; ue.user = "alice";
+    install_state_fault(t.db, "user");
+    CHECK_FALSE(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 0);
+    CHECK(t.db.get_state("user").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 1);
+    CHECK(t.db.get_state("user") == "b2");
+
+    ArpEvent ae; ae.ts = 3000; ae.snapshot_id = 1; ae.action = "appeared"; ae.iface = "Ethernet";
+    ae.ip_address = "192.168.1.1"; ae.mac_address = "aa:bb:cc:dd:ee:ff"; ae.entry_type = "dynamic";
+    install_state_fault(t.db, "arp");
+    CHECK_FALSE(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 0);
+    CHECK(t.db.get_state("arp").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 1);
+    CHECK(t.db.get_state("arp") == "b2");
+
+    DnsEvent de; de.ts = 3100; de.snapshot_id = 1; de.action = "appeared"; de.name = "example.com";
+    de.record_type = "A"; de.data = "93.184.216.34"; de.ttl_remaining_s = 60; de.source = "cache";
+    install_state_fault(t.db, "dns");
+    CHECK_FALSE(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 0);
+    CHECK(t.db.get_state("dns").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 1);
+    CHECK(t.db.get_state("dns") == "b2");
+
+    MapDriveEvent me{1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "historical"};
+    install_state_fault(t.db, "mapdrive");
+    CHECK_FALSE(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 0);
+    CHECK(t.db.get_state("mapdrive").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 1);
+    CHECK(t.db.get_state("mapdrive") == "b2");
+}
+
+TEST_CASE("TarDatabase: StateWrite with empty events writes only the baseline (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    CHECK(t.db.insert_process_events({}, StateWrite{"process", "only-state"}));
+    CHECK(t.db.get_state("process") == "only-state");
+    CHECK(count_rows(t.db, "process_live") == 0);
+
+    // nullopt state keeps the historical contract for an open handle byte-for-byte
+    // (a closed handle now returns false for the state-carrying overloads).
+    CHECK(t.db.insert_process_events({}));
+    CHECK(t.db.insert_process_events({}, std::nullopt));
+    CHECK(t.db.get_state("process") == "only-state");
+}
+
+TEST_CASE("TarDatabase: set_state reports a failed baseline write (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    install_state_fault(t.db, "process");
+    CHECK_FALSE(t.db.set_state("process", "x"));
+    drop_state_fault(t.db);
+    CHECK(t.db.set_state("process", "x"));
+    CHECK(t.db.get_state("process") == "x");
 }

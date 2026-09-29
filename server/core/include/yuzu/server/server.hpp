@@ -142,12 +142,20 @@ struct Config {
     // via --shutdown-drain-seconds / YUZU_SHUTDOWN_DRAIN_SECONDS.
     int shutdown_drain_seconds{0};
 
-    // Set by main.cpp iff `AuthDB::seed_admin_if_empty` actually seeded the
-    // sole admin user this boot (a genuinely-empty `auth.users` — fresh
-    // start / Postgres cutover). Threaded through Config rather than set
-    // directly on a metrics registry because the seed happens before
-    // `Server::create()` constructs `ServerImpl` (and therefore before
-    // `metrics_` exists) — ServerImpl's ctor reads this once to pre-seed
+    // Set by main.cpp iff `RbacStore::provision_first_admin` actually
+    // provisioned the sole admin user + their fleet-wide Administrator
+    // grant this boot (a genuinely-empty `auth.users` — fresh start /
+    // Postgres cutover). Sourced from `provision_first_admin`'s outcome,
+    // NOT `AuthDB::seed_admin_if_empty`'s — `provision_first_admin` is the
+    // SOLE production seeder now (main.cpp's fresh-start bootstrap block
+    // performs the fresh-start INSERT there; `seed_admin_if_empty` has no
+    // production caller at all); the flag's own meaning ("did this boot
+    // seed the sole admin user into an empty auth.users table") is
+    // unchanged, only which call detects it. Threaded through Config rather
+    // than set directly on a
+    // metrics registry because this happens before `Server::create()`
+    // constructs `ServerImpl` (and therefore before `metrics_` exists) —
+    // ServerImpl's ctor reads this once to pre-seed
     // `yuzu_auth_fresh_start_reset_total`.
     bool auth_fresh_start_seeded{false};
 

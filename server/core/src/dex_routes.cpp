@@ -1,5 +1,6 @@
 #include "dex_routes.hpp"
 
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
@@ -57,135 +58,16 @@ std::string num(int64_t n) { return std::to_string(n); }
 } // namespace — the catalogue accessors below are PUBLIC (declared in
   // dex_routes.hpp) since F1: the Settings → DEX alerts panel renders the
   // routable-type list from the same single source of truth.
-
-// The catalogued signal types (114 today), GROUPED for display — the server-side mirror
-// of the agent catalogue (dex_signal_catalog.cpp; keep in sync when adding a
-// signal). The All-signals panel renders EVERY entry, fired or not, so
-// operators see what the fleet is monitoring — not just what happened to fire
-// in the window. Types present in the DB but absent here (a newer agent's
-// signal) are appended under "Other" with the raw-label fallback, so the panel
-// never hides data.
-
-const std::vector<DexSignalGroup>& dex_signal_groups() {
-    static const std::vector<DexSignalGroup> kGroups = {
-        {"App reliability",
-         {"process.crashed", "process.hung", "process.crashed_managed",
-          "process.file_access_failure", "app.sxs_error", "app.activation_failed",
-          "app.com_failed", "app.error_popup", "app.shutdown_blocked",
-          "app.push_notification_error", "app.file_association_reset", "app.staterepo_error"}},
-        {"Boot, start-up & shutdown",
-         {"os.boot", "boot.degraded_app", "boot.degraded_driver", "boot.degraded_service",
-          "boot.degraded_device", "boot.fast_startup_failed", "os.shutdown",
-          "shutdown.degraded", "os.restart_initiated", "os.standby", "os.standby_degraded",
-          "os.modern_standby_exit", "os.resume_report", "os.uptime_report"}},
-        {"Service health",
-         {"service.crashed", "service.start_failed", "service.start_timeout", "service.hung",
-          "service.unresponsive", "service.logon_failed", "service.recovery_failed",
-          "service.shutdown_failed", "service.dependency_failed"}},
-        {"System stability",
-         {"os.bugcheck", "os.power_loss", "os.dirty_shutdown", "os.time_unsynced",
-          "os.activation_failed", "os.vss_error", "os.shadow_copies_lost",
-          "os.crashdump_disabled", "display.driver_reset", "display.dwm_exited",
-          "memory.exhausted"}},
-        {"Hardware & storage",
-         {"hw.error", "hw.device_start_failed", "hw.driver_load_failed", "hw.user_driver_error",
-          "hw.cpu_throttled", "hw.battery_error", "hw.tpm_error", "disk.error",
-          "disk.smart_failure", "disk.port_reset", "storage.low"}},
-        {"Performance",
-         {"perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high"}},
-        {"File system",
-         {"fs.corruption", "fs.write_lost", "fs.flush_failed", "fs.database_corrupt",
-          "fs.hive_recovered", "fs.autochk_ran"}},
-        {"Network",
-         {"network.wifi_drop", "network.wifi_connect_failed", "network.adapter_driver_dump",
-          "network.adapter_reset", "network.dns_timeout", "network.dns_register_failed",
-          "network.dhcp_failed",
-          "network.vpn_failed", "network.smb_failed", "network.smb_write_lost",
-          "network.ip_conflict", "network.name_conflict", "network.port_exhaustion",
-          "session.rdp_disconnected"}},
-        {"Identity & logon",
-         {"logon.temp_profile", "logon.profile_locked", "logon.slow_subscriber",
-          "logon.folder_redirect_failed", "logon.no_dc", "logon.winlogon_terminated",
-          "logon.machine_trust_failed", "logon.biometric_error", "logon.hello_error",
-          "logon.aad_token_error", "security.kerberos_error", "security.auth_error"}},
-        {"Security & protection",
-         {"security.rtp_disabled", "security.rtp_error", "security.threat_detected",
-          "security.threat_action_failed", "security.av_update_failed",
-          "security.tamper_blocked", "security.tls_alert", "security.bitlocker_error",
-          "security.cert_enroll_failed"}},
-        {"Updates & installs",
-         {"update.failed", "update.check_failed", "update.download_failed",
-          "update.transfer_failed", "app_install.failed", "app_uninstall.failed",
-          "app_install.appx_failed"}},
-        {"Policy & management",
-         {"gpo.failed", "gpo.cse_failed", "mgmt.mdm_error"}},
-        {"Printing",
-         {"print.failed", "print.driver_install_failed", "print.plugin_failed"}},
-    };
-    return kGroups;
-}
-
-std::size_t dex_catalogued_type_count() {
-    std::size_t n = 0;
-    for (const auto& g : dex_signal_groups())
-        n += g.types.size();
-    return n;
-}
-
-// Per-obs_type platform coverage — which OSes collect a signal type today. Windows
-// is the whole EvtSubscribe catalogue; Linux (dex_linux_*) and macOS (dex_macos_*)
-// collect the subsets below. THIN explicit map (the one bit of new grouping) — keep
-// in sync with the agent collectors; a schema↔catalogue cross-check test guards it.
-std::vector<std::string> dex_obs_platforms(const std::string& obs_type) {
-    static const char* const kLinux[] = {
-        // poll_perf: /proc/stat + /proc/meminfo + /proc/diskstats breaches (all three
-        // via the SAME win::breach_update used on Windows) + statvfs storage + uptime
-        "perf.cpu_sustained", "perf.memory_pressure", "perf.disk_latency_high", "storage.low",
-        "os.uptime_report",
-        // poll_throttle: sysfs thermal-throttle counter (dex_linux_sysfs → dex_linux_collector)
-        "hw.cpu_throttled",
-        // systemd-structured journal records (dex_linux_journal)
-        "process.crashed", "service.crashed", "service.hung", "os.time_unsynced",
-        // kernel-transport journal lines, classified by dex_linux_kmsg
-        // (classify_kernel_message, delegated from parse_journal_line)
-        "memory.exhausted", "os.bugcheck", "os.dirty_shutdown", "disk.error", "fs.corruption",
-        "hw.error", "process.hung"};
-    // The Linux DEX observer (dex_linux_collector) drives all of the above: poll_perf
-    // (the /proc CPU + memory + diskstats breach trio — perf.disk_latency_high is the
-    // /proc/diskstats await breach, as live as cpu/mem on any ordinary sd*/nvme*/mmcblk
-    // disk; only exotic/fabric storage is excluded, dex_linux_proc.hpp is_whole_disk) +
-    // statvfs storage + the sysfs throttle counter + the journald poll, whose every
-    // `_TRANSPORT=kernel` line is delegated to dex_linux_kmsg's classify_kernel_message
-    // (so the kmsg-classified types ARE emitted at runtime via journald, not a separate
-    // unwired reader). Keep this map and the drift-net test in test_dex_routes.cpp in
-    // lockstep with the collectors — they are hand-maintained because the server suite
-    // can't introspect the agent (durable fix: generate from the collector registries).
-    static const char* const kMac[] = {
-        "process.crashed", "process.hung",  "os.bugcheck",     "memory.exhausted",
-        "os.uptime_report", "disk.smart_failure", "hw.error",  "storage.low",
-        "hw.cpu_throttled", "service.crashed",    "network.wifi_drop", "update.failed",
-        "print.failed",     "mgmt.mdm_error",     "logon.no_dc",       "fs.corruption"};
-    auto in = [&](const char* const* arr, std::size_t n) {
-        for (std::size_t i = 0; i < n; ++i)
-            if (obs_type == arr[i])
-                return true;
-        return false;
-    };
-    std::vector<std::string> out;
-    out.emplace_back("windows"); // the catalogue IS the Windows EvtSubscribe set
-    if (in(kLinux, std::size(kLinux)))
-        out.emplace_back("linux");
-    if (in(kMac, std::size(kMac)))
-        out.emplace_back("macos");
-    return out;
-}
-
-// One family's slice of the canonical health composite — the SAME formula as
-// dex_compute_health (severity × default-preset × device-impact), for one family.
-// Forward-declared here (used by the Catalogue above its definition); defined just
-// after dex_compute_health below so it shares the family-weights helpers.
-double dex_family_health_deduction(const DexSignalGroup& g,
-                                   const std::vector<DexSignalCount>& signals, int64_t N);
+  //
+  // `dex_signal_groups`, `dex_catalogued_type_count`, `dex_obs_platforms`,
+  // `dex_family_health_deduction`, `dex_family_rollup`, `dex_compute_health`
+  // and `dex_family_index` are declared in `dex_types.hpp` and now DEFINED in
+  // `dex_types.cpp` (ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28) — the
+  // definitions used to live here despite the pure-header declaration, so core
+  // TUs (`dex_read_model.cpp`) linked against this presentation TU, invisible
+  // to the include-closure seam gate. This file's own renderers below call the
+  // exact same declarations, now satisfied from `dex_types.cpp` instead
+  // (ODR-safe relocation, not a duplication; no logic changes).
 
 // Friendly display label for an obs_type — the ONE place the catalogue taxonomy
 // meets the UI. Unknown types fall back to the escaped raw obs_type, so a signal
@@ -372,31 +254,17 @@ std::string back_to_overview(const std::string& window) {
            "style=\"cursor:pointer;\">&larr; Reliability overview</a>";
 }
 
-// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
-// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
-std::string iso_days_ago(int days) {
-    if (days <= 0)
-        return {};
-    const auto t = std::chrono::system_clock::now() - std::chrono::hours(24 * days);
-    std::time_t tt = std::chrono::system_clock::to_time_t(t);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &tt);
-#else
-    gmtime_r(&tt, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
-}
-
-// Map the window selector value to a day count (0 = "all").
-int window_to_days(const std::string& w) {
-    if (w == "24h") return 1;
-    if (w == "30d") return 30;
-    if (w == "all") return 0;
-    return 7; // "7d" / default
-}
+// ISO-8601 UTC cutoff for "N days ago" / the window→day-count map — the REAL
+// logic now lives in `dex_window.cpp` as `dex_iso_since`/`dex_window_to_days`
+// (declared in the pure `dex_window.hpp`, ADR-0031 WS-A4 PR-1 F1 fix, Fable
+// review 2026-09-28): this file used to define BOTH the public wrappers below
+// AND these file-local helpers with duplicated bodies, so a core TU
+// (`dex_api.cpp`) linked against this presentation TU's object file for the
+// public names, invisible to the include-closure seam gate. These two names
+// stay (used at ~20 call sites across this file's route handlers below) but
+// now simply forward — one implementation, no logic changes.
+std::string iso_days_ago(int days) { return dex_iso_since(days); }
+int window_to_days(const std::string& w) { return dex_window_to_days(w); }
 
 // CANONICAL window token for a day count — the inverse of window_to_days. This
 // is the XSS chokepoint (governance Gate-8 HIGH): the window value is
@@ -505,14 +373,11 @@ std::string history_detail(const GuardianObservationRow& r) {
 
 } // namespace
 
-// Public wrappers over the internal window helpers (declared in dex_window.hpp) so
-// the /api/v1/dex REST surface resolves the window token through the exact same
-// logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
-int dex_window_to_days(const std::string& window) { return window_to_days(window); }
-std::string dex_iso_since(int days) { return iso_days_ago(days); }
-std::string dex_normalize_os_filter(const std::string& os) {
-    return (os == "windows" || os == "linux" || os == "macos") ? os : std::string{};
-}
+// `dex_window_to_days`/`dex_iso_since`/`dex_normalize_os_filter` are declared in
+// `dex_window.hpp` and DEFINED in `dex_window.cpp` (see the comment above
+// `iso_days_ago`/`window_to_days`) — this file's own `since`/`window_days`
+// locals below call the exact same declarations, transitively via those two
+// file-local forwarders.
 
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
@@ -559,35 +424,11 @@ std::string dex_window_chips(const char* frag, int window_days) {
            chip("30d", "30d") + chip("all", "All") + "</div>";
 }
 
-// One family's rollup over the window (events, active count, blast radius, leader).
-// #4035: DexFamilyRollup itself moved to dex_routes.hpp (external linkage, no
-// longer inside this TU's anonymous namespace below) so dex_read_model.cpp can
-// build the same rollup without a second copy (Rule 1) — this stays the ONE definition
-// of the function, now implementing the header's declared struct.
-DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
-                                  const std::vector<DexSignalCount>& signals) {
-    DexFamilyRollup r;
-    r.total = static_cast<int>(g.types.size());
-    r.benign = std::string(g.name) == "Boot, start-up & shutdown";
-    for (const char* t : g.types) {
-        const DexSignalCount* c = nullptr;
-        for (const auto& s : signals)
-            if (s.obs_type == t) {
-                c = &s;
-                break;
-            }
-        if (!c)
-            continue;
-        r.events += c->count;
-        if (c->count > 0)
-            ++r.active;
-        if (c->distinct_devices > r.max_signal_devices)
-            r.max_signal_devices = c->distinct_devices; // #1374: max, not union (see field doc)
-        if (!r.top || c->count > r.top->count)
-            r.top = c;
-    }
-    return r;
-}
+// `dex_family_rollup` (events, active count, blast radius, leader for one family
+// over the window) is declared in `dex_types.hpp` and now DEFINED in
+// `dex_types.cpp` alongside its sibling pure catalogue/health functions (see the
+// note above `dex_signal_groups`) — the renderers below call the exact same
+// declaration.
 
 // DEX Catalogue — View 1: the 13 family cards (mockup dex-catalogue.html). Replaces
 // the flat All-signals table with a card grid that drills into a family, then a
@@ -1145,140 +986,16 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     return h;
 }
 
-// The composite-score weighting policy (mockup dex-health-score.html). Names MUST
-// match dex_signal_groups(). `severity` = how much a failure of this family hurts
-// experience; the four multipliers are the server-chosen weighting PRESETS. This
-// is policy (transparent + shown), not data — the DATA is the measured impact rate.
-struct DexFamilyWeight {
-    const char* name;
-    const char* severity; // "high" | "med" | "low"
-    double m_default, m_stability, m_productivity, m_security;
-};
-const std::vector<DexFamilyWeight>& dex_family_weights() {
-    static const std::vector<DexFamilyWeight> w = {
-        {"App reliability", "high", 1.0, 1.3, 1.1, 0.8},
-        {"System stability", "high", 1.0, 1.6, 0.9, 0.9},
-        {"Network", "med", 1.0, 0.8, 1.5, 0.9},
-        {"Service health", "med", 1.0, 1.2, 1.0, 0.9},
-        {"Updates & installs", "med", 1.0, 1.0, 1.1, 1.0},
-        {"Security & protection", "high", 1.0, 0.8, 0.7, 2.2},
-        {"Identity & logon", "med", 1.0, 0.9, 1.2, 1.6},
-        {"Hardware & storage", "med", 1.0, 1.4, 0.8, 0.9},
-        {"Performance", "med", 1.0, 1.1, 1.5, 0.7},
-        {"Printing", "low", 1.0, 0.6, 1.6, 0.6},
-        {"Boot, start-up & shutdown", "low", 1.0, 0.9, 1.5, 0.7},
-        {"Policy & management", "low", 1.0, 0.9, 0.9, 1.3},
-        {"File system", "low", 1.0, 1.3, 0.7, 0.9},
-    };
-    return w;
-}
-double dex_severity_points(const std::string& sev) {
-    return sev == "high" ? 12.0 : (sev == "med" ? 6.0 : 2.0);
-}
-double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset) {
-    if (preset == "stability")
-        return fw.m_stability;
-    if (preset == "productivity")
-        return fw.m_productivity;
-    if (preset == "security")
-        return fw.m_security;
-    return fw.m_default;
-}
-
-// The composite-health computation, shared by the Health page and the Overview
-// hub's health teaser. score = 100 − Σ deductions; -1 when N<=0 (suppressed, no
-// reporting agents → no fabricated 100).
-// #4035: DexHealthResult moved to dex_routes.hpp (same rationale as
-// DexFamilyRollup above) so dex_read_model.cpp's health-score builder shares
-// this exact computation instead of a second copy (Rule 1).
-DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
-                                   const std::string& preset) {
-    DexHealthResult r;
-    if (N <= 0)
-        return r;
-    double total = 0.0;
-    for (const auto& fw : dex_family_weights()) {
-        const DexSignalGroup* g = nullptr;
-        for (const auto& grp : dex_signal_groups())
-            if (std::string(grp.name) == fw.name) {
-                g = &grp;
-                break;
-            }
-        const DexFamilyRollup rr = g ? dex_family_rollup(*g, signals) : DexFamilyRollup{};
-        // #1374: largest single-signal device radius, not the family union (see field doc).
-        double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
-        if (impact > 1.0)
-            impact = 1.0;
-        const double ded = dex_severity_points(fw.severity) * dex_preset_mult(fw, preset) * impact;
-        r.deds.push_back({fw.name, fw.severity, ded});
-        total += ded;
-    }
-    r.score = std::clamp(100.0 - total, 0.0, 100.0);
-    return r;
-}
-
-// One family's deduction — the per-family term of dex_compute_health above, factored
-// out so the Catalogue's per-card score is provably the SAME number (default preset).
-double dex_family_health_deduction(const DexSignalGroup& g,
-                                   const std::vector<DexSignalCount>& signals, int64_t N) {
-    if (N <= 0)
-        return 0.0;
-    const DexFamilyRollup rr = dex_family_rollup(g, signals);
-    // #1374: impact uses the largest single-signal device radius, not the family
-    // union — documented in the methodology so the number and label agree. A union
-    // would deduct more for disjoint-device families; this stays the (intentionally
-    // approximate, cross-family-overlapping) secondary composite.
-    double impact = static_cast<double>(rr.max_signal_devices) / static_cast<double>(N);
-    if (impact > 1.0)
-        impact = 1.0;
-    for (const auto& fw : dex_family_weights())
-        if (std::string(fw.name) == g.name)
-            return dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
-    return 0.0;
-}
-
-// The pure scoring formula (#4855 extraction) — everything dex_device_score
-// below did with `device_signals` once it had them, factored out so the ONE
-// checked store read the score builder now performs (closing the #4855 torn
-// read between score + signals) can feed this directly instead of forcing a
-// second read just to get a score.
-int dex_score_from_signals(const std::vector<DexSignalCount>& device_signals) {
-    double total = 0.0;
-    for (const auto& fw : dex_family_weights()) {
-        const DexSignalGroup* g = nullptr;
-        for (const auto& grp : dex_signal_groups())
-            if (std::string(grp.name) == fw.name) {
-                g = &grp;
-                break;
-            }
-        if (!g)
-            continue;
-        const DexFamilyRollup rr = dex_family_rollup(*g, device_signals);
-        if (rr.benign || rr.events <= 0) // benign reports (boot/uptime) never deduct
-            continue;
-        // Per-device impact: this device's events in the family, gently scaled
-        // (1 event = partial; kCap+ events = full severity). Illustrative cap,
-        // pending calibration (like the perf baseline).
-        constexpr double kCap = 5.0;
-        const double impact = std::min(1.0, static_cast<double>(rr.events) / kCap);
-        total += dex_severity_points(fw.severity) * dex_preset_mult(fw, "default") * impact;
-    }
-    return static_cast<int>(std::clamp(100.0 - total, 0.0, 100.0) + 0.5);
-}
-
-int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
-                     const std::string& since) {
-    if (!store)
-        return -1;
-    // #4855: a degraded read must never render as a signal-free, perfectly
-    // healthy device — use the type-distinguishable checked twin and refuse
-    // to score (-1, "unscored") rather than fabricate a 100 from an empty
-    // container indistinguishable from "genuinely no signals".
-    const auto device_signals = store->dex_device_signal_summary_checked(agent_id, since);
-    if (!device_signals)
-        return -1;
-    return dex_score_from_signals(*device_signals);
-}
+// `DexFamilyWeight`/`dex_family_weights`/`dex_severity_points`/`dex_preset_mult`
+// and `dex_compute_health`/`dex_family_health_deduction` are declared in
+// `dex_types.hpp` and now DEFINED in `dex_types.cpp` (see the note above
+// `dex_signal_groups`, ADR-0031 WS-A4 PR-1 F1 fix, Fable review 2026-09-28).
+//
+// `dex_score_from_signals`/`dex_device_score` are declared in the core-only
+// `dex_read_builders.hpp` and now DEFINED in `dex_read_model.cpp` (core),
+// closing the WS-B2 "LINK RESIDUAL" #4579 that header's own doc comment
+// flagged for both — `dex_device_score` is still called by the Overview
+// renderer below via that exact declaration.
 
 // DEX Health score — the derived/SECONDARY composite (mockup dex-health-score.html).
 // score = 100 − Σ deductions; deduction(family) = severity points × preset
@@ -1429,17 +1146,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
     return h;
 }
 
-// obs_type → family index (into dex_signal_groups), or -1.
-int dex_family_index(const std::string& obs_type) {
-    int fi = 0;
-    for (const auto& g : dex_signal_groups()) {
-        for (const char* t : g.types)
-            if (obs_type == t)
-                return fi;
-        ++fi;
-    }
-    return -1;
-}
+// `dex_family_index` (obs_type → family index into dex_signal_groups, or -1) is
+// declared in `dex_types.hpp` and now DEFINED in `dex_types.cpp` (see the note
+// above `dex_signal_groups`) — the Trends renderer below calls the exact same
+// declaration.
+
 // Inline-SVG sparkline from a daily series.
 std::string dex_sparkline(const std::vector<int64_t>& series, const char* color) {
     if (series.empty())
