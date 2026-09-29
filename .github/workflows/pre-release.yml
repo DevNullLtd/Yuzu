@@ -468,11 +468,23 @@ jobs:
         shell: pwsh
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
+          $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
           if (Test-Path $uninstaller) {
-            Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
-            Start-Sleep -Seconds 3
+            # Bounded, not Start-Process -Wait: -Wait also waits on the
+            # uninstaller's descendants, so one lingering child held this step
+            # (and, on the always() TLS pass, every later diagnostic step) until
+            # the job timeout (#5145).
+            $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+            $deadline = (Get-Date).AddMinutes(3)
+            while ((Get-Date) -lt $deadline -and ((-not $p.HasExited) -or (Test-Path $bin))) {
+              Start-Sleep -Seconds 2
+            }
+            if (-not $p.HasExited) {
+              Write-Error "FAIL: uninstaller still running after 3 minutes"
+              exit 1
+            }
           }
-          if (Test-Path "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe") {
+          if (Test-Path $bin) {
             Write-Error "FAIL: binary still present after uninstall"
             exit 1
           }
@@ -537,11 +549,23 @@ jobs:
         shell: pwsh
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
+          $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
           if (Test-Path $uninstaller) {
-            Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
-            Start-Sleep -Seconds 3
+            # Bounded, not Start-Process -Wait: -Wait also waits on the
+            # uninstaller's descendants, so one lingering child held this step
+            # (and, on the always() TLS pass, every later diagnostic step) until
+            # the job timeout (#5145).
+            $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+            $deadline = (Get-Date).AddMinutes(3)
+            while ((Get-Date) -lt $deadline -and ((-not $p.HasExited) -or (Test-Path $bin))) {
+              Start-Sleep -Seconds 2
+            }
+            if (-not $p.HasExited) {
+              Write-Error "FAIL: uninstaller still running after 3 minutes"
+              exit 1
+            }
           }
-          if (Test-Path "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe") {
+          if (Test-Path $bin) {
             Write-Error "FAIL: binary still present after uninstall"
             exit 1
           }
