@@ -340,9 +340,12 @@ is gated **pre-emptively**: no compose healthchecks an agent image today.
 
 The probes are a hard-coded copy of the healthcheck commands, so both the script
 and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
-defines one — including the two easy-to-miss ones,
-`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
-`pre-release.yml`.
+defines one — including the easy-to-miss
+`scripts/test/docker-compose.upgrade-test.yml`. `pre-release.yml` no longer
+inlines a compose stack: its integration, soak and upgrade jobs run the shipped
+`deploy/docker/docker-compose.reference-gateway.yml` through
+`scripts/ci/qa-stack.sh`, so that template's server healthcheck is the one they
+exercise.
 
 `scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
 real healthcheck probe **against a live HTTP listener** in a shared network
