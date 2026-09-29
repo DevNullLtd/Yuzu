@@ -1,3 +1,4 @@
+%{!?_sysusersdir:%global _sysusersdir /usr/lib/sysusers.d}
 Name:           yuzu-server
 Version:        0.1.0
 Release:        1%{?dist}
@@ -17,6 +18,14 @@ install -D -m 0755 %{_sourcedir}/install-server-postgres.sh %{buildroot}%{_datad
 install -d -m 0750 %{buildroot}/var/lib/yuzu
 install -d -m 0750 %{buildroot}/var/log/yuzu
 install -d -m 0750 %{buildroot}/etc/yuzu
+
+# Service account as a sysusers.d entry (#5142). rpm >= 4.19 turns the
+# yuzu-owned paths in the files list into Requires: user(yuzu)/group(yuzu) and
+# this file into the matching Provides, so the package satisfies its own
+# requirement on Fedora/RHEL; rpm 4.19+ also creates the account from it.
+# The pre-install scriptlet still creates it for older rpm (e.g. RHEL/Rocky 9).
+install -d -m 0755 %{buildroot}%{_sysusersdir}
+printf 'u yuzu - "Yuzu server" /var/lib/yuzu /sbin/nologin\n' > %{buildroot}%{_sysusersdir}/yuzu.conf
 
 %pre
 getent group yuzu >/dev/null 2>&1 || groupadd -r yuzu
@@ -46,3 +55,4 @@ fi
 %dir %attr(0750,yuzu,yuzu) /var/lib/yuzu
 %dir %attr(0750,yuzu,yuzu) /var/log/yuzu
 %dir %attr(0750,yuzu,yuzu) /etc/yuzu
+%{_sysusersdir}/yuzu.conf
