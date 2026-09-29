@@ -1,0 +1,18 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 08943043c455
+== action=permissions
+permissions|macos|-|camera|absent|-|-|-
+permissions|macos|-|microphone|absent|-|-|-
+permissions|macos|/Library/PrivilegedHelperTools/com.microsoft.autoupdate.helper|full_disk_access|denied|0|-|-
+permissions|macos|/usr/libexec/sshd-keygen-wrapper|full_disk_access|allowed|2|-|-
+permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-
+permissions|macos|com.nordvpn.macos|full_disk_access|denied|0|-|-
+permissions|macos|com.spotify.client|full_disk_access|denied|0|-|-
+permissions|macos|net.whatsapp.WhatsApp|full_disk_access|denied|0|-|-
+permissions|macos|jsmith/com.microsoft.teams2|camera|allowed|2|-|-
+permissions|macos|jsmith/org.whispersystems.signal-desktop|camera|allowed|2|-|-
+permissions|macos|jsmith/com.microsoft.teams2|microphone|allowed|2|-|-
+permissions|macos|jsmith/org.whispersystems.signal-desktop|microphone|allowed|2|-|-
+permissions|macos|jsmith/-|full_disk_access|absent|-|-|-
+permissions|macos|-|location|unsupported|-|-|-
+[result_status] OK / FULL / 
+

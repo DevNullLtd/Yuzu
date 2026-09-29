@@ -141,19 +141,17 @@ TEST_CASE("privacy_permissions: no category is silently omitted -- each of the f
         INFO(cat);
         CHECK((has(cat) || whole_source_failure || whole_source_unavailable));
     }
-    // macOS: once the real leg lands (currently a PLANNED placeholder emitting one whole-source
-    // row), location is its own `unsupported` row on every collection -- restore
-    // `CHECK(has("location"))` under `#if defined(__APPLE__)` here (see
-    // privacy_permissions_legs.hpp's "when a leg lands" checklist). The whole-source check above
-    // already covers the placeholder's shape (`whole_source_unavailable`).
+#if defined(__APPLE__)
+    CHECK(has("location")); // macOS: location is its own `unsupported` row on every collection
+#endif
 }
 
-#if defined(__APPLE__) || defined(_WIN32)
-TEST_CASE("privacy_permissions: the PLANNED leg's placeholder row and typed status are both "
-          "pinned exactly -- one whole-source row, UNAVAILABLE/PARTIAL, provenance <os>:planned "
-          "-- so an emptied/duplicated row or a status that erases the planned token (both real "
-          "defects this pin has caught) fail here, not silently. Restore/replace this case per "
-          "privacy_permissions_legs.hpp's checklist once the real leg lands.",
+#if defined(_WIN32)
+TEST_CASE("privacy_permissions: the Windows PLANNED leg's placeholder row and typed status are "
+          "both pinned exactly -- one whole-source row, UNAVAILABLE/PARTIAL, provenance "
+          "windows:planned -- so an emptied/duplicated row or a status that erases the planned "
+          "token (both real defects this pin has caught) fail here, not silently. Replace this "
+          "case per privacy_permissions_legs.hpp's checklist once the real leg lands.",
           "[privacy_permissions][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;
@@ -161,18 +159,14 @@ TEST_CASE("privacy_permissions: the PLANNED leg's placeholder row and typed stat
     const auto result = dispatcher.run(plugin->descriptor(), "permissions");
     const auto rows = rows_of(result.captured);
     REQUIRE(rows.size() == 1);
-#if defined(__APPLE__)
-    CHECK(rows[0] == "permissions|macos|-|-|unsupported|macos:planned|-|-");
-    CHECK(result.result_provenance == "macos:planned");
-#elif defined(_WIN32)
     CHECK(rows[0] == "permissions|windows|-|-|unsupported|windows:planned|-|-");
     CHECK(result.result_provenance == "windows:planned");
-#endif
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     // PARTIAL, not FULL: a planned leg has not looked at all, unlike the Linux leg's own
     // "genuinely reachable mechanism, definitively no session" case (FULL, portal:unavailable
-    // -- a real, complete answer). Both legs bypass the shared select_status() for exactly
-    // this reason; see privacy_permissions_macos.cpp's banner.
+    // -- a real, complete answer) and the macOS leg's own per-source denied/unreadable rows.
+    // The Windows leg bypasses the shared select_status() for exactly this reason; see
+    // privacy_permissions_win.cpp's banner.
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
 }
 #endif

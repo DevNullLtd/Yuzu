@@ -16,9 +16,12 @@
 ## Linux: xdg-desktop-portal's PermissionStore over the AGENT'S OWN session bus only -- rows are
 ## that one session's grants, never machine-wide; `unsupported`/UNAVAILABLE (no session, no
 ## daemon) is the expected outcome for a system-service agent and says nothing about interactive
-## users' grants. macOS and Windows are PLANNED, follow as their own PR: each reports one
-## whole-source `unsupported`/UNAVAILABLE row (`macos:planned`/`windows:planned` in `raw`) rather
-## than an empty success, so neither host reads as "no grants" from a leg that has not shipped.
+## users' grants. macOS: in-process, immutable read of the system and every real per-user
+## `TCC.db`; every TCC.db is TCC-protected, so an agent identity without Full Disk Access reads
+## `denied` for every source, recorded honestly. Windows is PLANNED, follows as its own PR: until
+## then it reports one whole-source `unsupported`/UNAVAILABLE row (`windows:planned` in `raw`)
+## rather than an empty success, so the host does not read as "no grants" from a leg that has not
+## shipped.
 ##
 ## Every row leads with `row_kind` (`permissions`; `constrained` only on the plugin's
 ## internal_error row), so these columns line up with the wire row positionally -- see
@@ -40,9 +43,10 @@ metadata:
     `denied` row whose `raw` names the refusal, never collapsed into `absent`. Every category
     gets a row, or is covered by a whole-source row (category "-"). The two `last_used_*` fields
     are Windows-only (epoch-milliseconds; "-" elsewhere). Reads one machine per request and is
-    off until enabled: Linux reports only the agent's own session, normally `unavailable` under
-    the shipped service; macOS and Windows are planned and report `unsupported`/UNAVAILABLE with
-    a `planned` token until their legs ship in a follow-up PR.
+    off until enabled: macOS is expected to read `denied` until the agent has Full Disk Access,
+    Windows is planned and reports `unsupported`/UNAVAILABLE with a `windows:planned` token until
+    its leg ships in a follow-up PR, and Linux reports only the agent's own session, normally
+    `unavailable` under the shipped service.
   tags: [privacy_permissions, security, posture, privacy, forensics]
 
 spec:

@@ -5,18 +5,19 @@
  * |<last_used_stop>` rows (the leading field is the YAML's `row_kind` column; states and the
  * row contract in privacy_permissions_parsers.hpp):
  *   Linux:   xdg-desktop-portal PermissionStore.Lookup over the agent's OWN session bus (rung 1)
- *   macOS:   PLANNED, follows as its own PR: the system TCC.db + every /Users home's per-user
- *            TCC.db, read-only, in-process sqlite3 (rung 1)
+ *   macOS:   the system TCC.db + every /Users home's per-user TCC.db, read-only, in-process
+ *            sqlite3 over one descriptor with an immutable URI (rung 1)
  *   Windows: PLANNED, follows as its own PR: HKLM ProfileList -> each real profile's
  *            ConsentStore (live HKU hive or offline NTUSER.DAT mount) + the HKLM
  *            ...\CapabilityAccessManager\ConsentStore mirror (rung 1)
  *
- * The Windows and macOS legs are placeholders: each reports ONE whole-source row (category
- * "-", state `unsupported`, `<os>:planned` in `raw`) and result status UNAVAILABLE/PARTIAL with
- * `<os>:planned` as the provenance, never an empty success -- never claimed working the way the
- * Linux leg's own "no session bus" case is (UNAVAILABLE/FULL, portal:unavailable -- a real,
+ * The Windows leg is a placeholder: it reports ONE whole-source row (category "-", state
+ * `unsupported`, `windows:planned` in `raw`) and result status UNAVAILABLE/PARTIAL with
+ * `windows:planned` as the provenance, never an empty success -- never claimed working the way
+ * the Linux leg's own "no session bus" case is (UNAVAILABLE/FULL, portal:unavailable -- a real,
  * complete answer about that one mechanism; see privacy_permissions_legs.hpp's banner for why
- * the two are deliberately different).
+ * the two are deliberately different). The macOS leg is real: a TCC-protected read reports
+ * `denied` per source, never collapsed into the Windows leg's whole-source placeholder shape.
  *
  * Default-off (Forensics class, same posture as execution_artifacts) -- the server-side
  * kill-switch seed (server.cpp) gates whether this plugin's dispatch is even reachable; this
@@ -60,11 +61,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "only portal-mediated grants are visible (an app opening the device directly never "
       "appears); full_disk_access is unsupported (no portal equivalent)"},
      /* macos_leg   = */
-     {YUZU_SUPPORT_PLANNED, 1,
-      "TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI: the "
-      "system /Library/Application Support/com.apple.TCC/TCC.db plus each /Users/<home> "
-      "(uid >= 500) per-user Library/Application Support/com.apple.TCC/TCC.db",
-      "follows as its own PR"},
+     {YUZU_SUPPORT_CONSTRAINED, 1,
+      "TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI (no lock, "
+      "no -journal/-wal/-shm ever opened or created; a WAL-mode, journal-bearing or changing "
+      "file is refused, never read): the system /Library/Application Support/"
+      "com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user "
+      "Library/Application Support/com.apple.TCC/TCC.db",
+      "every TCC.db is TCC-protected: without Full Disk Access each read is denied; camera and "
+      "microphone grants normally live in the per-user dbs; location is unsupported (locationd, "
+      "outside TCC)"},
      /* windows_leg = */
      {YUZU_SUPPORT_PLANNED, 1,
       "HKLM ProfileList enumeration, then each real profile's "
