@@ -9190,6 +9190,7 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(fleet["cpu_pct"]["n"] == 16);
     CHECK(fleet["reporting"] == 16);
     CHECK(fleet["windows_online"] == 16);
+    CHECK(fleet["perf_capable_online"] == 16);
     // Additive per-OS fields (C1) — every fixture device is "windows".
     CHECK(fleet["linux_online"] == 0);
     CHECK(fleet["macos_online"] == 0);

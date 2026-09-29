@@ -38,6 +38,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "command_capability.hpp"
@@ -154,6 +155,7 @@ struct LabeledSpan {
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
+        {"privacy_permissions", capdecls::plugin_action_catalogue_privacy_permissions(), false},
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -164,7 +166,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-three sources exactly as a live composition site would use.
+    // literally, twenty-four sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -186,6 +188,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::core_dispatch_capabilities(),
@@ -547,4 +550,30 @@ TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact
         CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
         CHECK_FALSE(it->system_reserved);
     }
+}
+
+/// Exact-row pin for `privacy_permissions` (Wave 8 PR8.5, Forensics-class): the same
+/// field-for-field copy of execution_artifacts' Forensics/AdminOrApproval boundary as the
+/// browser_inventory pin above, checked on the fragment AND as the composed registry
+/// classifies it, so neither a fragment edit nor a composition change can drift it silently.
+TEST_CASE("capability catalogue: privacy_permissions.permissions pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_privacy_permissions();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "privacy_permissions");
+        CHECK(r.action == "permissions");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("privacy_permissions", "permissions");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
 }

@@ -47,6 +47,7 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
@@ -191,6 +192,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
@@ -2165,6 +2167,14 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_tar_db_corruption_agents",
+                          "Agents whose TAR database has ever been quarantined as corrupt "
+                          "(cumulative per agent since install; a rising value is the signal)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_plugin_init_failed",
+                          "Agents reporting a plugin that failed init, by plugin name (absent "
+                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
@@ -4839,6 +4849,23 @@ public:
             }
         }
 
+        // Wave 8: privacy_permissions (per-app sensitive-permission grants —
+        // camera/microphone/location/full-disk-access equivalents) ships
+        // default-off, same Forensics-class posture as execution_artifacts. An
+        // operator must explicitly enable it via PUT
+        // /api/v1/plugin-config/privacy_permissions/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "privacy_permissions",
+                    "default-off: forensics class (Wave 8); enable per PUT "
+                    "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: privacy_permissions default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -5244,6 +5271,55 @@ public:
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
                 (void)audit_store_->log(ev);
+            }
+
+            // #1567: tar.db corruption audit. AgentHealthStore surfaces candidates
+            // from heartbeat tags; the gate dedups DURABLY against the audit store
+            // itself (one row per agent + quarantine identity across health-store
+            // prunes, server restarts and HA node switches).
+            {
+                auto latest = [this](const std::string& agent_id)
+                    -> std::optional<std::optional<std::string>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    AuditQuery q;
+                    q.action = detail::kTarCorruptionAuditAction;
+                    q.target_id = agent_id;
+                    q.limit = 1;
+                    auto rows = audit_store_->query(q);
+                    if (!rows)
+                        return std::nullopt; // degraded store: retry on a later heartbeat
+                    if (rows->empty())
+                        return std::optional<std::string>{};
+                    return detail::decode_tar_quarantine_from_detail(rows->front().detail);
+                };
+                auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
+                health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
+                                                               int64_t total,
+                                                               const std::string& quarantine) {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return;
+                    if (!gate->should_log(agent_id, quarantine))
+                        return;
+                    // Reservation completes the slot even if AuditEvent construction
+                    // or audit_store_->log() throws (log() is not noexcept).
+                    detail::TarCorruptionAuditGate::Reservation res(*gate);
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "system";
+                    ev.principal_role = "system";
+                    ev.action = detail::kTarCorruptionAuditAction;
+                    ev.target_type = detail::kTarCorruptionAuditTargetType;
+                    ev.target_id = agent_id;
+                    ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
+                    ev.result = "success";
+                    if (audit_store_->log(ev))
+                        res.logged(agent_id, quarantine);
+                    else
+                        res.failed();
+                });
             }
 
             // #802 / W7.4 — mirror the viz-disable audit emission pattern:
@@ -19952,6 +20028,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
     };

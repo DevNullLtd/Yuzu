@@ -483,8 +483,11 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
     const std::string scope_key = plugin_config::kill_switch_scope_key(*scope);
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: no connection lease ({})",
+                      plugin, pool_.last_error());
         return false;
+    }
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO plugin_config_store.kill_switches "
@@ -492,7 +495,12 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
         "VALUES ($1, $2, $3, FALSE, $4, 'system') "
         "ON CONFLICT (scope_key) DO NOTHING",
         std::vector<std::string>{scope_key, scope->plugin, scope->action, std::string(reason)});
-    return res.status() == PGRES_COMMAND_OK;
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("PluginConfigStore: kill-switch seed for {} failed: {}", plugin,
+                      PQresultErrorMessage(res.get()));
+        return false;
+    }
+    return true;
 }
 
 bool PluginConfigStore::action_allowed(std::string_view plugin, std::string_view action) const {

@@ -1288,6 +1288,25 @@ public:
     void upsert(const std::string& agent_id,
                 const google::protobuf::Map<std::string, std::string>& tags);
 
+    /// #1567: receives a tar.db corruption CANDIDATE `(agent_id, corruption_total,
+    /// quarantine_last)` when a heartbeat carries a valid
+    /// `yuzu.plugin.tar.db_corruption_total` (> 0) and `db_quarantine_last`, and
+    /// on EVERY such heartbeat. The store deliberately does NOT dedup (its
+    /// memory is per-process and pruned every ~90 s): the sink
+    /// (TarCorruptionAuditGate) owns durable dedup and its own rate limit; a
+    /// failed write is retried after the gate's degraded window, and a
+    /// candidate skipped only because the gate's slot was busy is retried on
+    /// the next heartbeat -- see tar_corruption_audit.hpp for the distinction.
+    /// This is the store's first plugin-specific side-effecting hook -- a
+    /// second consumer of the same "surface a candidate, let an injected sink
+    /// durably dedup it" shape should generalize this to a small named-sink
+    /// registry rather than adding a second `set_<plugin>_sink`. Invoked
+    /// OUTSIDE mu_.
+    using CorruptionSink =
+        std::function<void(const std::string& agent_id, int64_t corruption_total,
+                           const std::string& quarantine_last)>;
+    void set_corruption_sink(CorruptionSink sink);
+
     void remove(const std::string& agent_id);
 
     void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness);
@@ -1311,6 +1330,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+    CorruptionSink corruption_sink_;
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

@@ -2007,15 +2007,28 @@ RbacStore::list_all_principal_roles_checked() const {
     if (!open_)
         return std::unexpected("rbac store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        // sre (Gate 6, governance round 2026-09-28): this read had no
+        // route-specific metric AND didn't bump the generic degrade
+        // counter either — a sustained-poll retry storm against this route
+        // was invisible even though the mechanism (note_read_degrade) was
+        // already available on every other RbacStore read path.
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("RbacStore::list_all_principal_roles_checked: pool acquire timed out");
         return std::unexpected("pool acquire timeout");
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
         "ORDER BY principal_type, principal_id, role_name",
         std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore::list_all_principal_roles_checked: query failed");
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
     std::vector<PrincipalRole> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(read_pr(r.get(), i));
