@@ -5,7 +5,7 @@
  * open must never collapse into `absent` -- is proven here against the real open this leg
  * makes, not only at the pure layer.
  *
- * Both take the db path as a parameter (default: the real TCC.db) specifically so this test can
+ * Both take the db path as a parameter specifically so this test can
  * force each outcome branch deterministically, without a non-FDA identity and without touching
  * any real TCC.db: a missing per-user db must read `absent`, a missing SYSTEM db `unreadable`, a
  * present-but-unopenable file (mode 000, the same refusal an SIP/TCC denial produces) `denied`
@@ -420,6 +420,7 @@ struct Poke {
     bool bump_counter = false;
     bool create_journal = false;
     bool replace_path = false; // unlink `path` and create a DIFFERENT file there (TOCTOU probe)
+    bool rewrite_keep_mtime = false; // same-size in-place write, then restore mtime (ctime probe)
 } g_poke;
 
 void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
@@ -435,6 +436,18 @@ void poke_fn(sqlite3_context* ctx, int, sqlite3_value**) {
         // and create a hostile replacement at the same name.
         ::unlink(g_poke.path.c_str());
         std::ofstream{g_poke.path} << "not a sqlite database, and not the original bytes";
+    }
+    if (g_poke.rewrite_keep_mtime) {
+        // What an owner CAN do: rewrite a byte of the open inode in place (same value, same size,
+        // header untouched) and put the old mtime back. It cannot put ctime back.
+        struct stat before{};
+        ::stat(g_poke.path.c_str(), &before);
+        yuzu::agent::ScopedFd fd{::open(g_poke.path.c_str(), O_RDWR | O_CLOEXEC)};
+        unsigned char byte = 0;
+        static_cast<void>(::pread(fd.get(), &byte, 1, 200));
+        static_cast<void>(::pwrite(fd.get(), &byte, 1, 200));
+        const struct timespec times[2] = {{0, UTIME_OMIT}, before.st_mtimespec};
+        ::futimens(fd.get(), times);
     }
     sqlite3_result_int(ctx, 0);
 }
@@ -478,11 +491,10 @@ TEST_CASE("privacy_permissions macOS: a change made to the file while it is bein
 }
 
 TEST_CASE("privacy_permissions macOS: reading stays bound to the descriptor opened at the "
-          "start, never the pathname -- a TOCTOU replace of the file mid-read is invisible to "
-          "the query in progress (SQLite steps through /dev/fd/N, not the path a second time) "
-          "and does not corrupt the file-stamp comparison, since both snapshots come from the "
-          "same fd's fstat(), never a path re-lstat() (code-review Functional-axis finding, "
-          "round 1)",
+          "start, never the pathname -- a mid-read replace of the file is never parsed (SQLite "
+          "steps through /dev/fd/N, not the path a second time) and the replaced inode is refused "
+          "as changed_during_read (both snapshots come from the same fd's fstat(), never a path "
+          "re-lstat())",
           "[privacy_permissions][macos][internals]") {
     yuzu::test::TempDir tmp{"yuzu_test_pp_toctou_"};
     const auto dir = scratch_dir(tmp);
@@ -498,16 +510,101 @@ TEST_CASE("privacy_permissions macOS: reading stays bound to the descriptor open
     const auto result = read_source(dir / "TCC.db");
     g_poke.replace_path = false;
 
-    // Proof of descriptor binding: the row reflects the ORIGINAL db's content (auth_value 2 =
-    // allowed), never a defect from the replacement text SQLite could not have parsed as SQL
-    // (which would surface as a step/prepare failure, not a clean "allowed" row) -- and the
-    // read is NOT refused as "changed_during_read", because the fd's own inode (the one
-    // fstat() actually observes, both before and after) was never touched; only the path was.
-    CHECK(result.count("camera", PermissionState::allowed) == 1);
-    for (const auto& r : result.rows) {
-        INFO(r.raw);
-        CHECK(r.raw != "evil:tcc_db:changed_during_read");
+    // Proof of descriptor binding: SQLite kept reading the ORIGINAL inode through /dev/fd/N, so
+    // the replacement text ("not a sqlite database ...") is never parsed -- no prepare/step/
+    // not_sqlite failure. The unlink itself does move the original inode's ctime, so the
+    // read is refused as changed_during_read (a replaced file is a changed file); the one row is
+    // that refusal, never a row built from the replacement.
+    REQUIRE(result.rows.size() == 1);
+    CHECK(result.rows[0].raw == "evil:tcc_db:changed_during_read");
+    CHECK_FALSE(result.has_raw("evil:tcc_db:not_sqlite"));
+}
+
+TEST_CASE("privacy_permissions macOS: an in-place write that restores mtime, size and the header "
+          "counter is still a change during the read (ctime cannot be put back)",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_ctime_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "TCC.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'a.app' AS client, 0 AS "
+            "client_type, 2 + poke() AS auth_value;");
+    const PokeRegistered registered;
+    g_poke = {};
+    g_poke.path = (dir / "TCC.db").string();
+
+    CHECK(read_source(dir / "TCC.db").count("camera", PermissionState::allowed) == 1);
+    g_poke.rewrite_keep_mtime = true;
+    const auto result = read_source(dir / "TCC.db");
+    g_poke.rewrite_keep_mtime = false;
+    CHECK(result.rows.at(0).raw == "evil:tcc_db:changed_during_read");
+    CHECK(result.count("camera", PermissionState::allowed) == 0);
+}
+
+TEST_CASE("privacy_permissions macOS: a path on a network mount is refused before any syscall "
+          "touches it, and the rest of the run still reads",
+          "[privacy_permissions][macos][internals]") {
+    if (::geteuid() < 500) SKIP("homes owned by a system uid are not enumerated");
+    yuzu::test::TempDir tmp{"yuzu_test_pp_mounts_"};
+    const auto base = scratch_dir(tmp);
+    const auto users = base / "users";
+    const std::string honest =
+        std::string{kAccessSchema} + "INSERT INTO access VALUES('kTCCServiceCamera','x.app',0,2);";
+    for (const char* name : {"a", "b"}) {
+        const auto dir = users / name / "Library/Application Support/com.apple.TCC";
+        std::filesystem::create_directories(dir);
+        make_db(dir / "TCC.db", honest);
     }
+    make_db(base / "system.db", honest);
+
+    SECTION("a source under a network mount is never opened -- not even to learn it is missing") {
+        macos::ReadBounds bounds;
+        bounds.mounts = {{"/", "apfs"}, {(base / "gone").string(), "nfs"}};
+        SourceRead r;
+        read_tcc_source("evil", (base / "gone" / "TCC.db").string(), /*missing_is_absent=*/true,
+                        r.rows, r.acc, bounds);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].raw == "evil:tcc_db:network_mount");
+        CHECK(r.rows[0].state == PermissionState::unreadable); // a missing file would read absent
+    }
+    SECTION("a home that is itself a network mount point is skipped by name; its sibling reads") {
+        macos::ReadBounds bounds;
+        bounds.mounts = {{(users / "a").string(), "smbfs"}};
+        SourceRead r;
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, (base / "system.db").string(), users.string(), bounds,
+                         output);
+        CHECK(r.has_raw("a:network_mount"));
+        CHECK(std::none_of(r.rows.begin(), r.rows.end(), [](const auto& row) {
+            return row.app_id.rfind("a\\", 0) == 0 && row.state == PermissionState::allowed;
+        }));
+        CHECK(std::any_of(r.rows.begin(), r.rows.end(), [](const auto& row) {
+            return row.app_id.rfind("b\\", 0) == 0 && row.state == PermissionState::allowed;
+        }));
+    }
+    SECTION("a users directory on a network mount is not opened at all") {
+        macos::ReadBounds bounds;
+        bounds.mounts = {{users.string(), "nfs"}};
+        SourceRead r;
+        macos::OutputBudget output;
+        read_all_sources(r.rows, r.acc, (base / "system.db").string(), users.string(), bounds,
+                         output);
+        CHECK(r.has_raw("users:network_mount"));
+        CHECK_FALSE(r.has_raw("users:open_errno_2"));
+    }
+}
+
+TEST_CASE("privacy_permissions macOS: a delimiter or backslash in a sqlite diagnostic is folded once, "
+          "not escaped twice",
+          "[privacy_permissions][macos][internals]") {
+    yuzu::test::TempDir tmp{"yuzu_test_pp_errmsg_"};
+    const auto dir = scratch_dir(tmp);
+    make_db(dir / "pipe.db",
+            "CREATE VIEW access AS SELECT 'kTCCServiceCamera' AS service, 'c' AS client, 0 AS "
+            "client_type, 2 AS auth_value FROM \"a|b\\c\";");
+    const auto r = read_source(dir / "pipe.db");
+    CHECK(r.rows.at(0).raw == "evil:tcc_db:prepare_failed:no such table: main.a/b/c");
+    CHECK(r.rows.at(0).raw.find('|') == std::string::npos);
+    CHECK(r.rows.at(0).raw.find('\\') == std::string::npos);
 }
 
 TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and homes stop being "
@@ -546,7 +643,13 @@ TEST_CASE("privacy_permissions macOS: one run deadline covers every source, and 
     }
     SECTION("the home that spends the budget is kept, the next is not read") {
         macos::OutputBudget output;
-        output.max_bytes = 20; // the system db alone stays under it; one home's rows do not
+        {
+            SourceRead sys; // what the system db alone is charged
+            read_tcc_source({}, system_db, false, sys.rows, sys.acc);
+            macos::OutputBudget probe;
+            probe.charge(sys.rows);
+            output.max_bytes = probe.bytes + 1; // the system db stays under it; one home's rows do not
+        }
         read_all_sources(r.rows, r.acc, system_db, users.string(), {}, output);
         CHECK(from("a"));
         CHECK_FALSE(from("b"));

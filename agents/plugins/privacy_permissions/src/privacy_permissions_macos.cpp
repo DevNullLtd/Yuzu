@@ -58,13 +58,17 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/ucred.h>
 #include <unistd.h>
 
 #include <sqlite3.h>
@@ -104,18 +108,21 @@ struct Deadline {
 };
 
 /// sqlite3_errmsg, or a fixed literal when sqlite3 could not even allocate a handle. The text can
-/// echo hostile schema identifiers, so it is cut, scrubbed, stripped of control characters and
-/// line separators (U+2028/2029) and escaped before it reaches a token.
+/// echo hostile schema identifiers, so it is cut, scrubbed and stripped of control characters and
+/// line separators (U+2028/2029). `|` and `\` become `/` here, once: this text is also a
+/// provenance token, so it must be delimiter-free before format_row's own escape ever runs (a
+/// second escape would only mangle it).
 std::string sqlite_errmsg(sqlite3* db) {
     if (!db) return "no_handle";
     auto msg = sanitize_utf8(std::string_view{sqlite3_errmsg(db)}.substr(0, 200));
     for (std::size_t i = 0; i < msg.size(); ++i) {
         const auto c = static_cast<unsigned char>(msg[i]);
         if (c < 0x20 || c == 0x7F) msg[i] = ' ';
+        else if (c == '|' || c == '\\') msg[i] = '/';
         else if (msg.compare(i, 3, "\xE2\x80\xA8") == 0 || msg.compare(i, 3, "\xE2\x80\xA9") == 0)
             msg.replace(i, 3, " ");
     }
-    return yuzu::util::safe_output_field(msg);
+    return msg;
 }
 
 /// Opens `db_path` read-only through an immutable URI (no lock, so no
@@ -186,8 +193,13 @@ std::optional<FdSnapshot> snapshot_fd(int fd) {
         if (n < 0) return std::nullopt;
         s.header_len = static_cast<std::size_t>(n);
     }
-    s.stamp = {st.st_ino, st.st_size, st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec,
-               macos::header_change_counter({s.header.data(), s.header_len})};
+    s.stamp = {st.st_ino,
+               st.st_size,
+               st.st_mtimespec.tv_sec,
+               st.st_mtimespec.tv_nsec,
+               macos::header_change_counter({s.header.data(), s.header_len}),
+               st.st_ctimespec.tv_sec,
+               st.st_ctimespec.tv_nsec};
     return s;
 }
 
@@ -267,6 +279,8 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
         rows.push_back(macos::tcc_source_failed_row(owner, f, acc));
     };
     constexpr auto unreadable = macos::SourceOutcome::unreadable;
+    // Before ANY syscall on the path: a network-backed mount is never touched.
+    if (macos::path_under_network_mount(path, bounds.mounts)) return fail({unreadable, "network_mount"});
     struct stat st{};
     const int lstat_errno = (::lstat(path.c_str(), &st) == 0) ? 0 : errno;
     const bool regular = lstat_errno == 0 && S_ISREG(st.st_mode);
@@ -327,8 +341,13 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 /// (no fault-injection seam) and `users:truncated` (`kMaxUserHomes` is not injected).
 std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                               yuzu::shared::ConstraintAccumulator& acc,
-                                              const std::string& users_dir = std::string{kUsersDir}) {
+                                              const std::string& users_dir = std::string{kUsersDir},
+                                              std::span<const macos::MountEntry> mounts = {}) {
     std::vector<std::string> names;
+    if (macos::path_under_network_mount(users_dir, mounts)) {
+        rows.push_back(failure_row("macos", "-", "-", false, "users:network_mount", acc));
+        return names;
+    }
     yuzu::agent::ScopedFd fd{::open(users_dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
     if (!fd) {
         const int err = errno;
@@ -347,6 +366,12 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
     const auto walk = yuzu::shared::walk_dir_capped(dir.get(), kMaxUserHomes, [&](const struct dirent* e) {
         const std::string name{e->d_name};
         if (!macos::home_name_eligible(name)) return true;
+        // A home that is itself a network mount point: even the fstatat below would block on it.
+        if (macos::path_under_network_mount(users_dir + "/" + name, mounts)) {
+            rows.push_back(failure_row("macos", qualify_app_id(name, "-"), "-", false,
+                                       name + ":network_mount", acc));
+            return true;
+        }
         struct stat st{};
         if (::fstatat(::dirfd(dir.get()), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int err = errno;
@@ -368,6 +393,22 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
     return names;
 }
 
+/// The mount table, once per run, from the kernel's cache: MNT_NOWAIT never calls into a wedged
+/// remote server. If it cannot be read the sources are still read, unguarded, and the run says so
+/// (`mounts:getmntinfo_failed`, CONSTRAINED) rather than claiming a guard it did not have.
+std::vector<macos::MountEntry> snapshot_mounts(std::vector<PermissionRow>& rows,
+                                               yuzu::shared::ConstraintAccumulator& acc) {
+    std::vector<macos::MountEntry> out;
+    struct statfs* mnt = nullptr;
+    const int n = ::getmntinfo(&mnt, MNT_NOWAIT);
+    if (n <= 0) {
+        rows.push_back(failure_row("macos", "-", "-", false, "mounts:getmntinfo_failed", acc));
+        return out;
+    }
+    for (int i = 0; i < n; ++i) out.push_back({mnt[i].f_mntonname, mnt[i].f_fstypename});
+    return out;
+}
+
 /// The system db, then each home's db until the run-wide output budget is spent.
 void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
                       const std::string& system_db, const std::string& users_dir,
@@ -379,7 +420,10 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
     };
     // The system db keeps its unqualified rows; a missing system db is `unreadable`, never absent.
     read({}, system_db, /*missing_is_absent=*/false);
-    for (const auto& user : enumerate_user_homes(rows, acc, users_dir)) {
+    const auto walked = rows.size();
+    const auto users = enumerate_user_homes(rows, acc, users_dir, bounds.mounts);
+    output.charge({rows.data() + walked, rows.size() - walked});
+    for (const auto& user : users) {
         if (output.exhausted()) {
             rows.push_back(failure_row("macos", "-", "-", false,
                                        std::string{macos::kBudgetExceededToken}, acc));
@@ -400,7 +444,8 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
-    const macos::ReadBounds bounds; // one run-wide deadline, shared by every source
+    macos::ReadBounds bounds; // one run-wide deadline, shared by every source
+    bounds.mounts = snapshot_mounts(rows, acc);
     macos::OutputBudget output;
     read_all_sources(rows, acc, std::string{kTccDbPath}, std::string{kUsersDir}, bounds, output);
 

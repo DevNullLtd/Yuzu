@@ -14,5 +14,4 @@ permissions|macos|jsmith/com.microsoft.teams2|microphone|allowed|2|-|-
 permissions|macos|jsmith/org.whispersystems.signal-desktop|microphone|allowed|2|-|-
 permissions|macos|jsmith/-|full_disk_access|absent|-|-|-
 permissions|macos|-|location|unsupported|-|-|-
-[result_status] OK / FULL / 
-
+[result_status] OK / FULL /

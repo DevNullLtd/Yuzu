@@ -26,6 +26,8 @@
 #include <string_view>
 #include <vector>
 
+#include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
+
 #include "privacy_permissions_parsers.hpp"
 
 namespace yuzu::privacy_permissions::macos {
@@ -144,10 +146,39 @@ inline constexpr std::int64_t kMaxDbBytes = 4LL << 20;
 inline constexpr std::chrono::milliseconds kRunBudget{10'000};
 inline constexpr std::chrono::milliseconds kSourceBudget{500};
 
+/// One mounted filesystem, from a single non-blocking mount-table snapshot taken at the start of
+/// the run (getmntinfo(MNT_NOWAIT): the kernel's cached table, never a call into a wedged server).
+struct MountEntry {
+    std::string mount_point;
+    std::string fstype;
+};
+
+/// The shared deny-list plus the two macOS client names it lacks (`webdav`, `afpfs`).
+[[nodiscard]] inline bool is_network_mount_fstype(std::string_view fstype) noexcept {
+    return yuzu::shared::is_network_fstype(fstype) || fstype == "webdav" || fstype == "afpfs";
+}
+
+/// True when `path`, or any directory on the way to it, is a network-backed mount point: an
+/// lstat/open/read under one pins a worker of the agent's shared command pool until the server
+/// answers, and no deadline here can interrupt it. Segment-boundary match (`/Users/al` is not under
+/// `/Users/alice`); `/` is every path's ancestor. A stacked filesystem reports its own local type
+/// and is not seen -- the disclosed limit shared with runtimes and filesystem_posture.
+[[nodiscard]] inline bool path_under_network_mount(std::string_view path,
+                                                   std::span<const MountEntry> mounts) {
+    return std::any_of(mounts.begin(), mounts.end(), [&](const MountEntry& m) {
+        std::string_view mp = m.mount_point;
+        while (mp.size() > 1 && mp.back() == '/') mp.remove_suffix(1);
+        const bool covers = mp == "/" || path == mp ||
+                            (path.size() > mp.size() && path.starts_with(mp) && path[mp.size()] == '/');
+        return covers && is_network_mount_fstype(m.fstype);
+    });
+}
+
 struct ReadBounds {
     std::chrono::steady_clock::time_point run_end = std::chrono::steady_clock::now() + kRunBudget;
     std::chrono::steady_clock::duration source_budget = kSourceBudget;
     std::size_t row_cap = kMaxRowsPerService;
+    std::vector<MountEntry> mounts; // empty = no mount-table guard (tests); production fills it
 };
 
 // Why a category's read stopped short: the token suffix after `<source>:<category>:`.
@@ -161,15 +192,16 @@ inline constexpr std::array<std::string_view, 3> kSidecarSuffixes{"-journal", "-
 inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
 inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
 
-/// Run-wide bound on the row text the sources have produced. Checked between sources, so the one
-/// source that crosses it (itself bounded) is kept and no further one is read.
+/// Run-wide bound on the bytes the sources put on the wire: each row is charged at its formatted
+/// length (every field, escaping and separator). Checked between sources, so the one source that
+/// crosses it (itself bounded) is kept and no further one is read.
 struct OutputBudget {
     std::size_t max_bytes = kMaxRunOutputBytes;
     std::size_t bytes = 0;
 
     [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
     void charge(std::span<const PermissionRow> rows) noexcept {
-        for (const auto& r : rows) bytes += r.app_id.size() + r.raw.size();
+        for (const auto& r : rows) bytes += format_row(r).size() + 1; // +1: the row separator
     }
 };
 
@@ -230,6 +262,10 @@ struct FileStamp {
     std::int64_t mtime_sec = 0;
     std::int64_t mtime_nsec = 0;
     std::uint32_t change_counter = 0;
+    // ctime moves on every content write and an unprivileged writer cannot restore it (there is
+    // no utimes for ctime), so a same-size, mtime-restoring in-place write still changes the stamp.
+    std::int64_t ctime_sec = 0;
+    std::int64_t ctime_nsec = 0;
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 

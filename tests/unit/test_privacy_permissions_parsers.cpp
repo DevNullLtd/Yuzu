@@ -621,9 +621,13 @@ TEST_CASE("macos::FileStamp: every field of the file stamp matters",
     CHECK(changed([](auto& s) { s.mtime_sec += 1; }));
     CHECK(changed([](auto& s) { s.mtime_nsec += 1; }));
     CHECK(changed([](auto& s) { s.change_counter += 1; }));
+    // A same-size write that restores mtime and the header counter still moves ctime.
+    CHECK(changed([](auto& s) { s.ctime_sec += 1; }));
+    CHECK(changed([](auto& s) { s.ctime_nsec += 1; }));
 }
 
-TEST_CASE("macos::OutputBudget: counts app_id and raw text and is spent at the cap",
+TEST_CASE("macos::OutputBudget: counts the formatted row, escapes and separator included, and is "
+          "spent at the cap",
           "[privacy_permissions][macos_parsers]") {
     CHECK(macos::kMaxRunOutputBytes == 16u * 1024u * 1024u);
     CHECK(macos::kBudgetExceededToken == "collection:budget_exceeded");
@@ -632,10 +636,48 @@ TEST_CASE("macos::OutputBudget: counts app_id and raw text and is spent at the c
     const std::vector<PermissionRow> rows{
         {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
     b.charge(rows);
-    CHECK(b.bytes == 6);
-    CHECK_FALSE(b.exhausted());
-    b.charge(rows);
-    CHECK(b.exhausted());
+    CHECK(b.bytes == format_row(rows[0]).size() + 1);
+    CHECK(b.exhausted()); // 45 bytes against a 10-byte cap: every field counts, not two of them
+    // Escape expansion is charged: a pipe-dense client costs its escaped length.
+    macos::OutputBudget plain, dense;
+    const std::vector<PermissionRow> p{{"macos", "aaaa", "camera", PermissionState::allowed, "2",
+                                        "-", "-", false}};
+    const std::vector<PermissionRow> d{{"macos", "||||", "camera", PermissionState::allowed, "2",
+                                        "-", "-", false}};
+    plain.charge(p);
+    dense.charge(d);
+    CHECK(dense.bytes == plain.bytes + 4);
+    CHECK_FALSE(macos::OutputBudget{}.exhausted());
+}
+
+TEST_CASE("macos::path_under_network_mount: a network mount at or above the path refuses it, on a "
+          "segment boundary only",
+          "[privacy_permissions][macos_parsers]") {
+    const std::vector<macos::MountEntry> mounts{{"/", "apfs"},
+                                                {"/Users/alice", "nfs"},
+                                                {"/Users/carol/", "smbfs"},
+                                                {"/Volumes/web", "webdav"},
+                                                {"/Users/dave", "apfs"}};
+    const auto refused = [&](std::string_view path) {
+        return macos::path_under_network_mount(path, mounts);
+    };
+    CHECK(refused("/Users/alice"));
+    CHECK(refused("/Users/alice/Library/Application Support/com.apple.TCC/TCC.db"));
+    CHECK(refused("/Users/carol/Library")); // a trailing slash on the mount point is normalised
+    CHECK(refused("/Volumes/web/x"));
+    CHECK_FALSE(refused("/Users/alicia"));   // prefix of the name, not of a segment
+    CHECK_FALSE(refused("/Users/al"));
+    CHECK_FALSE(refused("/Users/dave/Library")); // a local mount is never a reason
+    CHECK_FALSE(refused("/Library/Application Support/com.apple.TCC/TCC.db"));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/alice", {}));
+    // A network root covers every path.
+    CHECK(macos::path_under_network_mount("/Users/x", std::vector<macos::MountEntry>{{"/", "nfs"}}));
+    CHECK(macos::is_network_mount_fstype("nfs"));
+    CHECK(macos::is_network_mount_fstype("smbfs"));
+    CHECK(macos::is_network_mount_fstype("webdav"));
+    CHECK(macos::is_network_mount_fstype("afpfs"));
+    CHECK_FALSE(macos::is_network_mount_fstype("apfs"));
+    CHECK_FALSE(macos::is_network_mount_fstype("devfs"));
 }
 
 TEST_CASE("macos::is_user_home_entry: a real home is a non-dot name, a directory seen without "
