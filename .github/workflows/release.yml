@@ -219,7 +219,9 @@ jobs:
           # This job runs in a reused self-hosted workspace (clean: false). Clear
           # packages left by an earlier release first, or the "*.deb"/"*.rpm"
           # attest and upload globs ship them as this release's output (v0.13.0-rc6
-          # published rc4 packages with rc6 provenance).
+          # published rc4 packages with rc6 provenance). This rm is the primary
+          # control; scripts/check-release-artifacts.sh catches only leftovers
+          # from a different version.
           rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
@@ -415,10 +417,10 @@ jobs:
 
       - name: Build .deb package
         run: |
-          # This job runs in a reused self-hosted workspace (clean: false). Clear
-          # packages left by an earlier release first, or the "*.deb"/"*.rpm"
-          # attest and upload globs ship them as this release's output (v0.13.0-rc6
-          # published rc4 packages with rc6 provenance).
+          # Defensive: this job's checkout cleans the workspace, but build-linux's
+          # does not (clean: false) and there old packages were shipped as this
+          # release's output (#5141). Never let the "*.deb"/"*.rpm" attest and
+          # upload globs below see a package this step did not build.
           rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
@@ -2281,14 +2283,14 @@ jobs:
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
           # Agent
-          YuzuAgentSetup-*.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+          YuzuAgentSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
 
           # Server
-          YuzuServerSetup-*.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=<password> \`
+          YuzuServerSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=<password> \`
             /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
 
-          A silent uninstall (\`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`) removes the program but keeps \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) — or, for the server, \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory. Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
+          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed with \`/DIR=\`). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash

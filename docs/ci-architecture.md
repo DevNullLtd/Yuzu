@@ -162,6 +162,30 @@ code.
 
 ## Gates outside the tier ladder
 
+### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
+
+Runs in `release.yml`'s `release` job after the artifacts are downloaded and
+flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
+`gh release create`, so when it fails **nothing has been published**. It
+fails the release when:
+
+- an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- an asset name contains a character GitHub rewrites on upload (anything but
+  letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
+  digit), which would make `SHA256SUMS` and the provenance name an asset that
+  does not exist (#5141);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` does not carry the tag's version in the form
+  its builder writes; the error prints the expected pattern (#5141). The usual
+  cause is a package left in a reused self-hosted workspace by an earlier
+  build of another version.
+
+Recovery: find the offending file in the error, fix its source (clear the
+runner workspace, or fix the builder's naming), then re-run **all** jobs of
+the release run. "Re-run failed jobs" re-downloads the same build artifacts
+and fails the same way. If the build artifacts have expired, delete and
+re-push the tag. The gate has no override; the naming forms it checks are a
+second copy of the builders' naming and its header lists where each lives.
+
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
 A per-PR grep over `agents/plugins/*` and `agents/core` for a raw

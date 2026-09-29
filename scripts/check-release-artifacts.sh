@@ -10,8 +10,11 @@
 #   scripts/check-release-artifacts.sh artifacts 0.14.0-rc3
 #
 # With <release-version> (the tag without its leading "v") it also checks
-# every package/installer name carries that version, so a file left in a
-# reused build workspace by an earlier release cannot ship (#5141).
+# every package/installer name carries that version, so a package left in a
+# reused build workspace by an earlier release of a DIFFERENT version fails
+# the release (#5141). A leftover of the same version has the same name and
+# is not detectable here; the build jobs' `rm -f` of old packages is the
+# primary control for that.
 #
 # Expected contents of <artifacts-dir> after the flatten step:
 #
@@ -39,9 +42,9 @@
 #     yuzu-gateway-image.cdx.json  + .spdx.json
 #     yuzu-postgres-image.cdx.json + .spdx.json   (#1318)
 #
-# Every file's name must also be one GitHub stores unchanged
-# ([A-Za-z0-9._-], not starting with "."), or SHA256SUMS and the
-# provenance subjects would name an asset that does not exist.
+# Every file's name must also be one GitHub stores unchanged (letters,
+# digits, ".", "_" and "-", starting with a letter or digit), or SHA256SUMS
+# and the provenance subjects would name an asset that does not exist.
 #
 # Emits GitHub Actions `::error file=...` annotations so failures show
 # up inline on the release run summary.
@@ -49,7 +52,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || -z "${1:-}" ]]; then
-  echo "usage: $0 <artifacts-dir>" >&2
+  echo "usage: $0 <artifacts-dir> [<release-version>]" >&2
   exit 2
 fi
 
@@ -147,12 +150,17 @@ fi
 #    checksummed as this release's output (v0.13.0-rc6 shipped rc4 .debs
 #    and .rpms).
 # So every file must have a GitHub-safe name, and every package/installer
-# must carry this release's version in the form its builder writes.
+# must carry this release's version in the form its builder writes. These
+# forms are a second copy of the builders' naming, keep them in step with:
+#   .deb  release.yml "Build .deb package(s)" rename (~ -> -)
+#   .rpm  deploy/packaging/rpm/build-rpm.sh + build-gateway-rpm.sh Release field
+#   .exe  release.yml "Build Windows installers" $version (- -> _)
+#   .pkg  release.yml "Build macOS installer (.pkg)" VERSION (- -> _)
 for f in "$ART_DIR"/*; do
   [[ -f "$f" ]] || continue
   name="${f##*/}"
   if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "::error file=$name::asset name contains a character GitHub rewrites on upload (allowed: A-Z a-z 0-9 . _ -)" >&2
+    echo "::error file=$name::asset name would be rewritten by GitHub on upload (use only A-Z a-z 0-9 . _ -, starting with a letter or digit)" >&2
     fail=1
   fi
 done
@@ -167,14 +175,16 @@ if [[ -n "$RELEASE_VERSION" ]]; then
     [[ -f "$f" ]] || continue
     name="${f##*/}"
     case "$name" in
-      *.deb) [[ "$name" == *_"${RELEASE_VERSION}"_*.deb ]] ;;
-      *.rpm) [[ "$name" == *-"${base}"-"${rpm_rel}".*.rpm ]] ;;
-      *.exe) [[ "$name" == *-"${underscored}".exe ]] ;;
-      *.pkg) [[ "$name" == *-"${underscored}"-*.pkg ]] ;;
-    esac || {
-      echo "::error file=$name::package is not from release ${RELEASE_VERSION} (stale file from an earlier build in the workspace?)" >&2
+      *.deb) want="*_${RELEASE_VERSION}_*.deb" ;;
+      *.rpm) want="*-${base}-${rpm_rel}.*.rpm" ;;
+      *.exe) want="*-${underscored}.exe" ;;
+      *.pkg) want="*-${underscored}-*.pkg" ;;
+    esac
+    # shellcheck disable=SC2053 # $want is a glob pattern on purpose
+    if [[ "$name" != $want ]]; then
+      echo "::error file=$name::package is not from release ${RELEASE_VERSION}: expected a name matching ${want} (a stale file from an earlier build in the workspace?)" >&2
       fail=1
-    }
+    fi
   done
 fi
 
