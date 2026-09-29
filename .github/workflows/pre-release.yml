@@ -192,7 +192,7 @@ jobs:
           # Bind tag to env to avoid code-injection via crafted ref name.
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
+          for img in yuzu-server yuzu-agent-chisel yuzu-gateway; do
             docker pull "$REGISTRY/$img:${TAG#v}"
           done
 
@@ -808,7 +808,7 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
+          for img in yuzu-server yuzu-agent-chisel yuzu-gateway; do
             echo "=== $img ==="
             docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
             # Non-root user
