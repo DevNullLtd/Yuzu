@@ -56,6 +56,8 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
@@ -128,13 +130,13 @@ std::string sqlite_errmsg(sqlite3* db) {
 /// Opens `db_path` read-only through an immutable URI (no lock, so no
 /// busy timeout either), bounds the schema parse, applies sqlite's untrusted-database posture and
 /// makes the connection query-only. `deadline`, when given, is installed before the first prepare.
-/// On failure returns an empty handle and sets `failure` -- classified by
+/// On failure returns the SourceFailure -- classified by
 /// macos::classify_tcc_sqlite_failure from the real result code, the VFS's own failed-syscall
 /// errno (sqlite3_system_errno) and sqlite3_errmsg, never a guessed diagnostic. A failed
 /// `PRAGMA query_only=1` is a failure too: the source is never read without it. A unit test
 /// can force the open-failure branch with a path this process genuinely cannot open.
-DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
-                    std::string_view db_path, Deadline* deadline = nullptr) {
+std::expected<DbPtr, macos::SourceFailure> open_readonly(std::string_view db_path,
+                                                         Deadline* deadline = nullptr) {
     sqlite3* raw = nullptr;
     const int rc = sqlite3_open_v2(macos::immutable_uri(db_path).c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX,
@@ -143,18 +145,17 @@ DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
                    // carry the error message; RAII from here regardless of `rc`.
     if (rc != SQLITE_OK) {
         // The EXTENDED code: sqlite3_open_v2 returns only the primary one.
-        failure = macos::classify_tcc_sqlite_failure(
+        return std::unexpected(macos::classify_tcc_sqlite_failure(
             macos::SqliteStage::open, db ? sqlite3_extended_errcode(db.get()) : rc,
-            db ? sqlite3_system_errno(db.get()) : 0, sqlite_errmsg(db.get()));
-        return {};
+            db ? sqlite3_system_errno(db.get()) : 0, sqlite_errmsg(db.get())));
     }
     // The schema is parsed at the first prepare, before any per-value limit could apply.
     sqlite3_limit(db.get(), SQLITE_LIMIT_LENGTH, macos::kMaxSchemaBytes);
     sqlite3_limit(db.get(), SQLITE_LIMIT_SQL_LENGTH, macos::kMaxSchemaBytes);
     if (sqlite3_db_config(db.get(), SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr) != SQLITE_OK ||
         sqlite3_db_config(db.get(), SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, nullptr) != SQLITE_OK) {
-        failure = macos::SourceFailure{macos::SourceOutcome::unreadable, "hardening_failed"};
-        return {};
+        return std::unexpected(
+            macos::SourceFailure{macos::SourceOutcome::unreadable, "hardening_failed"});
     }
     if (deadline) {
         const auto check = +[](void* d) noexcept -> int {
@@ -165,10 +166,9 @@ DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
     const int pragma_rc = sqlite3_exec(db.get(), "PRAGMA query_only=1; PRAGMA cell_size_check=ON",
                                        nullptr, nullptr, nullptr);
     if (pragma_rc != SQLITE_OK) {
-        failure = macos::classify_tcc_sqlite_failure(macos::SqliteStage::query_only, pragma_rc,
-                                                     sqlite3_system_errno(db.get()),
-                                                     sqlite_errmsg(db.get()));
-        return {};
+        return std::unexpected(macos::classify_tcc_sqlite_failure(
+            macos::SqliteStage::query_only, pragma_rc, sqlite3_system_errno(db.get()),
+            sqlite_errmsg(db.get())));
     }
     return db;
 }
@@ -272,6 +272,9 @@ std::vector<macos::TccServiceRead> read_services(sqlite3_stmt* stmt, Deadline& d
 /// rows: a whole-source row when the file is missing/refused/unopenable/unpreparable or not one
 /// quiescent rollback-mode SQLite file, else every mapped category's rows
 /// (macos::append_tcc_source_rows).
+///
+/// Untested gaps (no fault-injection seam): `read_failed` (fstat/pread on a descriptor that just
+/// opened) and `hardening_failed` (sqlite3_db_config refusing a documented option).
 void read_tcc_source(std::string_view owner, const std::string& path, bool missing_is_absent,
                      std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
                      const macos::ReadBounds& bounds = {}) {
@@ -301,10 +304,9 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 
     // Declared before `db`, so the progress handler's state outlives the connection.
     Deadline deadline{std::min(bounds.run_end, now + bounds.source_budget)};
-    std::optional<macos::SourceFailure> open_failure;
-    const DbPtr db = open_readonly(open_failure, "/dev/fd/" + std::to_string(fd.get()), &deadline);
-    if (!db)
-        return fail(open_failure.value_or(macos::SourceFailure{unreadable, "open_failed:unknown"}));
+    auto opened = open_readonly("/dev/fd/" + std::to_string(fd.get()), &deadline);
+    if (!opened) return fail(std::move(opened.error()));
+    const DbPtr db = std::move(*opened);
 
     sqlite3_stmt* raw_stmt = nullptr;
     static constexpr char kQuery[] =
@@ -393,19 +395,26 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
     return names;
 }
 
+/// getmntinfo_r_np's shape: a caller-owned array, so no process-wide buffer is shared with the
+/// other getmntinfo callers on the dispatch pool (disk_actions, filesystem_posture). A parameter
+/// so a unit test can supply the table and observe the call.
+using MountFetch = int (*)(struct statfs**, int);
+
 /// The mount table, once per run, from the kernel's cache: MNT_NOWAIT never calls into a wedged
 /// remote server. If it cannot be read the sources are still read, unguarded, and the run says so
 /// (`mounts:getmntinfo_failed`, CONSTRAINED) rather than claiming a guard it did not have.
 std::vector<macos::MountEntry> snapshot_mounts(std::vector<PermissionRow>& rows,
-                                               yuzu::shared::ConstraintAccumulator& acc) {
+                                               yuzu::shared::ConstraintAccumulator& acc,
+                                               MountFetch fetch) {
     std::vector<macos::MountEntry> out;
-    struct statfs* mnt = nullptr;
-    const int n = ::getmntinfo(&mnt, MNT_NOWAIT);
+    struct statfs* raw = nullptr;
+    const int n = fetch(&raw, MNT_NOWAIT);
+    const std::unique_ptr<struct statfs, decltype(&std::free)> mnt{raw, &std::free};
     if (n <= 0) {
         rows.push_back(failure_row("macos", "-", "-", false, "mounts:getmntinfo_failed", acc));
         return out;
     }
-    for (int i = 0; i < n; ++i) out.push_back({mnt[i].f_mntonname, mnt[i].f_fstypename});
+    for (int i = 0; i < n; ++i) out.push_back({mnt.get()[i].f_mntonname, mnt.get()[i].f_fstypename});
     return out;
 }
 
@@ -434,6 +443,17 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
     }
 }
 
+/// One whole collection: the mount snapshot, then every source. The seam that pins the wiring
+/// (snapshot -> guard -> reads); collect_macos_permissions only supplies the real paths and fetch.
+void run_collection(std::vector<PermissionRow>& rows, yuzu::shared::ConstraintAccumulator& acc,
+                    const std::string& system_db, const std::string& users_dir, MountFetch fetch,
+                    macos::ReadBounds bounds = {}) {
+    macos::OutputBudget output;
+    bounds.mounts = snapshot_mounts(rows, acc, fetch);
+    output.charge(rows); // the snapshot's failure row, if any
+    read_all_sources(rows, acc, system_db, users_dir, bounds, output);
+}
+
 } // namespace
 
 // Excluded under YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY: the seam
@@ -444,10 +464,7 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<PermissionRow> rows;
-    macos::ReadBounds bounds; // one run-wide deadline, shared by every source
-    bounds.mounts = snapshot_mounts(rows, acc);
-    macos::OutputBudget output;
-    read_all_sources(rows, acc, std::string{kTccDbPath}, std::string{kUsersDir}, bounds, output);
+    run_collection(rows, acc, std::string{kTccDbPath}, std::string{kUsersDir}, ::getmntinfo_r_np);
 
     // Fixed four-category vocabulary: location has no TCC service at all, so it
     // ships its own explicit `unsupported` row on EVERY collection -- including when every

@@ -82,8 +82,7 @@ TEST_CASE("privacy_permissions: descriptor pins the single action per OS",
     // The whole point of this PR: macOS moves from PLANNED to a real, CONSTRAINED rung-1
     // leg; Windows stays PLANNED until its own PR lands. A descriptor regression back to
     // PLANNED (or an accidental Windows promotion) would otherwise pass every other test
-    // in this file, since none of them read the descriptor's support level (code-review
-    // Functional-axis finding, round 1).
+    // in this file, since none of them read the descriptor's support level.
     CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(a.macos_leg.rung == 1);
     CHECK(a.windows_leg.support == YUZU_SUPPORT_PLANNED);
@@ -161,8 +160,7 @@ TEST_CASE("privacy_permissions: the real macOS dispatch derives its typed status
           "placeholder result. None of the row-shape checks above read "
           "result_status/completeness/provenance at all, so a regression that quietly "
           "reverted collect_macos_permissions to the PLANNED placeholder (or hard-coded a "
-          "status) would leave every other test in this file green (code-review "
-          "Functional-axis finding, round 1).",
+          "status) would leave every other test in this file green.",
           "[privacy_permissions][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;

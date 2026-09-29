@@ -32,6 +32,10 @@
 #include <string>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -117,14 +121,13 @@ TEST_CASE("privacy_permissions macOS: open_readonly on a genuinely unopenable pa
           "through the same generic path a real TCC/SIP denial would, with a real "
           "sqlite3_errmsg diagnostic",
           "[privacy_permissions][macos][internals]") {
-    std::optional<macos::SourceFailure> failure;
-    auto db = open_readonly(failure, "/nonexistent/deliberately-broken/privacy_permissions_test.db");
-    CHECK_FALSE(static_cast<bool>(db));
-    REQUIRE(failure.has_value());
-    CHECK(failure->cause.rfind("open_failed:", 0) == 0);
-    CHECK(failure->cause.size() > std::string_view{"open_failed:"}.size());
+    const auto db = open_readonly("/nonexistent/deliberately-broken/privacy_permissions_test.db");
+    REQUIRE_FALSE(db.has_value());
+    const auto& failure = db.error();
+    CHECK(failure.cause.rfind("open_failed:", 0) == 0);
+    CHECK(failure.cause.size() > std::string_view{"open_failed:"}.size());
     // A missing parent directory is SQLITE_CANTOPEN with ENOENT from the VFS -- not a refusal.
-    CHECK(failure->outcome == macos::SourceOutcome::unreadable);
+    CHECK(failure.outcome == macos::SourceOutcome::unreadable);
 }
 
 TEST_CASE("privacy_permissions macOS: read_tcc_source on a MISSING per-user db is one absent "
@@ -208,8 +211,7 @@ TEST_CASE("privacy_permissions macOS: a db reads sorted, whatever the path's spe
             "'b.app', 0, 4294967298 UNION ALL SELECT 'kTCCServiceCamera', 'a.app', 0, 0;");
     const auto before = listing(dir);
 
-    std::optional<macos::SourceFailure> failure;
-    CHECK(open_readonly(failure, (dir / "TCC.db").string())); // the URI builder round-trips it
+    CHECK(open_readonly((dir / "TCC.db").string()).has_value()); // the URI builder round-trips it
     const auto r = read_source(dir / "TCC.db");
     REQUIRE(r.rows.size() == 5);
     CHECK(format_row(r.rows[0]) == "permissions|macos|evil/a.app|camera|denied|0|-|-");
@@ -321,9 +323,9 @@ TEST_CASE("privacy_permissions macOS: a spent run or source budget is a named ti
         CHECK(cut.has_raw("evil:tcc_db:" + std::string{svc.category} + ":timeout"));
 
     Deadline deadline{std::chrono::steady_clock::time_point{}};
-    std::optional<macos::SourceFailure> failure;
-    const DbPtr handle = open_readonly(failure, db.string(), &deadline);
-    REQUIRE(handle);
+    auto opened = open_readonly(db.string(), &deadline);
+    REQUIRE(opened.has_value());
+    const DbPtr handle = std::move(*opened);
     sqlite3_stmt* raw = nullptr;
     REQUIRE(sqlite3_prepare_v2(handle.get(),
                                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) "
@@ -589,6 +591,74 @@ TEST_CASE("privacy_permissions macOS: a path on a network mount is refused befor
         read_all_sources(r.rows, r.acc, (base / "system.db").string(), users.string(), bounds,
                          output);
         CHECK(r.has_raw("users:network_mount"));
+    }
+}
+
+// A caller-owned array like getmntinfo_r_np hands back, so snapshot_mounts' free() is exercised.
+std::string g_fake_mount_point;
+int g_fake_fetch_calls = 0;
+int g_fake_fetch_flags = 0;
+int fake_fetch_nfs(struct statfs** out, int flags) {
+    ++g_fake_fetch_calls;
+    g_fake_fetch_flags = flags;
+    auto* table = static_cast<struct statfs*>(std::calloc(2, sizeof(struct statfs)));
+    std::strncpy(table[0].f_mntonname, "/", sizeof table[0].f_mntonname - 1);
+    std::strncpy(table[0].f_fstypename, "apfs", sizeof table[0].f_fstypename - 1);
+    std::strncpy(table[1].f_mntonname, g_fake_mount_point.c_str(), sizeof table[1].f_mntonname - 1);
+    std::strncpy(table[1].f_fstypename, "nfs", sizeof table[1].f_fstypename - 1);
+    *out = table;
+    return 2;
+}
+int fake_fetch_fails(struct statfs** out, int flags) {
+    ++g_fake_fetch_calls;
+    g_fake_fetch_flags = flags;
+    *out = nullptr;
+    return 0;
+}
+
+TEST_CASE("privacy_permissions macOS: one collection takes exactly one non-blocking mount "
+          "snapshot and the guard it builds is what the reads obey",
+          "[privacy_permissions][macos][internals]") {
+    if (::geteuid() < 500) SKIP("homes owned by a system uid are not enumerated");
+    yuzu::test::TempDir tmp{"yuzu_test_pp_collect_"};
+    const auto base = scratch_dir(tmp);
+    const auto users = base / "users";
+    const std::string honest =
+        std::string{kAccessSchema} + "INSERT INTO access VALUES('kTCCServiceCamera','x.app',0,2);";
+    for (const char* name : {"a", "b"}) {
+        const auto dir = users / name / "Library/Application Support/com.apple.TCC";
+        std::filesystem::create_directories(dir);
+        make_db(dir / "TCC.db", honest);
+    }
+    make_db(base / "system.db", honest);
+    const auto allowed_for = [](const SourceRead& r, std::string_view home) {
+        return std::any_of(r.rows.begin(), r.rows.end(), [&](const auto& row) {
+            return row.app_id.rfind(std::string{home} + "\\", 0) == 0 &&
+                   row.state == PermissionState::allowed;
+        });
+    };
+
+    SECTION("the snapshot's network mount refuses that home; the sibling still reads") {
+        g_fake_mount_point = (users / "a").string();
+        g_fake_fetch_calls = 0;
+        SourceRead r;
+        run_collection(r.rows, r.acc, (base / "system.db").string(), users.string(), fake_fetch_nfs);
+        CHECK(g_fake_fetch_calls == 1);
+        CHECK(g_fake_fetch_flags == MNT_NOWAIT);
+        CHECK(r.has_raw("a:network_mount"));
+        CHECK_FALSE(allowed_for(r, "a"));
+        CHECK(allowed_for(r, "b"));
+    }
+    SECTION("a snapshot that cannot be read is named, and the sources are still read") {
+        g_fake_fetch_calls = 0;
+        SourceRead r;
+        run_collection(r.rows, r.acc, (base / "system.db").string(), users.string(), fake_fetch_fails);
+        CHECK(g_fake_fetch_calls == 1);
+        CHECK(g_fake_fetch_flags == MNT_NOWAIT);
+        CHECK(r.has_raw("mounts:getmntinfo_failed"));
+        CHECK(r.acc.any_failure()); // CONSTRAINED: the run says it read without the guard
+        CHECK(allowed_for(r, "a"));
+        CHECK(allowed_for(r, "b"));
     }
 }
 
