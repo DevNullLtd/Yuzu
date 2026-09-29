@@ -1625,10 +1625,12 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | installed_apps | Y | Y | Y | Software |
 | runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
+| pkg_inventory | - | - | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
 | license_scan | Y | Y | Y | Software |
+| browser_policy | - | Y | - | Software |
 | antivirus | Y | Y | Y | Security |
 | firewall | Y | Y | Y | Security |
 | bitlocker | Y | Y | Y | Security |
@@ -1645,6 +1647,9 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | firmware_posture | Y | Y | Y | Security |
 | platform_security | Y | Y | Y | Security |
 | browser_inventory | - | Y | - | Security |
+| local_security_policy | - | Y | Y | Security |
+| privacy_permissions | - | Y | - | Security |
+| system_hardening | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
@@ -1668,7 +1673,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**61 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 63 directories, minus `example` + `chargen` = 61). This recount catches up `update_source_trust` (this PR) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only this wave — macOS/Windows follow as their own PR) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**66 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 68 directories, minus `example` + `chargen` = 66). This recount adds `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs this PR — Windows and the `sudoers` action follow as their own PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

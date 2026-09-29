@@ -156,6 +156,14 @@ constexpr const char* kSeedAdminLockSql =
     // Postgres major versions — two mixed-version first-boot processes could
     // otherwise compute different locks and both seed). `1` in the shared
     // `2037545589` yuzu namespace (the migration runner's global lock uses `0`).
+    //
+    // Duplicated byte-for-byte in `rbac_admin_authority_owner.cpp`'s
+    // anonymous-namespace `kProvisionFirstAdminLockSql` (no shared header
+    // exists between the two TUs) — the two MUST stay equal, or
+    // `RbacStore::provision_first_admin` and `AuthDB::seed_admin_if_empty`
+    // stop serializing against each other on a shared first boot. Changing
+    // this literal without updating that copy silently reopens the race
+    // both comments describe.
     "SELECT pg_advisory_xact_lock(2037545589, 1)";
 
 // ── Schema ────────────────────────────────────────────────────────────────
@@ -230,6 +238,51 @@ const std::vector<pg::PgMigration>& migrations() {
     // (`auth.users`, ...). Deliberately NO `sessions` / `auth_kv` tables —
     // sessions stay in-memory only (AuthManager's `sessions_` map); `auth_kv`
     // was unused scaffolding in the SQLite era and is not carried forward.
+    //
+    // EXTERNAL cross-schema reader of `users.is_active` (routed-concerns
+    // access-control table, "A2 global human role assignment" row):
+    // `RbacStore::unassign_role`'s last-Administrator guard
+    // (`RbacAdminAuthorityOwner`, rbac_admin_authority_owner.cpp) runs
+    // `rbac_store.principal_roles JOIN auth.users ... WHERE
+    // u.is_active` in its OWN transaction, on the assumption this column
+    // keeps its name and its "not soft-deleted / deactivated" meaning — the
+    // precondition every LOCAL PASSWORD login path filters on (lockout via
+    // locked_until/failed_login_count, an MFA-enrolled-but-pending account,
+    // and --auth-mode=sso-only all additionally gate the local path). An
+    // OIDC/SAML session is minted directly from IdP group membership
+    // (AuthManager::create_oidc_session/create_saml_session, auth.cpp) and
+    // never reads this column at all — see docs/user-manual/rbac.md's
+    // local-account-only-check note (#4966) for the resulting guard-coverage
+    // gap. A rename fails the guard closed (SQL error); a change to what
+    // `is_active` *means* silently changes what the guard counts.
+    //
+    // The guard (`RbacAdminAuthorityOwner`, rbac_admin_authority_owner.cpp) also TAKES
+    // A ROW LOCK on one `auth.users` row: for an Administrator unassign whose removed
+    // grant was not already among the rows it counted, it runs `SELECT is_active FROM
+    // auth.users WHERE username = $1 FOR UPDATE` for the deleted principal after its
+    // DELETE, so a concurrent reactivation (`reactivate_user`, a single autocommit
+    // UPDATE that just blocks on this lock) cannot commit between that read and the
+    // guard's own COMMIT. The lock order is documented in
+    // rbac_admin_authority_owner.hpp: `principal_roles` rows, then one `auth.users`
+    // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
+    // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
+    // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
+    // order, or have EVERY participant, the unassign guard as well as a `remove_user`
+    // guard, take one shared transaction-scoped advisory lock as the first statement of
+    // its own transaction; an advisory lock taken by only some of them removes no
+    // inversion.
+    //
+    // A1's `RbacAdminAuthorityOwner::set_enforcement` (`RbacStore::set_rbac_enforcement`
+    // delegates to it, same as `unassign_role` above) is the SECOND external
+    // cross-schema reader of `users.is_active` (its enable direction shares
+    // the identical JOIN above via `kAuthenticatableAdminGrantsFrom`) — and so
+    // is its sibling `regime_authority` (`RbacStore::check_caller_authorized_
+    // under_current_regime`'s own delegate), reusing the SAME fragment for its
+    // own fresh regime read. Both ALSO read `users.role` for the literal
+    // `'admin'` on the DISABLE-regime path (written here by the first-admin
+    // bootstrap and by `update_role`'s `SET role = $1`) — a rename of EITHER
+    // column fails that guard closed
+    // the same way.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE users ("
@@ -241,7 +294,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  last_login_at TIMESTAMPTZ,"
-         "  is_active BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  is_active BOOLEAN NOT NULL DEFAULT TRUE," // see RbacStore::unassign_role back-reference above
          "  mfa_totp_secret BYTEA,"
          "  mfa_enrolled_at TIMESTAMPTZ,"
          "  mfa_disabled_at TIMESTAMPTZ,"

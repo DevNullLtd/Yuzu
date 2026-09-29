@@ -8,12 +8,25 @@
 /// .claude/plans/spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md for the full
 /// design record (adjudication table, decisions taken, risk register).
 ///
-/// PR-1 SCOPE ONLY: this file builds the primitive -- StallObservableSink, LogHandoff,
-/// drain_log_bounded() -- as a correct, fully unit-tested, standalone unit. Nothing here
-/// is called from the shipped binary yet: PR-2 wires main.cpp's/service_win.cpp's real
-/// install()/teardown() call sites and the guardian_engine.cpp/guardian_spark_runtime.hpp
-/// drain_log_bounded() call sites. Do not infer that any of this is live in production
-/// from this file's existence alone.
+/// PR-1 built the primitive -- StallObservableSink, LogHandoff, drain_log_bounded() --
+/// as a correct, fully unit-tested, standalone unit. PR-2 (LANDED) wires it into
+/// production: main.cpp's/service_win.cpp's real install()/teardown() call sites
+/// (agent_log_wiring.hpp) and FOUR production drain_log_bounded() call sites (each
+/// firewalled in its own try/catch(...), since the call is not declared noexcept):
+/// main.cpp's F3 orphan-exit check; service_win.cpp's post-agent->run() best-effort
+/// drain immediately before the "operator stop always wins" report_status() chain;
+/// service_win.cpp's own F3 orphan-exit check; and service_win.cpp's
+/// completion-handshake-timeout drain in run_service(), fired if service_main does not
+/// finish within its grace window of the SCM dispatcher returning, just before the
+/// hard_exit(kShutdownDeadlineExitCode) that follows a failed
+/// wait_for_service_main_completion() (governance hardening round addition). The
+/// guardian_engine.cpp/guardian_spark_runtime.hpp drain_log_bounded() call
+/// sites PR-1's own plan once expected here were evaluated and deliberately NOT added
+/// by PR-2 -- neither file has a hard_exit() call site that would need one (grep-
+/// confirmed; see docs/spark-flip-gate.md's own status update and this file's PR-2
+/// resource-ledger section for the full record). Corrected here after an
+/// adversarial-review finding that this banner, as the primary anchor for both PRs,
+/// had drifted into contradicting the shipped code twice over.
 ///
 /// THE GUARANTEE (plan 1.1), stated exactly: a producer's spdlog:: call formats on the
 /// calling thread, constructs the log_msg (stamping `time` and `thread_id` there), and
@@ -22,8 +35,8 @@
 /// sink I/O or for queue capacity (overrun_oldest never blocks the producer on a full
 /// queue -- it evicts the oldest queued message instead). It can still take
 /// formatter/allocation time on the calling thread, and can throw into the logger's
-/// error handler (non-I/O, see below). "Non-blocking" in this file means exactly that,
-/// not "instantaneous" and not "never throws".
+/// error handler (see below). "Non-blocking" in this file means exactly that, not
+/// "instantaneous" and not "never throws".
 ///
 /// STRUCTURE: one spdlog::details::thread_pool (capacity kLogQueueCapacity, exactly one
 /// worker thread), constructed directly via std::make_shared -- NEVER
@@ -44,14 +57,33 @@
 /// they are bounded only by kLogQueueCapacity * (typical line length), measured on the
 /// rig in a later PR, never asserted here.
 ///
-/// NON-I/O ERROR HANDLER (plan 1.2): installed on the logger (not the spdlog-global
-/// handler, which does NOT reach a logger installed later via set_default_logger --
-/// confirmed by the plan's own experiment). Reached from BOTH the producer thread (a
+/// ERROR HANDLER (plan 1.2, no longer non-I/O as of the governance hardening round --
+/// see STDERR FALLBACK below): installed on the logger (not the spdlog-global handler,
+/// which does NOT reach a logger installed later via set_default_logger -- confirmed by
+/// the plan's own experiment). Reached from BOTH the producer thread (a
 /// formatter/allocation exception, or "pool gone") and the pool's single worker thread
 /// (a sink's log()/flush() throwing) -- concurrently, in general, so the 256-byte
 /// last-message buffer is guarded by a plain std::mutex, NOT a lock-free/single-writer
 /// scheme (that was a specification bug in an earlier draft, caught by the final
 /// review -- verify against ErrorState below, not against a stale comment elsewhere).
+/// STDERR FALLBACK (governance hardening round): the handler also emits a rate-limited
+/// (1/sec) diagnostic line to stderr, mirroring what spdlog's own default error handler
+/// always did before this one replaced it. Since #5023 the write is NEVER made on the
+/// thread that entered the handler: for a sink throw that thread is the async logger's
+/// one worker (spdlog runs the handler inline there), and a write to a blocked stderr is
+/// unbounded. It is made by a short-lived detached thread, at most one write in flight
+/// (ErrorState::emit_in_flight). While one is stuck, or if the thread cannot be created,
+/// that diagnostic is dropped and counted (stderr_emits_dropped()). The write uses no
+/// stdio (a raw write(2) / WriteFile), so a stuck thread holds no FILE lock and cannot
+/// hang a normal exit(). SCOPE: this closes the DIAGNOSTIC's write only. It does not
+/// isolate delivery from a blocked stderr/stdout that is ALSO one of this logger's sinks
+/// (create() adds a stderr sink beside the file sink outside a Windows service, and a
+/// stdout sink when there is no usable log file, i.e. none configured or it could not be
+/// opened; a Windows service derives one when none is configured): that stall is in the
+/// sink's own write, unchanged, exposed by stalled_for() (no shipped code reads it) and
+/// bounded only at shutdown by teardown()'s watchdog. The mutex above guards only the
+/// in-memory ErrorState fields. See the handler's own comment in log_handoff.cpp for the
+/// full rationale.
 ///
 /// TEARDOWN CONTRACT (plan 1.4, PR-1-scoped): teardown() is idempotent -- a second SEQUENTIAL
 /// call (or the destructor firing after an explicit call already returned) is a no-op. A second
@@ -118,16 +150,34 @@
 ///       sink destruction (e.g. a rotating file sink's fclose()) is exactly the
 ///       uncovered I/O path the plan's adjudication table calls out (3.4).
 ///
-/// MULTI-IMAGE (plan 1.9): confirmed by symbol inspection (final review) that Linux has
-/// ONE spdlog registry shared by the exe, libyuzu_agent_core.so, and every plugin .so
-/// (RTLD_LAZY | RTLD_LOCAL with no RTLD_DEEPBIND resolves the global/core scope for
-/// every plugin) -- so install()/teardown() as implemented here are already complete
-/// for Linux. Windows is one registry too (spdlog.dll, dynamic). macOS is LIKELY two
-/// registries (exe image + this library's image) -- unproved, characterised by PR-2's
-/// own fixture -- in which case install() must ALSO be called in the exe image (this
-/// function returns the shared_ptr<logger> specifically so main.cpp can do that), and
-/// teardown() needs an exe-image half too (PR-2's job -- this class only tears down the
-/// registry of the image IT runs in).
+/// MULTI-IMAGE (plan 1.9, status updated post-PR-2 -- see docs/darwin-compat.md's
+/// "spdlog registry identity across images" row and tests/unit/test_log_handoff_multi_image.cpp
+/// for the measurements this paragraph summarizes): confirmed by symbol inspection
+/// (final review) that Linux has ONE spdlog registry shared by the exe,
+/// libyuzu_agent_core.so, and every plugin .so (RTLD_LAZY | RTLD_LOCAL with no
+/// RTLD_DEEPBIND resolves the global/core scope for every plugin) -- so
+/// install()/teardown() as implemented here are already complete for Linux. Windows is
+/// INFERRED to be one registry too (spdlog.dll, dynamic linkage, matching the measured
+/// Linux case) but this has not been directly measured on Windows hardware. macOS is
+/// MEASURED, on real hardware, to be TWO SEPARATE registries (exe image + this
+/// library's image, since spdlog is statically linked per image there) -- install()
+/// must ALSO be called in the exe image (this function returns the shared_ptr<logger>
+/// specifically so main.cpp can do that), and teardown() needs an exe-image half too
+/// (PR-2's job, shipped -- this class only tears down the registry of the image IT runs
+/// in). Despite two registries, core-library-compiled logging (Guardian/TriggerEngine/
+/// SparkEngine) already reaches the async hand-off logger correctly on macOS WITHOUT
+/// the exe-image install() call, since install() itself runs in the core library's own
+/// image -- that call is not what those call sites depend on. The exe-image half is
+/// load-bearing on BOTH sides, just for a DIFFERENT set of call sites each time: on the
+/// INSTALL side, for main.cpp's OWN exe-image-originated spdlog:: calls (its startup
+/// banner, its F3 orphan-worker diagnostic, etc. -- confirmed by
+/// tests/unit/test_log_handoff_multi_image.cpp's MI-1b(a): without the exe-image
+/// install()/set_default_logger() call, those specific lines do NOT reach the sink on
+/// macOS); and on the TEARDOWN side, for releasing the exe-image's own kept-alive
+/// registry reference so it cannot outlive the watchdog. Do not "simplify" this to
+/// "only teardown needs the exe-image call" -- that would silently drop macOS
+/// visibility of main.cpp's own log lines, including the orphaned-worker
+/// spdlog::critical() diagnostic.
 ///
 /// CONSTRUCTION FAILURE (plan 1.7, Decision 7): two DISTINCT, DISTINGUISHABLE failure
 /// surfaces, matched precisely to the plan's carve-out --
@@ -257,6 +307,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::agent {
@@ -427,7 +478,8 @@ struct DrainHandle;
 ///
 /// Separately, they are NOT synchronized against a
 /// concurrent call to the plain accessors below (overrun_total()/queue_depth()/
-/// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()) or against
+/// in_write()/stalled_for()/log_errors_total()/last_log_error_for_test()/
+/// stderr_emits_dropped()) or against
 /// install()/logger() -- those read pool_/logger_/wrapped_sinks_/error_state_
 /// directly, with no lock, while teardown_body() resets them. This is UNREACHABLE in
 /// PR-1 (nothing calls these accessors from a second thread yet) but is a REAL
@@ -536,9 +588,16 @@ public:
     /// own comment for the benign race this can reflect.
     [[nodiscard]] std::chrono::seconds stalled_for() const noexcept;
 
-    /// Cumulative count of times the logger's non-I/O error handler fired (a sink
+    /// Cumulative count of times the logger's error handler fired (a sink
     /// throw, or a producer-side formatter/allocation exception, or "pool gone").
     [[nodiscard]] std::uint64_t log_errors_total() const;
+
+    /// Cumulative count of stderr diagnostic lines the handler DROPPED: because an earlier
+    /// write had not yet released the in-flight slot (stderr is blocked, or the slot was
+    /// released a moment after the write returned), or because the emit thread could not be
+    /// created (#5023). Zero in a healthy process. Like log_errors_total(), no production
+    /// consumer reads it yet (see #5024).
+    [[nodiscard]] std::uint64_t stderr_emits_dropped() const;
 
     /// The most recent error message the handler observed, truncated to 256 bytes.
     /// Test/diagnostic accessor -- not surfaced on the heartbeat (PR-3's job, if ever).
@@ -570,11 +629,47 @@ public:
     /// into a later, unrelated test. Production callers never set this.
     static void set_construction_fault_for_test(bool fail) noexcept;
 
+    /// The function the handler's detached emit thread calls to write the diagnostic line
+    /// (count, message). Default (nullptr) is the real stderr write.
+    using StderrEmitFn = void (*)(std::uint64_t count, const std::string& message);
+
+    /// Test-only seam (the U11 family, and the no-op EmitSilencer in tests that only
+    /// incidentally trip the handler): replaces the stderr write so a test can make it
+    /// block and assert log delivery continues (#5023). Read once per emit, when the emit
+    /// thread is launched. PROCESS-WIDE and NOT auto-reset (unlike
+    /// set_construction_fault_for_test): the setter must restore nullptr, via a ScopeExit
+    /// declared after the LogHandoff (a blocking stub, which must first be released) or an
+    /// EmitSilencer declared before it (a no-op). Production callers never set this.
+    static void set_stderr_emit_for_test(StderrEmitFn fn) noexcept;
+
+    /// Test-only fault injection (#5023): the next emit-thread LAUNCH ATTEMPT fails as if
+    /// the OS refused the thread (EAGAIN), without real resource exhaustion. Consumed
+    /// (reset to false) only by a launch attempt, so a test whose diagnostic may be
+    /// throttled or dropped before reaching one must clear it itself. Process-wide.
+    /// Production callers never set this.
+    static void set_emit_thread_fault_for_test(bool fail) noexcept;
+
 private:
     struct ErrorState {
         mutable std::mutex mu;
         std::uint64_t count{0};
         std::string last_message;
+        // Rate-limits the stderr fallback the error handler prints (governance
+        // hardening round, sre finding): spdlog's OWN default error handler --
+        // which this custom one replaces -- prints to stderr at most once per
+        // second; this field reproduces that same throttle so replacing the
+        // default handler doesn't silently drop an operator-visible signal that
+        // existed before this primitive was wired into production (#4666 PR-2).
+        std::chrono::steady_clock::time_point last_emit{};
+        // #5023: claimed by the handler just before it launches the detached stderr-emit
+        // thread, released by an RAII permit (the single release site) when that thread's
+        // callable is destroyed after its write returns, or when the launch fails. At most
+        // one emit WRITE is in flight (a finishing thread may briefly overlap its
+        // successor), so a stuck stderr costs one blocked thread, never a growing number.
+        // Atomics, not guarded by `mu`: the emit thread must never take `mu` (it would
+        // re-couple a stuck write to the lock the accessors use).
+        std::atomic<bool> emit_in_flight{false};
+        std::atomic<std::uint64_t> emits_dropped{0};
     };
 
     LogHandoff() = default;
@@ -644,11 +739,19 @@ private:
     std::string log_file_fallback_reason_;
 
     static inline std::atomic<bool> construction_fault_for_test_{false};
+    static inline std::atomic<StderrEmitFn> stderr_emit_for_test_{nullptr};
+    static inline std::atomic<bool> emit_thread_fault_for_test_{false};
 };
 
 /// Pre-abort breadcrumb helper (plan 1.8). See the file banner's own paragraph for the
 /// full null-safety and concurrent-teardown contract. Never blocks longer than `wait`
 /// in the ordinary (non-racing-a-concurrent-teardown) case.
 YUZU_EXPORT bool drain_log_bounded(std::chrono::milliseconds wait);
+
+/// TEST-ONLY. Emits an spdlog::info() call that executes INSIDE THIS LIBRARY'S IMAGE --
+/// used by a later macOS multi-image test fixture to prove a library-originated log call
+/// reaches the same sink a same-process exe-image caller does (or doesn't, if the platform
+/// has separate spdlog registries per image). Not called anywhere in production code.
+YUZU_EXPORT void log_handoff_emit_probe_for_test(std::string_view message);
 
 } // namespace yuzu::agent

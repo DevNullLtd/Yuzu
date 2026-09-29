@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <map>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +19,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
+#include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -798,7 +801,19 @@ bool AgentRegistry::has_any_reachable() const {
     // all_ids()/evaluate_scope() already share, so this costs nothing beyond
     // has_any()'s own lock in the common (non-empty) case above, and at most
     // one cached-or-fresh presence read otherwise.
-    return !live_presence().empty();
+    //
+    // #4981 PR-1 (Finding B5): a DEGRADED presence read is treated as
+    // "reachable" (true), not "unreachable". Returning false here is what
+    // fires command_routes.cpp's/server.cpp's pre-dispatch "no agent
+    // connected" 503 BEFORE evaluate_scope() ever runs — a confusingly wrong
+    // diagnosis for a presence-store outage. Letting the request proceed
+    // means the ladder reaches evaluate_scope(), which produces the SPECIFIC
+    // `Kind::PresenceDegraded` abort reason instead. With zero local agents
+    // this function's answer makes no difference to whether a Broadcast
+    // actually reaches anyone (it reaches nobody either way) — this change
+    // only affects which error surfaces, never widens actual reach.
+    auto presence = live_presence();
+    return !presence || !presence->empty();
 }
 
 std::string AgentRegistry::display_name(const std::string& agent_id) const {
@@ -995,6 +1010,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // network_diag
         {"network_diag.listening", "List listening TCP ports"},
         {"network_diag.connections", "List established TCP connections"},
+        // browser_policy
+        {"browser_policy.policies",
+         "List enterprise-managed Chrome/Chromium/Edge browser policies (Linux JSON policy "
+         "files; Windows and macOS legs planned)"},
         // msi_packages
         {"msi_packages.list", "List installed packages (Windows MSI / macOS pkgutil receipts)"},
         {"msi_packages.product_codes",
@@ -1009,11 +1028,27 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags (read-only)"},
+        // privacy_permissions
+        {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
+        // system_hardening
+        {"system_hardening.posture", "Report exploit-mitigation and kernel-hardening posture per allowlisted key (value, absent or unreadable)"},
         // sccm
         // peripherals
         {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
         {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
         {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
+        // pkg_inventory
+        {"pkg_inventory.managers",
+         "List package managers present on the host with manager-level config facts "
+         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
+         "macOS only today, Linux and Windows report unsupported)"},
+        {"pkg_inventory.packages",
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
+         "today; the Linux package roster is owned by installed_apps)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
@@ -1454,7 +1489,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     // a configured one (the production default — see live_presence()'s own
     // doc comment for why this is NOT gated behind an HA-only signal) costs
     // at most one cached-or-fresh read, never a bare per-call round trip.
-    std::vector<PresenceIdentity> presence = live_presence();
+    //
+    // #4981 PR-1: this method's signature/contract predates the typed
+    // PresenceReadError split and stays a plain vector — a degraded read
+    // degrades to local-only visibility (byte-identical to the pre-#4981
+    // "empty on error" behavior), never a hard failure. `evaluate_scope`
+    // (below) is the ONE consumer that needs the typed distinction, because
+    // only it makes a dispatch/enforce decision a silently-narrowed fleet
+    // view can invert under a NOT combinator; this method's callers
+    // (confined_broadcast's sink, an empty-scope Guardian push) are already
+    // tracked separately for the same weakness (#5007) and are not widened
+    // here.
+    std::vector<PresenceIdentity> presence = live_presence().value_or(std::vector<PresenceIdentity>{});
 
     std::lock_guard lock(mu_);
     std::vector<std::string> ids;
@@ -1489,14 +1535,17 @@ void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono:
     presence_ttl_ = ttl;
 }
 
-std::vector<PresenceIdentity> AgentRegistry::live_presence() const {
+std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
     if (!presence_store_)
-        return {};
+        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
-    // cached copy.
+    // cached copy. #4981 PR-1 B2: a degraded read is cached and served back
+    // for the SAME window a success would be — negative-caching a failure,
+    // not just a success — so a sustained outage pays exactly one real query
+    // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
         presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
         presence_cache_at_ = now;
@@ -1583,15 +1632,17 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
 // (id extraction, not a prefix-suffix walk) and from_result_set: has no
 // synthetic interplay worth encoding.
 
-std::optional<std::vector<std::string>>
-AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                              std::string_view principal) const {
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                                   const CustomPropertiesStore* props_store,
+                                   ResultSetStore* rs_store, std::string_view principal,
+                                   ScopePopulation population,
+                                   bool touch_referenced_result_sets) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
     // store query per agent while holding mu_ (review finding F). The owner join
     // in member_set_owned is the authorization gate: a set `principal` does not
-    // own yields an empty membership and therefore never matches, so an operator
+    // own now ABORTS the whole evaluation (#4981 PR-1 A1/A3), so an operator
     // cannot target another operator's set by id (review finding B1). Aliases
     // are not resolved here; callers that accept aliases pre-resolve them.
     std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
@@ -1605,12 +1656,12 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         // NOT combinator that INVERTS to "matches every agent" — a
         // fleet-wide match reachable without any DB error at all. The
         // original guard lived inside `if (rs_store)`, so the callers that
-        // pass NO store (e.g. the Guardian push paths) skipped it entirely
-        // and silently evaluated the atom false — exactly the inversion
-        // hazard, and for a Guardian rule that arms an enforcing guard, a
-        // fleet-wide arm. Abort rather than silently no-match. NARROW by
-        // construction: a scope with no from_result_set: atom is completely
-        // unaffected.
+        // pass NO store (e.g. the Guardian push paths — now
+        // evaluate_scope_local) skipped it entirely and silently evaluated
+        // the atom false — exactly the inversion hazard, and for a Guardian
+        // rule that arms an enforcing guard, a fleet-wide arm. Abort rather
+        // than silently no-match. NARROW by construction: a scope with no
+        // from_result_set: atom is completely unaffected.
         std::vector<std::string> refs;
         collect_result_set_ids(expr, refs);
         if (!refs.empty() && (rs_store == nullptr || principal.empty())) {
@@ -1619,7 +1670,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                           rs_store == nullptr ? "no ResultSetStore is wired to resolve it"
                                               : "no principal was supplied to owner-resolve "
                                                 "against");
-            return std::nullopt;
+            return std::unexpected(ScopeEvalError{
+                rs_store == nullptr ? ScopeEvalError::Kind::Unresolvable
+                                    : ScopeEvalError::Kind::PrincipalUnresolved,
+                {}});
         }
         if (rs_store && !principal.empty()) {
             const std::string owner(principal);
@@ -1628,22 +1682,50 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
                 if (!mem) {
-                    // ADR-0036 fail-closed contract: a Postgres error mid-preload
-                    // ABORTS the whole evaluation — never proceed with a partial
-                    // membership map. Under a NOT combinator, an atom missing from
-                    // rs_members would resolve "" (no match) and INVERT to "matches
-                    // every agent" — the concrete fleet-wide fail-open this guards
-                    // against (a degraded/transient DB blip must never silently
-                    // expand a scope to the entire fleet).
-                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded for "
+                    // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
+                    // statement query now type-distinguishes a genuine DB
+                    // error (StoreDegraded) from the set being absent/expired
+                    // or not owned by `principal` (both collapse to
+                    // OwnerCheckFailed — a caller must never be able to tell
+                    // "doesn't exist" from "exists but isn't yours", the same
+                    // oracle-safety contract rest_api_v1.cpp's load_owned
+                    // already maintains). EITHER WAY this ABORTS the whole
+                    // evaluation — never proceed with a partial membership
+                    // map: under a NOT combinator, an atom missing from
+                    // rs_members would resolve "" (no match) and INVERT to
+                    // "matches every agent", the fleet-wide fail-open this
+                    // guards against (this is Finding A's TOCTOU regression
+                    // test: a set deleted between a caller's own pre-dispatch
+                    // ownership gate and this preload used to surface here as
+                    // a SUCCESSFUL empty membership, not an error).
+                    const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
+                                                    mem.error() == ResultSetError::NotOwner;
+                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
                                   "result-set '{}' (owner={}) — aborting scope evaluation",
-                                  rsid, owner);
-                    return std::nullopt;
+                                  owner_check_failed ? "owner-check failed" : "degraded", rsid,
+                                  owner);
+                    return std::unexpected(
+                        ScopeEvalError{owner_check_failed ? ScopeEvalError::Kind::OwnerCheckFailed
+                                                          : ScopeEvalError::Kind::StoreDegraded,
+                                      rsid});
                 }
-                // Touch only sets we actually own (non-empty owned membership): keeps
-                // a set actively used as scope from being GC'd mid-investigation
-                // (review finding I), and never extends another operator's set TTL.
-                if (!mem->empty())
+                // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
+                // owned-but-empty set is now a real, distinguishable success
+                // case (A1), not indistinguishable from not-owned, so it
+                // deserves the same "keep it alive while actively used as
+                // scope" treatment a non-empty owned set gets (review finding
+                // I). Never extends another operator's set TTL (member_set_owned
+                // already failed the whole evaluation for that case above). A
+                // touch racing a concurrent GC sweep is a harmless no-op (an
+                // UPDATE affecting 0 rows).
+                // #4981 PR-3: gated on `touch_referenced_result_sets` — a
+                // read-only preview evaluation (evaluate_scope's own
+                // `touch_referenced_result_sets = false` caller) must resolve
+                // `from_result_set:` membership identically to a real dispatch
+                // WITHOUT extending the set's TTL merely for being referenced
+                // in a dry-run check. Every real dispatch/enforcement caller
+                // leaves this at its default `true` and is unaffected.
+                if (touch_referenced_result_sets)
                     rs_store->touch(rsid);
                 rs_members.emplace(rsid, std::move(*mem));
             }
@@ -1674,13 +1756,13 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "
                               "CustomPropertiesStore is wired to resolve it — aborting scope "
                               "evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
             }
             auto preload = props_store->get_values_for_keys(prop_keys);
             if (!preload) {
                 spdlog::error("AgentRegistry::evaluate_scope: get_values_for_keys degraded — "
                               "aborting scope evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
             }
             props_values = std::move(*preload);
         }
@@ -1714,7 +1796,7 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
             if (!preload) {
                 spdlog::error("AgentRegistry::evaluate_scope: tag preload degraded — aborting "
                               "scope evaluation");
-                return std::nullopt;
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
             }
             tag_values = std::move(*preload);
         }
@@ -1726,7 +1808,22 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     // session for; local always wins. Cached (live_presence(),
     // kPresenceCacheTtl) so the policy-evaluator's N-policies-per-tick
     // sweep issues one Postgres read per cache window, not N.
-    std::vector<PresenceIdentity> presence_rows = live_presence();
+    //
+    // #4981 PR-1 (Finding B4): `ScopePopulation::LocalOnly`
+    // (evaluate_scope_local) skips this call ENTIRELY — never even a
+    // pointer-check cost — which is what guarantees that entry point can
+    // never fail with Kind::PresenceDegraded. `Fleet` (evaluate_scope) is the
+    // ONLY population that can abort here.
+    std::vector<PresenceIdentity> presence_rows;
+    if (population == ScopePopulation::Fleet) {
+        auto presence_result = live_presence();
+        if (!presence_result) {
+            spdlog::error("AgentRegistry::evaluate_scope: live_presence degraded — aborting "
+                          "scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, {}});
+        }
+        presence_rows = std::move(*presence_result);
+    }
 
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
@@ -1743,7 +1840,10 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         // The catalog cross-check test does NOT exercise that second copy —
         // a new scope-kind branch added HERE without also updating THAT one
         // silently under-matches presence-only (cross-replica) agents, with
-        // no test failure to catch it. Update both together.
+        // no test failure to catch it. Update both together. #4981 PR-1: this
+        // LOCAL loop runs for BOTH populations unchanged — only the
+        // presence-merge loop below is gated to ScopePopulation::Fleet, since
+        // `presence_rows` is always empty for LocalOnly.
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
             // from_result_set:<id> — composable-scope membership (capability
@@ -1860,12 +1960,39 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     return matched;
 }
 
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
+                              std::string_view principal,
+                              bool touch_referenced_result_sets) const {
+    return evaluate_scope_impl(expr, tag_store, props_store, rs_store, principal,
+                               ScopePopulation::Fleet, touch_referenced_result_sets);
+}
+
+std::expected<std::vector<std::string>, ScopeEvalError>
+AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                                    const CustomPropertiesStore* props_store) const {
+    // #4981 PR-1 (Finding B4): no ResultSetStore, no principal, LocalOnly
+    // population — this can never return Kind::PresenceDegraded (presence is
+    // never consulted) and can never return Kind::OwnerCheckFailed (no
+    // from_result_set: atom can resolve here regardless — an rs_store-null
+    // call site collects the same Unresolvable abort evaluate_scope would
+    // give a no-store caller). `touch_referenced_result_sets` is passed as
+    // `true` (its default meaning) but is a no-op here regardless, since
+    // rs_store is always null for LocalOnly — the touch call site can never
+    // execute without a store to touch through.
+    return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
+                               /*principal=*/{}, ScopePopulation::LocalOnly,
+                               /*touch_referenced_result_sets=*/true);
+}
+
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
     static const std::vector<ScopeKindInfo> catalog = {
         {"from_result_set:<id>", "from_result_set:<id>", "from_result_set:rs_01H8X3ZQK7YB2",
          "Owner-checked membership of a previously-saved result set (composable "
-         "scope, docs/scope-walking-design.md). A set the caller does not own "
-         "resolves to no match."},
+         "scope, docs/scope-walking-design.md). A set the caller does not own, "
+         "or that no longer exists, aborts the whole dispatch (#4981 PR-1) — it "
+         "no longer silently resolves to no match."},
         {"ostype", "ostype <op> <value>", R"(ostype == "windows")",
          "Agent-reported OS family (windows/linux/darwin)."},
         {"hostname", "hostname <op> <value>", R"(hostname LIKE "WIN-%")",
@@ -1887,14 +2014,43 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog() {
 
 void AgentHealthStore::upsert(const std::string& agent_id,
                               const google::protobuf::Map<std::string, std::string>& tags) {
-    std::lock_guard lock(mu_);
-    auto& snap = snapshots_[agent_id];
-    snap.agent_id = agent_id;
-    snap.status_tags.clear();
-    for (const auto& [k, v] : tags) {
-        snap.status_tags[k] = v;
+    CorruptionSink sink;
+    int64_t corruption_total = 0;
+    std::string quarantine_last;
+    {
+        std::lock_guard lock(mu_);
+        auto& snap = snapshots_[agent_id];
+        snap.agent_id = agent_id;
+        snap.status_tags.clear();
+        for (const auto& [k, v] : tags) {
+            snap.status_tags[k] = v;
+        }
+        snap.last_seen = std::chrono::steady_clock::now();
+
+        // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
+        // deduped here); TarCorruptionAuditGate dedups; a candidate skipped
+        // because the gate's slot was busy retries on the next heartbeat, a
+        // failed write after the 60 s degraded window.
+        if (corruption_sink_) {
+            const auto tot = snap.status_tags.find(kTarTagCorruptionTotal);
+            const auto ql = snap.status_tags.find(kTarTagQuarantineLast);
+            if (tot != snap.status_tags.end() && ql != snap.status_tags.end()) {
+                const auto parsed = parse_tar_corruption_total(tot->second);
+                if (parsed && valid_tar_quarantine_last(ql->second)) {
+                    sink = corruption_sink_;
+                    corruption_total = *parsed;
+                    quarantine_last = ql->second;
+                }
+            }
+        }
     }
-    snap.last_seen = std::chrono::steady_clock::now();
+    if (sink)
+        sink(agent_id, corruption_total, quarantine_last); // outside mu_
+}
+
+void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
+    std::lock_guard lock(mu_);
+    corruption_sink_ = std::move(sink);
 }
 
 void AgentHealthStore::remove(const std::string& agent_id) {
@@ -1963,6 +2119,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Clear labeled gauge families before rebuilding
     metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
+    metrics.clear_gauge_family("yuzu_fleet_plugin_init_failed"); // #1567
     metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
     metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
     // A4 perf families cleared too: when no agent reports a metric this cycle
@@ -2224,6 +2381,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     };
 
     int ota_signature_refusing = 0;
+    int tar_db_corruption_agents = 0;               // #1567
+    std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2239,6 +2398,42 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (auto it = snap.status_tags.find("yuzu.ota_signature_refused");
             it != snap.status_tags.end() && !it->second.empty() && it->second != "0")
             ++ota_signature_refusing;
+
+        // #1567: agents whose plugin-published corruption total parses > 0, and the
+        // per-plugin count of agents reporting a failed init. Both tags are
+        // agent-controlled: bounded token count, in-place reads (no copies).
+        if (auto it = snap.status_tags.find(kTarTagCorruptionTotal);
+            it != snap.status_tags.end() && parse_tar_corruption_total(it->second))
+            ++tar_db_corruption_agents;
+        if (auto it = snap.status_tags.find("yuzu.plugins_failed");
+            it != snap.status_tags.end() && !it->second.empty()) {
+            std::string_view rest{it->second};
+            int tokens = 0;
+            // #1567 round-2: dedupe within THIS agent's tag value before counting.
+            // An honest agent never repeats a plugin name (plugins_failed_ is a
+            // set, one entry per failed plugin), so this only matters for a
+            // malformed or compromised agent sending e.g. "tar,tar" — without the
+            // dedupe that one agent would inflate yuzu_fleet_plugin_init_failed by
+            // its repeat count instead of by 1. `seen_this_agent` holds views into
+            // `it->second`, which outlives this block.
+            std::unordered_set<std::string_view> seen_this_agent;
+            while (!rest.empty() && tokens < 32) {
+                ++tokens; // every split counts toward the cap, valid or not
+                const auto comma = rest.find(',');
+                const auto tok = rest.substr(0, comma);
+                rest = comma == std::string_view::npos ? std::string_view{}
+                                                       : rest.substr(comma + 1);
+                if (tok.empty() || tok.size() > 64 ||
+                    !std::all_of(tok.begin(), tok.end(), [](char ch) {
+                        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                               (ch >= '0' && ch <= '9') || ch == '_';
+                    }))
+                    continue;
+                if (!seen_this_agent.insert(tok).second)
+                    continue; // already counted for this agent this sweep
+                ++plugin_init_failed[std::string{tok}];
+            }
+        }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
         // by the 4 MB gRPC frame, so `get()` above memcpy's it on every lookup, on every
@@ -2583,6 +2778,29 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // without this the refusal is invisible outside a per-endpoint log.
     metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
         .set(static_cast<double>(ota_signature_refusing));
+    // #1567: agents reporting a quarantined tar.db (cumulative per agent since
+    // install; a RISING value is the signal), and per-plugin init failures
+    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
+    // lexicographic order, the remainder summed under plugin="other".
+    metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
+        .set(static_cast<double>(tar_db_corruption_agents));
+    {
+        constexpr std::size_t kMaxPluginLabels = 64;
+        std::size_t n = 0;
+        int64_t other = 0;
+        for (const auto& [plugin, count] : plugin_init_failed) {
+            if (n < kMaxPluginLabels) {
+                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                    .set(static_cast<double>(count));
+                ++n;
+            } else {
+                other += count;
+            }
+        }
+        if (other > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
+                .set(static_cast<double>(other));
+    }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
         .set(static_cast<double>(dex_observer_disarmed));

@@ -1,5 +1,6 @@
 #include "log_handoff.hpp"
 
+#include "guardian_io_executor.hpp"    // io_detail::spawn_detached
 #include "hard_exit.hpp"              // hard_exit()
 #include "shutdown_deadline_guard.hpp" // ShutdownDeadlineGuard
 
@@ -9,9 +10,28 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <charconv>
 #include <condition_variable>
+#include <cstring>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
+
+#ifdef _WIN32
+// Same guards as hard_exit.hpp (which already brings <windows.h> in): default_stderr_emit
+// needs GetStdHandle/WriteFile, and NOMINMAX keeps std::min usable.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace yuzu::agent {
 
@@ -271,6 +291,8 @@ bool drain_log_bounded(std::chrono::milliseconds wait) {
     // a concurrently-waiting teardown()'s wait_for_drain_quiescence().
 }
 
+void log_handoff_emit_probe_for_test(std::string_view message) { spdlog::info("{}", message); }
+
 // ---------------------------------------------------------------------------
 // LogHandoff
 // ---------------------------------------------------------------------------
@@ -314,9 +336,96 @@ std::string LogHandoff::last_log_error_for_test() const {
     return error_state_->last_message;
 }
 
+std::uint64_t LogHandoff::stderr_emits_dropped() const {
+    return error_state_ ? error_state_->emits_dropped.load(std::memory_order_relaxed) : 0;
+}
+
 void LogHandoff::set_construction_fault_for_test(bool fail) noexcept {
     construction_fault_for_test_.store(fail, std::memory_order_relaxed);
 }
+
+void LogHandoff::set_stderr_emit_for_test(StderrEmitFn fn) noexcept {
+    stderr_emit_for_test_.store(fn, std::memory_order_release);
+}
+
+void LogHandoff::set_emit_thread_fault_for_test(bool fail) noexcept {
+    emit_thread_fault_for_test_.store(fail, std::memory_order_relaxed);
+}
+
+namespace {
+
+// Cap on the last-message text the error handler records and echoes (ErrorState::
+// last_message, and therefore the stderr diagnostic). One constant so the handler's cap
+// and default_stderr_emit's buffer cannot drift apart (see its static_assert).
+constexpr std::size_t kLogErrorMaxMessage = 256;
+
+// The real stderr diagnostic write. It deliberately uses NO stdio: no FILE lock is ever
+// held across a write that may block. A detached emit thread stuck in fprintf(stderr)
+// holds the stderr FILE lock, and a normal exit() then waits on that lock forever, with
+// no watchdog left armed once teardown() has returned (found by the #5023 governance
+// review). Reproduced on glibc/libstdc++, where ios_base::Init's destructor calls
+// cerr.flush() -> fflush(stderr): a driver that returns from main with stderr blocked
+// hangs with fprintf and exits rc=0 with one raw write(2). The UCRT and macOS libc exit
+// paths are believed to flush streams under their locks too, but were NOT run. A thread
+// blocked in write(2) holds no lock, so exit() proceeds and the process ends it.
+//
+// default_stderr_emit itself allocates nothing (the caller's copy of the line and the
+// thread's creation can fail; the launch site handles that). The line is formatted into
+// a fixed stack buffer and written with a single write(2) in the normal case (a loop
+// resumes after EINTR or a short write; the Windows leg is one WriteFile), which for a
+// pipe is atomic up to PIPE_BUF. A write that fails or makes no progress is abandoned:
+// this is best effort. The agent does not change SIGPIPE's disposition (a bare launch
+// leaves it at the default, a systemd service inherits "ignored"), so a write to a pipe
+// whose reader has gone either raises SIGPIPE or fails with EPIPE here, exactly as the
+// fprintf this replaced did.
+void default_stderr_emit(std::uint64_t count, const std::string& message) {
+    constexpr std::string_view kHead = "[*** LOG ERROR #";
+    constexpr std::string_view kMid = " ***] ";
+#ifdef _WIN32
+    constexpr std::string_view kEol = "\r\n"; // the CRT text-mode fprintf this replaced wrote CRLF
+#else
+    constexpr std::string_view kEol = "\n";
+#endif
+    char buf[384];
+    static_assert(kHead.size() + 20 /* digits of a uint64 */ + kMid.size() +
+                          kLogErrorMaxMessage + kEol.size() <=
+                      sizeof buf,
+                  "a maximal diagnostic line must fit in default_stderr_emit's buffer");
+    char* out = buf;
+    char* const limit = buf + sizeof buf - kEol.size(); // always leave room for the terminator
+    std::memcpy(out, kHead.data(), kHead.size());
+    out += kHead.size();
+    out = std::to_chars(out, limit, count).ptr;
+    const std::size_t mid = std::min(kMid.size(), static_cast<std::size_t>(limit - out));
+    std::memcpy(out, kMid.data(), mid);
+    out += mid;
+    const std::size_t body = std::min(message.size(), static_cast<std::size_t>(limit - out));
+    std::memcpy(out, message.data(), body);
+    out += body;
+    std::memcpy(out, kEol.data(), kEol.size());
+    out += kEol.size();
+    const std::size_t len = static_cast<std::size_t>(out - buf);
+#ifdef _WIN32
+    // A Windows service has no valid std handles: nothing to write to, and nothing blocks.
+    const HANDLE h = ::GetStdHandle(STD_ERROR_HANDLE);
+    if (h == nullptr || h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written = 0;
+    (void)::WriteFile(h, buf, static_cast<DWORD>(len), &written, nullptr);
+#else
+    std::size_t off = 0;
+    while (off < len) {
+        const ssize_t w = ::write(STDERR_FILENO, buf + off, len - off);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0)
+            return; // a failure (EBADF, ENOSPC, EAGAIN, ...) or no progress: best effort
+        off += static_cast<std::size_t>(w);
+    }
+#endif
+}
+
+} // namespace
 
 std::expected<std::unique_ptr<LogHandoff>, std::string>
 LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t queue_capacity) {
@@ -383,14 +492,188 @@ LogHandoff::create_with_sinks(std::vector<spdlog::sink_ptr> sinks, std::size_t q
             // a lock-free/single-writer scheme -- it is reached concurrently from the
             // pool's worker thread (a sink throw) and any producer thread (a
             // formatter/allocation exception, or "pool gone"): see the header's own
-            // NON-I/O ERROR HANDLER note.
+            // ERROR HANDLER note.
+            //
+            // STDERR FALLBACK (governance hardening round, sre finding): this handler
+            // REPLACES spdlog's own default error handler, which prints
+            // "[*** LOG ERROR #N ***] [date] [logger-name] msg" to stderr, rate-limited
+            // to once per second, for as long as the process runs. Before #4666 PR-2
+            // wired LogHandoff into production, that default handler was the live one
+            // -- so a sink-level write failure (disk full or EMFILE on the rotating
+            // file sink of a --log-file run) was always visible on stderr, which reaches
+            // journald when the agent runs under the shipped unit (that unit passes no
+            // --log-file).
+            // Recording ONLY into ErrorState -- readable via log_errors_total()/
+            // last_log_error_for_test(), but not read by any PRODUCTION consumer today
+            // (PR-3's heartbeat-surfacing work is still pending) -- would silently
+            // regress that existing operator-visible signal to nothing. Reproduce the
+            // same once-per-second stderr throttle here so a sink failure stays
+            // visible without that later work. NOT a strict superset of the handler it
+            // replaces: this line omits the timestamp and logger name spdlog's default
+            // includes (this logger's own name is always the fixed "" here anyway) and
+            // uses an unpadded decimal count rather than its zero-padded one -- the count
+            // and message text are the fields that matter for "something is failing," and
+            // both are preserved.
+            //
+            // The line itself is written by default_stderr_emit (no stdio, no allocation:
+            // see its comment for why a stdio write here would hang process exit).
+            //
+            // THE stderr WRITE IS NEVER MADE ON THIS THREAD (#5023). For a sink
+            // log()/flush() throw, spdlog invokes this handler SYNCHRONOUSLY, INLINE, on
+            // the async logger's one worker thread (backend_sink_it_() ->
+            // SPDLOG_LOGGER_CATCH -> err_handler_(), no thread hop; verified against the
+            // vendored spdlog 1.17.0 source). A write to a blocked stderr (a full pipe to
+            // a stalled collector) is unbounded, so made here it would stop the whole
+            // bounded queue draining. For a producer-thread trigger (a formatter or
+            // allocation exception, "pool gone") it would block the application thread
+            // that called spdlog, which this primitive exists to prevent. So the handler
+            // only (1) records the error under `mu`, (2) decides under `mu` whether this
+            // diagnostic is due (the once-per-second throttle), and (3) hands the line to
+            // a short-lived DETACHED thread, at most one write in flight
+            // (ErrorState::emit_in_flight). While one write is stuck, later diagnostics
+            // are dropped and counted (stderr_emits_dropped()).
+            //
+            // SCOPE (do not widen this claim): it closes the DIAGNOSTIC's own write. It
+            // does NOT isolate log delivery from a blocked stderr or stdout when that
+            // stream is ALSO one of this logger's sinks: create() adds a stderr sink
+            // beside the file sink outside a Windows service, and a stdout sink when
+            // there is no usable log file (none configured, or it could not be opened; a
+            // Windows service derives one when none is configured). A blocked console fd
+            // then stalls the worker inside that sink's own write, exactly as any stuck
+            // sink does. That stall is a BLOCK, and it never reaches this handler: the
+            // console sinks create() installs are spdlog's colour sinks (ansicolor on
+            // POSIX, wincolor on Windows), and both discard the result of a failed write.
+            // Only the non-colour stdout_sink/stderr_sink throw on a Windows WriteFile
+            // failure, and create() never builds them. stalled_for() exposes the stall but
+            // no shipped code reads it, and only teardown()'s watchdog bounds it, at
+            // shutdown.
+            //
+            // The handler is reached from the file sink's own failure (the rotating file
+            // sink throws), from producer-thread triggers (an allocation or formatting
+            // failure, logging through a retained logger after teardown) and from
+            // embedders that build their own sink list. Where the file sink fails, stderr
+            // is itself a sink (outside a Windows service), so a blocked stderr still
+            // stalls the worker in that sink: the gain on shipped configurations is the
+            // producer-thread triggers, and embedders whose sink list has no console sink.
+            //
+            // Cost: a permanently blocked stderr strands exactly one thread, blocked in
+            // write(2) holding no lock, until process exit; the slot is not re-claimed
+            // while it is stuck, so diagnostics are dropped meanwhile. The thread cannot
+            // be joined, so nothing joins it; see the launch site for why that is safe.
+            std::uint64_t emit_count = 0;
+            std::string emit_message;
+            bool should_emit = false;
             try {
                 std::lock_guard<std::mutex> lk(error_state->mu);
                 ++error_state->count;
-                error_state->last_message.assign(msg, 0, std::min<std::size_t>(msg.size(), 256));
+                error_state->last_message.assign(
+                    msg, 0, std::min<std::size_t>(msg.size(), kLogErrorMaxMessage));
+                const auto now = std::chrono::steady_clock::now();
+                if (now - error_state->last_emit >= std::chrono::seconds(1)) {
+                    error_state->last_emit = now;
+                    should_emit = true;
+                    emit_count = error_state->count;
+                    emit_message = error_state->last_message;
+                }
             } catch (...) {
             }
+            if (should_emit) {
+                // At most one emit WRITE in flight (a finishing thread may briefly overlap
+                // its successor): claim the slot, or drop and count this diagnostic
+                // because an earlier write has not returned (stderr is blocked). The
+                // handler NEVER waits for the write.
+                if (error_state->emit_in_flight.exchange(true, std::memory_order_acq_rel)) {
+                    error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    // RAII permit: the ONE place emit_in_flight is released. It is owned by
+                    // this scope first and then moved into the emit thread's callable, so
+                    // the slot is released when that callable is destroyed after the write
+                    // returns, or when the launch fails (unwinding destroys this local, or
+                    // the callable that never ran).
+                    struct Permit {
+                        std::shared_ptr<ErrorState> state;
+                        explicit Permit(std::shared_ptr<ErrorState> s) noexcept
+                            : state(std::move(s)) {}
+                        Permit(Permit&& o) noexcept : state(std::move(o.state)) {}
+                        Permit(const Permit&) = delete;
+                        Permit& operator=(const Permit&) = delete;
+                        Permit& operator=(Permit&&) = delete;
+                        ~Permit() {
+                            if (state)
+                                state->emit_in_flight.store(false, std::memory_order_release);
+                        }
+                    };
+                    try {
+                        Permit permit{error_state};
+                        if (emit_thread_fault_for_test_.exchange(false, std::memory_order_relaxed))
+                            throw std::system_error(
+                                std::make_error_code(std::errc::resource_unavailable_try_again));
+                        const StderrEmitFn fn =
+                            stderr_emit_for_test_.load(std::memory_order_acquire);
+                        // Detached: a thread blocked inside a stuck write can never be
+                        // joined, so nothing joins it. Why that is safe: it owns a
+                        // shared_ptr to ErrorState (via the permit, so ErrorState outlives
+                        // ~LogHandoff), touches no spdlog state and never takes `mu`; the
+                        // code it runs lives in libyuzu_agent_core.so, which is never
+                        // unloaded; and it holds no stdio lock (default_stderr_emit uses a
+                        // raw write), so a normal exit() cannot wait on it and the process
+                        // ends it.
+                        //
+                        // Launched via io_detail::spawn_detached (guardian_io_executor.hpp),
+                        // not a bare std::thread(...).detach(): the thread is created
+                        // ALREADY DETACHED, so there is no joinable std::thread object
+                        // whose destructor could terminate, and no separate detach() call
+                        // that could itself throw mid-unwind -- a real gap a plain
+                        // std::thread(...).detach() has (spawn_detached's own header
+                        // comment states why: detach() can throw per the standard, and a
+                        // still-joinable temporary's destructor terminates before a
+                        // surrounding catch gets control). spawn_detached returns false
+                        // only if the OS refused to create the thread; either way its
+                        // payload -- and the Permit it captured -- is destroyed
+                        // synchronously before we see the result, so the slot is released
+                        // exactly once regardless of which path fires below.
+                        const bool launched = io_detail::spawn_detached(
+                            [permit = std::move(permit), fn, emit_count,
+                             text = std::move(emit_message)]() {
+                                try {
+                                    (fn ? fn : &default_stderr_emit)(emit_count, text);
+                                } catch (...) {
+                                }
+                            });
+                        if (!launched) {
+                            // The OS refused to create the thread: the permit was already
+                            // released (see above). Drop and count this diagnostic.
+                            error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } catch (...) {
+                        // The fault-injection throw above releases the permit by unwinding
+                        // the local. std::bad_alloc from spawn_detached's own single
+                        // payload allocation releases it the same way, but from the
+                        // lambda-argument temporary instead: by the time spawn_detached
+                        // is entered, the permit is already moved into that argument
+                        // (argument evaluation precedes the call), so this catch does not
+                        // touch the local `permit` again either way. Drop and count this
+                        // diagnostic. Never throw into spdlog.
+                        error_state->emits_dropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
         });
+
+        // Governance hardening round, unhappy-path UP-1: bound (not eliminate -- the
+        // message must still be POPPED off the bounded queue by the worker thread
+        // before this fires, so this is a probabilistic improvement, never a
+        // guarantee) the number of already-formatted-but-undelivered lines lost if the
+        // process dies abnormally (e.g. an exception escaping main()'s agent->run()
+        // reaches std::terminate() without unwinding on this toolchain --
+        // LogHandoffEpilogue's destructor, and therefore the graceful drain in
+        // teardown(), never runs on that path). Per spdlog's own async_logger::
+        // backend_sink_it_ (verified against the vendored source), a warn-or-above
+        // line makes the WORKER THREAD call backend_flush_() synchronously and
+        // inline, in the same callback that just wrote that line to every sink --
+        // there is no second queued flush entry -- so once the worker has popped the
+        // line at all, its sinks are flushed before the callback returns.
+        logger->flush_on(spdlog::level::warn);
 
         // Drain-reader-lease control block (BLOCKER-1 fix) -- built here, still inside
         // the "everything that can throw happens before the object exists" phase, same

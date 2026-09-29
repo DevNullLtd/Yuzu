@@ -86,7 +86,7 @@ struct DexPerfFleetNow {
     std::optional<DexPerfStat> commit;
     std::optional<DexPerfStat> disk_lat;
     int64_t reporting{0};      ///< devices contributing at least one metric
-    int64_t windows_online{0}; ///< the coverage-honest denominator (unchanged; keep first)
+    int64_t windows_online{0}; ///< online Windows devices (unchanged wire field; keep first)
     // Trailing per-OS breakdown (C1, additive — REST/MCP responses only ever
     // APPEND fields; windows_online/reporting above stay byte-identical).
     // *_online counts every online device of that OS (collector or not);
@@ -97,6 +97,10 @@ struct DexPerfFleetNow {
     int64_t reporting_windows{0};
     int64_t reporting_linux{0};
     int64_t reporting_macos{0};
+    /// Online devices whose OS has a real perf collector per
+    /// detail::dex_perf_os_collects -- the OS-aware "of N" denominator for
+    /// `reporting`. windows_online stays as-is for wire compatibility. Trailing.
+    int64_t perf_capable_online{0};
 };
 
 DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap);
@@ -219,7 +223,7 @@ DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,
 /// The ONE device list that serves every drill (grill decision: metric card →
 /// worst devices; Reporting card → not-reporting; cohort/untagged row → that
 /// cohort's devices):
-///  - `not_reporting=true`  → Windows devices with NO metric this cycle
+///  - `not_reporting=true`  → devices of an OS with a perf collector with NO metric this cycle
 ///    (sorted by agent_id; metric/cohort filters still apply if given).
 ///  - `cohort_filter` set   → only devices whose resolved cohort equals it
 ///    ("" = the untagged residual). nullopt = no cohort filtering.

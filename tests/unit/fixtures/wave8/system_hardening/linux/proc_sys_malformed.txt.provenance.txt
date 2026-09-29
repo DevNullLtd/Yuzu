@@ -1,0 +1,7 @@
+host: braga (authored by hand)
+os: n/a
+identity: n/a
+command: n/a (hand-written in the same key<TAB>ok<TAB>value shape the real captures use)
+date: 2026-09-21
+status: RECONSTRUCTION (malformed-value path only: a non-numeric value, an out-of-table value, an empty file, and a numeric overflow; no real kernel emits these, so the unmodelled mapping cannot be captured; Documentation/admin-guide/sysctl/kernel.rst is the value spec)
+lines: 4 (budget 10)

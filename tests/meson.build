@@ -270,6 +270,7 @@ agent_test_exe = executable(
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
+    'unit/test_plugin_heartbeat_tags.cpp', # #1567: plugin KV -> heartbeat tag bridge (pure, lambda-fed)
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -291,6 +292,9 @@ agent_test_exe = executable(
     'unit/test_hard_exit.cpp',
     'unit/test_shutdown_deadline_guard.cpp',
     'unit/test_log_handoff.cpp', # #4666 PR-1: bounded async log hand-off primitive
+    'unit/test_service_completion.cpp', # #4666 PR-2: service shutdown completion handshake
+    'unit/test_agent_log_wiring.cpp', # #4666 PR-2: install/release wrapper (agent_log_wiring.hpp)
+    'unit/test_log_handoff_multi_image.cpp', # #4666 PR-2 W3a: macOS multi-image topology fixture (MI-1/MI-3)
     'unit/test_spark_detached_call.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
@@ -335,6 +339,7 @@ agent_test_exe = executable(
     'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction); header-only, no separate .cpp to list
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
+    'unit/test_agent_log_options.cpp', # #4666 PR-2: make_log_handoff_options CLI-flags translator
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
@@ -518,17 +523,22 @@ agent_test_exe = executable(
     'unit/test_peripherals_win_parsers.cpp',       # Wave 9 PR9.1a2: pure SetupAPI hardware-id parsers over the-rig REAL CAPTURE fixtures
     'unit/test_app_usage_parsers.cpp',           # Wave 7b PR7b.3: pure sqlite seam, :memory: db seeded from the REAL CAPTURE export
     'unit/test_app_usage_local_dispatcher.cpp',  # Wave 7b PR7b.3: real plugin via LocalDispatcher, unguarded on every OS; seeded via StandalonePluginContext
+    'unit/test_tar_local_dispatcher.cpp',        # #1567/#1846: real tar plugin via LocalDispatcher + KvStore-backed StandalonePluginContext, unguarded on every OS
     'unit/test_sync_source_app_usage.cpp',       # Wave 7b PR7b.3: app_usage daily-sync source
     'unit/test_execution_artifacts_parsers.cpp',   # Wave 7b PR7b.1: pure binary parsers over REAL CAPTURE fixtures + mutation fuzz
     'unit/test_execution_artifacts_local_dispatcher.cpp',  # Wave 7b PR7b.1: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
     'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
     'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
+    'unit/test_privacy_permissions_parsers.cpp',          # Wave 8 PR8.5: pure state/category/row tests, no OS call (Linux leg + shared; macOS/Windows follow in their own PR's test file)
+    'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
+    'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
+    'unit/test_browser_policy_local_dispatcher.cpp',  # Wave 10 PR10.2-b: real browser_policy dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822 row parsers, portable
     'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt walk + rpm-planned tripwire over committed fixture trees (bodies POSIX-only)
     'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -540,13 +550,22 @@ agent_test_exe = executable(
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure PAM/login.defs/auditd/pwpolicy parsers, no OS call (Linux+macOS legs; sudoers/secedit follow in their own PR's test file)
+    'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (POSIX body, empty TU on Windows)
+    'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
+    'unit/test_system_hardening_win_parsers.cpp',        # Wave 8 PR8.1-b: pure mitigation-registry decoder over the-rig REAL CAPTURE fixtures
+    'unit/test_system_hardening_local_dispatcher.cpp',   # Wave 8 PR8.1-b: real system_hardening dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_pkg_inventory_parsers.cpp',          # Wave 10 PR10.1-c: pure row formatters/tokens + synthetic in-code macOS walk cases (no committed fixture)
+    'unit/test_pkg_inventory_macos_parsers.cpp',    # Wave 10 PR10.1-c: injected-root Homebrew walk over a REAL CAPTURE Cellar tree
+    'unit/test_pkg_inventory_local_dispatcher.cpp', # Wave 10 PR10.1-c: real pkg_inventory plugin via LocalDispatcher, unguarded on every OS
+    '../agents/plugins/pkg_inventory/src/pkg_inventory_macos.cpp', # Wave 10 PR10.1-c: run_macos (the slot-guarded entry point execute() calls); self-gated to __APPLE__, empty elsewhere
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -556,17 +575,22 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
+    include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
+    include_directories('../agents/plugins/pkg_inventory/src'),  # Wave 10 PR10.1-c: pkg_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/app_usage/src'),  # Wave 7b PR7b.3: app_usage_parsers.hpp
     include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
+    include_directories('../agents/plugins/privacy_permissions/src'),  # Wave 8 PR8.5
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -622,7 +646,10 @@ agent_test_exe = executable(
              # Wave 8 PR8.4: test_firmware_posture_parsers.cpp reads REAL CAPTURE fixtures via
              # this same define.
              # Wave 8 PR8.1-a1: test_platform_security_{parsers,win_parsers}.cpp read
+             # Wave 8 PR8.1-b: test_system_hardening_{parsers,win_parsers}.cpp read
              # Docker/this-Mac/the-rig REAL CAPTURE fixtures via this same define.
+             # Wave 10 PR10.1-c: test_pkg_inventory_macos_parsers.cpp reads the this-Mac REAL
+             # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -670,6 +697,9 @@ agent_test_exe = executable(
   # plugin by path for the identical reason (PKG-NC).
   # content_dist_plugin_lib / script_exec_plugin_lib: same reasoning, for
   # test_content_dist_actions.cpp / test_script_exec_actions.cpp.
+  # agent_actions_plugin_lib (agents/plugins/agent_actions/meson.build):
+  # test_log_handoff_multi_image.cpp's MI-3 loads the real agent_actions plugin by path
+  # for the identical reason (#4666 PR-2 W3a macOS multi-image fixture).
   # echo_argv_fixture: test_content_dist_exec_seam.cpp's real B6 exec-verify
   # test stages and execs this fixture binary by path -- without it in
   # link_depends, a fresh build could leave the test executable built before
@@ -687,6 +717,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                agent_actions_plugin_lib,  # #4666 PR-2 W3a: MI-3 loads the real agent_actions plugin by path
                 certificates_plugin_lib,
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
@@ -714,18 +745,24 @@ agent_test_exe = executable(
                 power_health_plugin_lib,
                 autoruns_plugin_lib,  # Wave 7 PR7.1
                 app_usage_plugin_lib,  # Wave 7b PR7b.3
+                tar_plugin_lib,  # #1567/#1846 real-plugin test
                 execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
+                privacy_permissions_plugin_lib,  # Wave 8 PR8.5
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
                 app_control_plugin_lib,  # Wave 8 PR8.6
                 platform_security_plugin_lib,  # Wave 8 PR8.1-a1
                 peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
+                browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
+                local_security_policy_plugin_lib,  # Wave 8 PR8.3
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
+                system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
+                pkg_inventory_plugin_lib,  # Wave 10 PR10.1-c
                 ],
 )
 # ONE agent test is [tsan-heavy] as of #4153 (down from three): the #3848 concurrency soak
@@ -988,6 +1025,7 @@ tar_test_exe = executable(
     'unit/test_tar_service.cpp',   # Wave 5 PR5.2: pure systemctl/launchctl list parsers (fixture-fed, no spawn)
     'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
+    'unit/test_tar_source_health.cpp', # #1846: pure per-source health ledger (registry-name keyed)
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
@@ -1147,6 +1185,9 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
+      'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
+      'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
@@ -1221,6 +1262,7 @@ if build_server
       'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',
+      'unit/server/test_scope_preview.cpp', # #4981 PR-2: scope_preview.hpp's ladder-backed rewrite
       'unit/server/test_scope_yaml.cpp',
       'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
@@ -1232,6 +1274,7 @@ if build_server
       'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_guardian_routes.cpp',
       'unit/server/test_dex_routes.cpp',
+      'unit/server/test_dex_dashboard_golden.cpp', # WS-A4 PR-1: pins /dex fragment HTML before the DexApi rewire
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
@@ -1247,6 +1290,11 @@ if build_server
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
+      # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
+      # capture_sources() perf row. Registry TU compiled in here; NO tar include dir
+      # (see the include-path constraint below) - the test includes the header by
+      # relative path.
+      '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
@@ -1256,6 +1304,7 @@ if build_server
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+      'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
       'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
@@ -1283,6 +1332,7 @@ if build_server
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
+      'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
@@ -1490,6 +1540,15 @@ if build_server
                # case, but there is no reason to rely on it. std::filesystem and
                # the Win32 API both accept forward slashes.
                (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
+               '"',
+               # WS-A4 /dex golden files (test_dex_dashboard_golden.cpp): the build
+               # runs out-of-tree, so the committed `tests/unit/server/golden/`
+               # directory (one .html per rendered matrix cell) is located via a
+               # source-root-relative define, same backslash-normalisation
+               # requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_TEST_GOLDEN_DIR="' +
+               (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
+                   '\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
@@ -2103,8 +2162,37 @@ if build_server
        args: ['[pg][saml]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][result_set]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][audit]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][access_review]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][secrets]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar],[pg][discovery]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[dex]~[mcp]~[scim]~[custom_props]~[engine_principal]~[guaranteed_state]~[rbac]~[oidc]~[management_group]~[software_inventory]~[notification_store]~[quarantine]~[auth_routes]~[agent_service]~[authz]~[tar]',
               '--allow-running-no-tests'],
        suite: ['server', 'server-pg'], timeout: 700)
+  # WS-A4 PR-1 Gate 7 fix round build-ci review (ci-2, 2026-09-28): shard F
+  # (dex+mcp) landed at 620/700s (89%) on the Windows MSVC debug leg (run
+  # 36455943295) BEFORE this PR's own ~28 new [golden]/[catalogue] PG cases
+  # (the dashboard-fragment golden-master suite, test_dex_dashboard_golden.cpp,
+  # plus the REST catalogue-drill regression cases in
+  # test_rest_guaranteed_state.cpp), which would have pushed it to ~97% —
+  # both tags are dex-shaped test SUITES, not [dex]-tag-excluding store
+  # behaviour, and F's own filter admits every [dex]/[mcp] case unconditionally,
+  # so the new cases landed here by default. Per this file's "split, don't
+  # raise the timeout" house rule, they instead join shard L's own "carved
+  # from C, one clause per newly-heavy tag, deferring to L's shared exclusion
+  # suffix" recipe (ADR-0065 note above) — L measured ~148s in that same CI
+  # run, comfortably lighter than F. `~[golden]~[catalogue]` excludes them
+  # from F's dex/mcp clauses; the two new L clauses below admit them.
+  # Verified via --list-tests on the built binary: old F 517 - 28 = 489 at
+  # the time of that split (exact); old L 284 + 28 = 312 (exact); the two
+  # new L clauses (`[pg][golden]`/`[pg][catalogue]`, each reusing L's shared
+  # suffix MINUS `~[dex]`, since every one of these cases carries the [dex]
+  # tag) matched exactly 15 + 13 = 28 cases with zero overlap between them
+  # and zero overlap against L's pre-existing six clauses. Re-measured
+  # 2026-09-28 (Gate 7 fix round) after the same round's
+  # confinement-test rewrite removed 13 now-inapplicable [dex]/[mcp] cases
+  # (the retired fleet_read_fn-gate/real-RBAC-rig coverage for GET
+  # /api/v1/dex/{signals/{obs_type},app,overview} + their MCP twins, whose
+  # gate reverted to base's bare permission check): current F = 476, L
+  # still 312 (unaffected — golden/catalogue cases are untouched by that
+  # rewrite). Total [pg] population is 4273 (was 4286 before this round's
+  # net -13) — a shard-count change here moves/removes cases, it is not a
+  # partition defect.
   test('server pg unit tests shard F', server_test_exe,
-       args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]'],
+       args: ['[pg][dex]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue],[pg][mcp]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[golden]~[catalogue]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 85)
   # server pg unit tests shard K — carved from shard C 2026-08-28 (Windows CI
   # test-phase restructuring, #3443): ten named store tags, none claimed by
@@ -2141,8 +2229,16 @@ if build_server
   # naive form matched 258, not 202). A DSN-less run of L exits 0 (some
   # cases assert before reaching a PG-requiring line), matching shard C/K's
   # own precedent.
+  #
+  # 2026-09-28 (WS-A4 PR-1 Gate 7 fix round, ci-2): two clauses added —
+  # `[pg][golden]` and `[pg][catalogue]`, the DEX golden-master and
+  # REST-catalogue-drill cases moved off shard F (see shard F's own comment
+  # above for the trigger and the verified 517/489/284/312/28 counts). Both
+  # reuse this shard's shared exclusion suffix EXCEPT `~[dex]` — every one
+  # of these 28 cases carries the [dex] tag, so keeping that exclusion would
+  # match zero of them.
   test('server pg unit tests shard L', server_test_exe,
-       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
+       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][golden]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][catalogue]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 92)
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]'],
@@ -2231,6 +2327,36 @@ if build_server
     depends: [server_test_exe],
     timeout: 60,
   )
+
+  # ADR-0031 WS-A4 PR-1 F1 fix: check-seam-closure.py (docs-lint.yml, no build
+  # dependency) enforces INCLUDE closure only, and is blind to a core TU
+  # linking against a symbol only DEFINED in a presentation TU's own `.cpp`
+  # (the `dex` family's exact defect — see check_core_presentation_link.py's
+  # module docstring). This link-level twin needs compiled `.o` files, so it
+  # runs as a build-and-test-gated meson test() instead of a docs-lint.yml
+  # step — `depends:` on the static lib forces ninja to build every enrolled
+  # family's core AND presentation objects first. `--build-dir` is threaded
+  # explicitly (mirrors the pg-shard check above) rather than relying on the
+  # script's own $MESON_BUILD_ROOT fallback, so this stays correct even if a
+  # future harness stops setting that var for `meson test`-launched processes.
+  # GCC/Clang only: the script reads `*.cpp.o` objects with `nm`; MSVC emits
+  # `.obj` files and its runners ship no `nm`, so this test() entry does not
+  # exist at all on that toolchain — the Windows leg adds nothing here. The
+  # macOS leg runs it (no by-name filter, full `meson test`); the Linux
+  # leg's own non-pg Test step selects `server-checks`-suite tests by an
+  # explicit NAME list, which had never named this one (CI-2, 2026-09-28,
+  # WS-A4 PR-1 Gate 7 fix round build-ci review) — this test silently never
+  # ran on Linux despite existing in the build; fixed in ci.yml.
+  if cxx.get_id() != 'msvc'
+    test('dex link no presentation symbols',
+      _pg_shard_python3,
+      args: [files('../scripts/ci/check_core_presentation_link.py'),
+             '--build-dir', meson.project_build_root(), '--verbose'],
+      suite: ['server', 'server-checks'],
+      depends: [yuzu_server_core_lib],
+      timeout: 60,
+    )
+  endif
 
   # 2026-08-20 (ADR-0056, PolicyStore, batch-6): PolicyStore moved off SQLite
   # onto Postgres, and test_policy_store.cpp / test_policy_evaluator.cpp went
@@ -2356,6 +2482,17 @@ test('firmware_posture definition columns',
 test('runtimes definition columns',
   _python3_test,
   args: [files('test_runtimes_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
+# row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
+# parses the YAML directly -- catches a reordered or renamed column the C++ test's
+# hard-coded literal cannot.
+test('browser_policy definition columns',
+  _python3_test,
+  args: [files('test_browser_policy_definition.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -2573,6 +2710,55 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# #4666 PR-2 W3a: static lexical gate over main.cpp's log-handoff wiring call sites (the
+# four textual invariants agent_log_wiring.hpp's/log_handoff.hpp's own header banners
+# describe -- see the script's own header). No build required, so gated only on bash
+# being present, same as the other lexical selftests above.
+if _bash_test.found()
+  test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
+    _bash_test,
+    args: [files('shell/test_log_handoff_wiring_lexical.sh')],
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
+# #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
+# agent_actions plugin (see the script's own header for what it does and does not prove).
+# Gated on build_agent the same way the capability matrix gate above is -- nothing to
+# inspect without a real agent build.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
+  test('spdlog registry identity symbol-binding report (#4666 PR-2 W3a MI-2)',
+    _bash_test,
+    args: [files('shell/test_spdlog_registry_identity.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 60,
+    depends: [
+      yuzu_agent_exe,
+      yuzu_agent_core_lib,
+      agent_actions_plugin_lib,
+    ],
+  )
+endif
+
+# #4666 PR-2 acceptance-evidence harness: formalizes the hand-verified manual
+# repro of the blocked-log-sink SIGTERM scenario (main.cpp's async log
+# hand-off, log_handoff.hpp) into a committed, repeatable shell test against
+# the real yuzu-agent binary. Linux-only -- the blockage-detection mechanism
+# reads /proc/<pid>/task/*/wchan, which has no equivalent on macOS/Windows.
+# `yuzu_agent_exe` (agents/core/meson.build) is named specifically so this
+# depends: entry can pin the real agent binary as a build dependency.
+if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('blocked log sink SIGTERM harness (#4666 PR-2)',
+    _bash_test,
+    args: [files('shell/test_blocked_log_sink_sigterm.sh'), meson.project_build_root()],
+    suite: 'agent',
+    timeout: 300,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
@@ -2619,6 +2805,18 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
+# and authorization-topology-floor tables must match rbac_store.cpp's seed
+# arrays and authz_topology_floor.hpp's kTopologyFloor. Also runs in
+# .github/workflows/docs-lint.yml on every PR; registered here for local
+# `meson test --suite docs` parity with the sibling python doc-tests.
+test('rbac doc counts',
+  _python3_test,
+  args: [files('test_rbac_doc_counts.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
 # ADR-0032 split interlock merge-gate: the tripwire (no engine-path symbol may
 # merge while the gate is red) and its self-test (the ledger's load-bearing
 # constants are pinned so the gate cannot be silently neutered). Both also run in
@@ -2644,6 +2842,15 @@ test('split interlock tripwire selftest',
 test('no conn-less libpq escape references',
   _python3_test,
   args: [files('test_no_connless_pq_escape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL lives only in the
+# query owner, and its one shared SQL fragment has exactly one definition (PR #4985).
+test('rbac cross-schema query-owner seam',
+  _python3_test,
+  args: [files('test_rbac_query_owner_seam.py')],
   suite: 'docs',
   timeout: 30,
 )

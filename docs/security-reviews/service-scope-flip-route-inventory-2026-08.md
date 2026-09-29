@@ -50,6 +50,38 @@ Rows 13–25 were not in the plan's original enumeration — found by the
 residual sweep of `rest_api_v1.cpp` (all 74 `auth_fn` call sites) and
 `mcp_server.cpp` (3 call sites) the plan itself flagged as outstanding.
 
+**Correction (#4980, 2026-09-25):** row 25's claim was accurate WHEN
+WRITTEN, not wrong from the start — but it did not survive a later,
+unrelated change. On 2026-08-18 this route genuinely gated `Inventory:Read`
+via `perm_fn` (`require_permission`), and the §3a flip's hard 403 closed
+the service-scope gap at that point. Commit `606b9ec72` (2026-09-12, an
+unrelated Batch B2 fix closing a real management-group confinement gap on
+this same route) replaced that `perm_fn` gate with `fleet_read_fn` (the
+ADR-0017 admit-then-filter chokepoint) — whose service-scope branch
+admits-and-confines a service-scoped caller UNDER RBAC-ON rather than
+denying it outright (it still hard-403s under RBAC-off, same as `perm_fn`)
+— and in doing so silently reopened the service-scope axis this row's fix
+had closed. The actual exposure window was 2026-09-12 through #4980's
+merge (~13 days), RBAC-enabled deployments only, not the ~5 weeks since
+this row's own date. #4980 closed it again with a dedicated
+`deny_fleet_wide_service_scoped` call that no longer depends on which
+underlying gate this route uses.
+
+**Correction (#4981, 2026-09-28):** `POST /api/v1/scope/preview` (REST only — see
+below for MCP) is not a row in this sweep because it did not exist yet — it was
+added 2026-09-12 (`b00d3cadc`), after this sweep's 2026-08-18 cutoff, and was never
+retroactively audited into it. It shipped without the deny-first pattern this sweep
+established: a service-scoped token was admitted and narrowed rather than denied.
+#4981 closed it with the same `deny_fleet_wide_service_scoped` chokepoint rows
+17-24 already use. Exposure window: 2026-09-12 through #4981's merge. The MCP twin,
+`preview_scope_targets`, is a DIFFERENT case, not part of this correction: it has
+existed since 2026-03-25 and was already structurally denied to a service-scoped
+token from 2026-08-18 onward (the same day as this sweep) via C8's default-deny —
+#4981 made no service-scope change on the MCP side. See the SOC 2 readiness doc's
+matching addendum for the full writeup (this route's fix also closed an unrelated,
+more severe from_result_set:/props. scope-atom evaluation defect shared by both
+surfaces, out of scope for this service-scope-focused inventory).
+
 ## MCP (`mcp_server.cpp`) — sweep result: 0 findings
 
 All 3 `auth_fn`-resolving call sites are self-scoped (the JSON-RPC

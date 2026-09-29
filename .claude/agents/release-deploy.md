@@ -64,7 +64,7 @@ You perform a targeted review when a change:
 
 The UAT stack runs server, gateway, and observability in Docker containers while the agent runs natively on the host. The canonical deployment is:
 
-- **`docker-compose.uat.yml`** — Release artifact (uploaded to GitHub Releases). Uses `ghcr.io/tr3kkr/yuzu-*` images. Remote UAT testers download this single file. This is the product.
+- **`docker-compose.uat.yml`** — Release artifact (uploaded to GitHub Releases). Uses `ghcr.io/devnullltd/yuzu-*` images. Remote UAT testers download this single file. This is the product.
 
 A `docker-compose.local.yml` (gitignored) may exist temporarily during development when the release images don't yet contain fixes being tested. The goal is to eliminate the need for it — every fix should flow through the release pipeline so `docker-compose.uat.yml` works out of the box.
 

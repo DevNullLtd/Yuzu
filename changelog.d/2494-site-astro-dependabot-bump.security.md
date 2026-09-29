@@ -1,1 +1,0 @@
-- **Docs site dependencies patched.** Bumped `astro` to 7.1.3 in `site/`, resolving 3 Dependabot alerts: a libvips-inherited `sharp` vulnerability (CVE-2026-33327/33328/35590/35591), an SVGO `removeScripts` bypass (GHSA-2p49-hgcm-8545), and a reflected XSS via unescaped View Transition animation properties in Astro itself (GHSA-4g3v-8h47-v7g6).

@@ -96,12 +96,17 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -128,19 +133,35 @@ FRAGMENT_FILES = [
 # posture; add_rule/remove_rule (#282) follow as separate Destructive-class rows.
 # Wave 8 PR8.1-a1: +2 platform_security (secure_boot/code_integrity).
 # Wave 10 PR10.1-b: +2 runtimes (dotnet/jvm).
-# Wave 10 PR10.1-d: +1 update_source_trust (sources).
-# This constant has been bumped independently on both sides of a merge several times
-# (PR #4719 CI is the trail; #4721 tracks deriving it per fragment). The rule is
-# always the same: never combine two possibly-stale running totals — recount every
-# fragment file directly (`grep -c '\.plugin\s*=\s*"' <fragment>`) and sum. Doing
-# that across all twenty-one sources (twenty per-group fragments + core) after
-# merging update_source_trust into dev's tip gives 4 (core) + 5 (content_dist) +
-# 45 (a) + 55 (b) + 34 (c) + 42 (d) + 2 (disk_actions) + 3 (filesystem_posture) +
-# 4 (power_health) + 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
-# 2 (windows_optional_features) + 3 (peripherals) + 3 (printing, incl. clear_queue) +
-# 1 (update_source_trust) + 2 (app_control) + 1 (firmware_posture) + 2 (runtimes) +
-# 2 (platform_security) + 2 (browser_inventory) = 220.
-EXPECTED_TOTAL_ROWS = 220
+# Wave 8 PR8.1-b: +1 system_hardening (posture).
+# Wave 10 PR10.1-c: +2 pkg_inventory (managers/packages).
+# Wave 10 PR10.2-b: +1 browser_policy (policies).
+# Running total: 194 (base, already includes __sync__.now — see above) +
+# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
+# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) +
+# 1 (printing.clear_queue) + 2 (app_control) + 2 (platform_security) +
+# 2 (browser_inventory) + 1 (firmware_posture) + 2 (runtimes, dotnet/jvm) +
+# 1 (system_hardening) + 2 (pkg_inventory, managers/packages) + 1 (browser_policy) = 223.
+# This constant has been bumped independently on several sides of several merges
+# (PR #4719 and PR #4964 CI are the trail; #4721 tracks deriving it per fragment).
+# The rule is always the same: find the shared baseline all sides agree on and add
+# EVERY side's new plugin on top of it, never pick one side's total -- and re-derive
+# by RUNNING parse_fragment_gate_rows over FRAGMENT_FILES rather than trusting hand
+# arithmetic, which has drifted before (206, then 203, then repeatedly since). Dev
+# landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); dev's own
+# browser_policy (+1) landed on top of that: 222 + 1 = 223. This branch's own
+# dev merged privacy_permissions (+1) on top of the 223 baseline: dev is now at 224.
+# This branch's own local_security_policy (+3: password_policy/lockout_policy/
+# audit_policy -- sudoers is PLANNED, follows as its own PR, not counted here) lands on
+# top of dev's CURRENT 224 (not the pre-merge 223): 224 + 3 = 227. Verified directly by
+# running parse_fragment_gate_rows over FRAGMENT_FILES with both plugins' fragments
+# present, not by hand arithmetic -- see the merge-arithmetic trap this comment exists
+# to name (adding this branch's own delta to a stale baseline undercounts by the other
+# side's own delta).
+# Wave 10 PR10.1-d: +1 update_source_trust (sources) on top of dev's 227 = 228, verified by
+# running parse_fragment_gate_rows over all 26 FRAGMENT_FILES and by a `grep -c` sum
+# (both 228), not by adding to a possibly-stale baseline.
+EXPECTED_TOTAL_ROWS = 228
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -185,6 +206,36 @@ def parse_content_pair_modes(content_root: Path) -> dict[tuple[str, str], list[s
             mode = approval.get("mode") or "auto"
             pair_modes.setdefault((plugin, str(action).lower()), []).append(mode)
     return pair_modes
+
+
+def non_string_column_values(doc: object, fallback_id: str) -> list[str]:
+    """`<definition id>.<column>: <repr>` for every non-string entry of the
+    `values` list of one definition document's result columns."""
+    if not isinstance(doc, dict):
+        return []
+    def_id = (doc.get("metadata") or {}).get("id", fallback_id)
+    result = (doc.get("spec") or {}).get("result")
+    columns = result.get("columns") if isinstance(result, dict) else None
+    return [
+        f"{def_id}.{col.get('name')}: {v!r}"
+        for col in columns or []
+        for v in col.get("values") or []
+        if not isinstance(v, str)
+    ]
+
+
+def find_non_string_column_values(content_root: Path) -> list[str]:
+    """Every `<definition id>.<column>: <repr>` whose `values` list holds a
+    non-string. YAML 1.1 reads an unquoted on/off/yes/no as a boolean, so such
+    a vocabulary token renders as True/False in every generated doc unless quoted.
+    """
+    bad: list[str] = []
+    for path in sorted(content_root.glob(CONTENT_GLOB)):
+        with path.open(encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
+        for doc in docs:
+            bad.extend(non_string_column_values(doc, path.name))
+    return bad
 
 
 def parse_fragment_gate_rows(path: Path) -> list[tuple[str, str, str]]:
@@ -328,10 +379,39 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
             self.fail("\n" + format_gaps(mismatches, unexempt_missing))
 
 
+class TestDefinitionValueVocabularies(unittest.TestCase):
+    """Every `values:` entry of every shipped definition column is a string."""
+
+    def test_every_values_entry_is_a_string(self) -> None:
+        bad = find_non_string_column_values(REPO_ROOT)
+        self.assertFalse(
+            bad,
+            "non-string `values:` entries (quote on/off/yes/no so YAML keeps them strings):\n"
+            + "\n".join(bad),
+        )
+
+
 class TestFailureModesOnSyntheticData(unittest.TestCase):
-    """Proves `diff_gates` actually catches both drift shapes, using
-    fabricated data only — never a real fragment or content file.
+    """Proves `diff_gates` and the `values:` vocabulary scan actually catch
+    the drift shapes they guard, using fabricated data only — never a real
+    fragment or content file.
     """
+
+    def test_an_unquoted_on_off_values_entry_is_named(self) -> None:
+        # `yaml.safe_load` turns an unquoted on/off into a boolean: exactly the
+        # silent coercion the real-tree guard exists to catch.
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, on, off]}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), ["x.state: True", "x.state: False"])
+
+    def test_quoted_on_off_values_entries_pass(self) -> None:
+        doc = yaml.safe_load(
+            "metadata: {id: x}\n"
+            "spec: {result: {columns: [{name: state, values: [enabled, 'on', 'off']}]}}\n"
+        )
+        self.assertEqual(non_string_column_values(doc, "fallback"), [])
 
     def test_stricter_content_than_catalogue_is_named(self) -> None:
         pair_modes = {("widget", "explode"): ["role-gated"]}

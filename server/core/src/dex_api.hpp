@@ -50,13 +50,23 @@
 /// `dex_iso_since(dex_window_to_days(window))` and obtains the cross-store
 /// `DexFleet` denominator from an injected `FleetFn` — exactly as today's
 /// handlers do — so neither `since` nor `DexFleet` appears in this abstract
-/// interface. `visible` (the caller's ADR-0017 admit-then-filter set) DOES
-/// appear where a resource confines its device list: it is resolved from the
-/// authenticated request by the handler (`resolve_dex_visible`) and threaded
-/// in, since it depends on the caller's identity, not the store.
+/// interface. NONE of `app`/`overview`/`signal_detail` takes a `visible`
+/// parameter. `app`/`overview` carried one since #4035 (resolved from a
+/// per-caller resolver, `resolve_dex_visible`/`dex_visible_fn_`); WS-A4 PR-1
+/// removed it: the resolver was dormant for a management-group-confined-only caller
+/// (REST/MCP's `perm_fn` gate on all three routes is GLOBAL-only, so a
+/// confined-only operator never reached it) and wrongly narrowed a
+/// JIT-elevated administrator to their BASE identity's grant instead of the
+/// unfiltered view elevation earns. A per-row `visible` filter on `app`/
+/// `overview` was ALSO never a real fix even where it did run: it would
+/// filter only the returned `devices[]`/`top_devices[]` ROWS while leaving
+/// every AGGREGATE field (crash/hang counts, health/score distribution,
+/// …) fleet-wide regardless — a caller could reasonably (and wrongly) read
+/// the aggregate as scoped to their own visible devices. `signal_detail`
+/// briefly gained one during WS-A4 PR-1 review and lost it for the same
+/// reason — see its own doc comment.
 
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -103,14 +113,23 @@ public:
     [[nodiscard]] virtual std::optional<GuardianObservationRow>
     observation(const std::string& agent_id, const std::string& event_id) const = 0;
 
-    /// GET /api/v1/dex/app?name= — per-app blast radius; `visible` confines the
-    /// affected-devices list (nullptr = unconfined / global Read).
+    /// GET /api/v1/dex/app?name= — per-app blast radius: crash/hang counts,
+    /// faulting modules, exceptions, and the affected-devices list — ALL
+    /// fleet-wide, with no per-caller confinement (see this header's own
+    /// doc comment on why a `visible` parameter was tried and removed).
     [[nodiscard]] virtual DexAppModel app(const std::string& process_name,
-                                          const std::string& window,
-                                          const std::set<std::string>* visible) const = 0;
+                                          const std::string& window) const = 0;
 
     /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity).
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
+
+    /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family
+    /// cards + fleet coverage + the "Other (uncatalogued)" list (ADR-0031
+    /// WS-A4 PR-1: the first public resource for the
+    /// per-family health score / online-denominator coverage the dashboard
+    /// fragment previously computed with no REST/MCP twin).
+    [[nodiscard]] virtual DexCatalogueModel
+    catalogue(const std::string& os_filter, const std::string& window) const = 0;
 
     /// GET /api/v1/dex/catalogue/group?name=&os= — one signal family's members;
     /// `nullopt` for an unknown family name (the caller's 404).
@@ -125,10 +144,11 @@ public:
     /// GET /api/v1/dex/trends — cross-OS + per-family trend source data.
     [[nodiscard]] virtual DexTrendsModel trends(const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/overview — /dex landing fleet summary; `visible` confines
-    /// the top-devices list (nullptr = unconfined / global Read).
-    [[nodiscard]] virtual DexOverviewModel
-    overview(const std::string& window, const std::set<std::string>* visible) const = 0;
+    /// GET /api/v1/dex/overview — /dex landing fleet summary: health/score
+    /// distribution, top apps, and the most-affected top-devices list — ALL
+    /// fleet-wide, with no per-caller confinement (same rationale as
+    /// `app` above).
+    [[nodiscard]] virtual DexOverviewModel overview(const std::string& window) const = 0;
 
     // ── Builder-less resources (raw store reads, previously assembled inline in
     //    the handler; the seam returns the pure rows, the handler serializes) ──
@@ -140,7 +160,20 @@ public:
     /// GET /api/v1/dex/scope — per-OS signal coverage.
     [[nodiscard]] virtual std::vector<DexOsScope> scope(const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/signals/{obs_type}?os=&limit= — one signal type's drill-down.
+    /// GET /api/v1/dex/signals/{obs_type}?os=&limit= — one signal type's
+    /// drill-down: subjects/by_os/devices/by_day are ALL fleet-wide
+    /// aggregates (the `devices[]` "most-affected" list is a top-`limit`
+    /// ranking over the WHOLE fleet, not a per-agent row set a caller could
+    /// safely narrow) — no `visible` parameter, matching `app`/`overview`
+    /// above, and for the same reason: a post-limit per-row filter on
+    /// `devices[]` alone (tried in an earlier WS-A4 PR-1 fix round) left
+    /// `subjects`/`by_os`/`by_day` fleet-wide for EVERY caller regardless
+    /// of confinement, and top-N-then-filter meant a confined caller could
+    /// see FEWER than `limit` devices while never being told the aggregate
+    /// above included excluded ones. Both REST and MCP gate this resource
+    /// on `GuaranteedState:Read` (a global grant; with RBAC off, any authenticated non-service/non-engine session
+    /// only) plus their own service-scoped-token denial — nothing left for
+    /// a `visible` parameter to do here.
     [[nodiscard]] virtual DexSignalDetailModel
     signal_detail(const std::string& obs_type, const std::string& window,
                   const std::string& os_filter, int limit) const = 0;

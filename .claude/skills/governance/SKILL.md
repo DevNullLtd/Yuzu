@@ -2062,8 +2062,8 @@ procedure:
 1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
 2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
    ```bash
-   gh issue list --repo Tr3kkR/Yuzu --state open --search "<file-or-symbol>" --json number,title
-   gh search issues --repo Tr3kkR/Yuzu --state open "<title keywords>" --json number,title --limit 20
+   gh issue list --repo DevNullLtd/Yuzu --state open --search "<file-or-symbol>" --json number,title
+   gh search issues --repo DevNullLtd/Yuzu --state open "<title keywords>" --json number,title --limit 20
    ```
    An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
 
@@ -2081,7 +2081,7 @@ procedure:
    free-text disposition note.
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
-   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+   gh issue create --repo DevNullLtd/Yuzu --title "..." \
      --label <type> --label governance-deferred --label <P0|P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
@@ -2093,7 +2093,7 @@ procedure:
    phrasing is what a previous round of this runbook mistakenly acted on — so the park
    branch carries NEITHER:
    ```bash
-   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+   gh issue create --repo DevNullLtd/Yuzu --title "..." \
      --label <type> --label governance-deferred --label roadmap \
      --body-file <candidate>.md
    ```

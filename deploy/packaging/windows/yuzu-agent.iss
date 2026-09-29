@@ -51,7 +51,7 @@ Name: "core"; Description: "Yuzu Agent core"; Types: full minimal custom; Flags:
 Name: "plugins"; Description: "Agent plugins"; Types: full custom
 Name: "plugins\system"; Description: "System info (OS, hardware, storage, users)"; Types: full custom
 Name: "plugins\network"; Description: "Network (config, diagnostics, actions, WiFi, WoL)"; Types: full custom
-Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall)"; Types: full custom
+Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall, exploit-mitigation posture)"; Types: full custom
 Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
 Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan, quarantine)"; Types: full custom
@@ -95,6 +95,8 @@ Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"
 Source: "{#BuildDir}\agents\plugins\runtimes\runtimes.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_optional_features\windows_optional_features.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 
 ; --- Plugins: network ---
 Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
@@ -115,6 +117,8 @@ Source: "{#BuildDir}\agents\plugins\update_source_trust\update_source_trust.dll"
 Source: "{#BuildDir}\agents\plugins\app_control\app_control.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\firmware_posture\firmware_posture.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\platform_security\platform_security.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\system_hardening\system_hardening.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\local_security_policy\local_security_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 

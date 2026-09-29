@@ -50,7 +50,9 @@
 // handler's pre-validation can never diverge from what the store accepts.
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
-#include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
+#include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 6-role set
+#include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
@@ -966,19 +968,20 @@ static const ToolDef kTools[] = {
      R"j(]})j"},
 
     {"preview_scope_targets",
-     "Show which agents match a scope expression. Confined by management group (ADR-0017): a "
-     "caller admitted through a management-group grant sees matched_agents/matched_count "
-     "narrowed to only their own visible devices, never the whole fleet. NOTE: tag:<key> atoms "
-     "resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls "
-     "back to a connected agent's own live self-reported value when the store has no row for "
-     "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
-     "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". NOTE: "
-     "from_result_set:<id> and props.* atoms are NOT resolved by this preview (only "
-     "os/arch/hostname/agent_version/tag:* are) - an expression using from_result_set: always "
-     "previews as matched_count:0 here even though a real dispatch resolves it correctly; do "
-     "not rely on this tool for such an expression (tracked #4307). REST v1 twin: POST "
-     "/api/v1/scope/preview.",
+     "Show which agents match a scope expression. Runs the SAME evaluation ladder a real "
+     "dispatch uses (owner-check gate included, #4981) - tag:<key>, props.<key>, and "
+     "from_result_set:<id> atoms all resolve identically to a real dispatch, not just "
+     "os/arch/hostname/agent_version/tag:* as before. Confined by management group (ADR-0017): "
+     "a caller admitted through a management-group grant sees matched_agents/matched_count "
+     "narrowed to only their own visible devices, never the whole fleet - the ladder itself "
+     "evaluates fleet-wide, then this confinement is intersected in afterward. tag:<key> atoms "
+     "resolve IDENTICALLY to a real dispatch: the persistent tag store first, falling back to a "
+     "locally-connected agent's own live self-reported value only when the store has no row for "
+     "that agent - a presence-only cross-replica agent has no live session to fall back to, so "
+     "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
+     "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
+     "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
+     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -1018,11 +1021,9 @@ static const ToolDef kTools[] = {
      "conditions against every agent's stored inventory server-side; membership is every "
      "match, optionally narrowed to an owned parent set's CURRENT members. Requires "
      "Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same "
-     "securable as query_installed_software). Unlike every other result-set tool in this "
-     "family, a service-scoped API token is admitted and confined here, not denied outright "
-     "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
-     "the minting token's username, so a service token can mint a set the minter's other "
-     "credentials can later read back. If any candidate inventory record was excluded for "
+     "securable as query_installed_software). Service-scoped API tokens are denied "
+     "outright, same as every other result-set tool in this family (#4980). If any "
+     "candidate inventory record was excluded for "
      "nesting past the JSON depth guard (the exclusion check runs before condition matching, "
      "so a record's plugin/fields need not relate to the query's conditions to trigger it), "
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
@@ -1416,7 +1417,9 @@ static const ToolDef kTools[] = {
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
      "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
      "audit-logged (dex.signal.view). A well-formed obs_type with no observations returns empty "
-     "arrays. Mirrors GET /api/v1/dex/signals/{obs_type}. Requires GuaranteedState:Read.",
+     "arrays. Every field, including the devices list, is a fleet-wide aggregate with no "
+     "per-caller confinement; denied outright to a service-scoped API token. Mirrors GET "
+     "/api/v1/dex/signals/{obs_type}. Requires a global GuaranteedState:Read grant.",
      R"j({"type":"object","properties":{)j"
      R"j("obs_type":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","maxLength":64,"description":"Catalogue key, e.g. process.crashed, os.boot"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
@@ -1466,9 +1469,10 @@ static const ToolDef kTools[] = {
     // dex.device.view/dex.observation.view, matching their fragments).
     {"get_dex_app",
      "App blast-radius drill: crash/hang summary + faulting modules + exception codes + the "
-     "affected-device list for one application. The devices list names affected agent IDs "
-     "(behavioral data), confined to the caller's management-group scope — every call is "
-     "audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. Requires GuaranteedState:Read.",
+     "affected-device list for one application. ALL of it, including the devices list of "
+     "affected agent IDs (behavioral data), is a fleet-wide aggregate with no per-caller "
+     "confinement — every call is audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. "
+     "Requires GuaranteedState:Read; denied outright to a service-scoped API token.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":512,"description":"Process image name, e.g. notepad.exe"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
@@ -1490,6 +1494,22 @@ static const ToolDef kTools[] = {
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}}},)j"
      R"j("required":["window","apps"]})j"},
 
+    {"get_dex_catalogue",
+     "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
+     "monitored/total type count, its own health-score slice, window event count and busiest "
+     "member type, plus an 'other' list of obs_types seen on the wire but not yet in a curated "
+     "family. No per-agent identity — not audited. Mirrors GET /api/v1/dex/catalogue. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string"},"window":{"type":"string"},"monitored_types":{"type":"integer"},"total_types":{"type":"integer"},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"monitored":{"type":"integer"},"total":{"type":"integer"},"health_score":{"type":["number","null"]},"events":{"type":"integer"},"top_obs_type":{"type":["string","null"]}},"required":["name","monitored","total","health_score","events","top_obs_type"]}},)j"
+     R"j("uncatalogued":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}})j"
+     R"j(},"required":["os","window","monitored_types","total_types","families","uncatalogued"]})j"},
+
     {"get_dex_catalogue_group",
      "One signal family's member signals (Catalogue View 2): per-type monitored/not-collected "
      "state, coverage platforms, event count + blast radius, plus the family's own health-score "
@@ -1503,7 +1523,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("group_name":{"type":"string"},"os":{"type":"string"},"window":{"type":"string"},)j"
      R"j("monitored_count":{"type":"integer"},"total_type_count":{"type":"integer"},)j"
-     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},)j"
+     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},"benign":{"type":"boolean"},)j"
      R"j("types":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"monitored":{"type":"boolean"},"coverage_platforms":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","monitored","coverage_platforms","count","distinct_devices","last_seen"]}})j"
      R"j(},"required":["group_name","os","window","monitored_count","total_type_count","active_events","max_signal_devices","types"]})j"},
 
@@ -1567,16 +1587,18 @@ static const ToolDef kTools[] = {
     {"get_dex_overview",
      "The /dex landing page's fleet summary: per-device experience score distribution + "
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
-     "devices list. The devices list names affected agent IDs (behavioral data), confined to "
-     "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "unscored (#4855) counts connected devices whose per-device score could not be computed "
-     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
-     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
-     "GuaranteedState:Read.",
+     "devices list. ALL of it, including the top-devices list of affected agent IDs (behavioral "
+     "data), is a fleet-wide aggregate with no per-caller confinement — every call is "
+     "audit-logged (dex.overview.view). unscored (#4855) counts connected devices whose "
+     "per-device score could not be computed (no store, or a degraded per-device read) — treat "
+     "a non-zero unscored as partial coverage, not a healthier fleet than reported. Mirrors GET "
+     "/api/v1/dex/overview. Requires GuaranteedState:Read; denied outright to a service-scoped "
+     "API token.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
      R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("connected_platforms":{"type":"integer"},"busiest_family":{"type":["string","null"]},"busiest_family_events":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -1604,7 +1626,8 @@ static const ToolDef kTools[] = {
      // Additive per-OS fields (C1) — appended after the original five, which
      // stay untouched including "required" (unchanged on purpose).
      R"j("linux_online":{"type":"integer"},"macos_online":{"type":"integer"},)j"
-     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"})j"
+     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"},)j"
+     R"j("perf_capable_online":{"type":"integer","description":"Online devices whose OS has a perf collector (Windows + Linux today): the denominator for reporting"})j"
      R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
@@ -1655,7 +1678,7 @@ static const ToolDef kTools[] = {
      "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
-     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
+     R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices of an OS with a perf collector (Windows + Linux today) with no perf sample this cycle"},)j"
      R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
@@ -2566,6 +2589,85 @@ static const ToolDef kTools[] = {
      R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
      R"j(},"required":["principal_id","count","roles"]})j"},
 
+    // ── A2: global human role assignment (delivery plan §2 "A2 — Global
+    // human role assignment/unassignment") — MCP twins of POST/DELETE
+    // /api/v1/rbac/roles/{name}/assignments. Closes the "no production
+    // caller" gap for RbacStore::assign_role(principal_type="user"): before
+    // this PR, no REST route, MCP tool, or dashboard fragment could grant a
+    // human anything beyond Operator/Viewer at management-group scope.
+    {"assign_rbac_role",
+     "Grant one of the 6 fleet-wide-assignable built-in RBAC roles to a human user, "
+     "FLEET-WIDE: Administrator, PlatformEngineer, Operator, ApiTokenManager, Viewer, "
+     "Reviewer. Requires the CALLER to hold a durable Administrator role themselves — this "
+     "is a stronger gate than an ordinary Security:Write permission check, since it mints "
+     "standing authority (including, potentially, Administrator itself). principal_type "
+     "must be \"user\" (group-scoped assignment is not supported yet). 'ITServiceOwner' is "
+     "REJECTED for this fleet-wide surface — its confinement model requires a "
+     "management-group scope this tool does not carry; use the management-group role route "
+     "instead. Assigning to a username with no existing account is allowed "
+     "(pre-provisioning) and reported via target_provisioned. Requires Security:Write "
+     "(supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_type":{"type":"string","enum":["user"],"description":"Must be \"user\" — group-scoped assignment is not supported yet"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
+     R"j("role":{"type":"string","enum":["Administrator","PlatformEngineer","Operator","ApiTokenManager","Viewer","Reviewer"],"description":"One of the 6 fleet-wide-assignable built-in roles — see discover_permissions for the full role/securable catalog, including non-assignable roles like ITServiceOwner"})j"
+     R"j(},"required":["principal_type","principal_id","role"]})j",
+     R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_type":{"const":"user"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
+     R"j("target_provisioned":{"type":"string","enum":["true","false","unknown"],"description":"\"true\" iff principal_id has a currently-active auth.users row at assignment time; \"false\" means it does not — either no account ever existed at this username, or the account is currently deactivated (not distinguished); \"unknown\" means the AuthDB read degraded and this could not be determined (never conflated with \"false\")"})j"
+     // audit_persisted deliberately NOT documented here: an audit-persist
+     // failure on this tool always returns a hard JSON-RPC error (fail
+     // closed, #3937/#2466 parity), never a success payload with
+     // audit_persisted:false — unlike ~80 other tools in this file using the
+     // opposite "set-and-proceed" convention. It appears only inside the
+     // error response's own `data` (see the local `a4_error` lambda's
+     // `audit_ok` parameter).
+     R"j(},"required":["assigned","principal_type","principal_id","role","target_provisioned"]})j"},
+
+    {"unassign_rbac_role",
+     "Revoke a FLEET-WIDE RBAC role grant from a human user, immediately removing the "
+     "standing authority it currently grants. Requires the CALLER to hold a durable "
+     "Administrator role. A caller may NOT remove their own Administrator assignment through "
+     "this tool (self-lockout guard); removing the fleet's LAST remaining authenticatable "
+     "Administrator grant is refused even by another admin, by a check in the same "
+     "transaction as the removal. That check does not cover an account created or deactivated "
+     "concurrently, or an Administrator's account deactivated through a separate path, so it "
+     "does not by itself guarantee the fleet keeps one. A grant naming a nonexistent, "
+     "deactivated, soft-deleted, or group-held "
+     "principal is never counted as a surviving Administrator, so a refusal can happen even "
+     "when other Administrator grants nominally exist. "
+     "Idempotent: unassigning a role the principal did not hold still returns success. "
+     "Destructive — verify the target doesn't need this role before calling. Requires "
+     "Security:Write (supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{)j"
+     R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
+     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 6 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
+     R"j(},"required":["principal_id","role"]})j",
+     R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"})j"
+     // audit_persisted deliberately NOT documented here — see
+     // assign_rbac_role's identical schema comment above for why (fail
+     // closed, never a success payload with audit_persisted:false).
+     R"j(},"required":["unassigned","principal_id","role"]})j"},
+
+    // ── A1: RBAC enforcement enable/disable toggle — MCP twin of
+    // PUT /api/v1/rbac/enforcement.
+    {"set_rbac_enforcement",
+     "Switch RBAC enforcement ON or OFF fleet-wide (durable; every replica converges within "
+     "~1s). Requires the CALLER to hold a durable Administrator role (same dedicated gate as "
+     "assign_rbac_role, not a plain permission check). On a real transition, REFUSED unless the "
+     "caller ALSO holds authority under the regime that is durably true RIGHT NOW (enabling "
+     "requires the caller's own local admin role; disabling requires the caller's own fleet-wide "
+     "Administrator grant) AND would REMAIN a durable administrator after the switch: enabling "
+     "requires the caller's own fleet-wide Administrator grant (call assign_rbac_role for "
+     "yourself first); disabling requires the caller's local account to hold the admin role. "
+     "Destructive: enabling immediately denies every operator who lacks a role grant. "
+     "Idempotent: requesting the current state returns changed=false without evaluating either "
+     "check. Requires Security:Write (supervised MCP tier; approval-gated).",
+     R"j({"type":"object","properties":{"enabled":{"type":"boolean","description":"true to enable RBAC enforcement, false to disable it"}},"required":["enabled"]})j",
+     R"j({"type":"object","properties":{"enabled":{"type":"boolean"},"previous_enabled":{"type":"boolean"},"changed":{"type":"boolean"},)j"
+     R"j("post_transition_administrators":{"type":"integer","minimum":0,"description":"after enabling: fleet-wide Administrator grants held by currently-active local accounts; after disabling: active local accounts holding the admin role"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["enabled","previous_enabled","changed","post_transition_administrators"]})j"},
+
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
      "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
@@ -2743,17 +2845,22 @@ static const ToolDef kTools[] = {
      "MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately "
      "gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + "
      "the Reviewer role, NOT AuditLog:Read), not a management-group-confined read — a scoped "
-     "slice would be useless as fleet-wide CC6.2 evidence. Self-audited as "
+     "slice would be useless as fleet-wide CC6.2 evidence. rbac_enforcement "
+     "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
+     "right now — degraded means the read could not confirm state, so gates deny "
+     "defensively, NOT that an admin turned RBAC off. Self-audited as "
      "access_review.exported. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
      "(export_access_review expanded to one row per (principal, role) grant) into a new, "
      "durable campaign for reviewer attestation. A grant created after this call returns is "
      "out of scope for THIS campaign (review it in the next one); a grant revoked afterward "
-     "stays reviewable (frozen, not re-derived from live state). Mirrors POST "
+     "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
+     "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
+     "moment — see get_access_review. Mirrors POST "
      "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
@@ -2786,21 +2893,25 @@ static const ToolDef kTools[] = {
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. Mirrors GET "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
+     "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
      "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Mirrors GET /api/v1/access-reviews. "
+     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
+     "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
      "Self-audited as access_review.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -3318,6 +3429,27 @@ static const ToolDef kTools[] = {
      "Requires SoftwareDeployment:Execute.",
      R"j({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Deployment id from list_software_deployments"}},"required":["id"]})j",
      R"j({"type":"object","properties":{"cancelled":{"const":true},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["cancelled"]})j"},
+
+    // Fleet-wide RBAC role assignment listing — MCP twin of GET
+    // /api/v1/rbac/roles/assignments, reusing the SAME
+    // RbacStore::list_all_principal_roles_checked() bulk read
+    // build_access_review() (access_review_model.cpp) already uses for the
+    // SOC 2 CC6.2 grant-table export. Gated on the SAME dedicated
+    // AccessReview:Read securable that store method was built for (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role above, which
+    // mint/revoke standing authority — a stronger decision than reading the
+    // grant table). Appended at the VERY END of kTools[] per the standing
+    // governance note above (KEK rotation tools) — minimizes rebase conflict
+    // with any concurrent PR inserting tools earlier in this array.
+    {"list_rbac_role_assignments",
+     "List every current RBAC role assignment fleet-wide: every "
+     "(principal_type, principal_id, role_name) grant row on record, across "
+     "all three principal types (user/group/engine), in one bulk read — the "
+     "grant table itself, not a per-roster-member derivation. Read-only. "
+     "Mirrors GET /api/v1/rbac/roles/assignments. Self-audited as "
+     "rbac.assignments.list. Requires AccessReview:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"assignments":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["principal_type","principal_id","role_name"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","assignments"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -3344,6 +3476,10 @@ static const char* const kWriteToolsRaw[] = {
     "transfer_engine_principal_owner", "confirm_engine_rotation",
     // PR 4.2 (design §4.1) — engine-principal role-assignment authoring.
     "assign_engine_role", "unassign_engine_role",
+    // A2 (delivery plan §2) — global human role assignment authoring.
+    "assign_rbac_role", "unassign_rbac_role",
+    // A1 — RBAC enforcement enable/disable toggle.
+    "set_rbac_enforcement",
     // Periodic Access Reviews (SOC 2 CC6.2) — campaign-opening, attestation, and
     // close are mutations (persist a new campaign / a reviewer decision / a
     // lifecycle transition); export/get/list are read-only and deliberately
@@ -3591,14 +3727,21 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // (Gate 2 BLOCKING fix, #2146 Batch B2 review) -- a REAL per-agent
     // confinement mechanism (authz::in_scope narrows candidate inventory
     // records before evaluation), matching its REST twin exactly. Still the
-    // default `denied` ServiceScopeClass, NOT `confined`: fleet_read_fn's
-    // own service-scope branch admits-and-confines a service-scoped caller
-    // rather than hard-denying it the way this tool's 8 non-dispatch
-    // siblings' deny_fleet_wide_service_scoped call does -- since the
-    // created result set is still owner-scoped to the minting token, that
-    // asymmetry is a real cross-service-reach gap, tracked in #4307, not
-    // resolved by this classification. The kToolSecurity OPERATION here is
-    // deliberately "Write", NOT "Read", even though the
+    // default `denied` ServiceScopeClass, NOT `confined` -- and unlike the
+    // REST twin (fixed by #4980), that default was ALREADY the correct,
+    // enforced posture on MCP: `denied` means a service-scoped token never
+    // reaches this tool's handler -- and therefore never reaches
+    // fleet_read_fn_ -- at all, refused outright by the generic C8 gate
+    // before the handler body runs (matching `list_result_sets` above; see
+    // that row's comment). An earlier revision of this comment (#2146 Batch
+    // B2 Gate 4 fold-in) claimed fleet_read_fn's admit-and-confine branch was
+    // reachable by a service-scoped caller here, a real cross-service-reach
+    // gap "tracked in #4307" -- that claim was incorrect for MCP from the
+    // moment it was written (C8's default-deny landed weeks earlier, #2298
+    // PR 3 §3c) and was never actually true; #4980 traced and empirically
+    // disproved it (`test_mcp_server.cpp`'s "MCP C8: ... before fleet_read_fn_
+    // ever runs" case) and fixed the REST-only gap it correctly identified.
+    // The kToolSecurity OPERATION here is deliberately "Write", NOT "Read", even though the
     // real RBAC gate the handler calls is Inventory:Read -- these are two
     // independent things (kToolSecurity's operation feeds tier_allows/
     // requires_approval/readOnlyHint-coherence; the handler's own perm_fn
@@ -3694,6 +3837,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // per-tool about "is this data really safe", so these follow suit).
     {"get_dex_app", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_catalogue", {"GuaranteedState", "Read"}},
     {"get_dex_catalogue_group", {"GuaranteedState", "Read"}},
     {"get_dex_device_history", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_observation", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
@@ -3784,6 +3928,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"assign_engine_role", {"Security", "Write"}},
     {"unassign_engine_role", {"Security", "Write"}},
     {"list_engine_roles", {"EnginePrincipal", "Read"}},
+    // A2 (delivery plan §2) — same op the two REST twins gate the generic
+    // C8 tier/approval check on; the ACTUAL authorization decision is
+    // is_rbac_administrator (rbac_admin_predicate.hpp), run inside the
+    // handler, not this op — see that header for why a fleet-wide role
+    // grant needs a stronger gate than a plain Security:Write check.
+    {"assign_rbac_role", {"Security", "Write"}},
+    {"unassign_rbac_role", {"Security", "Write"}},
+    // A1 — drives the generic C8 tier/approval gate; the actual decision is
+    // is_rbac_administrator, same as the two rows above.
+    {"set_rbac_enforcement", {"Security", "Write"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -3816,6 +3970,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_access_review", {"AccessReview", "Read"}},
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
+    // Fleet-wide RBAC role assignment listing — SAME dedicated
+    // AccessReview:Read securable as the access-review family above (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role, which mint/
+    // revoke standing authority rather than read the grant table).
+    {"list_rbac_role_assignments", {"AccessReview", "Read"}},
     // KEK rotation (#2395 track C) — parity with the REST twins'
     // Security:Write (rotate/rewrap) and Security:Read (status) gates.
     {"rotate_kek", {"Security", "Write"}},
@@ -4382,6 +4541,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
     {"get_dex_app", {ToolEffect::ReadOnly, true, "Get DEX app blast radius"}},
     {"list_dex_apps", {ToolEffect::ReadOnly, true, "List DEX app stability"}},
+    {"get_dex_catalogue", {ToolEffect::ReadOnly, true, "Get DEX signal catalogue"}},
     {"get_dex_catalogue_group", {ToolEffect::ReadOnly, true, "Get DEX catalogue signal family"}},
     {"get_dex_device_history", {ToolEffect::ReadOnly, true, "Get per-device DEX signal history"}},
     {"get_dex_observation", {ToolEffect::ReadOnly, true, "Get DEX single-observation detail"}},
@@ -4421,6 +4581,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
     {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
     {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
+    {"list_rbac_role_assignments",
+     {ToolEffect::ReadOnly, true, "List fleet-wide RBAC role assignments"}},
     {"get_kek_status", {ToolEffect::ReadOnly, true, "Get KEK rotation status"}},
 
     // ── Mutating tools (effect Additive/Destructive) ──────────────────────────
@@ -4519,6 +4681,16 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
     {"unassign_engine_role",
      {ToolEffect::Destructive, true, "Revoke fleet-wide role from engine principal"}},
+    // assign/unassign_rbac_role: same INSERT-OR-IGNORE (additive) vs DELETE
+    // (destructive) shape as assign/unassign_engine_role above, for a human
+    // principal instead of an engine one.
+    {"assign_rbac_role", {ToolEffect::Additive, true, "Assign fleet-wide RBAC role to user"}},
+    {"unassign_rbac_role",
+     {ToolEffect::Destructive, true, "Revoke fleet-wide RBAC role from user"}},
+    // A1 — Destructive (enabling immediately denies every operator who
+    // lacks a role grant); idempotent (requesting the current state is a
+    // no-op, changed=false).
+    {"set_rbac_enforcement", {ToolEffect::Destructive, true, "Set RBAC enforcement"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
     // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
@@ -8275,6 +8447,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 q.name_filter = param_str(args, "name");
                 const auto limit_opt = param_int_strict(args, "limit", q.limit);
                 if (!limit_opt) {
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams, "limit must be a JSON integer"),
                         "application/json");
@@ -8292,7 +8465,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("list_product_packs",
                                                             packs_result.error()),
-                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
+                                {}, /*retry_after_ms=*/transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -8336,7 +8509,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                 product_pack_client_message("get_product_pack",
                                                             pack_result.error()),
-                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
+                                {}, /*retry_after_ms=*/transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -11293,38 +11466,103 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Narrow the candidate set to the caller's admitted scope
-                // BEFORE the preview builder runs — the unfiltered snapshot
-                // (get_agents()) is the SAME source list_agents' own agents_fn
-                // and GET /api/v1/devices use; gate.scope is the sole filter,
-                // mirroring GET /api/v1/devices' own in_scope-filter-then-render.
-                const auto& all_agents = get_agents();
-                nlohmann::json visible_agents = nlohmann::json::array();
-                for (const auto& a : all_agents) {
-                    if (authz::in_scope(gate.scope, a.value("agent_id", "")))
-                        visible_agents.push_back(a);
+                // Checked AFTER the cheap input-shape validation above
+                // (mirrors GET /api/v1/events' own ordering — a malformed
+                // request is rejected before any backend-unavailable check).
+                if (!scope_evaluate_fn_) {
+                    spdlog::error("preview_scope_targets: scope_evaluate_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
                 }
-                // #2146 Batch B2: delegates to the shared preview_scope_targets()
-                // builder (scope_preview.hpp) so this tool and its new REST v1
+                // #4981 PR-2: delegates to the shared preview_scope_targets()
+                // builder (scope_preview.hpp) so this tool and its REST v1
                 // twin (POST /api/v1/scope/preview) cannot silently diverge in
-                // which agents match (api-twin-recipe.md Rule 1).
-                auto outcome =
-                    yuzu::server::preview_scope_targets(expression, visible_agents, tag_store);
+                // which agents match (api-twin-recipe.md Rule 1). Runs the
+                // SAME evaluation ladder a real dispatch uses (owner-check
+                // gate included) — gate.scope is applied AFTER the ladder's
+                // unfiltered fleet-wide evaluation, mirroring
+                // GET /api/v1/devices' own in_scope-filter-then-render.
+                auto outcome = yuzu::server::preview_scope_targets(
+                    expression, session->username, gate.scope, result_set_store_,
+                    scope_evaluate_fn_);
                 switch (outcome.kind) {
                 case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
                     res.set_content(error_response(id, kInvalidParams, outcome.detail),
                                     "application/json");
                     return;
-                case yuzu::server::ScopePreviewOutcome::Kind::kTagStoreDegraded:
-                    // Target = the expression being previewed — every sibling
-                    // failure audit here carries a target (governance cons-F2).
+                case yuzu::server::ScopePreviewOutcome::Kind::kEvaluationAborted: {
+                    if (outcome.detail == "owner_check_failed") {
+                        // Existence-oracle-safe, mirrors rs_load_owned's own
+                        // 404 body: a non-owner is indistinguishable from an
+                        // absent set. One row PER failing ref — a compound
+                        // expression can name more than one.
+                        for (const auto& ref : outcome.failing_refs)
+                            (void)audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
+                                           "not found or not owned");
+                        mcp_audit("failure", expression);
+                        // #4981 fix-round finding: was a bare error_response(...) with
+                        // no `data` object at all -- no correlation_id, no
+                        // retry_after_ms (not even null). Routed through the same
+                        // a4_error lambda the sibling db_degraded/principal_unresolved
+                        // arm below uses, so this permanent (non-retryable — the
+                        // referenced set doesn't exist or isn't owned by this
+                        // caller) failure carries a full A4 envelope too, per
+                        // agentic-first-principle.md A4.
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "RESULT_SET_NOT_FOUND: result set not found"),
+                            "application/json");
+                        return;
+                    }
+                    // db_degraded / principal_unresolved / presence_degraded /
+                    // unresolvable — never silently rendered as "0 matches"
+                    // (that would under-report the scope's real blast
+                    // radius). Target = the expression being previewed —
+                    // every sibling failure audit here carries a target
+                    // (governance cons-F2).
+                    //
+                    // #4981 adversarial-review finding 4: `principal_unresolved`
+                    // (no dispatching principal) and `unresolvable` (a
+                    // required store not wired — a configuration error) are
+                    // PERMANENT per scope_eval_error.hpp's own doc comments on
+                    // those two Kind values — a retry cannot fix either, so
+                    // they must NOT carry the same `retry_after_ms` hint as a
+                    // genuine transient degrade (`db_degraded`/
+                    // `presence_degraded`). Matches REST's identical split on
+                    // this same route and `approval_store_read_error_body`'s
+                    // (mcp_approval_error.hpp) precedent for
+                    // `list_pending_approvals`: the permanent arm omits
+                    // `retry_after_ms` entirely so `a4_error`'s default (-1 ->
+                    // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
-                    res.set_content(
-                        a4_error(kInternalError, "Tag store unavailable",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
+                    // #4981 fix-round finding: was a raw string comparison against
+                    // outcome.detail, which cannot warn if a future 6th
+                    // ScopeEvalError::Kind value lands unclassified. Routed
+                    // through the shared, exhaustive scope_abort_is_permanent()
+                    // classifier (scope_eval_error.hpp) instead — see that
+                    // function's doc comment for why OwnerCheckFailed never
+                    // actually reaches here (handled above).
+                    const bool permanent = outcome.abort_kind &&
+                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
+                    if (permanent) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "this is a permanent condition and will NOT clear on "
+                                     "retry; escalate to an operator"),
+                            "application/json");
+                    } else {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "scope evaluation unavailable: " + outcome.detail,
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    }
                     return;
+                }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
                     mcp_audit("success", expression);
                     res.set_content(
@@ -14523,9 +14761,8 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // Routed through the DexApi seam (ADR-0031 WS-A4) — the four raw
                 // reads the REST twin also bundles, same obs_type/window/os/limit.
-                const auto detail =
-                    dex_api_->signal_detail(obs_type, param_str(args, "window", "7d"),
-                                            param_str(args, "os", ""), limit);
+                const auto detail = dex_api_->signal_detail(
+                    obs_type, param_str(args, "window", "7d"), param_str(args, "os", ""), limit);
                 JArr subjects;
                 for (const auto& s : detail.subjects) {
                     subjects.add(JObj()
@@ -14758,17 +14995,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the affected-devices
-                // list to the caller's management-group scope (ADR-0017 World
-                // A) -- deny_fleet_wide_service_scoped above closes the
-                // service-scoped-token axis only; this is the independent
-                // confined-OPERATOR axis the REST twin now also applies (see
-                // rest_api_v1.cpp's GET /dex/app handler).
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
-                // Fail-closed success audit (matches REST twin's posture --
-                // see rest_api_v1.cpp's route comment above GET /dex/app).
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::app`
+                // no longer takes a `visible` parameter at all — the
+                // per-caller resolver this used to thread through
+                // (`dex_visible_fn_`) was retired permanently (see
+                // dex_api.hpp's own doc comment), so every admitted caller
+                // gets the same unfiltered device list.
+                const auto model = dex_api_->app(name, window);
+                // Set-and-proceed success audit (MCP's posture, NOT the REST
+                // twin's fail-closed one -- see rest_api_v1.cpp's route
+                // comment above GET /dex/app): a dropped audit row surfaces
+                // as `audit_persisted:false` in the JSON result below rather
+                // than refusing the response.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.app.view", "success", "GuaranteedState", "",
                     "DEX app affected-devices read via MCP get_dex_app");
@@ -14811,6 +15049,57 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            if (tool_name == "get_dex_catalogue") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!dex_api_) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string os = param_str(args, "os", "all");
+                if (os != "all" && os != "windows" && os != "linux" && os != "macos") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid os (expected all|windows|linux|macos)"),
+                        "application/json");
+                    return;
+                }
+                const auto model = dex_api_->catalogue(os, window);
+                // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet
+                // signal-summary read must never render as a healthy,
+                // zero-event catalogue -- an error, matching the REST
+                // twin's 503 and get_dex_device_score's degrade branch.
+                if (model.degraded) {
+                    mcp_audit("failure", "DEX signal-summary store read degraded");
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_catalogue_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             if (tool_name == "get_dex_catalogue_group") {
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
@@ -14843,6 +15132,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string os = param_str(args, "os", "all");
                 auto model = dex_api_->catalogue_group(name, os, window);
                 if (!model) {
+                    // retry-hint-exempt: unknown signal family name, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams, "no such signal family: " + name),
                         "application/json");
@@ -14949,6 +15239,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the scope gate already allowed.
                 auto obs = dex_api_->observation(agent_id, event_id);
                 if (!obs) {
+                    // retry-hint-exempt: oracle-closed by design (not-found and a
+                    // foreign/guessed event_id share this same body) — the dex_api_
+                    // null check above already handles genuine store unavailability
                     res.set_content(error_response(id, kInvalidParams, "observation not found"),
                                     "application/json");
                     return;
@@ -15060,14 +15353,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the top-devices list
-                // to the caller's management-group scope (ADR-0017 World A) --
-                // same independent second belt as get_dex_app above.
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
-                // Fail-closed success audit (matches REST twin's posture --
-                // see rest_api_v1.cpp's route comment above GET /dex/overview).
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::
+                // overview` no longer takes a `visible` parameter at all —
+                // see get_dex_app's comment above for why. Every admitted
+                // caller gets the same unfiltered top-devices list.
+                const auto model = dex_api_->overview(window);
+                // Set-and-proceed success audit (MCP's posture, NOT the REST
+                // twin's fail-closed one -- see rest_api_v1.cpp's route
+                // comment above GET /dex/overview): a dropped audit row
+                // surfaces as `audit_persisted:false` in the JSON result
+                // below rather than refusing the response.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.overview.view", "success", "GuaranteedState", "",
                     "DEX overview top-devices read via MCP get_dex_overview");
@@ -15173,6 +15468,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("reporting_windows", now.reporting_windows)
                                   .add("reporting_linux", now.reporting_linux)
                                   .add("reporting_macos", now.reporting_macos)
+                                  // OS-aware denominator (#1845), trailing.
+                                  .add("perf_capable_online", now.perf_capable_online)
                                   .str();
                 } else if (tool_name == "get_dex_perf_cohorts") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);
@@ -19124,9 +19421,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     crl_ok = publish_crl_fn().has_value();
                 audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
                                     "Security", serial,
-                                    crl_ok ? ""
-                                           : "CRL build/record failed after revocation; CRL may "
-                                             "be stale") &&
+                                    crl_ok ? "reason=revoke"
+                                           : "reason=revoke CRL build/record failed after "
+                                             "revocation; CRL may be stale") &&
                            audit_ok;
                 nlohmann::json payload_j = {{"revoked", true},
                                             {"serial_hex", serial},
@@ -19227,10 +19524,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     const int rpc_code =
                         (no_root || bad_csr || weak_key || bad_validity) ? kInvalidParams
                                                                           : kInternalError;
+                    const bool retryable = rpc_code == kInternalError;
                     res.set_content(
-                        error_response(id, rpc_code, msg,
-                                       audit_ok ? std::string_view{}
-                                                : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(rpc_code, msg, retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 audit_ok),
                         "application/json");
                     return;
                 }
@@ -19695,6 +19993,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto key = param_str(args, "key");
                 auto pk = plugin_config::parse_plugin_key(plugin, key);
                 if (!pk) {
+                    // retry-hint-exempt: invalid plugin/key format, not a store fault
                     res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
                                     "application/json");
                     return;
@@ -19818,6 +20117,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto key = param_str(args, "key");
                 auto pk = plugin_config::parse_plugin_key(plugin, key);
                 if (!pk) {
+                    // retry-hint-exempt: invalid plugin/key format, not a store fault
                     res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
                                     "application/json");
                     return;
@@ -20009,7 +20309,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                                  ? std::string_view("retry once the server reports "
                                                                     "ready")
                                                  : std::string_view{},
-                                             retryable ? mcp::kMcpStoreFaultShortRetryMs : -1),
+                                             /*retry_after_ms=*/retryable
+                                                 ? mcp::kMcpStoreFaultShortRetryMs
+                                                 : -1),
                                     "application/json");
                     return;
                 }
@@ -21215,7 +21517,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     result = "failure";
                     break;
                 }
-                const bool audit_ok =
+                bool audit_ok =
                     audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
                 if (!ok) {
                     // StoreError is a genuine server-side persistence fault (matches
@@ -21238,6 +21540,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Re-publish the CRL so it's signed under the new issuing cert's
                 // identity - same follow-up REST performs after a successful import.
                 const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+                // #4829: was previously unaudited - the MCP twin of the REST/dashboard
+                // import-chain handlers' own ca.crl.published addition.
+                audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                    "Security", "root",
+                                    crl_ok ? "reason=import_chain"
+                                           : "reason=import_chain CRL build/record failed after "
+                                             "import; public CRL may be stale under the new "
+                                             "issuer") &&
+                           audit_ok;
                 nlohmann::json payload_j = {
                     {"imported", true}, {"mode", "subordinate"}, {"crl_republished", crl_ok}};
                 if (!audit_ok)
@@ -21780,6 +22091,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "engine_principal.role.assigned", "denied",
                                    "EnginePrincipal", principal_id,
                                    role_name + ": " + result.error());
+                    // retry-hint-exempt: business-rule rejection (validate_assignment), not a store fault
                     res.set_content(error_response(id, kInvalidParams, kUniformReject),
                                     "application/json");
                     return;
@@ -21849,13 +22161,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
-                    res.set_content(error_response(id, kInternalError, result.error()),
+                    res.set_content(a4_error(kInternalError, result.error(), {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
+                // removed=<bool> (governance SHOULD #10, matching the
+                // human-route convention) lets an auditor tell an actual
+                // revoke apart from an idempotent no-op from the log alone
+                // (Doomgoose external review, PR #4985 MINOR "audit-fidelity
+                // asymmetry").
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
-                    principal_id, role_name);
+                    principal_id, role_name + "; removed=" + (*result ? "true" : "false"));
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The grant was removed but its audit row did not
@@ -21872,6 +22190,668 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 nlohmann::json payload = {
                     {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── A2: global human role assignment/unassignment (delivery
+            // plan §2) — MCP twins of POST/DELETE
+            // /api/v1/rbac/roles/{name}/assignments. See that route's own
+            // comment in rest_api_v1.cpp for the full rule. Gated on
+            // is_rbac_administrator (rbac_admin_predicate.hpp), NOT perm_fn
+            // — minting/revoking standing Administrator authority is a
+            // stronger security decision than an ordinary Security:Write
+            // permission check. The kToolSecurityRows {"Security","Write"}
+            // entry for both tools still drives the generic C8 tier/approval
+            // gate (supervised tier, approval-gated) — this predicate is the
+            // actual authorization decision, run in addition.
+
+            if (tool_name == "assign_rbac_role") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp).
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            // Doomgoose external review, PR #4985 IMPORTANT
+                            // #2: a kUnavailable gate outcome was previously
+                            // invisible to operators — log AND audit it,
+                            // matching every sibling degraded-store denial in
+                            // this codebase (e.g.
+                            // AuthRoutes::require_permission's engine
+                            // branch).
+                            spdlog::warn("rbac.role.assigned: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                           session->username,
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                           session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
+                    return;
+                // Gate 8 HIGH (security-guardian): is_rbac_administrator's
+                // branch selection is driven by a replica-local cached
+                // rbac_enabled_ view that can lag a real commit — the SAME
+                // cross-replica cache-staleness gap set_rbac_enforcement's own
+                // source-regime check closes for the toggle
+                // (rbac_admin_predicate.hpp). Unlike the toggle's transient
+                // window, a grant minted here persists indefinitely once
+                // written, so the caller must be re-verified against the
+                // FRESH durable regime before this mutates principal_roles.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: this outcome was invisible
+                        // to operators — log AND audit it, matching the FIRST
+                        // check's own kUnavailable treatment above (Doomgoose
+                        // PR #4985 IMPORTANT #2) with a DISTINCT reason string
+                        // so the two checks are individually diagnosable from
+                        // the audit log.
+                        spdlog::warn("rbac.role.assigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.assigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable — cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, "rbac.role.assigned", "denied", "User", session->username,
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                // Empty mcp_tier guard (adversarial-review PR1/A2 round-2 finding,
+                // #4309 gap class): an empty tier makes tier_allows()/requires_approval()
+                // both no-op (tier_allows("") == true, requires_approval("") == false),
+                // so a durable-admin cookie session or an untiered API token would
+                // otherwise reach this mutation with NEITHER REST's MFA step-up (no MCP
+                // tool calls it) NOR the supervised-tier approval ticket
+                // (requires_approval() itself no-ops on an empty tier) — minting
+                // standing Administrator authority with neither control. Same fix
+                // shape as delete_guardian_rule/create_api_token/revoke_api_token/
+                // unlock_account/rotate_api_token/confirm_api_token_rotation (#4309).
+                if (session->mcp_tier.empty()) {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", session->username,
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "assign_rbac_role requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "POST /api/v1/rbac/roles/{name}/assignments instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
+
+                auto principal_type = param_str(args, "principal_type");
+                auto principal_id = param_str(args, "principal_id");
+                auto role_name = param_str(args, "role");
+                if (principal_id.empty() || role_name.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "principal_id and role are required"),
+                        "application/json");
+                    return;
+                }
+                // Governance BLOCKING #2 (audit-log-injection, CWE-117):
+                // every audit call below uses `audit_target_id`, never raw
+                // `principal_id`, as its target_id — matches this file's
+                // established `audit_token`/`log_token` convention
+                // (web_utils.hpp).
+                const std::string audit_target_id = audit_token(principal_id);
+                // Strict username charset — validated BEFORE the
+                // principal_type check below and BEFORE any other audit
+                // call (governance BLOCKING #2's "ordering bug") — matches
+                // the REST route's own reasoning (nothing accepted here is
+                // unreachable via the DELETE twin's URL-path-captured
+                // principal_id).
+                if (!is_valid_username(principal_id)) {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   "invalid principal_id format");
+                    res.set_content(error_response(id, kInvalidParams, "invalid principal_id format"),
+                                    "application/json");
+                    return;
+                }
+                // A2 scope: principal_type=="user" ONLY — see the REST
+                // route's own comment (rest_api_v1.cpp) for why group-scoped
+                // assignment is deferred. principal_type is free-text JSON
+                // (never charset-validated, only equality-checked), so it
+                // is ALSO neutralized before embedding.
+                if (principal_type != "user") {
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   "principal_type '" + audit_token(principal_type) +
+                                       "' not supported (user only)");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "principal_type must be \"user\" (group-scoped assignment "
+                                       "is not supported yet)"),
+                        "application/json");
+                    return;
+                }
+
+                // Uniform rejection (M1): ITServiceOwner and an unknown role
+                // both return the SAME client-facing message.
+                const std::string kUniformReject =
+                    "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
+                // Closed six-name allow-list (rbac_assignable_roles.hpp) —
+                // see the REST route's own comment for the full reasoning
+                // (adversarial-review PR1/A2 finding). Covers BOTH the
+                // ITServiceOwner named exclusion (delivery plan §2) AND a
+                // genuinely unknown/custom role name, uniformly.
+                if (!is_rbac_assignable_role(role_name)) {
+                    const std::string reason =
+                        rbac_role_rejection_reason(role_name, audit_token(role_name));
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   reason);
+                    res.set_content(error_response(id, kInvalidParams, kUniformReject),
+                                    "application/json");
+                    return;
+                }
+                // Defense-in-depth — see the REST route's own comment.
+                if (!rbac_store->get_role(role_name)) {
+                    // Doomgoose external review, PR #4985 IMPORTANT finding
+                    // #3: reclassified from kInvalidParams to kInternalError
+                    // (503-analog, retryable) — role_name has ALREADY passed
+                    // the closed six-name allow-list above, so the caller's
+                    // input was never wrong; a missing row here is a
+                    // store-integrity fault, matching the REST route's own
+                    // fix.
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   role_name + ": assignable role name missing from store "
+                                                "(internal inconsistency)");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "role store integrity fault — an allow-listed role name is "
+                                 "missing from the store; escalate to an operator",
+                                 "escalate to an operator",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+
+                // Pre-provisioning IS allowed — see the REST route's own
+                // comment. Recorded either way via target_provisioned.
+                // Three-state ("true"/"false"/"unknown" — governance SHOULD
+                // #4): see rbac_admin_predicate.hpp's target_provisioned_state.
+                const std::string_view target_provisioned =
+                    target_provisioned_state(auth_db, principal_id);
+
+                PrincipalRole assignment;
+                assignment.principal_type = "user";
+                assignment.principal_id = principal_id;
+                assignment.role_name = role_name;
+                auto result = rbac_store->assign_role(assignment);
+                if (!result) {
+                    // Doomgoose external review, PR #4985 IMPORTANT finding
+                    // #3: this used to map EVERY assign_role failure to
+                    // kInvalidParams unconditionally — a genuine store fault
+                    // was misreported as a permanent client rejection
+                    // instead of the retryable kInternalError it actually
+                    // is. Classify via the shared, ALLOWLIST-based
+                    // chokepoint (rbac_store.hpp) — matches the REST route's
+                    // own fix.
+                    (void)audit_fn(req, "rbac.role.assigned", "denied", "User", audit_target_id,
+                                   role_name + ": " + result.error());
+                    if (rbac_assign_error_is_client_fault(result.error())) {
+                        // retry-hint-exempt: validate_assignment's
+                        // business-rule rejection (malformed/reserved-
+                        // namespace principal_id), not a store fault.
+                        res.set_content(error_response(id, kInvalidParams, kUniformReject),
+                                        "application/json");
+                    } else {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "role assignment store fault — retry; if this persists, "
+                                     "escalate to an operator",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    }
+                    return;
+                }
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "rbac.role.assigned", "success", "User", audit_target_id,
+                    role_name + "; target_provisioned=" + std::string(target_provisioned));
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466). The grant
+                    // committed but its audit row did not persist —
+                    // reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role assignment took effect but its audit record could not "
+                                 "be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json payload = {{"assigned", true},
+                                          {"principal_type", "user"},
+                                          {"principal_id", principal_id},
+                                          {"role", role_name},
+                                          {"target_provisioned", std::string(target_provisioned)}};
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "unassign_rbac_role") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp).
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            // Doomgoose external review, PR #4985 IMPORTANT
+                            // #2: a kUnavailable gate outcome was previously
+                            // invisible to operators — log AND audit it,
+                            // matching every sibling degraded-store denial in
+                            // this codebase (e.g.
+                            // AuthRoutes::require_permission's engine
+                            // branch).
+                            spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                           session->username,
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                           session->username, std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
+                    return;
+                // Gate 8 HIGH (security-guardian): see assign_rbac_role's
+                // identical block above for the full reasoning — a caller
+                // admitted under a STALE regime read of is_rbac_administrator
+                // must be re-verified against the FRESH durable regime before
+                // this mutates principal_roles.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        // Governance re-verification: see the identical fix on
+                        // assign_rbac_role above for the full reasoning.
+                        spdlog::warn("rbac.role.unassigned: {} (user={})",
+                                     kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                        (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                       session->username,
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable — cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, "rbac.role.unassigned", "denied", "User", session->username,
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                // Empty mcp_tier guard — see assign_rbac_role's identical guard
+                // above for the full reasoning (adversarial-review PR1/A2 round-2
+                // finding, #4309 gap class).
+                if (session->mcp_tier.empty()) {
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                   session->username,
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "unassign_rbac_role requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id} "
+                                 "instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
+
+                auto principal_id = param_str(args, "principal_id");
+                auto role_name = param_str(args, "role");
+                if (principal_id.empty() || role_name.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "principal_id and role are required"),
+                        "application/json");
+                    return;
+                }
+                if (!is_valid_username(principal_id)) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid principal_id format"),
+                                    "application/json");
+                    return;
+                }
+                // Governance BLOCKING #2 (audit-log-injection, CWE-117):
+                // principal_id is charset-safe past is_valid_username above,
+                // but role_name is DELIBERATELY unrestricted here (schema:
+                // maxLength:64 only, no enum/charset — unlike
+                // assign_rbac_role's closed enum) so this tool can still
+                // clean up an out-of-band grant (a custom role, or
+                // ITServiceOwner, assigned by direct SQL — see this tool's
+                // own schema comment). That means role_name can reach a
+                // SUCCESSFUL Administrator-revoke audit row completely raw
+                // unless neutralized here. Matches this file's established
+                // `audit_token`/`log_token` convention (web_utils.hpp).
+                const std::string audit_target_id = audit_token(principal_id);
+                const std::string audit_role = audit_token(role_name);
+
+                // Self-target guard (#397/#403 — third call site; shared via
+                // rbac_admin_predicate.hpp's is_self_target). Scoped to
+                // role_name=="Administrator" ONLY — see the REST route's own
+                // comment for why.
+                if (role_name == "Administrator" && is_self_target(*session, principal_id)) {
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
+                                   "self_admin_unassign_blocked");
+                    res.set_content(
+                        error_response(id, kPermissionDenied,
+                                       "cannot remove your own Administrator role assignment"),
+                        "application/json");
+                    return;
+                }
+
+                // Idempotent DELETE. A !result here is either a genuine
+                // runtime query failure (retryable) or the store-layer A2
+                // last-Administrator guard refusing to leave the fleet with
+                // zero administrators (a business-rule conflict, not a store
+                // fault) — is_rbac_last_admin_refusal distinguishes them so
+                // only the genuine fault carries a retry hint.
+                auto result = rbac_store->unassign_role("user", principal_id, role_name);
+                if (!result) {
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
+                                   result.error());
+                    if (is_rbac_last_admin_refusal(result.error())) {
+                        // retry-hint-exempt: business-rule outcome (last
+                        // remaining Administrator), not a store fault.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                                         {{"transport", "mcp"}})
+                                .increment();
+                        res.set_content(error_response(id, kInvalidParams, result.error()),
+                                        "application/json");
+                        return;
+                    }
+                    // A store fault returns a constant client message; the raw text
+                    // goes only to the audit row above.
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "role unassignment store fault; retry, and if this persists "
+                                 "escalate to an operator",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // removed=<bool> (governance SHOULD #10) lets an auditor
+                // tell an actual revoke apart from an idempotent no-op from
+                // the log alone.
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
+                    audit_role + "; removed=" + (*result ? "true" : "false"));
+                if (!audit_ok) {
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role was unassigned but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json payload = {
+                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_rbac_enforcement") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
+                // Doomgoose external review, PR #4985 MINOR "duplicated
+                // gate-denial classification" — shared chokepoint, see its
+                // own doc comment (rbac_admin_predicate.hpp); matches
+                // assign_rbac_role's/unassign_rbac_role's identical usage
+                // above.
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            spdlog::warn("rbac.enforcement_changed: {} (user={})",
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                           "rbac_enabled",
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
+                            // retry-hint-exempt: N/A — a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                           "rbac_enabled",
+                                           std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
+                    return;
+                // Empty mcp_tier guard — see assign_rbac_role's/unassign_rbac_role's
+                // identical guard above for the full reasoning
+                // (adversarial-review PR1/A2 round-2 finding, #4309 gap class).
+                if (session->mcp_tier.empty()) {
+                    (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                   "rbac_enabled",
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "set_rbac_enforcement requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; use "
+                                 "PUT /api/v1/rbac/enforcement instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
+
+                if (!args.contains("enabled") || !args["enabled"].is_boolean()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "enabled is required and must be a boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool enabled = args["enabled"].get<bool>();
+
+                auto result = rbac_store->set_rbac_enforcement(enabled, session->username);
+                if (!result) {
+                    const auto err_kind = result.error().kind;
+                    const bool survivor_refused =
+                        err_kind == RbacEnforcementError::Kind::kCallerNotSurvivor;
+                    // Gate 7 Fix 1: a plain authority failure under the regime
+                    // that is durably true right now — distinct from
+                    // survivor_refused's post-transition survival conflict.
+                    const bool regime_refused =
+                        err_kind ==
+                        RbacEnforcementError::Kind::kCallerNotAuthorizedUnderCurrentRegime;
+                    const bool refused = survivor_refused || regime_refused;
+                    (void)audit_fn(req, "rbac.enforcement_changed", "denied", "Setting",
+                                   "rbac_enabled",
+                                   refused ? "guard: " + result.error().message
+                                           : result.error().message);
+                    if (refused) {
+                        // retry-hint-exempt: business-rule refusal (caller would
+                        // not survive the transition, or lacks authority under
+                        // the current regime), not a store fault.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                         {{"transport", "mcp"}, {"result", "refused"}})
+                                .increment();
+                        // Gate 7 Fix 5: route through the same A4-shaped a4_error
+                        // lambda the tier/permission denials above use (correlation
+                        // id + retry_after_ms + remediation), rather than a bare
+                        // error_response with no error.data. Remediation mirrors
+                        // the REST route's equivalent text (rest_api_v1.cpp) for
+                        // the SAME two directions — survivor_refused names the
+                        // DESTINATION-regime fix (matching `enabled`); regime_refused
+                        // names the SOURCE-regime fix (the opposite direction).
+                        const std::string_view administrator_grant_remediation =
+                            "POST /api/v1/rbac/roles/Administrator/assignments "
+                            "{\"principal_type\":\"user\",\"principal_id\":\"<your "
+                            "username>\"} (or MCP assign_rbac_role), then retry";
+                        const std::string_view local_admin_role_remediation =
+                            "only a local account holding the admin role satisfies this check; "
+                            "sign in as one, or have one set your local role via POST "
+                            "/api/settings/users/{username}/role, then retry";
+                        const std::string_view remediation =
+                            survivor_refused
+                                ? (enabled ? administrator_grant_remediation
+                                          : local_admin_role_remediation)
+                                : (enabled ? local_admin_role_remediation
+                                          : administrator_grant_remediation);
+                        res.set_content(
+                            a4_error(survivor_refused ? kInvalidParams : kPermissionDenied,
+                                     result.error().message, remediation),
+                            "application/json");
+                        return;
+                    }
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                     {{"transport", "mcp"}, {"result", "failed"}})
+                            .increment();
+                    // Gate 7 Fix 6: a fixed, generic client-facing message —
+                    // never the raw store error (can carry PQerrorMessage detail:
+                    // schema/table names, lock detail). The raw message is still
+                    // audited above (server-side only), matching REST's posture.
+                    res.set_content(
+                        a4_error(kInternalError, "RBAC store write failed; retry shortly",
+                                 "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const std::string audit_detail =
+                    "enabled=" + std::string(result->enabled ? "true" : "false") +
+                    "; previous=" + std::string(result->previous_enabled ? "true" : "false") +
+                    "; changed=" + std::string(result->changed ? "true" : "false") +
+                    "; post_transition_administrators=" +
+                    std::to_string(result->post_transition_administrators);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "rbac.enforcement_changed", "success", "Setting",
+                    "rbac_enabled", audit_detail);
+                if (!audit_ok) {
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the enforcement change took effect but its audit record could "
+                                 "not be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", "mcp"},
+                                  {"result", result->changed ? "applied" : "unchanged"}})
+                        .increment();
+                nlohmann::json payload = {{"enabled", result->enabled},
+                                          {"previous_enabled", result->previous_enabled},
+                                          {"changed", result->changed},
+                                          {"post_transition_administrators",
+                                           result->post_transition_administrators}};
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -22029,10 +23009,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok = audit_fn(req, "engine_principal.create", "failure",
                                                           "EnginePrincipal", principal_id,
                                                           created.error());
+                    const int code = mcp_error_for_store_msg(created.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(created.error()), created.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, created.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -22377,10 +23360,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.mint", "failure", "EnginePrincipal",
                                 principal_id, minted.error());
+                    const int code = mcp_error_for_store_msg(minted.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(minted.error()), minted.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, minted.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -22457,6 +23443,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // 30.0, or "30"). REST 400s this; so does the tool's own
                     // declared integer schema. Silently defaulting to 7 gave
                     // the caller a window they did not ask for.
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "overlap_days must be a JSON integer (days)"),
@@ -22494,10 +23481,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.rotate", "failure",
                                 "EnginePrincipal", principal_id, rotated.error());
+                    const int code = mcp_error_for_store_msg(rotated.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(rotated.error()), rotated.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, rotated.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
@@ -22753,6 +23743,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // 30.0, or "30"). REST 400s this; so does the tool's own
                     // declared integer schema. Silently defaulting to 7 gave
                     // the caller a window they did not ask for.
+                    // retry-hint-exempt: input-parse failure, not a store fault
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "overlap_days must be a JSON integer (days)"),
@@ -22814,10 +23805,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) {
                     const bool denied_audit_ok = audit_fn(req, "api_token.rotate", "failure",
                                                           "ApiToken", token_id, result.error());
+                    const int code = mcp_error_for_store_msg(result.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(result.error()), result.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, result.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     mcp_audit("failure", result.error());
                     return;
@@ -23057,11 +24051,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                     const bool denied_audit_ok = audit_fn(req, "api_token.confirm", "failure",
                                                           "ApiToken", token_id, confirmed.error());
+                    const int code = mcp_error_for_store_msg(confirmed.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
-                                       confirmed.error(),
-                                       denied_audit_ok ? std::string_view{}
-                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, confirmed.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     mcp_audit("failure", confirmed.error());
                     return;
@@ -23710,6 +24706,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& rows = *rows_res;
+                // A3 (RBAC delivery plan) — see the REST twin's identical comment.
+                const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
                 JArr arr;
                 for (const auto& r : rows) {
                     JArr roles;
@@ -23734,9 +24732,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // body instead, never silently swallowed.
                 const bool audit_ok = audit_fn(req, "access_review.exported", "success",
                                                "AccessReview", "",
-                                               "rows=" + std::to_string(rows.size()));
+                                               "rows=" + std::to_string(rows.size()) +
+                                                   " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
-                payload.add("count", static_cast<int64_t>(rows.size())).raw("rows", arr.str());
+                payload.add("count", static_cast<int64_t>(rows.size()))
+                    .raw("rows", arr.str())
+                    .add("rbac_enforcement", rbac_enforcement);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success");
@@ -23780,6 +24781,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // A3 (RBAC delivery plan): the enforcement state stamped onto this
+                // campaign row at freeze time — computed from the same RbacStore
+                // instance, read immediately after the grant population above (a
+                // separate, later call, not the same read; it can trigger its own
+                // maybe_refresh_generation() round-trip), never re-derived on a
+                // later read (matches every other frozen field). Equivalent to
+                // the REST twin's comment, not byte-identical.
+                const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
+
                 // Expand each row to one GrantRef per (principal, role) — the shape
                 // access_review_store.hpp's open_campaign requires — carrying an
                 // opaque JSON snapshot of the row's non-role fields as observed right
@@ -23800,24 +24810,27 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& role : r.roles)
                         frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
                 }
-                auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+                auto open_res = access_review_store->open_campaign(title, session->username, frozen,
+                                                                    rbac_enforcement);
                 if (!open_res) {
                     const bool denied_audit_ok =
                         audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview", "",
                                 open_res.error());
                     mcp_audit("failure", open_res.error());
+                    const int code = mcp_error_for_access_review_msg(open_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(open_res.error()),
-                                       open_res.error(),
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, open_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }
                 const bool audit_ok =
                     audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                            *open_res, "grants=" + std::to_string(frozen.size()));
+                            *open_res, "grants=" + std::to_string(frozen.size()) +
+                                           " rbac_enforcement=" + rbac_enforcement);
                 JObj payload;
                 payload.add("campaign_id", *open_res)
                     .add("grant_count", static_cast<int64_t>(frozen.size()));
@@ -23937,9 +24950,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto view_res = access_review_store->get_campaign(campaign_id);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
+                    const int code = mcp_error_for_access_review_msg(view_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(view_res.error()),
-                                       view_res.error()),
+                        a4_error(code, view_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -23951,7 +24967,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("created_by", view.campaign.created_by)
                     .add("created_at_ms", view.campaign.created_at_ms)
                     .add("closed_by", view.campaign.closed_by)
-                    .add("closed_at_ms", view.campaign.closed_at_ms);
+                    .add("closed_at_ms", view.campaign.closed_at_ms)
+                    .add("rbac_enforcement", view.campaign.rbac_enforcement);
                 JArr attestations;
                 for (const auto& a : view.attestations) {
                     // grant_snapshot is raw-embedded, not escaped: this store's only
@@ -24017,12 +25034,61 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("created_by", c.created_by)
                                 .add("created_at_ms", c.created_at_ms)
                                 .add("closed_by", c.closed_by)
-                                .add("closed_at_ms", c.closed_at_ms));
+                                .add("closed_at_ms", c.closed_at_ms)
+                                .add("rbac_enforcement", c.rbac_enforcement));
                 }
                 const bool audit_ok = audit_fn(req, "access_review.list", "success", "AccessReview",
                                                "", "count=" + std::to_string(rows_res->size()));
                 JObj payload;
                 payload.add("count", static_cast<int64_t>(rows_res->size())).raw("campaigns", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_rbac_role_assignments") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    mcp_audit("failure", "rbac store unavailable");
+                    res.set_content(a4_error(kInternalError, "rbac store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto grants_res = rbac_store->list_all_principal_roles_checked();
+                if (!grants_res) {
+                    mcp_audit("failure", grants_res.error());
+                    (void)audit_fn(req, "rbac.assignments.list", "failure", "AccessReview", "",
+                                   grants_res.error());
+                    res.set_content(a4_error(kInternalError, grants_res.error(),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& g : *grants_res) {
+                    arr.add(JObj()
+                                .add("principal_type", g.principal_type)
+                                .add("principal_id", g.principal_id)
+                                .add("role_name", g.role_name));
+                }
+                const bool audit_ok = audit_fn(req, "rbac.assignments.list", "success", "AccessReview",
+                                               "", "count=" + std::to_string(grants_res->size()));
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(grants_res->size()))
+                    .raw("assignments", arr.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success");
@@ -24061,12 +25127,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         audit_fn(req, "access_review.closed", "failure", "AccessReview", campaign_id,
                                 close_res.error());
                     mcp_audit("failure", close_res.error());
+                    const int code = mcp_error_for_access_review_msg(close_res.error());
+                    const bool retryable = code == kInternalError;
                     res.set_content(
-                        error_response(id, mcp_error_for_access_review_msg(close_res.error()),
-                                       close_res.error(),
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        a4_error(code, close_res.error(),
+                                 retryable ? "retry the request" : std::string_view{},
+                                 /*retry_after_ms=*/retryable ? mcp::kMcpStoreFaultRetryMs : -1, {},
+                                 denied_audit_ok),
                         "application/json");
                     return;
                 }

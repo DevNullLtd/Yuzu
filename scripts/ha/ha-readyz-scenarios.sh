@@ -46,6 +46,22 @@
 #   K. the same setting from a pg_service.conf entry (service=): the DSN-only
 #                       guard cannot see it, so the server checks what libpq resolved
 #                       on its first connection and refuses to boot (Gate 8 round 7).
+#   L. CPU-starved primary (#4944)  `docker update --cpus 0.01` on the database
+#      under a pgbench select load: the probe query misses its 2 s deadline, so
+#      /readyz goes red (sustained overload IS an outage from the operator's
+#      seat — the same database cannot answer real requests either); restoring
+#      the CPU brings it back within one probe. There is no server-side
+#      hysteresis by decision: the LB's healthy/unhealthy thresholds are the
+#      damping (docs/user-manual/server-admin.md, "Load balancers ...").
+#   M. brief stall (#4944)  a 3 s `docker pause`/unpause never turns /readyz
+#      red: one failed probe is a blip, two are needed.
+#   N. max_connections exhaustion (#4943)  a third database with
+#      max_connections=20 reserved_connections=8, the server on a NON-superuser
+#      app role granted pg_use_reserved_connections, foreign sessions holding
+#      every unreserved slot: killing the probe's backend makes it reconnect
+#      into the reserve and /readyz stays 200; REVOKE the grant and the same
+#      kill leaves the probe refused (53300) — /readyz 503 unreachable, the
+#      failure the shipped default prevents.
 #
 # Before WS-8, scenario A stayed green indefinitely and C closed the listener
 # immediately (see pg_reachability_probe.hpp / shutdown_drain_rules.hpp).
@@ -54,6 +70,15 @@
 # when every scenario passes. Ports and container names are salted per run —
 # the self-hosted CI runners share one OS identity (#1871). Manual today, like
 # the other scripts/ha/ harnesses (no workflow runs it).
+#
+# Passwords generated here (PG_PASS, APP_PASS) are for THROWAWAY, localhost-only
+# containers this script creates and destroys, and this is a LOCAL harness, not
+# a shipped artifact. Scenarios that grep the server log for a password's
+# ABSENCE (e.g. N) prove only that the SERVER never logs it — every DSN/password
+# is still visible in this process's own argv (`docker run`/`docker exec`/the
+# server invocation itself), same as every earlier scenario's `$PG_PASS`-bearing
+# DSN. Do not read a clean server-log grep as a complete secrecy proof
+# (security-guardian, Gate 2 finding #6).
 #
 # usage: ha-readyz-scenarios.sh [--server-bin PATH]
 set -uo pipefail
@@ -67,7 +92,7 @@ PG_IMAGE="${YUZU_HA_READYZ_PG_IMAGE:-postgres:18.4-bookworm@sha256:efef99e1558f8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,47p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,64p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -75,19 +100,20 @@ done
 
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 WEB="$(free_port)"; GRPC="$(free_port)"; MGMT="$(free_port)"
-PGPORT="$(free_port)"; PG2PORT="$(free_port)"
+PGPORT="$(free_port)"; PG2PORT="$(free_port)"; PG3PORT="$(free_port)"
 
 RIG="$(mktemp -d -t yuzu_ha_readyz.XXXXXX)"
 SALT="$$-$RANDOM"
 PG="yuzu-ha-readyz-pg-$SALT"
 PG2="yuzu-ha-readyz-pg2-$SALT"
+PG3="yuzu-ha-readyz-pg3-$SALT"
 SERVER_PID=""
 FAILS=0
 PG_PASS="$(openssl rand -hex 24)"
 
 cleanup() {
     [[ -n "$SERVER_PID" ]] && kill -KILL "$SERVER_PID" 2>/dev/null
-    for c in "$PG" "$PG2"; do
+    for c in "$PG" "$PG2" "$PG3"; do
         docker unpause "$c" >/dev/null 2>&1
         docker rm -f "$c" >/dev/null 2>&1
     done
@@ -116,10 +142,11 @@ wait_for() {
     done
 }
 
-start_pg() { # <name> <host-port>
-    docker run -d --name "$1" -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD="$PG_PASS" -e POSTGRES_DB=yuzu \
-        -p "127.0.0.1:$2:5432" "$PG_IMAGE" -c fsync=off >/dev/null || return 1
-    pg_up "$1"
+start_pg() { # <name> <host-port> [extra postgres -c flags...]
+    local name="$1" port="$2"; shift 2
+    docker run -d --name "$name" -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD="$PG_PASS" -e POSTGRES_DB=yuzu \
+        -p "127.0.0.1:$port:5432" "$PG_IMAGE" -c fsync=off "$@" >/dev/null || return 1
+    pg_up "$name"
 }
 pg_up() { # <name>
     for _ in $(seq 1 60); do
@@ -356,6 +383,89 @@ if wait_exit 30 "$(date +%s)"; then
         pass "refused to start ${ELAPSED}s in on the service file's load_balance_hosts, password not logged"
     else fail "exited, but without the expected refusal message (or with the password in it)"; fi
 else fail "server did not refuse load_balance_hosts from a service file"; kill -KILL "$SERVER_PID" 2>/dev/null; SERVER_PID=""; fi
+
+echo "== L: CPU-starved primary under load (#4944) -> red while starved, back within a probe"
+boot "$DSN" || exit 1
+docker exec "$PG" pgbench -q -i -s 5 -U yuzu -d yuzu >/dev/null 2>&1 || fail "pgbench -i failed"
+docker exec -d "$PG" pgbench -S -c 64 -j 8 -T 150 -U yuzu -d yuzu >/dev/null 2>&1
+sleep 1   # let load ramp up before starving it (empirically calibrated: 0.01 cpu + 64 clients
+          # reliably reds /readyz around t=12s; 0.02 cpu + 32 clients, tried first, did not
+          # reliably starve the probe's own trivial no-table query even over 60s)
+docker update --cpus 0.01 "$PG" >/dev/null
+if t=$(wait_for /readyz 503 40 '"pg":"'); then pass "/readyz 503 $(pg_reason) ${t}s after the database was starved to 1% of a CPU under a 64-client load"
+else fail "/readyz stayed 200 for 40s on a CPU-starved, loaded database: $(body /readyz)"; fi
+docker update --cpus "$(nproc)" "$PG" >/dev/null   # --cpus 0 does NOT clear a limit; the host's full count does
+if t=$(wait_for /readyz 200 20); then pass "/readyz 200 again ${t}s after the CPU limit was lifted (one successful probe recovers; no server-side hysteresis)"
+else fail "/readyz did not recover within 20s of lifting the CPU limit: $(body /readyz)"; fi
+docker exec "$PG" bash -c 'kill $(pidof pgbench)' >/dev/null 2>&1 || true
+
+echo "== M: 3s stall (#4944) -> never red (one failed probe is a blip)"
+docker pause "$PG" >/dev/null
+red=0
+for _ in $(seq 1 6); do [[ "$(code /readyz)" == 503 ]] && red=1; sleep 0.5; done
+docker unpause "$PG" >/dev/null
+for _ in $(seq 1 10); do [[ "$(code /readyz)" == 503 ]] && red=1; sleep 0.5; done
+if (( red == 0 )); then pass "/readyz stayed 200 through a 3s stall and its recovery"
+else fail "/readyz went 503 on a 3s stall: $(body /readyz)"; fi
+stop_server 120
+
+echo "== N: max_connections exhaustion (#4943) -> reserved slots keep the probe (and the pool) connecting"
+# A third database, small enough to fill by hand: 20 slots, 3 superuser-only,
+# 8 reserved for pg_use_reserved_connections members -> 9 for everyone else. The
+# server's own footprint is pinned to --postgres-pool-size 2 (+1 leader +1
+# probe = 4), all privileged (granted below), so exactly 9-4=5 ordinary slots
+# remain for foreign_client to fill before being refused.
+start_pg "$PG3" "$PG3PORT" -c max_connections=20 -c reserved_connections=8 -c superuser_reserved_connections=3 \
+    || { echo "third postgres did not start" >&2; exit 2; }
+APP_PASS="$(openssl rand -hex 16)"
+psql_in "$PG3" "CREATE ROLE app LOGIN PASSWORD '${APP_PASS}'"
+psql_in "$PG3" "GRANT pg_use_reserved_connections TO app"
+psql_in "$PG3" "CREATE DATABASE appdb OWNER app"
+psql_in "$PG3" "CREATE ROLE foreign_client LOGIN PASSWORD 'x'"
+NDSN="postgresql://app:${APP_PASS}@127.0.0.1:${PG3PORT}/appdb"
+boot "$NDSN" --postgres-pool-size 2 || exit 1
+# Foreign clients take every unreserved slot: open sessions until one is refused.
+# The refusal is asserted on THIS SAME attempt's own output, not a later, separate
+# connection — the app role's own pool can shrink an idle connection between two
+# checks, transiently freeing an ordinary slot, so a second, later probe connection
+# can go through even though the loop's own attempt was genuinely refused.
+foreign_burst() { docker exec -d "$PG3" psql -U foreign_client -d postgres -c "SELECT pg_sleep(300)" 2>/dev/null || true; }
+held=0
+refusal=""
+for _ in $(seq 1 20); do
+    foreign_burst
+    sleep 0.3
+    out=$(docker exec "$PG3" psql -U foreign_client -d postgres -tAc "SELECT 1" 2>&1)
+    if [[ "$out" != "1" ]]; then refusal="$out"; break; fi
+done
+held=$(docker exec "$PG3" psql -U yuzu -d postgres -tAc "SELECT count(*) FROM pg_stat_activity WHERE usename='foreign_client'")
+if [[ -n "$refusal" ]] && grep -q "remaining connection slots are reserved" <<<"$refusal"; then
+    pass "foreign clients hold ${held} sessions; a further foreign connect is refused (slots reserved)"
+else fail "could not fill the unreserved slots (foreign sessions: ${held}; last attempt: ${refusal:-succeeded, no refusal in 20 tries})"; fi
+# Kill the probe's backend, and have a foreign client burst for the freed slot at
+# once (the realistic shape: foreign demand is continuous, the probe ticks every
+# 2 s). The probe must still reconnect — into the reserve — and /readyz stay 200.
+kill_probe() { docker exec "$PG3" psql -U yuzu -d postgres -tAc "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name='yuzu-readyz-probe'"; }
+[[ "$(kill_probe)" == 1 ]] || fail "did not find exactly one probe backend to terminate"
+foreign_burst
+red=0
+for _ in $(seq 1 16); do [[ "$(code /readyz)" == 503 ]] && red=1; sleep 0.5; done
+if (( red == 0 )) && [[ "$(docker exec "$PG3" psql -U yuzu -d postgres -tAc "SELECT count(*) FROM pg_stat_activity WHERE application_name='yuzu-readyz-probe'")" == 1 ]]; then
+    pass "/readyz stayed 200: the probe reconnected into the reserved slots with every unreserved slot held"
+else fail "/readyz went 503 (or the probe never reconnected) with reserved slots available: $(body /readyz)"; fi
+# Negative control: without the grant the app role is an ordinary client and the
+# same kill leaves the probe refused — the #4943 failure shape.
+psql_in "$PG3" "REVOKE pg_use_reserved_connections FROM app"
+[[ "$(kill_probe)" == 1 ]] || fail "did not find exactly one probe backend to terminate (control)"
+foreign_burst
+if t=$(wait_for /readyz 503 20 '"pg":"unreachable"'); then pass "/readyz 503 pg=unreachable ${t}s after the same kill WITHOUT the grant (probe refused at max_connections; log shows 53300)"
+else fail "/readyz did not go 503 without the grant: $(body /readyz)"; fi
+grep -q "remaining connection slots are reserved" "$RIG/server.log" && pass "server log names the refusal (slots reserved), not the password" || fail "server log lacks the slots-reserved refusal"
+grep -q "$APP_PASS" "$RIG/server.log" && fail "server log contains the app password" || true
+psql_in "$PG3" "GRANT pg_use_reserved_connections TO app"
+if t=$(wait_for /readyz 200 20); then pass "/readyz 200 again ${t}s after re-granting (probe admitted into the reserve)"
+else fail "/readyz did not recover after re-grant: $(body /readyz)"; fi
+stop_server 120
 
 echo
 if (( FAILS == 0 )); then echo "ha-readyz-scenarios: ALL PASS"; exit 0; fi

@@ -85,6 +85,17 @@ struct AccessReviewCampaignRow {
     std::int64_t created_at_ms{0};
     std::string closed_by;   ///< "" while open
     std::int64_t closed_at_ms{0}; ///< 0 while open
+    /// "enabled" | "disabled" | "degraded" (A3, RBAC delivery plan) — the
+    /// fleet's RBAC enforcement state AT OPEN, per
+    /// `access_review_model::access_review_rbac_enforcement` /
+    /// `rbac_enforcement_label` (`rbac_store.hpp`). Stamped once, at freeze
+    /// time, alongside the grant population itself — NOT re-derived on a
+    /// later read, matching every other frozen field on this row. Empty
+    /// (`""`) is the honest-empty value for a campaign frozen BEFORE this
+    /// column existed (schema migration 2) — never re-backfilled, and never
+    /// confused with `"degraded"`: the store genuinely didn't degrade, the
+    /// field simply didn't exist yet.
+    std::string rbac_enforcement;
 };
 
 /// One persisted (campaign, principal, role) attestation row.
@@ -124,12 +135,23 @@ public:
     /// inserts the campaign row (`status='open'`), and inserts one
     /// `decision='pending'` attestation row per entry in
     /// `frozen_population` — ALL in one transaction. `title`/`created_by`
-    /// must be non-empty. Returns the minted `campaign_id` on success;
+    /// must be non-empty. `rbac_enforcement` must be exactly one of
+    /// `"enabled"`/`"disabled"`/`"degraded"` (A3 — the caller computes this
+    /// via `access_review_model::access_review_rbac_enforcement` on the same
+    /// `RbacStore` INSTANCE used to build `frozen_population`, read
+    /// immediately afterward — a separate, later call, not the same read —
+    /// and passes it in; this store has no `RbacStore*` of its own and never
+    /// derives authorization state itself) — an empty or unrecognised value is
+    /// rejected, mirroring `record_attestation`'s `decision` validation; the
+    /// column's own `""` default exists ONLY for rows frozen before this
+    /// field existed (schema migration 2), never as a value a live caller
+    /// may supply. Returns the minted `campaign_id` on success;
     /// `unexpected(msg)` if the transaction did not commit (nothing is
     /// left half-open — the whole freeze is atomic).
     [[nodiscard]] std::expected<std::string, std::string>
     open_campaign(std::string title, std::string created_by,
-                 const std::vector<GrantRef>& frozen_population);
+                 const std::vector<GrantRef>& frozen_population,
+                 std::string rbac_enforcement);
 
     /// Record (or overwrite, on a later re-attest) a reviewer's decision for
     /// one frozen grant. `decision` must be `"attested"` or

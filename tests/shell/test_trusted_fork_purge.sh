@@ -64,7 +64,7 @@ run_purge() { # run_purge <ref> <n-ids>  (env FAIL_ID / STICKY_ID optional)
   : > "$TMP/state"; : > "$TMP/log"
   [ "$2" -gt 0 ] && python3 -c "import sys; print('\n'.join(str(i) for i in range(1, int(sys.argv[1]) + 1)))" "$2" > "$TMP/state"
   ( set +e
-    export PATH="$TMP/bin:$PATH" REPOSITORY=Tr3kkR/Yuzu GH_TOKEN="" GITHUB_REF="$1" \
+    export PATH="$TMP/bin:$PATH" REPOSITORY=DevNullLtd/Yuzu GH_TOKEN="" GITHUB_REF="$1" \
            STATE="$TMP/state" LOG="$TMP/log" FAIL_ID="${FAIL_ID:-}" STICKY_ID="${STICKY_ID:-}"
     bash "$TMP/purge.sh" >"$TMP/out" 2>"$TMP/err"; echo $? > "$TMP/rc" )
   rc=$(cat "$TMP/rc")

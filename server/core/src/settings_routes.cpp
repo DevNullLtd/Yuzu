@@ -21,6 +21,7 @@
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
@@ -4874,7 +4875,10 @@ void SettingsRoutes::register_routes(
         // The UI suppresses the Remove button for the self row (#403),
         // but the handler must reject independently because a hand-
         // crafted HTTP DELETE bypasses the dashboard entirely.
-        if (username == session->username) {
+        //
+        // Shared comparison (rbac_admin_predicate.hpp's is_self_target) —
+        // this is call site #1 of the third-call-site trigger named below.
+        if (is_self_target(*session, username)) {
             spdlog::warn("User '{}' attempted to delete their own account via "
                          "/api/settings/users — rejected",
                          session->username);
@@ -5102,8 +5106,12 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // Self-demotion guard — can't change your own role
-        if (target_username == session->username) {
+        // Self-demotion guard — can't change your own role. Shared
+        // comparison (rbac_admin_predicate.hpp's is_self_target) — call site
+        // #2 of the third-call-site trigger named at the DELETE handler
+        // above (#397/#403); A2's unassign-own-Administrator-grant guard is
+        // the third, per that guard's own doc comment.
+        if (is_self_target(*session, target_username)) {
             spdlog::warn("User '{}' attempted to change their own role via "
                          "/api/settings/users/:username/role — rejected",
                          session->username);

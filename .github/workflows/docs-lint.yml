@@ -74,6 +74,13 @@ jobs:
       - name: No conn-less libpq escape references (#1611)
         run: python3 tests/test_no_connless_pq_escape.py
 
+      # PR #4985 / ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL
+      # lives only in RbacAdminAuthorityOwner (never rbac_store.cpp), and its shared SQL
+      # fragment kAuthenticatableAdminGrantsFrom has exactly one definition. Also
+      # registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
+        run: python3 tests/test_rbac_query_owner_seam.py
+
       # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
       # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
       # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered
@@ -107,6 +114,26 @@ jobs:
       - name: Seam-closure gate self-test
         run: python3 tests/test_seam_closure_selftest.py
 
+      # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
+      # presentation_link.py (ADR-0031 WS-A4 PR-1 F1 fix), needs COMPILED
+      # objects to run `nm` over, so the gate itself runs as a meson test()
+      # in suite:server (tests/meson.build's `dex link no presentation
+      # symbols`) instead of here. Its SELF-test, unlike the gate, compiles
+      # its own tiny throwaway fixtures and needs no project build — same
+      # "pure lexical / no build deps" posture as check-seam-closure.py's own
+      # gate above — so it belongs in this build-free job, pinning the
+      # checker's FAMILIES constant and positive-fire/negative-control
+      # probing the link-symbol logic exactly like the include-closure
+      # self-test above does for its own gate.
+      - name: Core/presentation link gate self-test (ADR-0031 WS-A4 PR-1 F1 fix)
+        # qa-4 (WS-A4 PR-1 Gate 7 fix round): docs-lint's runner image is
+        # guaranteed a C++ compiler + `nm` (ubuntu-24.04) — require the
+        # selftest to FAIL loudly, not silently SkipTest-and-pass, if that
+        # ever stops being true.
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
+        run: python3 tests/test_core_presentation_link_selftest.py
+
       # Governance-ledger linter self-test. NOTE: the linter itself
       # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
       # gate over governance.d/ — calibration showed most historical
@@ -117,6 +144,17 @@ jobs:
       # synthetic input, touches no real ledger. Stdlib only.
       - name: Governance-ledger linter self-test
         run: python3 tests/test_governance_ledger_check_selftest.py
+
+      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
+      # (system roles, securable types, operations, the authorization-topology
+      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
+      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
+      # by the time PR #4776 audited them the doc was 15 securable types, one
+      # role and five floor entries behind — each drift arriving through a
+      # reviewed PR. Set-equality, so a failure names the entry rather than the
+      # count. Stdlib only, parses source text, needs no build.
+      - name: RBAC doc/seed parity
+        run: python3 tests/test_rbac_doc_counts.py
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
