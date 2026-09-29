@@ -18772,6 +18772,14 @@ private:
         // BEFORE register_routes(), same timing contract as the two setters
         // immediately above.
         rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
+        // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
+        // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
+        // registry_.to_json_obj() (the local-only agents_fn snapshot passed
+        // to register_routes below), which would reintroduce the #4981
+        // local-vs-presence mismatch one route over. MUST run BEFORE
+        // register_routes(), same timing contract as the setters above.
+        rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)

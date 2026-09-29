@@ -179,6 +179,28 @@ public:
     /// class branches (see the route's own comment in rest_api_v1.cpp).
     /// Empty/default `{}` = the two routes answer 503 (misconfiguration).
     using AgentsJsonFn = std::function<nlohmann::json()>;
+    /// #4983 — presence-merged agent-id existence check for `POST
+    /// /api/v1/result-sets`'s caller-supplied `device_ids[]`. Deliberately
+    /// NOT `AgentsJsonFn` above: `AgentsJsonFn` is backed by
+    /// `AgentRegistry::to_json_obj()`, which is LOCAL-REPLICA-ONLY, whereas
+    /// this is backed by `AgentRegistry::all_ids()`, which additionally
+    /// merges in any cross-replica agent known only via presence
+    /// (`configure_presence`/`live_presence()`, HA WS-5, ADR-2002 §7a) — the
+    /// SAME domain `evaluate_scope`'s `ScopePopulation::Fleet` path and every
+    /// real dispatch already use. #4981 (PR-3) fixed exactly this local-vs-
+    /// presence domain mismatch on the sibling `scope/preview` route; using
+    /// `AgentsJsonFn`'s local-only snapshot here would reintroduce the same
+    /// bug class one route over — a real device known only via presence
+    /// would be wrongly rejected as nonexistent. Called ONCE per request
+    /// (never per supplied id) and the result cached in an
+    /// `unordered_set` for O(1) per-id membership checks — the
+    /// `device_ids[]` array can be up to `ResultSetStore::kMaxMembersPerSet`
+    /// entries, so a per-id backing call would be its own DoS. Empty/default
+    /// `{}` = the route answers 503 when `device_ids` is non-empty
+    /// (misconfiguration), same fail-closed contract as `FleetReadFn`/
+    /// `ScopeEvaluateFn`. Set via `set_all_agent_ids_fn` (below), BEFORE
+    /// `register_routes()`.
+    using AllAgentIdsFn = std::function<std::vector<std::string>()>;
     /// #4981 PR-2 — `POST /api/v1/scope/preview`'s SOLE scope-evaluation
     /// callback: a thin closure over `AgentRegistry::evaluate_scope` with the
     /// caller's tag/custom-properties/result-set stores already bound (see
@@ -659,10 +681,19 @@ public:
     /// `POST /api/v1/scope/preview` answer 503 (misconfiguration).
     void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
 
+    /// #4983 — see `AllAgentIdsFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`. Unset (`{}`, the default) makes
+    /// `POST /api/v1/result-sets` answer 503 whenever a non-empty
+    /// `device_ids` is supplied (misconfiguration) — a request with no
+    /// `device_ids` is unaffected either way.
+    void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
+
 private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
     ScopeEvaluateFn scope_evaluate_fn_;
+    AllAgentIdsFn all_agent_ids_fn_;
 };
 
 } // namespace yuzu::server
