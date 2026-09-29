@@ -3161,6 +3161,28 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
+        // log-only on failure at every REST/MCP call site — a sustained
+        // pool/query degrade on either had no Prometheus signal, only an
+        // spdlog::error line. `op` names which call failed, `surface` which
+        // family of handler hit it. Bounded: 2 ops x 2 surfaces = 4 series,
+        // pre-seeded below so absent() stays meaningful (same closed-label-set
+        // convention as yuzu_exec_correlation_read_degrade_total above). A
+        // sustained mark_cancelled failure specifically can leave an
+        // execution row stranded at status='running' forever (#4982) — see
+        // the stuck-row sweep this issue also adds for the recovery side.
+        metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
+                          "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
+                          "failed (pool exhaustion or a failed statement) at a REST or MCP "
+                          "dispatch call site, by op (set_agents_targeted|mark_cancelled) and "
+                          "surface (rest|mcp). No retry is attempted inline — retrying in an "
+                          "already-degraded-store request handler risks doubling request "
+                          "latency for no reliability gain.",
+                          "counter");
+        for (auto op : {"set_agents_targeted", "mark_cancelled"})
+            for (auto surface : {"rest", "mcp"})
+                metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", op}, {"surface", surface}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
         // from `RbacStore::provision_first_admin`'s outcome (the fresh-start

@@ -11734,8 +11734,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // refusing is free. Mirrors REST's run_async fix exactly.
                 auto quota = result_set_store_->count_for_owner_checked(session->username);
                 if (!quota.has_value()) {
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982: log-only swallowed the failure with no observable
+                        // signal — count it alongside the log line at every call site.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
                     // Deliberately minimal, not the full
                     // <store>_read_degrade_total{reason} convention other
@@ -11761,8 +11769,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (*quota >= ResultSetStore::kMaxPerOwner) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // retry-hint-exempt: owner is genuinely at the per-owner
                     // quota, not a transient fault.
                     res.set_content(
@@ -11787,9 +11802,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     sent = dispatch_outcome.sent;
                 } catch (const std::exception& e) {
                     spdlog::error("result-set MCP async producer dispatch failed: {}", e.what());
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled also failed for execution_id={}",
                                      exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // No retry_after_ms: dispatch_fn may have already reached some
                     // agents before throwing, and this producer's own tool
                     // description says NEVER re-send on error - a positive retry
@@ -11809,8 +11831,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // identically to a scope that genuinely matched nobody —
                     // deliberate, so a distinct status never discloses devices
                     // the caller cannot see.
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     res.set_content(
                         a4_error(kInternalError,
                                  "RESULT_SET_NO_AGENTS: no agents reached in the target scope — "
@@ -11821,8 +11850,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!execution_tracker->set_agents_targeted(exec_id, sent))
+                if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
                     spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+                            .increment();
+                }
 
                 CreateRequest cr;
                 cr.owner_principal = session->username;
@@ -11835,8 +11871,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!created) {
                     if (metrics && created.error() == ResultSetError::QuotaExceeded)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     if (created.error() == ResultSetError::DbError) {
                         // No retry_after_ms: dispatch already succeeded above
                         // (sent > 0, set_agents_targeted already called) - only the
@@ -17244,6 +17287,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         !execution_tracker->mark_cancelled(execution_id, session->username)) {
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     mcp_audit("failure",
                               std::string("dispatch_exception execution_id=") + execution_id);
@@ -17273,6 +17322,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         !execution_tracker->mark_cancelled(execution_id, session->username)) {
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     // #3424/#3511: "reachable" is no longer the only reason
                     // this can be zero — a target that is QUARANTINED is
@@ -17456,6 +17511,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!execution_tracker->set_agents_targeted(execution_id, agents_reached)) {
                         spdlog::error("mcp_server: set_agents_targeted failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
                     // arrived BEFORE set_agents_targeted saw agents_targeted==0

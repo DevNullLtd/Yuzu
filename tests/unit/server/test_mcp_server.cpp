@@ -29172,6 +29172,137 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// #4982: mark_cancelled / set_agents_targeted were log-only on failure at
+// every call site. These two tests force each call to fail deterministically
+// (the established LOCK TABLE + short lock_timeout_ms technique, this time
+// against execution_tracker.executions — the tracker's OWN table, on the
+// tracker_bundle's OWN dsn, distinct from rs_bundle's schema every other test
+// in this file locks) and assert the new
+// yuzu_exec_tracker_bookkeeping_failed_total{op,surface="mcp"} counter.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("MCP create_result_set_from_tar_query: zero agents reached AND mark_cancelled "
+          "itself failing counts "
+          "yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=mcp} (#4982)",
+          "[pg][mcp][integration][result-sets][tar][4982]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    // Lock execution_tracker.executions from a second connection INSIDE the
+    // fake dispatch closure — fires after the (already-passed) quota
+    // pre-check, strictly before the handler's own mark_cancelled UPDATE.
+    pg::PgConn locker{PQconnectdb(tracker_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    auto zero_agents_dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        return {.sent = 0, .command_id = ""}; // nobody reached -> handler calls mark_cancelled
+    };
+
+    // execution_tracker's own pool needs a short lock_timeout_ms so the lock
+    // above faults mark_cancelled's UPDATE deterministically and fast.
+    pg::PgPool short_lock_tracker_pool{
+        {.conninfo = tracker_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_tracker_pool.valid());
+    yuzu::server::ExecutionTracker short_lock_tracker{short_lock_tracker_pool};
+    REQUIRE(short_lock_tracker.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &short_lock_tracker;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.metrics_for_test = &reg;
+    ts.start_with_dispatch(zero_agents_dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    // mark_cancelled's own failure is silent to the caller — unchanged
+    // RESULT_SET_NO_AGENTS shape.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NO_AGENTS") !=
+          std::string::npos);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(reg.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                      {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                      {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("MCP create_result_set_from_tar_query: set_agents_targeted failing after a real "
+          "dispatch counts "
+          "yuzu_exec_tracker_bookkeeping_failed_total{op=set_agents_targeted,surface=mcp} "
+          "(#4982)",
+          "[pg][mcp][integration][result-sets][tar][4982]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    pg::PgConn locker{PQconnectdb(tracker_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    auto real_dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        return {.sent = 2, .command_id = "cmd-targetedfail"}; // a real dispatch
+    };
+
+    pg::PgPool short_lock_tracker_pool{
+        {.conninfo = tracker_bundle.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_tracker_pool.valid());
+    yuzu::server::ExecutionTracker short_lock_tracker{short_lock_tracker_pool};
+    REQUIRE(short_lock_tracker.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &short_lock_tracker;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.metrics_for_test = &reg;
+    ts.start_with_dispatch(real_dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1","name":"mcptargetedfail"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    // set_agents_targeted's own failure is swallowed to the caller too — the
+    // row still lands pending (create_pending only touches
+    // result_set_store's own, unlocked, schema).
+    REQUIRE(body.contains("result"));
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(reg.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                      {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                      {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+              .value() == 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // #4306 PR-B MCP twins: findings 1 + 3 (+ #4307 finding 2) — mirrors the REST
 // coverage in test_rest_result_sets_async.cpp for the MCP tool surface.
 // ═══════════════════════════════════════════════════════════════════════════
